@@ -10,8 +10,10 @@ mod nbest;
 mod section;
 mod system_dictionary;
 mod tagger;
+mod templates;
 
 pub use constraint::{BoundaryKind, Constraint};
 pub use dictionary::Dictionary;
 pub use error::Error;
 pub use tagger::{FeatureId, NBest, Node, NodeKind, Path, Tagger};
+pub use templates::{ConnectionTemplates, MappedTemplates, TemplatePart};

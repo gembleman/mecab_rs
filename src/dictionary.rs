@@ -9,6 +9,10 @@ use crate::error::Error;
 use crate::matrix::Matrix;
 use crate::system_dictionary::{DictionaryKind, PrefixHit, SystemDictionary, TokenRecord};
 
+const DENSE_MATRIX_FILE: &str = "matrix.bin";
+const HOT_MATRIX_FILE: &str = "matrix.hot";
+const TEMPLATES_FILE: &str = "matrix.tpl";
+
 const OPTION_DEFAULT_MAX_GROUPING_SIZE: usize = 24;
 const BOS_FEATURE_KEY: &[u8] = b"bos-feature";
 const UNK_FEATURE_KEY: &[u8] = b"unk-feature";
@@ -73,6 +77,20 @@ impl Dictionary {
 
     pub fn open(directory: impl AsRef<Path>) -> Result<Self, Error> {
         let directory = directory.as_ref();
+        let hot_path = directory.join(HOT_MATRIX_FILE);
+        let templates_path = directory.join(TEMPLATES_FILE);
+        if hot_path.exists() && templates_path.exists() {
+            Self::open_matrix(directory, HOT_MATRIX_FILE, |path| Matrix::open_hot(path, &templates_path))
+        } else {
+            Self::open_matrix(directory, DENSE_MATRIX_FILE, Matrix::open_dense)
+        }
+    }
+
+    fn open_matrix(
+        directory: &Path,
+        matrix_file: &str,
+        open_matrix: impl FnOnce(&Path) -> Result<Matrix, Error>,
+    ) -> Result<Self, Error> {
         let dicrc = directory.join("dicrc");
         let bytes = fs::read(&dicrc)
             .map_err(|source| Error::Io { path: dicrc.clone(), source })?;
@@ -88,8 +106,8 @@ impl Dictionary {
         let system = SystemDictionary::open(&directory.join("sys.dic"), DictionaryKind::System)?;
         let unknown_path = directory.join("unk.dic");
         let unknown = SystemDictionary::open(&unknown_path, DictionaryKind::Unknown)?;
-        let matrix_path = directory.join("matrix.bin");
-        let matrix = Matrix::open(&matrix_path)?;
+        let matrix_path = directory.join(matrix_file);
+        let matrix = open_matrix(&matrix_path)?;
         let chars = CharProperty::open(&directory.join("char.bin"))?;
         let matches_matrix = |dictionary: &SystemDictionary| {
             dictionary.left_size() == matrix.left_size() && dictionary.right_size() == matrix.right_size()

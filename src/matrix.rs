@@ -5,29 +5,38 @@ use memmap2::Mmap;
 use crate::dictionary::map_file;
 use crate::error::Error;
 use crate::section::Section;
+use crate::templates::MappedTemplates;
 
+const COLD_CACHE_BITS: u32 = 16;
+const CACHE_HASH_MULTIPLIER: u32 = 0x9E37_79B1;
 const HEADER_BYTES: usize = 4;
+const HOT_HEADER_BYTES: usize = 8;
 const COST_BYTES: usize = 2;
 
 fn broken(path: &Path, reason: &'static str) -> Error {
     Error::Format { file: path.to_path_buf(), reason }
 }
 
-pub(crate) struct Matrix {
+fn header_sizes(map: &Mmap, path: &Path, words: usize) -> Result<[usize; 4], Error> {
+    let mut sizes = [0; 4];
+    let header = map.get(..words * 2).ok_or_else(|| broken(path, "the file is shorter than its header"))?;
+    for (size, &word) in sizes.iter_mut().zip(header.as_chunks::<2>().0) {
+        *size = usize::from(u16::from_le_bytes(word));
+    }
+    Ok(sizes)
+}
+
+pub(crate) struct DenseMatrix {
     map: Mmap,
     costs: Section<i16>,
     left_size: usize,
     right_size: usize,
 }
 
-impl Matrix {
-    pub(crate) fn open(path: &Path) -> Result<Self, Error> {
+impl DenseMatrix {
+    fn open(path: &Path) -> Result<Self, Error> {
         let map = map_file(path)?;
-        let Some((&[left_low, left_high, right_low, right_high], _)) = map.split_first_chunk() else {
-            return Err(broken(path, "the file is shorter than its header"));
-        };
-        let left_size = usize::from(u16::from_le_bytes([left_low, left_high]));
-        let right_size = usize::from(u16::from_le_bytes([right_low, right_high]));
+        let [left_size, right_size, _, _] = header_sizes(&map, path, HEADER_BYTES / 2)?;
         if left_size == 0 || right_size == 0 {
             return Err(broken(path, "the matrix has no context ids"));
         }
@@ -39,16 +48,133 @@ impl Matrix {
         Ok(Self { map, costs, left_size, right_size })
     }
 
-    pub(crate) fn left_size(&self) -> usize {
-        self.left_size
-    }
-
-    pub(crate) fn right_size(&self) -> usize {
-        self.right_size
-    }
-
     pub(crate) fn right_column(&self, right_lc_attr: u16) -> &[i16] {
         let start = self.left_size * usize::from(right_lc_attr);
         &self.costs.view(&self.map)[start..start + self.left_size]
+    }
+}
+
+pub(crate) struct HotMatrix {
+    map: Mmap,
+    costs: Section<i16>,
+    templates: MappedTemplates,
+    hot_left: usize,
+    hot_right: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct ColdCache {
+    slots: Vec<u64>,
+}
+
+impl ColdCache {
+    fn slot_of(key: u32) -> usize {
+        (key.wrapping_mul(CACHE_HASH_MULTIPLIER) >> (u32::BITS - COLD_CACHE_BITS)) as usize
+    }
+
+    fn cost(&mut self, templates: &MappedTemplates, left_rc_attr: u16, right_lc_attr: u16) -> i16 {
+        if self.slots.is_empty() {
+            self.slots = vec![0; 1 << COLD_CACHE_BITS];
+        }
+        let key = u32::from(left_rc_attr) << u16::BITS | u32::from(right_lc_attr);
+        let slot = &mut self.slots[Self::slot_of(key)];
+        let tag = u64::from(key) + 1;
+        if *slot >> i16::BITS == tag {
+            return *slot as u16 as i16;
+        }
+        let cost = templates.cost(left_rc_attr, right_lc_attr);
+        *slot = tag << i16::BITS | u64::from(cost as u16);
+        cost
+    }
+}
+
+pub(crate) struct HotColumn<'m> {
+    cells: &'m [i16],
+    templates: &'m MappedTemplates,
+    cache: &'m mut ColdCache,
+    right_lc_attr: u16,
+}
+
+#[cold]
+#[inline(never)]
+fn cold_cost(
+    templates: &MappedTemplates,
+    cache: &mut ColdCache,
+    left_rc_attr: u16,
+    right_lc_attr: u16,
+) -> i16 {
+    cache.cost(templates, left_rc_attr, right_lc_attr)
+}
+
+impl<'m> HotColumn<'m> {
+    pub(crate) fn into_cost_fn(self) -> impl FnMut(u16) -> i16 + 'm {
+        let Self { cells, templates, cache, right_lc_attr } = self;
+        move |left_rc_attr| match cells.get(usize::from(left_rc_attr)) {
+            Some(&cost) => cost,
+            None => cold_cost(templates, cache, left_rc_attr, right_lc_attr),
+        }
+    }
+}
+
+impl HotMatrix {
+    fn open(path: &Path, templates: MappedTemplates) -> Result<Self, Error> {
+        let map = map_file(path)?;
+        let [left_size, right_size, hot_left, hot_right] = header_sizes(&map, path, HOT_HEADER_BYTES / 2)?;
+        if left_size != templates.left_size() || right_size != templates.right_size() {
+            return Err(broken(path, "the hot matrix size does not match the templates"));
+        }
+        if hot_left == 0 || hot_right == 0 || hot_left > left_size || hot_right > right_size {
+            return Err(broken(path, "the hot block lies outside of the matrix"));
+        }
+        if HOT_HEADER_BYTES + hot_left * hot_right * COST_BYTES != map.len() {
+            return Err(broken(path, "the file size does not match the header"));
+        }
+        let costs = Section::new(&map, HOT_HEADER_BYTES..map.len())
+            .ok_or_else(|| broken(path, "the cost table is misaligned"))?;
+        Ok(Self { map, costs, templates, hot_left, hot_right })
+    }
+
+    pub(crate) fn right_column<'m>(
+        &'m self,
+        right_lc_attr: u16,
+        cache: &'m mut ColdCache,
+    ) -> HotColumn<'m> {
+        let row = usize::from(right_lc_attr);
+        let cells = if row < self.hot_right {
+            &self.costs.view(&self.map)[row * self.hot_left..(row + 1) * self.hot_left]
+        } else {
+            &[]
+        };
+        HotColumn { cells, templates: &self.templates, cache, right_lc_attr }
+    }
+}
+
+pub(crate) enum Matrix {
+    Dense(DenseMatrix),
+    Hot(HotMatrix),
+}
+
+impl Matrix {
+    pub(crate) fn open_dense(path: &Path) -> Result<Self, Error> {
+        DenseMatrix::open(path).map(Self::Dense)
+    }
+
+    pub(crate) fn open_hot(path: &Path, templates_path: &Path) -> Result<Self, Error> {
+        let templates = MappedTemplates::open(templates_path)?;
+        HotMatrix::open(path, templates).map(Self::Hot)
+    }
+
+    pub(crate) fn left_size(&self) -> usize {
+        match self {
+            Self::Dense(dense) => dense.left_size,
+            Self::Hot(hot) => hot.templates.left_size(),
+        }
+    }
+
+    pub(crate) fn right_size(&self) -> usize {
+        match self {
+            Self::Dense(dense) => dense.right_size,
+            Self::Hot(hot) => hot.templates.right_size(),
+        }
     }
 }

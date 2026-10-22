@@ -5,6 +5,7 @@ use crate::constraint::{Constraint, ConstraintSet, NO_FEATURE};
 use crate::dictionary::Dictionary;
 use crate::error::Error;
 use crate::ids::{ElementId, LinkId, NodeId};
+use crate::matrix::{ColdCache, HotMatrix, Matrix};
 use crate::nbest::{Agenda, PathLink};
 use crate::system_dictionary::PrefixHit;
 
@@ -82,6 +83,7 @@ pub(crate) struct Lattice {
     all_paths: bool,
     links: Vec<PathLink>,
     agenda: Agenda,
+    cold_cache: ColdCache,
 }
 
 impl Lattice {
@@ -246,42 +248,79 @@ impl Lattice {
         begun: Range<usize>,
         lefts: &[LeftCandidate],
     ) -> Result<(), Error> {
+        match &dictionary.matrix {
+            Matrix::Dense(dense) => {
+                for right_index in begun.rev() {
+                    let right_id = NodeId::from_index(right_index);
+                    let column = dense.right_column(self.nodes[right_id].lc_attr);
+                    self.connect_right::<NBEST>(position, right_id, lefts, |rc| column[usize::from(rc)])?;
+                }
+                Ok(())
+            }
+            Matrix::Hot(hot) => {
+                let mut cache = std::mem::take(&mut self.cold_cache);
+                let connected = self.connect_rights_hot::<NBEST>(hot, &mut cache, position, begun, lefts);
+                self.cold_cache = cache;
+                connected
+            }
+        }
+    }
+
+    fn connect_rights_hot<const NBEST: bool>(
+        &mut self,
+        hot: &HotMatrix,
+        cache: &mut ColdCache,
+        position: usize,
+        begun: Range<usize>,
+        lefts: &[LeftCandidate],
+    ) -> Result<(), Error> {
         for right_index in begun.rev() {
             let right_id = NodeId::from_index(right_index);
-            let right_node = self.nodes[right_id];
-            let column = dictionary.matrix.right_column(right_node.lc_attr);
-            let word_cost = i32::from(right_node.wcost);
-            let mut best_cost = i32::MAX;
-            let mut best: Option<NodeId> = None;
-            let mut lpath: Option<LinkId> = None;
-            for left in lefts.iter().rev() {
-                let connection = column[usize::from(left.rc_attr)];
-                let local = i32::from(connection) + word_cost;
-                let cost = left.cost.wrapping_add(local);
-                if cost < best_cost {
-                    best = Some(left.id);
-                    best_cost = cost;
-                }
-                if NBEST {
-                    let link = PathLink { left_node: left.id, cost: local, next_left: lpath };
-                    self.links.push(link);
-                    lpath = Some(LinkId::from_index(self.links.len() - 1));
-                }
-            }
-            let Some(best) = best else {
-                return Err(Error::TooLongSentence);
-            };
-            let target = usize::from(right_node.rlength) + position;
-            if target >= self.position_count {
-                return Err(Error::NodeEndOutOfRange);
-            }
-            let node = &mut self.nodes[right_id];
-            node.prev = Some(best);
-            node.cost = best_cost;
-            node.lpath = lpath;
-            let ending = LeftCandidate { rc_attr: right_node.rc_attr, cost: best_cost, id: right_id };
-            self.ends[target].push(ending);
+            let column = hot.right_column(self.nodes[right_id].lc_attr, cache);
+            self.connect_right::<NBEST>(position, right_id, lefts, column.into_cost_fn())?;
         }
+        Ok(())
+    }
+
+    fn connect_right<const NBEST: bool>(
+        &mut self,
+        position: usize,
+        right_id: NodeId,
+        lefts: &[LeftCandidate],
+        mut connection_cost: impl FnMut(u16) -> i16,
+    ) -> Result<(), Error> {
+        let right_node = self.nodes[right_id];
+        let word_cost = i32::from(right_node.wcost);
+        let mut best_cost = i32::MAX;
+        let mut best: Option<NodeId> = None;
+        let mut lpath: Option<LinkId> = None;
+        for left in lefts.iter().rev() {
+            let connection = connection_cost(left.rc_attr);
+            let local = i32::from(connection) + word_cost;
+            let cost = left.cost.wrapping_add(local);
+            if cost < best_cost {
+                best = Some(left.id);
+                best_cost = cost;
+            }
+            if NBEST {
+                let link = PathLink { left_node: left.id, cost: local, next_left: lpath };
+                self.links.push(link);
+                lpath = Some(LinkId::from_index(self.links.len() - 1));
+            }
+        }
+        let Some(best) = best else {
+            return Err(Error::TooLongSentence);
+        };
+        let target = usize::from(right_node.rlength) + position;
+        if target >= self.position_count {
+            return Err(Error::NodeEndOutOfRange);
+        }
+        let node = &mut self.nodes[right_id];
+        node.prev = Some(best);
+        node.cost = best_cost;
+        node.lpath = lpath;
+        let ending = LeftCandidate { rc_attr: right_node.rc_attr, cost: best_cost, id: right_id };
+        self.ends[target].push(ending);
         Ok(())
     }
 

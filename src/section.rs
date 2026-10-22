@@ -6,6 +6,8 @@ use std::ops::Range;
 pub(crate) unsafe trait Plain: Copy {}
 
 unsafe impl Plain for i16 {}
+unsafe impl Plain for u16 {}
+unsafe impl Plain for f64 {}
 unsafe impl Plain for u32 {}
 unsafe impl Plain for [u32; 2] {}
 
