@@ -354,7 +354,7 @@ impl Lattice {
                     && !self.constraints.admits(
                         begin,
                         surface + hit.length,
-                        dictionary.system.feature(token.feature),
+                        || dictionary.system.feature(token.feature),
                     )
                 {
                     continue;
@@ -479,7 +479,7 @@ impl Lattice {
                 && !self.constraints.admits(
                     span.begin,
                     span.end,
-                    dictionary.unknown.feature(token.feature),
+                    || dictionary.unknown.feature(token.feature),
                 )
             {
                 continue;

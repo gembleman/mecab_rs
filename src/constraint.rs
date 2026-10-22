@@ -78,7 +78,7 @@ impl ConstraintSet {
         &self.bytes[start..end]
     }
 
-    pub(crate) fn admits(&self, begin: usize, end: usize, feature: &[u8]) -> bool {
+    pub(crate) fn admits<'f>(&self, begin: usize, end: usize, feature: impl FnOnce() -> &'f [u8]) -> bool {
         if self.is_inside_token(end) {
             return false;
         }
@@ -88,7 +88,7 @@ impl ConstraintSet {
         }
         self.is_token_boundary(begin)
             && self.is_token_boundary(end)
-            && partial_match(self.feature_bytes(index), feature)
+            && partial_match(self.feature_bytes(index), feature())
     }
 
     fn boundary_at(&self, position: usize) -> u8 {
