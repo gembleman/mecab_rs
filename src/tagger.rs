@@ -54,6 +54,7 @@ impl<D: Deref<Target = Dictionary>> Tagger<D> {
             },
             nodes: self.lattice.nodes(),
             order: self.lattice.path().iter(),
+            cost: self.lattice.path_cost(),
         })
     }
 
@@ -89,6 +90,7 @@ impl<'x> NBest<'_, 'x> {
             },
             nodes: self.lattice.nodes(),
             order: self.lattice.path().iter(),
+            cost: self.lattice.path_cost(),
         })
     }
 }
@@ -104,6 +106,13 @@ pub struct Path<'t, 'x> {
     frame: Frame<'t, 'x>,
     nodes: &'t [RawNode],
     order: slice::Iter<'t, NodeId>,
+    cost: i64,
+}
+
+impl Path<'_, '_> {
+    pub fn cost(&self) -> i64 {
+        self.cost
+    }
 }
 
 impl<'t, 'x> Iterator for Path<'t, 'x> {

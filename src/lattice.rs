@@ -77,6 +77,7 @@ pub(crate) struct Lattice {
     position_count: usize,
     hits: Vec<PrefixHit>,
     path: Vec<NodeId>,
+    path_cost: i64,
     constraints: ConstraintSet,
     all_paths: bool,
     links: Vec<PathLink>,
@@ -103,6 +104,7 @@ impl Lattice {
             cursor = self.nodes[id].prev;
         }
         self.path.reverse();
+        self.path_cost = i64::from(self.nodes[eos].cost);
         Ok(())
     }
 
@@ -123,6 +125,7 @@ impl Lattice {
         let Some(mut found) = self.advance_nbest() else {
             return false;
         };
+        self.path_cost = self.agenda.path_cost(found);
         loop {
             self.path.push(self.agenda.node(found));
             match self.agenda.next(found) {
@@ -178,6 +181,10 @@ impl Lattice {
 
     pub(crate) fn path(&self) -> &[NodeId] {
         &self.path
+    }
+
+    pub(crate) fn path_cost(&self) -> i64 {
+        self.path_cost
     }
 
     pub(crate) fn constraints(&self) -> &ConstraintSet {
