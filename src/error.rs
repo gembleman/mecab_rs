@@ -13,6 +13,7 @@ pub enum Error {
     TooLongSentence,
     NodeEndOutOfRange,
     UnsatisfiableConstraint,
+    Corrupt(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -30,6 +31,7 @@ impl fmt::Display for Error {
             Self::UnsatisfiableConstraint => {
                 formatter.write_str("no node satisfies the given constraints")
             }
+            Self::Corrupt(what) => write!(formatter, "the dictionary is corrupt: {what}"),
         }
     }
 }

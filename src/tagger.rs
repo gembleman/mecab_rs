@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 use std::ops::Range;
 use std::slice;
+use std::str::Utf8Error;
 use std::sync::Arc;
 
 use crate::constraint::{ConstraintSet, Constraint};
@@ -120,8 +121,8 @@ impl<'a> Node<'a> {
         usize::from(self.raw.rlength)
     }
 
-    pub fn feature(&self) -> &'a str {
-        std::str::from_utf8(self.feature_bytes()).unwrap_or("")
+    pub fn feature(&self) -> Result<&'a str, Utf8Error> {
+        str::from_utf8(self.feature_bytes())
     }
 
     pub fn feature_bytes(&self) -> &'a [u8] {

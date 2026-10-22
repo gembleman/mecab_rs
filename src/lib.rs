@@ -6,6 +6,7 @@ mod feature_match;
 mod lattice;
 mod matrix;
 mod nbest;
+mod section;
 mod system_dictionary;
 mod tagger;
 

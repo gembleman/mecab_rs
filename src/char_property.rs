@@ -4,7 +4,9 @@ use memmap2::Mmap;
 
 use crate::dictionary::map_file;
 use crate::error::Error;
+use crate::section::Section;
 
+const COUNT_BYTES: usize = 4;
 const NAME_BYTES: usize = 32;
 const TABLE_ENTRIES: usize = 0xffff;
 const ENTRY_BYTES: usize = 4;
@@ -52,22 +54,24 @@ pub(crate) struct Scan {
 pub(crate) struct CharProperty {
     map: Mmap,
     category_count: usize,
-    table_start: usize,
+    table: Section<u32>,
 }
 
 impl CharProperty {
     pub(crate) fn open(path: &Path) -> Result<Self, Error> {
         let map = map_file(path)?;
         let broken = |reason| Error::Format { file: path.to_path_buf(), reason };
-        if map.len() < 4 {
+        let Some(&count) = map.first_chunk() else {
             return Err(broken("the file is shorter than its header"));
-        }
-        let category_count = u32::from_le_bytes([map[0], map[1], map[2], map[3]]) as usize;
-        let table_start = 4 + NAME_BYTES * category_count;
+        };
+        let category_count = u32::from_le_bytes(count) as usize;
+        let table_start = COUNT_BYTES + NAME_BYTES * category_count;
         if table_start + ENTRY_BYTES * TABLE_ENTRIES != map.len() {
             return Err(broken("the file size does not match the header"));
         }
-        Ok(Self { map, category_count, table_start })
+        let table = Section::new(&map, table_start..map.len())
+            .ok_or_else(|| broken("the character table is misaligned"))?;
+        Ok(Self { map, category_count, table })
     }
 
     pub(crate) fn category_count(&self) -> usize {
@@ -75,24 +79,14 @@ impl CharProperty {
     }
 
     pub(crate) fn name(&self, index: usize) -> &[u8] {
-        let start = 4 + NAME_BYTES * index;
+        let start = COUNT_BYTES + NAME_BYTES * index;
         let bytes = &self.map[start..start + NAME_BYTES];
         let length = bytes.iter().position(|&byte| byte == 0).unwrap_or(NAME_BYTES);
         &bytes[..length]
     }
 
     fn info_of_code(&self, code: u16) -> CharInfo {
-        let index = usize::from(code);
-        if index >= TABLE_ENTRIES {
-            return CharInfo::default();
-        }
-        let at = self.table_start + index * ENTRY_BYTES;
-        CharInfo(u32::from_le_bytes([
-            self.map[at],
-            self.map[at + 1],
-            self.map[at + 2],
-            self.map[at + 3],
-        ]))
+        self.table.view(&self.map).get(usize::from(code)).copied().map_or_else(CharInfo::default, CharInfo)
     }
 
     pub(crate) fn space(&self) -> CharInfo {

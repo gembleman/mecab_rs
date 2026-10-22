@@ -214,7 +214,7 @@ impl Lattice {
             let mut lpath = NIL;
             let lefts = candidates.rc_attrs.iter().zip(&candidates.costs).zip(&candidates.indices);
             for ((&rc_attr, &left_cost), &left) in lefts {
-                let connection = column.get(usize::from(rc_attr)).copied().unwrap_or(0);
+                let connection = column[usize::from(rc_attr)];
                 let local = i32::from(connection) + word_cost;
                 let cost = left_cost.wrapping_add(local);
                 if cost < best_cost {
@@ -276,7 +276,7 @@ impl Lattice {
         for hit_index in 0..self.hits.len() {
             let hit = self.hits[hit_index];
             for offset in 0..hit.token_count() {
-                let token = dictionary.system.token(hit.first_token() + offset);
+                let token = dictionary.system.token(hit.first_token() + offset)?;
                 if partial
                     && !self.constraints.admits(
                         begin,
@@ -405,11 +405,10 @@ impl Lattice {
         span: &Span,
         mut head: u32,
     ) -> u32 {
-        let Some(&(first, count)) = dictionary.unknown_tokens.get(char_info.default_type()) else {
+        let Some(tokens) = dictionary.unknown_tokens.get(char_info.default_type()) else {
             return head;
         };
-        for offset in 0..count {
-            let token = dictionary.unknown.token(first + offset);
+        for &token in tokens {
             if self.constraints.is_active()
                 && !self.constraints.admits(
                     span.begin,

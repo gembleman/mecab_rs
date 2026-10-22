@@ -7,7 +7,7 @@ use memmap2::Mmap;
 use crate::char_property::CharProperty;
 use crate::error::Error;
 use crate::matrix::Matrix;
-use crate::system_dictionary::SystemDictionary;
+use crate::system_dictionary::{DictionaryKind, PrefixHit, SystemDictionary, TokenRecord};
 
 const OPTION_DEFAULT_MAX_GROUPING_SIZE: usize = 24;
 const BOS_FEATURE_KEY: &[u8] = b"bos-feature";
@@ -20,11 +20,6 @@ pub(crate) fn map_file(path: &Path) -> Result<Mmap, Error> {
 }
 
 const _: () = assert!(cfg!(target_endian = "little"));
-
-pub(crate) fn mapped_view<T>(bytes: &[u8]) -> Option<&'static [T]> {
-    let (prefix, body, _) = unsafe { bytes.align_to::<T>() };
-    prefix.is_empty().then(|| unsafe { &*std::ptr::from_ref(body) })
-}
 
 fn is_space(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
@@ -62,7 +57,7 @@ pub struct Dictionary {
     pub(crate) unknown: SystemDictionary,
     pub(crate) matrix: Matrix,
     pub(crate) chars: CharProperty,
-    pub(crate) unknown_tokens: Vec<(usize, usize)>,
+    pub(crate) unknown_tokens: Vec<Box<[TokenRecord]>>,
     pub(crate) bos_feature: Vec<u8>,
     pub(crate) max_grouping_size: usize,
 }
@@ -82,25 +77,33 @@ impl Dictionary {
             .filter(|value| !value.is_empty())
             .cloned()
             .ok_or_else(|| Error::Format { file: dicrc.clone(), reason: "bos-feature is missing" })?;
-        let system = SystemDictionary::open(&directory.join("sys.dic"))?;
+        let system = SystemDictionary::open(&directory.join("sys.dic"), DictionaryKind::System)?;
         let unknown_path = directory.join("unk.dic");
-        let unknown = SystemDictionary::open(&unknown_path)?;
+        let unknown = SystemDictionary::open(&unknown_path, DictionaryKind::Unknown)?;
         let matrix_path = directory.join("matrix.bin");
         let matrix = Matrix::open(&matrix_path)?;
         let chars = CharProperty::open(&directory.join("char.bin"))?;
-        if system.left_size() != matrix.left_size() || system.right_size() != matrix.right_size() {
+        let matches_matrix = |dictionary: &SystemDictionary| {
+            dictionary.left_size() == matrix.left_size() && dictionary.right_size() == matrix.right_size()
+        };
+        if !matches_matrix(&system) || !matches_matrix(&unknown) {
             return Err(Error::Format {
                 file: matrix_path,
-                reason: "the matrix size does not match sys.dic",
+                reason: "the matrix size does not match sys.dic or unk.dic",
             });
         }
+        let broken_unknown = |reason| Error::Format { file: unknown_path.clone(), reason };
         let mut unknown_tokens = Vec::with_capacity(chars.category_count());
         for category in 0..chars.category_count() {
-            let value = unknown.exact_match(chars.name(category)).ok_or_else(|| Error::Format {
-                file: unknown_path.clone(),
-                reason: "a character category of char.bin is missing",
-            })?;
-            unknown_tokens.push(((value >> 8) as usize, (value & 0xff) as usize));
+            let value = unknown
+                .exact_match(chars.name(category))
+                .ok_or_else(|| broken_unknown("a character category of char.bin is missing"))?;
+            let hit = PrefixHit { value, length: 0 };
+            let tokens = (hit.first_token()..hit.first_token() + hit.token_count())
+                .map(|index| unknown.token(index))
+                .collect::<Result<Box<[_]>, _>>()
+                .map_err(|_| broken_unknown("an unknown-word token is not valid"))?;
+            unknown_tokens.push(tokens);
         }
         Ok(Self {
             system,

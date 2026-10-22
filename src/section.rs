@@ -1,0 +1,33 @@
+use std::marker::PhantomData;
+use std::mem::size_of;
+use std::ops::Range;
+
+#[expect(clippy::missing_safety_doc)]
+pub(crate) unsafe trait Plain: Copy {}
+
+unsafe impl Plain for i16 {}
+unsafe impl Plain for u32 {}
+unsafe impl Plain for [u32; 2] {}
+
+pub(crate) struct Section<T> {
+    start: usize,
+    end: usize,
+    element: PhantomData<T>,
+}
+
+impl<T: Plain> Section<T> {
+    pub(crate) fn new(file: &[u8], bytes: Range<usize>) -> Option<Self> {
+        cast::<T>(file.get(bytes.clone())?)?;
+        Some(Self { start: bytes.start, end: bytes.end, element: PhantomData })
+    }
+
+    pub(crate) fn view<'f>(&self, file: &'f [u8]) -> &'f [T] {
+        cast(&file[self.start..self.end]).expect("a section is viewed in the file it was made from")
+    }
+}
+
+fn cast<T: Plain>(bytes: &[u8]) -> Option<&[T]> {
+    let pointer = bytes.as_ptr().cast::<T>();
+    let aligned = pointer.is_aligned() && bytes.len().is_multiple_of(size_of::<T>());
+    aligned.then(|| unsafe { std::slice::from_raw_parts(pointer, bytes.len() / size_of::<T>()) })
+}
