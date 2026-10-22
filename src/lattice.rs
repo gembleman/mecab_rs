@@ -34,7 +34,6 @@ pub(crate) struct RawNode {
     pub(crate) feature: u32,
     pub(crate) cost: i32,
     prev: Option<NodeId>,
-    enext: Option<NodeId>,
     lpath: Option<LinkId>,
 }
 
@@ -53,33 +52,16 @@ impl RawNode {
             feature: 0,
             cost: 0,
             prev: None,
-            enext: None,
             lpath: None,
         }
     }
 }
 
-#[derive(Default)]
-struct Candidates {
-    rc_attrs: Vec<u16>,
-    costs: Vec<i32>,
-    indices: Vec<NodeId>,
-}
-
-impl Candidates {
-    fn gather(&mut self, nodes: &[RawNode], first: Option<NodeId>) {
-        self.rc_attrs.clear();
-        self.costs.clear();
-        self.indices.clear();
-        let mut left = first;
-        while let Some(id) = left {
-            let node = &nodes[id];
-            self.rc_attrs.push(node.rc_attr);
-            self.costs.push(node.cost);
-            self.indices.push(id);
-            left = node.enext;
-        }
-    }
+#[derive(Clone, Copy)]
+struct LeftCandidate {
+    rc_attr: u16,
+    cost: i32,
+    id: NodeId,
 }
 
 struct Span {
@@ -91,9 +73,9 @@ struct Span {
 #[derive(Default)]
 pub(crate) struct Lattice {
     nodes: Vec<RawNode>,
-    end_nodes: Vec<Option<NodeId>>,
+    ends: Vec<Vec<LeftCandidate>>,
+    position_count: usize,
     hits: Vec<PrefixHit>,
-    candidates: Candidates,
     path: Vec<NodeId>,
     constraints: ConstraintSet,
     all_paths: bool,
@@ -157,8 +139,13 @@ impl Lattice {
         self.links.clear();
         self.all_paths = all_paths;
         self.constraints.load(sentence_len, constraints);
-        self.end_nodes.clear();
-        self.end_nodes.resize(sentence_len + LATTICE_SLACK, None);
+        self.position_count = sentence_len + LATTICE_SLACK;
+        for ending in &mut self.ends {
+            ending.clear();
+        }
+        if self.ends.len() < self.position_count {
+            self.ends.resize_with(self.position_count, Vec::new);
+        }
     }
 
     fn build<const NBEST: bool>(
@@ -168,9 +155,9 @@ impl Lattice {
     ) -> Result<NodeId, Error> {
         let sentence_len = sentence.len();
         let bos = self.push_node(RawNode::boundary(NodeSource::Bos, 0));
-        self.end_nodes[0] = Some(bos);
+        self.ends[0].push(LeftCandidate { rc_attr: 0, cost: 0, id: bos });
         for position in 0..sentence_len {
-            if self.end_nodes[position].is_none() {
+            if self.ends[position].is_empty() {
                 continue;
             }
             let begun = self.lookup(dictionary, sentence, position)?;
@@ -178,7 +165,7 @@ impl Lattice {
         }
         let eos_index = self.nodes.len();
         let eos = self.push_node(RawNode::boundary(NodeSource::Eos, sentence_len));
-        let last_end = (0..=sentence_len).rev().find(|&at| self.end_nodes[at].is_some());
+        let last_end = (0..=sentence_len).rev().find(|&at| !self.ends[at].is_empty());
         if let Some(position) = last_end {
             self.connect::<NBEST>(dictionary, position, eos_index..eos_index + 1)?;
         }
@@ -235,8 +222,23 @@ impl Lattice {
         position: usize,
         begun: Range<usize>,
     ) -> Result<(), Error> {
-        let mut candidates = std::mem::take(&mut self.candidates);
-        candidates.gather(&self.nodes, self.end_nodes[position]);
+        let mut lefts = std::mem::take(&mut self.ends[position]);
+        let connected = self.connect_rights::<NBEST>(dictionary, position, begun, &lefts);
+        let added = &mut self.ends[position];
+        if !added.is_empty() {
+            lefts.append(added);
+        }
+        std::mem::swap(added, &mut lefts);
+        connected
+    }
+
+    fn connect_rights<const NBEST: bool>(
+        &mut self,
+        dictionary: &Dictionary,
+        position: usize,
+        begun: Range<usize>,
+        lefts: &[LeftCandidate],
+    ) -> Result<(), Error> {
         for right_index in begun.rev() {
             let right_id = NodeId::from_index(right_index);
             let right_node = self.nodes[right_id];
@@ -245,37 +247,34 @@ impl Lattice {
             let mut best_cost = i32::MAX;
             let mut best: Option<NodeId> = None;
             let mut lpath: Option<LinkId> = None;
-            let lefts = candidates.rc_attrs.iter().zip(&candidates.costs).zip(&candidates.indices);
-            for ((&rc_attr, &left_cost), &left) in lefts {
-                let connection = column[usize::from(rc_attr)];
+            for left in lefts.iter().rev() {
+                let connection = column[usize::from(left.rc_attr)];
                 let local = i32::from(connection) + word_cost;
-                let cost = left_cost.wrapping_add(local);
+                let cost = left.cost.wrapping_add(local);
                 if cost < best_cost {
-                    best = Some(left);
+                    best = Some(left.id);
                     best_cost = cost;
                 }
                 if NBEST {
-                    self.links.push(PathLink { left_node: left, cost: local, next_left: lpath });
+                    let link = PathLink { left_node: left.id, cost: local, next_left: lpath };
+                    self.links.push(link);
                     lpath = Some(LinkId::from_index(self.links.len() - 1));
                 }
             }
             let Some(best) = best else {
-                self.candidates = candidates;
                 return Err(Error::TooLongSentence);
             };
             let target = usize::from(right_node.rlength) + position;
-            let Some(slot) = self.end_nodes.get_mut(target) else {
-                self.candidates = candidates;
+            if target >= self.position_count {
                 return Err(Error::NodeEndOutOfRange);
-            };
+            }
             let node = &mut self.nodes[right_id];
             node.prev = Some(best);
             node.cost = best_cost;
             node.lpath = lpath;
-            node.enext = *slot;
-            *slot = Some(right_id);
+            let ending = LeftCandidate { rc_attr: right_node.rc_attr, cost: best_cost, id: right_id };
+            self.ends[target].push(ending);
         }
-        self.candidates = candidates;
         Ok(())
     }
 
@@ -334,7 +333,6 @@ impl Lattice {
                     feature: token.feature,
                     cost: 0,
                     prev: None,
-                    enext: None,
                     lpath: None,
                 };
                 self.push_node(node);
@@ -428,7 +426,6 @@ impl Lattice {
             feature,
             cost: 0,
             prev: None,
-            enext: None,
             lpath: None,
         });
         Ok(())
@@ -461,7 +458,6 @@ impl Lattice {
                 feature: token.feature,
                 cost: 0,
                 prev: None,
-                enext: None,
                 lpath: None,
             };
             self.push_node(node);
