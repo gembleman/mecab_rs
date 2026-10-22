@@ -63,6 +63,14 @@ pub struct Dictionary {
 }
 
 impl Dictionary {
+    pub fn max_grouping_size(&self) -> usize {
+        self.max_grouping_size
+    }
+
+    pub fn set_max_grouping_size(&mut self, size: usize) {
+        self.max_grouping_size = size;
+    }
+
     pub fn open(directory: impl AsRef<Path>) -> Result<Self, Error> {
         let directory = directory.as_ref();
         let dicrc = directory.join("dicrc");

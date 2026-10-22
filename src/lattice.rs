@@ -106,7 +106,7 @@ impl Lattice {
         &mut self,
         dictionary: &Dictionary,
         text: &str,
-        constraints: &[Constraint],
+        constraints: &[Constraint<'_>],
         rank: usize,
     ) -> Result<(), Error> {
         let sentence = text.as_bytes();

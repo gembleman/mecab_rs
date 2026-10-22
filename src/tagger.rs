@@ -1,9 +1,9 @@
 use std::ops::Range;
 use std::slice;
 use std::str::Utf8Error;
-use std::sync::Arc;
+use std::ops::Deref;
 
-use crate::constraint::{ConstraintSet, Constraint};
+use crate::constraint::{Constraint, ConstraintSet};
 use crate::dictionary::Dictionary;
 use crate::error::Error;
 use crate::ids::NodeId;
@@ -22,26 +22,26 @@ pub enum NodeKind {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FeatureId(u64);
 
-pub struct Tagger {
-    dictionary: Arc<Dictionary>,
+pub struct Tagger<D> {
+    dictionary: D,
     lattice: Lattice,
 }
 
-impl Tagger {
-    pub fn new(dictionary: Arc<Dictionary>) -> Self {
+impl<D: Deref<Target = Dictionary>> Tagger<D> {
+    pub fn new(dictionary: D) -> Self {
         Self { dictionary, lattice: Lattice::default() }
     }
 
-    pub fn parse<'a>(&'a mut self, text: &'a str) -> Result<Path<'a>, Error> {
+    pub fn parse<'t, 'x>(&'t mut self, text: &'x str) -> Result<Path<'t, 'x>, Error> {
         self.parse_with(text, &[], 1)
     }
 
-    pub fn parse_with<'a>(
-        &'a mut self,
-        text: &'a str,
-        constraints: &[Constraint],
+    pub fn parse_with<'t, 'x>(
+        &'t mut self,
+        text: &'x str,
+        constraints: &[Constraint<'_>],
         rank: usize,
-    ) -> Result<Path<'a>, Error> {
+    ) -> Result<Path<'t, 'x>, Error> {
         if text.contains('\0') {
             return Err(Error::NulInText);
         }
@@ -59,22 +59,22 @@ impl Tagger {
 }
 
 #[derive(Clone, Copy)]
-struct Frame<'a> {
-    dictionary: &'a Dictionary,
-    constraints: &'a ConstraintSet,
-    text: &'a str,
+struct Frame<'t, 'x> {
+    dictionary: &'t Dictionary,
+    constraints: &'t ConstraintSet,
+    text: &'x str,
 }
 
-pub struct Path<'a> {
-    frame: Frame<'a>,
-    nodes: &'a [RawNode],
-    order: slice::Iter<'a, NodeId>,
+pub struct Path<'t, 'x> {
+    frame: Frame<'t, 'x>,
+    nodes: &'t [RawNode],
+    order: slice::Iter<'t, NodeId>,
 }
 
-impl<'a> Iterator for Path<'a> {
-    type Item = Node<'a>;
+impl<'t, 'x> Iterator for Path<'t, 'x> {
+    type Item = Node<'t, 'x>;
 
-    fn next(&mut self) -> Option<Node<'a>> {
+    fn next(&mut self) -> Option<Node<'t, 'x>> {
         let &id = self.order.next()?;
         Some(Node { frame: self.frame, raw: &self.nodes[id] })
     }
@@ -84,15 +84,15 @@ impl<'a> Iterator for Path<'a> {
     }
 }
 
-impl ExactSizeIterator for Path<'_> {}
+impl ExactSizeIterator for Path<'_, '_> {}
 
 #[derive(Clone, Copy)]
-pub struct Node<'a> {
-    frame: Frame<'a>,
-    raw: &'a RawNode,
+pub struct Node<'t, 'x> {
+    frame: Frame<'t, 'x>,
+    raw: &'t RawNode,
 }
 
-impl<'a> Node<'a> {
+impl<'t, 'x> Node<'t, 'x> {
     pub fn kind(&self) -> NodeKind {
         match self.raw.source {
             NodeSource::System => NodeKind::Normal,
@@ -102,7 +102,7 @@ impl<'a> Node<'a> {
         }
     }
 
-    pub fn surface(&self) -> &'a str {
+    pub fn surface(&self) -> &'x str {
         self.frame.text.get(self.surface_range()).unwrap_or("")
     }
 
@@ -119,11 +119,11 @@ impl<'a> Node<'a> {
         usize::from(self.raw.rlength)
     }
 
-    pub fn feature(&self) -> Result<&'a str, Utf8Error> {
+    pub fn feature(&self) -> Result<&'t str, Utf8Error> {
         str::from_utf8(self.feature_bytes())
     }
 
-    pub fn feature_bytes(&self) -> &'a [u8] {
+    pub fn feature_bytes(&self) -> &'t [u8] {
         let dictionary = self.frame.dictionary;
         match self.raw.source {
             NodeSource::System => dictionary.system.feature(self.raw.feature),

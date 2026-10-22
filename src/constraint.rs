@@ -13,9 +13,9 @@ pub enum BoundaryKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Constraint {
+pub enum Constraint<'a> {
     Boundary { position: usize, kind: BoundaryKind },
-    Feature { start: usize, end: usize, pattern: String },
+    Feature { start: usize, end: usize, pattern: &'a str },
 }
 
 #[derive(Default)]
@@ -27,7 +27,7 @@ pub(crate) struct ConstraintSet {
 }
 
 impl ConstraintSet {
-    pub(crate) fn load(&mut self, text_len: usize, constraints: &[Constraint]) {
+    pub(crate) fn load(&mut self, text_len: usize, constraints: &[Constraint<'_>]) {
         self.boundary.clear();
         self.feature_at.clear();
         self.spans.clear();
@@ -43,7 +43,7 @@ impl ConstraintSet {
                         self.set_boundary(text_len, position, raw);
                     }
                 }
-                Constraint::Feature { start, end, ref pattern } => {
+                Constraint::Feature { start, end, pattern } => {
                     if start >= end || end > text_len || pattern.contains('\0') {
                         continue;
                     }
