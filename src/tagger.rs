@@ -56,6 +56,41 @@ impl<D: Deref<Target = Dictionary>> Tagger<D> {
             order: self.lattice.path().iter(),
         })
     }
+
+    pub fn parse_nbest<'t, 'x>(
+        &'t mut self,
+        text: &'x str,
+        constraints: &[Constraint<'_>],
+    ) -> Result<NBest<'t, 'x>, Error> {
+        if text.contains('\0') {
+            return Err(Error::NulInText);
+        }
+        self.lattice.start_nbest(&self.dictionary, text, constraints)?;
+        Ok(NBest { dictionary: &self.dictionary, lattice: &mut self.lattice, text })
+    }
+}
+
+pub struct NBest<'t, 'x> {
+    dictionary: &'t Dictionary,
+    lattice: &'t mut Lattice,
+    text: &'x str,
+}
+
+impl<'x> NBest<'_, 'x> {
+    pub fn next_path(&mut self) -> Option<Path<'_, 'x>> {
+        if !self.lattice.next_nbest_path() {
+            return None;
+        }
+        Some(Path {
+            frame: Frame {
+                dictionary: self.dictionary,
+                constraints: self.lattice.constraints(),
+                text: self.text,
+            },
+            nodes: self.lattice.nodes(),
+            order: self.lattice.path().iter(),
+        })
+    }
 }
 
 #[derive(Clone, Copy)]

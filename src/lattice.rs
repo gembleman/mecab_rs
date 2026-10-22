@@ -109,23 +109,12 @@ impl Lattice {
         constraints: &[Constraint<'_>],
         rank: usize,
     ) -> Result<(), Error> {
-        let sentence = text.as_bytes();
-        let sentence_len = sentence.len();
-        self.nodes.clear();
-        self.path.clear();
-        self.links.clear();
-        self.all_paths = rank > 1;
-        self.constraints.load(sentence_len, constraints);
-        self.end_nodes.clear();
-        self.end_nodes.resize(sentence_len + LATTICE_SLACK, None);
-        let eos = if self.all_paths {
-            self.build::<true>(dictionary, sentence)?
-        } else {
-            self.build::<false>(dictionary, sentence)?
-        };
-        if self.all_paths {
-            return self.select_nbest_path(eos, rank);
+        if rank > 1 {
+            self.start_nbest(dictionary, text, constraints)?;
+            return self.select_nbest_path(rank);
         }
+        self.reset(text, constraints, false);
+        let eos = self.build::<false>(dictionary, text.as_bytes())?;
         let mut cursor = Some(eos);
         while let Some(id) = cursor {
             self.path.push(id);
@@ -133,6 +122,43 @@ impl Lattice {
         }
         self.path.reverse();
         Ok(())
+    }
+
+    pub(crate) fn start_nbest(
+        &mut self,
+        dictionary: &Dictionary,
+        text: &str,
+        constraints: &[Constraint<'_>],
+    ) -> Result<(), Error> {
+        self.reset(text, constraints, true);
+        let eos = self.build::<true>(dictionary, text.as_bytes())?;
+        self.agenda.start(eos);
+        Ok(())
+    }
+
+    pub(crate) fn next_nbest_path(&mut self) -> bool {
+        self.path.clear();
+        let Some(mut found) = self.advance_nbest() else {
+            return false;
+        };
+        loop {
+            self.path.push(self.agenda.node(found));
+            match self.agenda.next(found) {
+                Some(next) => found = next,
+                None => return true,
+            }
+        }
+    }
+
+    fn reset(&mut self, text: &str, constraints: &[Constraint<'_>], all_paths: bool) {
+        let sentence_len = text.len();
+        self.nodes.clear();
+        self.path.clear();
+        self.links.clear();
+        self.all_paths = all_paths;
+        self.constraints.load(sentence_len, constraints);
+        self.end_nodes.clear();
+        self.end_nodes.resize(sentence_len + LATTICE_SLACK, None);
     }
 
     fn build<const NBEST: bool>(
@@ -171,15 +197,11 @@ impl Lattice {
         &self.constraints
     }
 
-    fn select_nbest_path(&mut self, eos: NodeId, rank: usize) -> Result<(), Error> {
-        self.agenda.start(eos);
-        let mut found: Option<ElementId> = None;
+    fn select_nbest_path(&mut self, rank: usize) -> Result<(), Error> {
         for _ in 0..rank {
-            found = Some(self.advance_nbest().ok_or(Error::NoPath { rank })?);
-        }
-        while let Some(element) = found {
-            self.path.push(self.agenda.node(element));
-            found = self.agenda.next(element);
+            if !self.next_nbest_path() {
+                return Err(Error::NoPath { rank });
+            }
         }
         Ok(())
     }

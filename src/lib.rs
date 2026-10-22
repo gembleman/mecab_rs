@@ -14,4 +14,4 @@ mod tagger;
 pub use constraint::{BoundaryKind, Constraint};
 pub use dictionary::Dictionary;
 pub use error::Error;
-pub use tagger::{FeatureId, Node, NodeKind, Path, Tagger};
+pub use tagger::{FeatureId, NBest, Node, NodeKind, Path, Tagger};
