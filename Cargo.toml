@@ -1,0 +1,17 @@
+[package]
+name = "mecab_rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "BSD-3-Clause"
+description = "A native Rust port of the MeCab 0.996 analyzer: reads MeCab binary dictionaries, best path, constraints and N-best"
+readme = "README.md"
+keywords = ["mecab", "japanese", "morphological-analysis", "tokenizer", "nlp"]
+categories = ["text-processing"]
+include = ["src/", "README.md", "LICENSE", "Cargo.toml"]
+
+[dependencies]
+memmap2 = "0.9"
+
+[profile.release]
+incremental = true
