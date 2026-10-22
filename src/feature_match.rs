@@ -1,80 +1,92 @@
-const CSV_BUFFER_SIZE: usize = 8192;
+const MAX_INPUT_BYTES: usize = 8191;
 const MAX_COLUMNS: usize = 64;
 const WILDCARD: &[u8] = b"*";
+const QUOTE: u8 = b'"';
+const SEPARATOR: u8 = b',';
 
 pub(super) fn partial_match(constraint: &[u8], feature: &[u8]) -> bool {
     if constraint == WILDCARD {
         return true;
     }
-    let (constraint_buffer, constraint_columns) = split_columns(constraint);
-    let (feature_buffer, feature_columns) = split_columns(feature);
-    constraint_columns.iter().zip(&feature_columns).all(|(&left, &right)| {
-        let wanted = terminated(&constraint_buffer, left);
-        wanted == WILDCARD || wanted == terminated(&feature_buffer, right)
+    Columns::new(constraint).zip(Columns::new(feature)).all(|(wanted, actual)| {
+        wanted.bytes().eq(WILDCARD.iter().copied()) || wanted.bytes().eq(actual.bytes())
     })
 }
 
-fn terminated(buffer: &[u8], start: usize) -> &[u8] {
-    let rest = &buffer[start..];
-    let length = rest.iter().position(|&byte| byte == 0).unwrap_or(rest.len());
-    &rest[..length]
+#[derive(Clone, Copy)]
+struct Column<'a> {
+    content: &'a [u8],
+    quoted: bool,
 }
 
-fn split_columns(source: &[u8]) -> (Vec<u8>, Vec<usize>) {
-    let kept = source.len().min(CSV_BUFFER_SIZE - 1);
-    let mut buffer = source[..kept].to_vec();
-    buffer.push(0);
-    let columns = tokenize_csv(&mut buffer, MAX_COLUMNS);
-    (buffer, columns)
-}
-
-fn find_comma(buffer: &[u8], from: usize, end_of_string: usize) -> usize {
-    (from..end_of_string).find(|&at| buffer[at] == b',').unwrap_or(end_of_string)
-}
-
-fn tokenize_csv(buffer: &mut [u8], max: usize) -> Vec<usize> {
-    let end_of_string = buffer.len() - 1;
-    let mut columns = Vec::new();
-    let mut remaining = max;
-    let mut at = 0;
-    while at < end_of_string {
-        while matches!(buffer[at], b' ' | b'\t') {
-            at += 1;
-        }
-        let start;
-        let end;
-        if buffer[at] == b'"' {
-            at += 1;
-            start = at;
-            let mut write = start;
-            while at < end_of_string {
-                if buffer[at] == b'"' {
-                    at += 1;
-                    if buffer[at] != b'"' {
-                        break;
-                    }
-                }
-                buffer[write] = buffer[at];
-                write += 1;
-                at += 1;
+impl<'a> Column<'a> {
+    fn bytes(self) -> impl Iterator<Item = u8> + 'a {
+        let mut rest = self.content.iter().copied();
+        std::iter::from_fn(move || {
+            let byte = rest.next()?;
+            if self.quoted && byte == QUOTE {
+                rest.next();
             }
-            at = find_comma(buffer, at, end_of_string);
-            end = write;
-        } else {
-            start = at;
-            at = find_comma(buffer, at, end_of_string);
-            end = at;
-        }
-        let terminate = remaining > 1;
-        remaining -= 1;
-        if terminate {
-            buffer[end] = 0;
-        }
-        columns.push(start);
-        if remaining == 0 {
-            break;
-        }
-        at += 1;
+            Some(byte)
+        })
     }
-    columns
+}
+
+struct Columns<'a> {
+    source: &'a [u8],
+    at: usize,
+    produced: usize,
+}
+
+impl<'a> Columns<'a> {
+    fn new(source: &'a [u8]) -> Self {
+        Self { source: &source[..source.len().min(MAX_INPUT_BYTES)], at: 0, produced: 0 }
+    }
+
+    fn separator_from(&self, from: usize) -> usize {
+        let tail = &self.source[from..];
+        tail.iter().position(|&byte| byte == SEPARATOR).map_or(self.source.len(), |o| from + o)
+    }
+
+    fn closing_quote_from(&self, from: usize) -> usize {
+        let mut cursor = from;
+        while let Some(&byte) = self.source.get(cursor) {
+            if byte == QUOTE {
+                if self.source.get(cursor + 1) != Some(&QUOTE) {
+                    break;
+                }
+                cursor += 1;
+            }
+            cursor += 1;
+        }
+        cursor
+    }
+}
+
+impl<'a> Iterator for Columns<'a> {
+    type Item = Column<'a>;
+
+    fn next(&mut self) -> Option<Column<'a>> {
+        if self.at >= self.source.len() || self.produced == MAX_COLUMNS {
+            return None;
+        }
+        while matches!(self.source.get(self.at), Some(b' ' | b'\t')) {
+            self.at += 1;
+        }
+        self.produced += 1;
+        let last = self.produced == MAX_COLUMNS;
+        let column;
+        if self.source.get(self.at) == Some(&QUOTE) {
+            let start = self.at + 1;
+            let closing = self.closing_quote_from(start);
+            column = Column { content: &self.source[start..closing], quoted: true };
+            self.at = self.separator_from((closing + 1).min(self.source.len()));
+        } else {
+            let end = if last { self.source.len() } else { self.separator_from(self.at) };
+            column = Column { content: &self.source[self.at..end], quoted: false };
+            self.at = self.separator_from(self.at);
+        }
+        self.at += 1;
+        Some(column)
+    }
 }

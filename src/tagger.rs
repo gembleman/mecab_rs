@@ -1,5 +1,3 @@
-use std::cell::Cell;
-use std::marker::PhantomData;
 use std::ops::Range;
 use std::slice;
 use std::str::Utf8Error;
@@ -27,12 +25,11 @@ pub struct FeatureId(u64);
 pub struct Tagger {
     dictionary: Arc<Dictionary>,
     lattice: Lattice,
-    not_sync: PhantomData<Cell<()>>,
 }
 
 impl Tagger {
     pub fn new(dictionary: Arc<Dictionary>) -> Self {
-        Self { dictionary, lattice: Lattice::default(), not_sync: PhantomData }
+        Self { dictionary, lattice: Lattice::default() }
     }
 
     pub fn parse<'a>(&'a mut self, text: &'a str) -> Result<Path<'a>, Error> {

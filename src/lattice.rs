@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use crate::char_property::{CharInfo, Scan};
 use crate::constraint::{Constraint, ConstraintSet, NO_FEATURE};
 use crate::dictionary::Dictionary;
@@ -33,7 +35,6 @@ pub(crate) struct RawNode {
     pub(crate) cost: i32,
     prev: Option<NodeId>,
     enext: Option<NodeId>,
-    bnext: Option<NodeId>,
     lpath: Option<LinkId>,
 }
 
@@ -53,7 +54,6 @@ impl RawNode {
             cost: 0,
             prev: None,
             enext: None,
-            bnext: None,
             lpath: None,
         }
     }
@@ -90,10 +90,7 @@ struct Span {
 
 #[derive(Default)]
 pub(crate) struct Lattice {
-    sentence: Vec<u8>,
-    sentence_len: usize,
     nodes: Vec<RawNode>,
-    begin_nodes: Vec<Option<NodeId>>,
     end_nodes: Vec<Option<NodeId>>,
     hits: Vec<PrefixHit>,
     candidates: Candidates,
@@ -112,35 +109,29 @@ impl Lattice {
         constraints: &[Constraint],
         rank: usize,
     ) -> Result<(), Error> {
-        self.sentence.clear();
-        self.sentence.extend_from_slice(text.as_bytes());
-        self.sentence.push(0);
-        self.sentence_len = text.len();
+        let sentence = text.as_bytes();
+        let sentence_len = sentence.len();
         self.nodes.clear();
         self.path.clear();
         self.links.clear();
         self.all_paths = rank > 1;
-        self.constraints.load(text.len(), constraints);
-        let slots = self.sentence_len + LATTICE_SLACK;
-        self.begin_nodes.clear();
-        self.begin_nodes.resize(slots, None);
+        self.constraints.load(sentence_len, constraints);
         self.end_nodes.clear();
-        self.end_nodes.resize(slots, None);
+        self.end_nodes.resize(sentence_len + LATTICE_SLACK, None);
         let bos = self.push_node(RawNode::boundary(NodeSource::Bos, 0));
         self.end_nodes[0] = Some(bos);
-        for position in 0..self.sentence_len {
+        for position in 0..sentence_len {
             if self.end_nodes[position].is_none() {
                 continue;
             }
-            let head = self.lookup(dictionary, position)?;
-            self.begin_nodes[position] = head;
-            self.connect(dictionary, position, head)?;
+            let begun = self.lookup(dictionary, sentence, position)?;
+            self.connect(dictionary, position, begun)?;
         }
-        let eos = self.push_node(RawNode::boundary(NodeSource::Eos, self.sentence_len));
-        self.begin_nodes[self.sentence_len] = Some(eos);
-        let last_end = (0..=self.sentence_len).rev().find(|&at| self.end_nodes[at].is_some());
+        let eos_index = self.nodes.len();
+        let eos = self.push_node(RawNode::boundary(NodeSource::Eos, sentence_len));
+        let last_end = (0..=sentence_len).rev().find(|&at| self.end_nodes[at].is_some());
         if let Some(position) = last_end {
-            self.connect(dictionary, position, Some(eos))?;
+            self.connect(dictionary, position, eos_index..eos_index + 1)?;
         }
         if self.all_paths {
             return self.select_nbest_path(eos, rank);
@@ -206,12 +197,12 @@ impl Lattice {
         &mut self,
         dictionary: &Dictionary,
         position: usize,
-        head: Option<NodeId>,
+        begun: Range<usize>,
     ) -> Result<(), Error> {
         let mut candidates = std::mem::take(&mut self.candidates);
         candidates.gather(&self.nodes, self.end_nodes[position]);
-        let mut right = head;
-        while let Some(right_id) = right {
+        for right_index in begun.rev() {
+            let right_id = NodeId::from_index(right_index);
             let right_node = self.nodes[right_id];
             let column = dictionary.matrix.right_column(right_node.lc_attr);
             let word_cost = i32::from(right_node.wcost);
@@ -247,7 +238,6 @@ impl Lattice {
             node.lpath = lpath;
             node.enext = *slot;
             *slot = Some(right_id);
-            right = node.bnext;
         }
         self.candidates = candidates;
         Ok(())
@@ -256,33 +246,32 @@ impl Lattice {
     fn lookup(
         &mut self,
         dictionary: &Dictionary,
+        sentence: &[u8],
         begin: usize,
-    ) -> Result<Option<NodeId>, Error> {
+    ) -> Result<Range<usize>, Error> {
         let chars = &dictionary.chars;
-        let mut end = if self.sentence_len - begin >= MAX_LOOKUP_BYTES {
+        let sentence_len = sentence.len();
+        let first = self.nodes.len();
+        let mut end = if sentence_len - begin >= MAX_LOOKUP_BYTES {
             begin + MAX_LOOKUP_BYTES
         } else {
-            self.sentence_len
+            sentence_len
         };
         let partial = self.constraints.is_active();
         if partial
-            && let Some(boundary) = (begin + 1..self.sentence_len)
+            && let Some(boundary) = (begin + 1..sentence_len)
                 .find(|&position| self.constraints.is_token_boundary(position))
         {
             end = boundary;
         }
         let mut scan = Scan::default();
-        let surface =
-            chars.seek_other_type(&self.sentence, begin, end, chars.space(), &mut scan);
-        if surface == self.sentence_len {
-            return Ok(None);
+        let surface = chars.seek_other_type(sentence, begin, end, chars.space(), &mut scan);
+        if surface == sentence_len {
+            return Ok(first..first);
         }
         let char_info = scan.info;
-        let key_end = if end == surface { self.sentence_len } else { end };
-        dictionary
-            .system
-            .common_prefix_search(&self.sentence[surface..key_end], &mut self.hits);
-        let mut head: Option<NodeId> = None;
+        let key_end = if end == surface { sentence_len } else { end };
+        dictionary.system.common_prefix_search(&sentence[surface..key_end], &mut self.hits);
         for hit_index in 0..self.hits.len() {
             let hit = self.hits[hit_index];
             for offset in 0..hit.token_count() {
@@ -310,32 +299,31 @@ impl Lattice {
                     cost: 0,
                     prev: None,
                     enext: None,
-                    bnext: head,
                     lpath: None,
                 };
-                head = Some(self.push_node(node));
+                self.push_node(node);
             }
         }
-        if head.is_some() && !char_info.invoke() {
-            return Ok(head);
+        if self.nodes.len() > first && !char_info.invoke() {
+            return Ok(first..self.nodes.len());
         }
         let mut after_char = surface + scan.width;
         let mut group_end: Option<usize> = None;
         if after_char > end {
             let span = Span { begin, surface, end: after_char };
-            head = self.add_unknown(dictionary, char_info, &span, head);
-            if head.is_some() {
-                return Ok(head);
+            self.add_unknown(dictionary, char_info, &span);
+            if self.nodes.len() > first {
+                return Ok(first..self.nodes.len());
             }
         }
         if char_info.group() {
             let saved = after_char;
             let mut group_scan = Scan::default();
             after_char =
-                chars.seek_other_type(&self.sentence, after_char, end, char_info, &mut group_scan);
+                chars.seek_other_type(sentence, after_char, end, char_info, &mut group_scan);
             if group_scan.count <= dictionary.max_grouping_size {
                 let span = Span { begin, surface, end: after_char };
-                head = self.add_unknown(dictionary, char_info, &span, head);
+                self.add_unknown(dictionary, char_info, &span);
             }
             group_end = Some(after_char);
             after_char = saved;
@@ -348,48 +336,50 @@ impl Lattice {
                 continue;
             }
             let span = Span { begin, surface, end: after_char };
-            head = self.add_unknown(dictionary, char_info, &span, head);
-            let (next_info, width) = chars.char_info(&self.sentence, after_char, end);
+            self.add_unknown(dictionary, char_info, &span);
+            let (next_info, width) = chars.char_info(sentence, after_char, end);
             if !char_info.is_kind_of(next_info) {
                 break;
             }
             after_char += width;
         }
-        if head.is_none() {
+        if self.nodes.len() == first {
             let span = Span { begin, surface, end: after_char };
-            head = self.add_unknown(dictionary, char_info, &span, head);
+            self.add_unknown(dictionary, char_info, &span);
         }
-        if partial && head.is_none() {
-            head = self.add_constrained_unknown(dictionary, begin, surface, end)?;
+        if partial && self.nodes.len() == first {
+            self.add_constrained_unknown(dictionary, sentence, begin, surface, end)?;
         }
-        Ok(head)
+        Ok(first..self.nodes.len())
     }
 
     fn add_constrained_unknown(
         &mut self,
         dictionary: &Dictionary,
+        sentence: &[u8],
         begin: usize,
         surface: usize,
         end: usize,
-    ) -> Result<Option<NodeId>, Error> {
+    ) -> Result<(), Error> {
+        let first = self.nodes.len();
         let mut cursor = surface;
         let char_info = loop {
-            let (info, width) = dictionary.chars.char_info(&self.sentence, cursor, end);
+            let (info, width) = dictionary.chars.char_info(sentence, cursor, end);
             cursor += width;
             if cursor > end || !self.constraints.is_inside_token(cursor) {
                 break info;
             }
         };
         let span = Span { begin, surface, end: cursor };
-        let head = self.add_unknown(dictionary, char_info, &span, None);
-        if head.is_some() {
-            return Ok(head);
+        self.add_unknown(dictionary, char_info, &span);
+        if self.nodes.len() > first {
+            return Ok(());
         }
         let feature = self.constraints.feature_at(begin);
         if feature == NO_FEATURE {
             return Err(Error::UnsatisfiableConstraint);
         }
-        Ok(Some(self.push_node(RawNode {
+        self.push_node(RawNode {
             surface_start: surface as u32,
             length: (cursor - surface) as u16,
             rlength: (cursor - begin) as u16,
@@ -403,20 +393,14 @@ impl Lattice {
             cost: 0,
             prev: None,
             enext: None,
-            bnext: None,
             lpath: None,
-        })))
+        });
+        Ok(())
     }
 
-    fn add_unknown(
-        &mut self,
-        dictionary: &Dictionary,
-        char_info: CharInfo,
-        span: &Span,
-        mut head: Option<NodeId>,
-    ) -> Option<NodeId> {
+    fn add_unknown(&mut self, dictionary: &Dictionary, char_info: CharInfo, span: &Span) {
         let Some(tokens) = dictionary.unknown_tokens.get(char_info.default_type()) else {
-            return head;
+            return;
         };
         for &token in tokens {
             if self.constraints.is_active()
@@ -442,11 +426,9 @@ impl Lattice {
                 cost: 0,
                 prev: None,
                 enext: None,
-                bnext: head,
                 lpath: None,
             };
-            head = Some(self.push_node(node));
+            self.push_node(node);
         }
-        head
     }
 }

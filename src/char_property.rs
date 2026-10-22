@@ -138,10 +138,6 @@ fn decode_utf8(text: &[u8], begin: usize, available: usize) -> (u16, usize) {
         (code, 3)
     } else if available >= 4 && first & 0xf8 == 0xf0 {
         (0, 4)
-    } else if available >= 5 && first & 0xfc == 0xf8 {
-        (0, 5)
-    } else if available >= 6 && first & 0xfe == 0xfc {
-        (0, 6)
     } else {
         (0, 1)
     }
