@@ -3,6 +3,7 @@ mod constraint;
 mod dictionary;
 mod error;
 mod feature_match;
+mod ids;
 mod lattice;
 mod matrix;
 mod nbest;

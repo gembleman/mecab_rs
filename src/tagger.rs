@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::constraint::{ConstraintSet, Constraint};
 use crate::dictionary::Dictionary;
 use crate::error::Error;
+use crate::ids::NodeId;
 use crate::lattice::{Lattice, NodeSource, RawNode};
 
 const UNKNOWN_FEATURE_FLAG: u64 = 1 << 32;
@@ -70,15 +71,15 @@ struct Frame<'a> {
 pub struct Path<'a> {
     frame: Frame<'a>,
     nodes: &'a [RawNode],
-    order: slice::Iter<'a, u32>,
+    order: slice::Iter<'a, NodeId>,
 }
 
 impl<'a> Iterator for Path<'a> {
     type Item = Node<'a>;
 
     fn next(&mut self) -> Option<Node<'a>> {
-        let &index = self.order.next()?;
-        Some(Node { frame: self.frame, raw: &self.nodes[index as usize] })
+        let &id = self.order.next()?;
+        Some(Node { frame: self.frame, raw: &self.nodes[id] })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

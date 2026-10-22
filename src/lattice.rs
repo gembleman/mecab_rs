@@ -2,7 +2,8 @@ use crate::char_property::{CharInfo, Scan};
 use crate::constraint::{Constraint, ConstraintSet, NO_FEATURE};
 use crate::dictionary::Dictionary;
 use crate::error::Error;
-use crate::nbest::{Agenda, NIL, PathLink};
+use crate::ids::{ElementId, LinkId, NodeId};
+use crate::nbest::{Agenda, PathLink};
 use crate::system_dictionary::PrefixHit;
 
 const MAX_LOOKUP_BYTES: usize = 65535;
@@ -30,10 +31,10 @@ pub(crate) struct RawNode {
     pub(crate) char_type: u8,
     pub(crate) feature: u32,
     pub(crate) cost: i32,
-    prev: u32,
-    enext: u32,
-    bnext: u32,
-    lpath: u32,
+    prev: Option<NodeId>,
+    enext: Option<NodeId>,
+    bnext: Option<NodeId>,
+    lpath: Option<LinkId>,
 }
 
 impl RawNode {
@@ -50,10 +51,10 @@ impl RawNode {
             char_type: 0,
             feature: 0,
             cost: 0,
-            prev: NIL,
-            enext: NIL,
-            bnext: NIL,
-            lpath: NIL,
+            prev: None,
+            enext: None,
+            bnext: None,
+            lpath: None,
         }
     }
 }
@@ -62,20 +63,20 @@ impl RawNode {
 struct Candidates {
     rc_attrs: Vec<u16>,
     costs: Vec<i32>,
-    indices: Vec<u32>,
+    indices: Vec<NodeId>,
 }
 
 impl Candidates {
-    fn gather(&mut self, nodes: &[RawNode], first: u32) {
+    fn gather(&mut self, nodes: &[RawNode], first: Option<NodeId>) {
         self.rc_attrs.clear();
         self.costs.clear();
         self.indices.clear();
         let mut left = first;
-        while left != NIL {
-            let node = &nodes[left as usize];
+        while let Some(id) = left {
+            let node = &nodes[id];
             self.rc_attrs.push(node.rc_attr);
             self.costs.push(node.cost);
-            self.indices.push(left);
+            self.indices.push(id);
             left = node.enext;
         }
     }
@@ -92,11 +93,11 @@ pub(crate) struct Lattice {
     sentence: Vec<u8>,
     sentence_len: usize,
     nodes: Vec<RawNode>,
-    begin_nodes: Vec<u32>,
-    end_nodes: Vec<u32>,
+    begin_nodes: Vec<Option<NodeId>>,
+    end_nodes: Vec<Option<NodeId>>,
     hits: Vec<PrefixHit>,
     candidates: Candidates,
-    path: Vec<u32>,
+    path: Vec<NodeId>,
     constraints: ConstraintSet,
     all_paths: bool,
     links: Vec<PathLink>,
@@ -122,13 +123,13 @@ impl Lattice {
         self.constraints.load(text.len(), constraints);
         let slots = self.sentence_len + LATTICE_SLACK;
         self.begin_nodes.clear();
-        self.begin_nodes.resize(slots, NIL);
+        self.begin_nodes.resize(slots, None);
         self.end_nodes.clear();
-        self.end_nodes.resize(slots, NIL);
+        self.end_nodes.resize(slots, None);
         let bos = self.push_node(RawNode::boundary(NodeSource::Bos, 0));
-        self.end_nodes[0] = bos;
+        self.end_nodes[0] = Some(bos);
         for position in 0..self.sentence_len {
-            if self.end_nodes[position] == NIL {
+            if self.end_nodes[position].is_none() {
                 continue;
             }
             let head = self.lookup(dictionary, position)?;
@@ -136,18 +137,18 @@ impl Lattice {
             self.connect(dictionary, position, head)?;
         }
         let eos = self.push_node(RawNode::boundary(NodeSource::Eos, self.sentence_len));
-        self.begin_nodes[self.sentence_len] = eos;
-        let last_end = (0..=self.sentence_len).rev().find(|&at| self.end_nodes[at] != NIL);
+        self.begin_nodes[self.sentence_len] = Some(eos);
+        let last_end = (0..=self.sentence_len).rev().find(|&at| self.end_nodes[at].is_some());
         if let Some(position) = last_end {
-            self.connect(dictionary, position, eos)?;
+            self.connect(dictionary, position, Some(eos))?;
         }
         if self.all_paths {
             return self.select_nbest_path(eos, rank);
         }
-        let mut cursor = eos;
-        while cursor != NIL {
-            self.path.push(cursor);
-            cursor = self.nodes[cursor as usize].prev;
+        let mut cursor = Some(eos);
+        while let Some(id) = cursor {
+            self.path.push(id);
+            cursor = self.nodes[id].prev;
         }
         self.path.reverse();
         Ok(())
@@ -157,7 +158,7 @@ impl Lattice {
         &self.nodes
     }
 
-    pub(crate) fn path(&self) -> &[u32] {
+    pub(crate) fn path(&self) -> &[NodeId] {
         &self.path
     }
 
@@ -165,30 +166,30 @@ impl Lattice {
         &self.constraints
     }
 
-    fn select_nbest_path(&mut self, eos: u32, rank: usize) -> Result<(), Error> {
+    fn select_nbest_path(&mut self, eos: NodeId, rank: usize) -> Result<(), Error> {
         self.agenda.start(eos);
-        let mut found = NIL;
+        let mut found: Option<ElementId> = None;
         for _ in 0..rank {
-            found = self.advance_nbest().ok_or(Error::NoPath { rank })?;
+            found = Some(self.advance_nbest().ok_or(Error::NoPath { rank })?);
         }
-        while found != NIL {
-            self.path.push(self.agenda.node(found));
-            found = self.agenda.next(found);
+        while let Some(element) = found {
+            self.path.push(self.agenda.node(element));
+            found = self.agenda.next(element);
         }
         Ok(())
     }
 
-    fn advance_nbest(&mut self) -> Option<u32> {
+    fn advance_nbest(&mut self) -> Option<ElementId> {
         while let Some(top) = self.agenda.pop() {
-            let node_index = self.agenda.node(top);
-            let node = &self.nodes[node_index as usize];
+            let node_id = self.agenda.node(top);
+            let node = &self.nodes[node_id];
             if node.source == NodeSource::Bos {
                 return Some(top);
             }
             let mut link = node.lpath;
-            while link != NIL {
-                let PathLink { left_node, cost, next_left } = self.links[link as usize];
-                let left_cost = self.nodes[left_node as usize].cost;
+            while let Some(link_id) = link {
+                let PathLink { left_node, cost, next_left } = self.links[link_id];
+                let left_cost = self.nodes[left_node].cost;
                 self.agenda.extend(top, left_node, left_cost, cost);
                 link = next_left;
             }
@@ -196,58 +197,67 @@ impl Lattice {
         None
     }
 
-    fn push_node(&mut self, node: RawNode) -> u32 {
+    fn push_node(&mut self, node: RawNode) -> NodeId {
         self.nodes.push(node);
-        (self.nodes.len() - 1) as u32
+        NodeId::from_index(self.nodes.len() - 1)
     }
 
-    fn connect(&mut self, dictionary: &Dictionary, position: usize, head: u32) -> Result<(), Error> {
+    fn connect(
+        &mut self,
+        dictionary: &Dictionary,
+        position: usize,
+        head: Option<NodeId>,
+    ) -> Result<(), Error> {
         let mut candidates = std::mem::take(&mut self.candidates);
         candidates.gather(&self.nodes, self.end_nodes[position]);
         let mut right = head;
-        while right != NIL {
-            let right_node = self.nodes[right as usize];
+        while let Some(right_id) = right {
+            let right_node = self.nodes[right_id];
             let column = dictionary.matrix.right_column(right_node.lc_attr);
             let word_cost = i32::from(right_node.wcost);
             let mut best_cost = i32::MAX;
-            let mut best = NIL;
-            let mut lpath = NIL;
+            let mut best: Option<NodeId> = None;
+            let mut lpath: Option<LinkId> = None;
             let lefts = candidates.rc_attrs.iter().zip(&candidates.costs).zip(&candidates.indices);
             for ((&rc_attr, &left_cost), &left) in lefts {
                 let connection = column[usize::from(rc_attr)];
                 let local = i32::from(connection) + word_cost;
                 let cost = left_cost.wrapping_add(local);
                 if cost < best_cost {
-                    best = left;
+                    best = Some(left);
                     best_cost = cost;
                 }
                 if self.all_paths {
                     self.links.push(PathLink { left_node: left, cost: local, next_left: lpath });
-                    lpath = (self.links.len() - 1) as u32;
+                    lpath = Some(LinkId::from_index(self.links.len() - 1));
                 }
             }
-            if best == NIL {
+            let Some(best) = best else {
                 self.candidates = candidates;
                 return Err(Error::TooLongSentence);
-            }
+            };
             let target = usize::from(right_node.rlength) + position;
             let Some(slot) = self.end_nodes.get_mut(target) else {
                 self.candidates = candidates;
                 return Err(Error::NodeEndOutOfRange);
             };
-            let node = &mut self.nodes[right as usize];
-            node.prev = best;
+            let node = &mut self.nodes[right_id];
+            node.prev = Some(best);
             node.cost = best_cost;
             node.lpath = lpath;
             node.enext = *slot;
-            *slot = right;
+            *slot = Some(right_id);
             right = node.bnext;
         }
         self.candidates = candidates;
         Ok(())
     }
 
-    fn lookup(&mut self, dictionary: &Dictionary, begin: usize) -> Result<u32, Error> {
+    fn lookup(
+        &mut self,
+        dictionary: &Dictionary,
+        begin: usize,
+    ) -> Result<Option<NodeId>, Error> {
         let chars = &dictionary.chars;
         let mut end = if self.sentence_len - begin >= MAX_LOOKUP_BYTES {
             begin + MAX_LOOKUP_BYTES
@@ -265,14 +275,14 @@ impl Lattice {
         let surface =
             chars.seek_other_type(&self.sentence, begin, end, chars.space(), &mut scan);
         if surface == self.sentence_len {
-            return Ok(NIL);
+            return Ok(None);
         }
         let char_info = scan.info;
         let key_end = if end == surface { self.sentence_len } else { end };
         dictionary
             .system
             .common_prefix_search(&self.sentence[surface..key_end], &mut self.hits);
-        let mut head = NIL;
+        let mut head: Option<NodeId> = None;
         for hit_index in 0..self.hits.len() {
             let hit = self.hits[hit_index];
             for offset in 0..hit.token_count() {
@@ -298,15 +308,15 @@ impl Lattice {
                     char_type: char_info.default_type() as u8,
                     feature: token.feature,
                     cost: 0,
-                    prev: NIL,
-                    enext: NIL,
+                    prev: None,
+                    enext: None,
                     bnext: head,
-                    lpath: NIL,
+                    lpath: None,
                 };
-                head = self.push_node(node);
+                head = Some(self.push_node(node));
             }
         }
-        if head != NIL && !char_info.invoke() {
+        if head.is_some() && !char_info.invoke() {
             return Ok(head);
         }
         let mut after_char = surface + scan.width;
@@ -314,7 +324,7 @@ impl Lattice {
         if after_char > end {
             let span = Span { begin, surface, end: after_char };
             head = self.add_unknown(dictionary, char_info, &span, head);
-            if head != NIL {
+            if head.is_some() {
                 return Ok(head);
             }
         }
@@ -345,11 +355,11 @@ impl Lattice {
             }
             after_char += width;
         }
-        if head == NIL {
+        if head.is_none() {
             let span = Span { begin, surface, end: after_char };
             head = self.add_unknown(dictionary, char_info, &span, head);
         }
-        if partial && head == NIL {
+        if partial && head.is_none() {
             head = self.add_constrained_unknown(dictionary, begin, surface, end)?;
         }
         Ok(head)
@@ -361,7 +371,7 @@ impl Lattice {
         begin: usize,
         surface: usize,
         end: usize,
-    ) -> Result<u32, Error> {
+    ) -> Result<Option<NodeId>, Error> {
         let mut cursor = surface;
         let char_info = loop {
             let (info, width) = dictionary.chars.char_info(&self.sentence, cursor, end);
@@ -371,15 +381,15 @@ impl Lattice {
             }
         };
         let span = Span { begin, surface, end: cursor };
-        let head = self.add_unknown(dictionary, char_info, &span, NIL);
-        if head != NIL {
+        let head = self.add_unknown(dictionary, char_info, &span, None);
+        if head.is_some() {
             return Ok(head);
         }
         let feature = self.constraints.feature_at(begin);
         if feature == NO_FEATURE {
             return Err(Error::UnsatisfiableConstraint);
         }
-        Ok(self.push_node(RawNode {
+        Ok(Some(self.push_node(RawNode {
             surface_start: surface as u32,
             length: (cursor - surface) as u16,
             rlength: (cursor - begin) as u16,
@@ -391,11 +401,11 @@ impl Lattice {
             char_type: char_info.default_type() as u8,
             feature,
             cost: 0,
-            prev: NIL,
-            enext: NIL,
-            bnext: NIL,
-            lpath: NIL,
-        }))
+            prev: None,
+            enext: None,
+            bnext: None,
+            lpath: None,
+        })))
     }
 
     fn add_unknown(
@@ -403,8 +413,8 @@ impl Lattice {
         dictionary: &Dictionary,
         char_info: CharInfo,
         span: &Span,
-        mut head: u32,
-    ) -> u32 {
+        mut head: Option<NodeId>,
+    ) -> Option<NodeId> {
         let Some(tokens) = dictionary.unknown_tokens.get(char_info.default_type()) else {
             return head;
         };
@@ -430,12 +440,12 @@ impl Lattice {
                 char_type: char_info.default_type() as u8,
                 feature: token.feature,
                 cost: 0,
-                prev: NIL,
-                enext: NIL,
+                prev: None,
+                enext: None,
                 bnext: head,
-                lpath: NIL,
+                lpath: None,
             };
-            head = self.push_node(node);
+            head = Some(self.push_node(node));
         }
         head
     }

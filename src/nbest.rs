@@ -1,23 +1,23 @@
-pub(super) const NIL: u32 = u32::MAX;
+use crate::ids::{ElementId, LinkId, NodeId};
 
 #[derive(Clone, Copy)]
 pub(super) struct PathLink {
-    pub(super) left_node: u32,
+    pub(super) left_node: NodeId,
     pub(super) cost: i32,
-    pub(super) next_left: u32,
+    pub(super) next_left: Option<LinkId>,
 }
 
 #[derive(Clone, Copy)]
 struct Element {
-    node: u32,
-    next: u32,
+    node: NodeId,
+    next: Option<ElementId>,
     path_cost: i64,
 }
 
 #[derive(Clone, Copy)]
 struct Priority {
     estimate: i64,
-    element: u32,
+    element: ElementId,
 }
 
 impl Priority {
@@ -33,34 +33,34 @@ pub(super) struct Agenda {
 }
 
 impl Agenda {
-    pub(super) fn start(&mut self, eos: u32) {
+    pub(super) fn start(&mut self, eos: NodeId) {
         self.elements.clear();
         self.heap.clear();
-        self.elements.push(Element { node: eos, next: NIL, path_cost: 0 });
-        self.heap.push(Priority { estimate: 0, element: 0 });
+        self.elements.push(Element { node: eos, next: None, path_cost: 0 });
+        self.heap.push(Priority { estimate: 0, element: ElementId::from_index(0) });
     }
 
-    pub(super) fn node(&self, element: u32) -> u32 {
-        self.elements[element as usize].node
+    pub(super) fn node(&self, element: ElementId) -> NodeId {
+        self.elements[element].node
     }
 
-    pub(super) fn next(&self, element: u32) -> u32 {
-        self.elements[element as usize].next
+    pub(super) fn next(&self, element: ElementId) -> Option<ElementId> {
+        self.elements[element].next
     }
 
-    pub(super) fn path_cost(&self, element: u32) -> i64 {
-        self.elements[element as usize].path_cost
+    pub(super) fn path_cost(&self, element: ElementId) -> i64 {
+        self.elements[element].path_cost
     }
 
-    pub(super) fn extend(&mut self, top: u32, node: u32, node_cost: i32, step_cost: i32) {
+    pub(super) fn extend(&mut self, top: ElementId, node: NodeId, node_cost: i32, step_cost: i32) {
         let path_cost = i64::from(step_cost) + self.path_cost(top);
-        self.elements.push(Element { node, next: top, path_cost });
-        let element = (self.elements.len() - 1) as u32;
+        self.elements.push(Element { node, next: Some(top), path_cost });
+        let element = ElementId::from_index(self.elements.len() - 1);
         let estimate = i64::from(node_cost) + path_cost;
         self.push_heap(Priority { estimate, element });
     }
 
-    pub(super) fn pop(&mut self) -> Option<u32> {
+    pub(super) fn pop(&mut self) -> Option<ElementId> {
         let remaining = self.heap.len().checked_sub(1)?;
         let top = self.heap[0].element;
         let value = self.heap[remaining];
