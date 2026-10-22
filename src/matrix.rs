@@ -7,8 +7,6 @@ use crate::error::Error;
 use crate::section::Section;
 use crate::templates::MappedTemplates;
 
-const COLD_CACHE_BITS: u32 = 16;
-const CACHE_HASH_MULTIPLIER: u32 = 0x9E37_79B1;
 const HEADER_BYTES: usize = 4;
 const HOT_HEADER_BYTES: usize = 8;
 const COST_BYTES: usize = 2;
@@ -62,57 +60,29 @@ pub(crate) struct HotMatrix {
     hot_right: usize,
 }
 
-#[derive(Default)]
-pub(crate) struct ColdCache {
-    slots: Vec<u64>,
-}
-
-impl ColdCache {
-    fn slot_of(key: u32) -> usize {
-        (key.wrapping_mul(CACHE_HASH_MULTIPLIER) >> (u32::BITS - COLD_CACHE_BITS)) as usize
-    }
-
-    fn cost(&mut self, templates: &MappedTemplates, left_rc_attr: u16, right_lc_attr: u16) -> i16 {
-        if self.slots.is_empty() {
-            self.slots = vec![0; 1 << COLD_CACHE_BITS];
-        }
-        let key = u32::from(left_rc_attr) << u16::BITS | u32::from(right_lc_attr);
-        let slot = &mut self.slots[Self::slot_of(key)];
-        let tag = u64::from(key) + 1;
-        if *slot >> i16::BITS == tag {
-            return *slot as u16 as i16;
-        }
-        let cost = templates.cost(left_rc_attr, right_lc_attr);
-        *slot = tag << i16::BITS | u64::from(cost as u16);
-        cost
-    }
-}
-
 pub(crate) struct HotColumn<'m> {
     cells: &'m [i16],
     templates: &'m MappedTemplates,
-    cache: &'m mut ColdCache,
     right_lc_attr: u16,
 }
 
 #[cold]
 #[inline(never)]
-fn cold_cost(
-    templates: &MappedTemplates,
-    cache: &mut ColdCache,
-    left_rc_attr: u16,
-    right_lc_attr: u16,
-) -> i16 {
-    cache.cost(templates, left_rc_attr, right_lc_attr)
+fn cold_cost(templates: &MappedTemplates, left_rc_attr: u16, right_lc_attr: u16) -> i16 {
+    templates.cost(left_rc_attr, right_lc_attr)
 }
 
 impl<'m> HotColumn<'m> {
     pub(crate) fn into_cost_fn(self) -> impl FnMut(u16) -> i16 + 'm {
-        let Self { cells, templates, cache, right_lc_attr } = self;
+        let Self { cells, templates, right_lc_attr } = self;
         move |left_rc_attr| match cells.get(usize::from(left_rc_attr)) {
             Some(&cost) => cost,
-            None => cold_cost(templates, cache, left_rc_attr, right_lc_attr),
+            None => cold_cost(templates, left_rc_attr, right_lc_attr),
         }
+    }
+
+    pub(crate) fn cells(&self) -> &'m [i16] {
+        self.cells
     }
 }
 
@@ -134,18 +104,18 @@ impl HotMatrix {
         Ok(Self { map, costs, templates, hot_left, hot_right })
     }
 
-    pub(crate) fn right_column<'m>(
-        &'m self,
-        right_lc_attr: u16,
-        cache: &'m mut ColdCache,
-    ) -> HotColumn<'m> {
+    pub(crate) fn hot_left(&self) -> usize {
+        self.hot_left
+    }
+
+    pub(crate) fn right_column(&self, right_lc_attr: u16) -> HotColumn<'_> {
         let row = usize::from(right_lc_attr);
         let cells = if row < self.hot_right {
             &self.costs.view(&self.map)[row * self.hot_left..(row + 1) * self.hot_left]
         } else {
             &[]
         };
-        HotColumn { cells, templates: &self.templates, cache, right_lc_attr }
+        HotColumn { cells, templates: &self.templates, right_lc_attr }
     }
 }
 

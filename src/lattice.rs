@@ -5,7 +5,7 @@ use crate::constraint::{Constraint, ConstraintSet, NO_FEATURE};
 use crate::dictionary::Dictionary;
 use crate::error::Error;
 use crate::ids::{ElementId, LinkId, NodeId};
-use crate::matrix::{ColdCache, HotMatrix, Matrix};
+use crate::matrix::Matrix;
 use crate::nbest::{Agenda, PathLink};
 use crate::system_dictionary::PrefixHit;
 
@@ -83,7 +83,6 @@ pub(crate) struct Lattice {
     all_paths: bool,
     links: Vec<PathLink>,
     agenda: Agenda,
-    cold_cache: ColdCache,
 }
 
 impl Lattice {
@@ -258,28 +257,22 @@ impl Lattice {
                 Ok(())
             }
             Matrix::Hot(hot) => {
-                let mut cache = std::mem::take(&mut self.cold_cache);
-                let connected = self.connect_rights_hot::<NBEST>(hot, &mut cache, position, begun, lefts);
-                self.cold_cache = cache;
-                connected
+                let hot_left = hot.hot_left();
+                let lefts_are_hot = lefts.iter().all(|left| usize::from(left.rc_attr) < hot_left);
+                for right_index in begun.rev() {
+                    let right_id = NodeId::from_index(right_index);
+                    let column = hot.right_column(self.nodes[right_id].lc_attr);
+                    let cells = column.cells();
+                    if lefts_are_hot && cells.len() == hot_left {
+                        let cost = |rc: u16| cells[usize::from(rc)];
+                        self.connect_right::<NBEST>(position, right_id, lefts, cost)?;
+                    } else {
+                        self.connect_right::<NBEST>(position, right_id, lefts, column.into_cost_fn())?;
+                    }
+                }
+                Ok(())
             }
         }
-    }
-
-    fn connect_rights_hot<const NBEST: bool>(
-        &mut self,
-        hot: &HotMatrix,
-        cache: &mut ColdCache,
-        position: usize,
-        begun: Range<usize>,
-        lefts: &[LeftCandidate],
-    ) -> Result<(), Error> {
-        for right_index in begun.rev() {
-            let right_id = NodeId::from_index(right_index);
-            let column = hot.right_column(self.nodes[right_id].lc_attr, cache);
-            self.connect_right::<NBEST>(position, right_id, lefts, column.into_cost_fn())?;
-        }
-        Ok(())
     }
 
     fn connect_right<const NBEST: bool>(

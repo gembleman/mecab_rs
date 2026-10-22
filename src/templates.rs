@@ -8,6 +8,7 @@ use std::thread;
 
 use memmap2::Mmap;
 
+use crate::clusters::{MappedClusters, plan_clusters, write_clusters};
 use crate::dictionary::map_file;
 use crate::error::Error;
 use crate::section::{Plain, Section};
@@ -16,6 +17,7 @@ const TEMPLATE_MAGIC: &[u8; 4] = b"MXTP";
 const TEMPLATE_VERSION: u32 = 1;
 const ARRAY_ALIGNMENT: usize = 8;
 const MAX_PARTS: usize = 256;
+const DEFAULT_CLUSTER_COUNT: usize = 12;
 const ROWS_PER_BLOCK: usize = 64;
 const MIN_COST: f64 = -32767.0;
 const MAX_COST: f64 = 32767.0;
@@ -86,22 +88,22 @@ fn validate(part: &TemplatePart, left_size: usize, right_size: usize) -> Result<
     if consistent { Ok(()) } else { Err(Error::Corrupt("a connection template is inconsistent")) }
 }
 
-fn to_cost(sum: f64, cost_factor: f64) -> i16 {
+pub(crate) fn to_cost(sum: f64, cost_factor: f64) -> i16 {
     (-cost_factor * sum).clamp(MIN_COST, MAX_COST) as i16
 }
 
-struct PartSlices<'a> {
+pub(crate) struct PartSlices<'a> {
     left_count: usize,
     right_count: usize,
-    left_projection: &'a [u16],
-    right_projection: &'a [u16],
+    pub(crate) left_projection: &'a [u16],
+    pub(crate) right_projection: &'a [u16],
     indptr: &'a [u32],
     left_index: &'a [u16],
-    weight: &'a [f64],
+    pub(crate) weight: &'a [f64],
 }
 
 impl PartSlices<'_> {
-    fn weight_of(&self, left_node_rc: u16, right_node_lc: u16) -> Option<f64> {
+    pub(crate) fn weight_of(&self, left_node_rc: u16, right_node_lc: u16) -> Option<f64> {
         let right_key = usize::from(self.right_projection[usize::from(right_node_lc)]);
         if right_key == self.right_count {
             return None;
@@ -127,7 +129,7 @@ fn padding_after(bytes: usize) -> usize {
     bytes.next_multiple_of(ARRAY_ALIGNMENT) - bytes
 }
 
-fn write_array<T: Copy, const WIDTH: usize>(
+pub(crate) fn write_array<T: Copy, const WIDTH: usize>(
     output: &mut impl Write,
     items: &[T],
     encode: fn(T) -> [u8; WIDTH],
@@ -162,29 +164,29 @@ impl MappedPart {
     }
 }
 
-struct TemplateReader<'a> {
-    file: &'a [u8],
+pub(crate) struct TemplateReader<'a> {
+    pub(crate) file: &'a [u8],
     path: &'a Path,
     offset: usize,
 }
 
 impl TemplateReader<'_> {
-    fn broken(&self, reason: &'static str) -> Error {
+    pub(crate) fn broken(&self, reason: &'static str) -> Error {
         Error::Format { file: self.path.to_path_buf(), reason }
     }
 
-    fn bytes<const WIDTH: usize>(&mut self) -> Result<[u8; WIDTH], Error> {
+    pub(crate) fn bytes<const WIDTH: usize>(&mut self) -> Result<[u8; WIDTH], Error> {
         let end = self.offset + WIDTH;
         let bytes = self.file.get(self.offset..end).ok_or_else(|| self.broken("the file ends inside a header"))?;
         self.offset = end;
         Ok(bytes.try_into().expect("the slice has the requested width"))
     }
 
-    fn count(&mut self) -> Result<usize, Error> {
+    pub(crate) fn count(&mut self) -> Result<usize, Error> {
         self.bytes().map(|bytes| u32::from_le_bytes(bytes) as usize)
     }
 
-    fn section<T: Plain>(&mut self, count: usize) -> Result<Section<T>, Error> {
+    pub(crate) fn section<T: Plain>(&mut self, count: usize) -> Result<Section<T>, Error> {
         let length = count.checked_mul(size_of::<T>()).ok_or_else(|| self.broken("an array is too long"))?;
         let end = self.offset.checked_add(length).ok_or_else(|| self.broken("an array is too long"))?;
         let section = Section::new(self.file, self.offset..end).ok_or_else(|| self.broken("an array is misplaced"))?;
@@ -199,6 +201,7 @@ pub struct MappedTemplates {
     left_size: usize,
     right_size: usize,
     parts: Vec<MappedPart>,
+    clusters: Option<MappedClusters>,
 }
 
 impl MappedTemplates {
@@ -213,7 +216,7 @@ impl MappedTemplates {
         let left_size = reader.count()?;
         let right_size = reader.count()?;
         let part_count = reader.count()?;
-        reader.count()?;
+        let cluster_count = reader.count()?;
         if left_size == 0 || right_size == 0 || left_size > 0xFFFF || right_size > 0xFFFF {
             return Err(reader.broken("the template matrix size is out of range"));
         }
@@ -237,10 +240,14 @@ impl MappedTemplates {
             }
             parts.push(part);
         }
+        let clusters = match cluster_count {
+            0 => None,
+            count => Some(MappedClusters::read(&mut reader, count, left_size, right_size)?),
+        };
         if reader.offset != map.len() {
             return Err(reader.broken("the file has trailing bytes"));
         }
-        Ok(Self { map, cost_factor, left_size, right_size, parts })
+        Ok(Self { map, cost_factor, left_size, right_size, parts, clusters })
     }
 
     pub fn left_size(&self) -> usize {
@@ -252,6 +259,14 @@ impl MappedTemplates {
     }
 
     pub fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
+        let clustered = self
+            .clusters
+            .as_ref()
+            .and_then(|clusters| clusters.cost(&self.map, self.cost_factor, left_node_rc, right_node_lc));
+        clustered.unwrap_or_else(|| self.exact_cost(left_node_rc, right_node_lc))
+    }
+
+    fn exact_cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
         let parts = self.parts.iter().map(|part| part.slices(&self.map));
         connection_cost(parts, self.cost_factor, left_node_rc, right_node_lc)
     }
@@ -332,10 +347,20 @@ impl ConnectionTemplates {
     }
 
     pub fn write_templates(&self, output: &mut impl Write) -> io::Result<()> {
+        self.write_clustered_templates(DEFAULT_CLUSTER_COUNT, output)
+    }
+
+    pub fn write_clustered_templates(
+        &self,
+        cluster_count: usize,
+        output: &mut impl Write,
+    ) -> io::Result<()> {
+        let slices: Vec<PartSlices> = self.slices().collect();
+        let plans = if cluster_count == 0 { Vec::new() } else { plan_clusters(&slices, cluster_count) };
         output.write_all(TEMPLATE_MAGIC)?;
         output.write_all(&TEMPLATE_VERSION.to_le_bytes())?;
         output.write_all(&self.cost_factor.to_le_bytes())?;
-        for count in [self.left_size, self.right_size, self.parts.len(), 0] {
+        for count in [self.left_size, self.right_size, self.parts.len(), plans.len()] {
             output.write_all(&(count as u32).to_le_bytes())?;
         }
         for part in &self.parts {
@@ -348,7 +373,10 @@ impl ConnectionTemplates {
             write_array(output, &part.left_index, u16::to_le_bytes)?;
             write_array(output, &part.weight, f64::to_le_bytes)?;
         }
-        Ok(())
+        if plans.is_empty() {
+            return Ok(());
+        }
+        write_clusters(&slices, &plans, self.left_size, self.right_size, output)
     }
 
     fn render_block(&self, block: usize, hot_left: usize, hot_right: usize, scratch: &mut RowScratch) -> Vec<u8> {

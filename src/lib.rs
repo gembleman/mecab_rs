@@ -1,4 +1,5 @@
 mod char_property;
+mod clusters;
 mod constraint;
 mod dictionary;
 mod error;
