@@ -118,21 +118,11 @@ impl Lattice {
         self.constraints.load(sentence_len, constraints);
         self.end_nodes.clear();
         self.end_nodes.resize(sentence_len + LATTICE_SLACK, None);
-        let bos = self.push_node(RawNode::boundary(NodeSource::Bos, 0));
-        self.end_nodes[0] = Some(bos);
-        for position in 0..sentence_len {
-            if self.end_nodes[position].is_none() {
-                continue;
-            }
-            let begun = self.lookup(dictionary, sentence, position)?;
-            self.connect(dictionary, position, begun)?;
-        }
-        let eos_index = self.nodes.len();
-        let eos = self.push_node(RawNode::boundary(NodeSource::Eos, sentence_len));
-        let last_end = (0..=sentence_len).rev().find(|&at| self.end_nodes[at].is_some());
-        if let Some(position) = last_end {
-            self.connect(dictionary, position, eos_index..eos_index + 1)?;
-        }
+        let eos = if self.all_paths {
+            self.build::<true>(dictionary, sentence)?
+        } else {
+            self.build::<false>(dictionary, sentence)?
+        };
         if self.all_paths {
             return self.select_nbest_path(eos, rank);
         }
@@ -143,6 +133,30 @@ impl Lattice {
         }
         self.path.reverse();
         Ok(())
+    }
+
+    fn build<const NBEST: bool>(
+        &mut self,
+        dictionary: &Dictionary,
+        sentence: &[u8],
+    ) -> Result<NodeId, Error> {
+        let sentence_len = sentence.len();
+        let bos = self.push_node(RawNode::boundary(NodeSource::Bos, 0));
+        self.end_nodes[0] = Some(bos);
+        for position in 0..sentence_len {
+            if self.end_nodes[position].is_none() {
+                continue;
+            }
+            let begun = self.lookup(dictionary, sentence, position)?;
+            self.connect::<NBEST>(dictionary, position, begun)?;
+        }
+        let eos_index = self.nodes.len();
+        let eos = self.push_node(RawNode::boundary(NodeSource::Eos, sentence_len));
+        let last_end = (0..=sentence_len).rev().find(|&at| self.end_nodes[at].is_some());
+        if let Some(position) = last_end {
+            self.connect::<NBEST>(dictionary, position, eos_index..eos_index + 1)?;
+        }
+        Ok(eos)
     }
 
     pub(crate) fn nodes(&self) -> &[RawNode] {
@@ -193,7 +207,7 @@ impl Lattice {
         NodeId::from_index(self.nodes.len() - 1)
     }
 
-    fn connect(
+    fn connect<const NBEST: bool>(
         &mut self,
         dictionary: &Dictionary,
         position: usize,
@@ -218,7 +232,7 @@ impl Lattice {
                     best = Some(left);
                     best_cost = cost;
                 }
-                if self.all_paths {
+                if NBEST {
                     self.links.push(PathLink { left_node: left, cost: local, next_left: lpath });
                     lpath = Some(LinkId::from_index(self.links.len() - 1));
                 }
