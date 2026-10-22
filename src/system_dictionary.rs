@@ -15,6 +15,7 @@ const MIN_FILE_SIZE: usize = 100;
 const VALUE_SIZE_BITS: u32 = 8;
 const VALUE_SIZE_MASK: i32 = 0xff;
 const MAX_PREFIX_HITS: usize = 512;
+const OUTSIDE_TOKEN_TABLE: &str = "a double array entry points outside the token table";
 const VERSION_AT: usize = 4;
 const KIND_AT: usize = 8;
 const LEFT_SIZE_AT: usize = 16;
@@ -74,6 +75,25 @@ struct RawToken {
     reserved: u32,
 }
 
+impl RawToken {
+    fn record(&self) -> TokenRecord {
+        TokenRecord {
+            lc_attr: self.word as u16,
+            rc_attr: (self.word >> 16) as u16,
+            pos_id: self.costs as u16,
+            wcost: ((self.costs >> 16) as u16).cast_signed(),
+            feature: self.feature,
+        }
+    }
+
+    fn is_valid(&self, left_size: usize, right_size: usize, features_len: usize) -> bool {
+        let token = self.record();
+        usize::from(token.lc_attr) < right_size
+            && usize::from(token.rc_attr) < left_size
+            && (token.feature as usize) < features_len
+    }
+}
+
 const _: () = assert!(size_of::<RawToken>() == TOKEN_SIZE);
 
 unsafe impl Plain for RawToken {}
@@ -116,6 +136,11 @@ impl SystemDictionary {
             .ok_or_else(|| broken("the double array is misaligned"))?;
         let tokens = Section::new(bytes, array_end..tokens_end)
             .ok_or_else(|| broken("the token table is misaligned"))?;
+        let features_len = features_end - tokens_end;
+        let valid = |raw: &RawToken| raw.is_valid(left_size, right_size, features_len);
+        if !tokens.view(&map).iter().all(valid) {
+            return Err(broken("a token context id or feature offset is out of range"));
+        }
         Ok(Self { map, left_size, right_size, cells, tokens, features: tokens_end..features_end })
     }
 
@@ -127,20 +152,29 @@ impl SystemDictionary {
         self.right_size
     }
 
-    pub(crate) fn common_prefix_search(&self, key: &[u8], hits: &mut Vec<PrefixHit>) {
+    pub(crate) fn common_prefix_search(
+        &self,
+        key: &[u8],
+        hits: &mut Vec<PrefixHit>,
+    ) -> Result<(), Error> {
         hits.clear();
         let cells = self.cells.view(&self.map);
+        let token_total = self.tokens.view(&self.map).len();
         let Some((mut base, _)) = cell(cells, 0) else {
-            return;
+            return Ok(());
         };
         for (consumed, &byte) in key.iter().enumerate() {
-            push_terminal(cells, base, consumed, hits);
+            push_terminal(cells, token_total, base, consumed, hits)?;
             match cell(cells, i64::from(base) + i64::from(byte) + 1) {
                 Some((next, check)) if base.cast_unsigned() == check => base = next,
-                _ => return,
+                _ => return Ok(()),
             }
         }
-        push_terminal(cells, base, key.len(), hits);
+        push_terminal(cells, token_total, base, key.len(), hits)
+    }
+
+    pub(crate) fn holds_tokens_of(&self, hit: PrefixHit) -> bool {
+        hit.first_token() + hit.token_count() <= self.tokens.view(&self.map).len()
     }
 
     pub(crate) fn exact_match(&self, key: &[u8]) -> Option<i32> {
@@ -157,24 +191,8 @@ impl SystemDictionary {
         (base.cast_unsigned() == check && value < 0).then_some(-value - 1)
     }
 
-    pub(crate) fn token(&self, index: usize) -> Result<TokenRecord, Error> {
-        let raw = self.tokens.view(&self.map).get(index).ok_or(Error::Corrupt("a token index"))?;
-        let token = TokenRecord {
-            lc_attr: raw.word as u16,
-            rc_attr: (raw.word >> 16) as u16,
-            pos_id: raw.costs as u16,
-            wcost: ((raw.costs >> 16) as u16).cast_signed(),
-            feature: raw.feature,
-        };
-        let connectable =
-            usize::from(token.lc_attr) < self.right_size && usize::from(token.rc_attr) < self.left_size;
-        if !connectable {
-            return Err(Error::Corrupt("a token context id outside the matrix"));
-        }
-        if raw.feature as usize >= self.features.len() {
-            return Err(Error::Corrupt("a token feature offset"));
-        }
-        Ok(token)
+    pub(crate) fn token(&self, index: usize) -> TokenRecord {
+        self.tokens.view(&self.map)[index].record()
     }
 
     pub(crate) fn feature(&self, offset: u32) -> &[u8] {
@@ -189,12 +207,23 @@ fn cell(cells: &[[u32; 2]], index: i64) -> Option<(i32, u32)> {
     Some((value.cast_signed(), check))
 }
 
-fn push_terminal(cells: &[[u32; 2]], base: i32, length: usize, hits: &mut Vec<PrefixHit>) {
+fn push_terminal(
+    cells: &[[u32; 2]],
+    token_total: usize,
+    base: i32,
+    length: usize,
+    hits: &mut Vec<PrefixHit>,
+) -> Result<(), Error> {
     if let Some((value, check)) = cell(cells, i64::from(base))
         && value < 0
         && base.cast_unsigned() == check
         && hits.len() < MAX_PREFIX_HITS
     {
-        hits.push(PrefixHit { value: -value - 1, length });
+        let hit = PrefixHit { value: -value - 1, length };
+        if hit.first_token() + hit.token_count() > token_total {
+            return Err(Error::Corrupt(OUTSIDE_TOKEN_TABLE));
+        }
+        hits.push(hit);
     }
+    Ok(())
 }

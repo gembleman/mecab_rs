@@ -306,11 +306,11 @@ impl Lattice {
         }
         let char_info = scan.info;
         let key_end = if end == surface { sentence_len } else { end };
-        dictionary.system.common_prefix_search(&sentence[surface..key_end], &mut self.hits);
+        dictionary.system.common_prefix_search(&sentence[surface..key_end], &mut self.hits)?;
         for hit_index in 0..self.hits.len() {
             let hit = self.hits[hit_index];
             for offset in 0..hit.token_count() {
-                let token = dictionary.system.token(hit.first_token() + offset)?;
+                let token = dictionary.system.token(hit.first_token() + offset);
                 if partial
                     && !self.constraints.admits(
                         begin,

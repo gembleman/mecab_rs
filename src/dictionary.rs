@@ -107,10 +107,12 @@ impl Dictionary {
                 .exact_match(chars.name(category))
                 .ok_or_else(|| broken_unknown("a character category of char.bin is missing"))?;
             let hit = PrefixHit { value, length: 0 };
+            if !unknown.holds_tokens_of(hit) {
+                return Err(broken_unknown("an unknown-word token is not valid"));
+            }
             let tokens = (hit.first_token()..hit.first_token() + hit.token_count())
                 .map(|index| unknown.token(index))
-                .collect::<Result<Box<[_]>, _>>()
-                .map_err(|_| broken_unknown("an unknown-word token is not valid"))?;
+                .collect();
             unknown_tokens.push(tokens);
         }
         Ok(Self {
