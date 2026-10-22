@@ -1,3 +1,4 @@
+use std::ops::RangeInclusive;
 use std::path::Path;
 
 use memmap2::Mmap;
@@ -14,6 +15,11 @@ const TYPE_BITS: u32 = 18;
 const DEFAULT_TYPE_BITS: u32 = 8;
 const LENGTH_BITS: u32 = 4;
 const SPACE_CODE: u16 = 0x20;
+const IDEOGRAPHIC_PLANES: RangeInclusive<u32> = 0x2_0000..=0x3_ffff;
+const COMPATIBILITY_IDEOGRAPHS_SUPPLEMENT: RangeInclusive<u32> = 0x2_f800..=0x2_fa1f;
+const EXTENSION_A_IDEOGRAPH: u16 = 0x3400;
+const COMPATIBILITY_IDEOGRAPH: u16 = 0xf900;
+const UNCLASSIFIED_CODE: u16 = 0;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CharInfo(u32);
@@ -124,6 +130,16 @@ impl CharProperty {
     }
 }
 
+fn bmp_stand_in(code: u32) -> u16 {
+    if COMPATIBILITY_IDEOGRAPHS_SUPPLEMENT.contains(&code) {
+        COMPATIBILITY_IDEOGRAPH
+    } else if IDEOGRAPHIC_PLANES.contains(&code) {
+        EXTENSION_A_IDEOGRAPH
+    } else {
+        UNCLASSIFIED_CODE
+    }
+}
+
 fn decode_utf8(text: &[u8], begin: usize, available: usize) -> (u16, usize) {
     let byte = |offset: usize| text.get(begin + offset).copied().unwrap_or(0);
     let first = byte(0);
@@ -137,7 +153,11 @@ fn decode_utf8(text: &[u8], begin: usize, available: usize) -> (u16, usize) {
             | u16::from(byte(2) & 0x3f);
         (code, 3)
     } else if available >= 4 && first & 0xf8 == 0xf0 {
-        (0, 4)
+        let code = u32::from(first & 0x07) << 18
+            | u32::from(byte(1) & 0x3f) << 12
+            | u32::from(byte(2) & 0x3f) << 6
+            | u32::from(byte(3) & 0x3f);
+        (bmp_stand_in(code), 4)
     } else {
         (0, 1)
     }
