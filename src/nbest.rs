@@ -1,13 +1,29 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::ops::Range;
 
-use crate::ids::{ElementId, LinkId, NodeId};
+use crate::ids::{ElementId, NodeId};
 
 #[derive(Clone, Copy)]
 pub(super) struct PathLink {
     pub(super) left_node: NodeId,
     pub(super) cost: i32,
-    pub(super) next_left: Option<LinkId>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct LinkSpan {
+    start: u32,
+    len: u32,
+}
+
+impl LinkSpan {
+    pub(super) fn new(start: usize, end: usize) -> Self {
+        Self { start: start as u32, len: (end - start) as u32 }
+    }
+
+    pub(super) fn range(self) -> Range<usize> {
+        self.start as usize..(self.start + self.len) as usize
+    }
 }
 
 #[derive(Clone, Copy)]

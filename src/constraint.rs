@@ -1,10 +1,14 @@
 use crate::feature_match::partial_match;
 
-pub(crate) const NO_FEATURE: u32 = u32::MAX;
-const ANY_BOUNDARY: u8 = 0;
-const TOKEN_BOUNDARY: u8 = 1;
-const INSIDE_TOKEN: u8 = 2;
 const POSITION_SLACK: usize = 4;
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum Boundary {
+    #[default]
+    Any,
+    Token,
+    Inside,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BoundaryKind {
@@ -20,8 +24,8 @@ pub enum Constraint<'a> {
 
 #[derive(Default)]
 pub(crate) struct ConstraintSet {
-    boundary: Vec<u8>,
-    feature_at: Vec<u32>,
+    boundary: Vec<Boundary>,
+    feature_at: Vec<Option<u32>>,
     spans: Vec<(usize, usize)>,
     bytes: Vec<u8>,
 }
@@ -36,11 +40,11 @@ impl ConstraintSet {
             match *constraint {
                 Constraint::Boundary { position, kind } => {
                     if position != 0 && position < text_len {
-                        let raw = match kind {
-                            BoundaryKind::Token => TOKEN_BOUNDARY,
-                            BoundaryKind::Inside => INSIDE_TOKEN,
+                        let boundary = match kind {
+                            BoundaryKind::Token => Boundary::Token,
+                            BoundaryKind::Inside => Boundary::Inside,
                         };
-                        self.set_boundary(text_len, position, raw);
+                        self.set_boundary(text_len, position, boundary);
                     }
                 }
                 Constraint::Feature { start, end, pattern } => {
@@ -52,8 +56,8 @@ impl ConstraintSet {
             }
         }
         if self.is_active() {
-            self.set_boundary(text_len, 0, TOKEN_BOUNDARY);
-            self.set_boundary(text_len, text_len, TOKEN_BOUNDARY);
+            self.set_boundary(text_len, 0, Boundary::Token);
+            self.set_boundary(text_len, text_len, Boundary::Token);
         }
     }
 
@@ -62,15 +66,15 @@ impl ConstraintSet {
     }
 
     pub(crate) fn is_token_boundary(&self, position: usize) -> bool {
-        self.boundary_at(position) == TOKEN_BOUNDARY
+        self.boundary_at(position) == Boundary::Token
     }
 
     pub(crate) fn is_inside_token(&self, position: usize) -> bool {
-        self.boundary_at(position) == INSIDE_TOKEN
+        self.boundary_at(position) == Boundary::Inside
     }
 
-    pub(crate) fn feature_at(&self, begin: usize) -> u32 {
-        self.feature_at.get(begin).copied().unwrap_or(NO_FEATURE)
+    pub(crate) fn feature_at(&self, begin: usize) -> Option<u32> {
+        self.feature_at.get(begin).copied().flatten()
     }
 
     pub(crate) fn feature_bytes(&self, index: u32) -> &[u8] {
@@ -82,39 +86,38 @@ impl ConstraintSet {
         if self.is_inside_token(end) {
             return false;
         }
-        let index = self.feature_at(begin);
-        if index == NO_FEATURE {
+        let Some(index) = self.feature_at(begin) else {
             return true;
-        }
+        };
         self.is_token_boundary(begin)
             && self.is_token_boundary(end)
             && partial_match(self.feature_bytes(index), feature())
     }
 
-    fn boundary_at(&self, position: usize) -> u8 {
-        self.boundary.get(position).copied().unwrap_or(ANY_BOUNDARY)
+    fn boundary_at(&self, position: usize) -> Boundary {
+        self.boundary.get(position).copied().unwrap_or_default()
     }
 
-    fn set_boundary(&mut self, text_len: usize, position: usize, kind: u8) {
+    fn set_boundary(&mut self, text_len: usize, position: usize, boundary: Boundary) {
         if self.boundary.is_empty() {
-            self.boundary.resize(text_len + POSITION_SLACK, ANY_BOUNDARY);
+            self.boundary.resize(text_len + POSITION_SLACK, Boundary::Any);
         }
-        self.boundary[position] = kind;
+        self.boundary[position] = boundary;
     }
 
     fn set_feature(&mut self, text_len: usize, begin: usize, end: usize, feature: &[u8]) {
         if self.feature_at.is_empty() {
-            self.feature_at.resize(text_len + POSITION_SLACK, NO_FEATURE);
+            self.feature_at.resize(text_len + POSITION_SLACK, None);
         }
         let end = end.min(text_len);
-        self.set_boundary(text_len, begin, TOKEN_BOUNDARY);
-        self.set_boundary(text_len, end, TOKEN_BOUNDARY);
+        self.set_boundary(text_len, begin, Boundary::Token);
+        self.set_boundary(text_len, end, Boundary::Token);
         for inside in begin + 1..end {
-            self.set_boundary(text_len, inside, INSIDE_TOKEN);
+            self.set_boundary(text_len, inside, Boundary::Inside);
         }
         let start = self.bytes.len();
         self.bytes.extend_from_slice(feature);
         self.spans.push((start, self.bytes.len()));
-        self.feature_at[begin] = (self.spans.len() - 1) as u32;
+        self.feature_at[begin] = Some((self.spans.len() - 1) as u32);
     }
 }

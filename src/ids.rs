@@ -49,5 +49,4 @@ macro_rules! define_id {
 }
 
 define_id!(NodeId);
-define_id!(LinkId);
 define_id!(ElementId);

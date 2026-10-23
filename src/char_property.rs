@@ -110,11 +110,10 @@ impl CharProperty {
         begin: usize,
         end: usize,
         start: CharInfo,
-        scan: &mut Scan,
-    ) -> usize {
+    ) -> (usize, Scan) {
         let mut position = begin;
         let mut current = start;
-        scan.count = 0;
+        let mut scan = Scan::default();
         while position < end {
             let (info, width) = self.char_info(text, position, end);
             scan.info = info;
@@ -126,7 +125,7 @@ impl CharProperty {
             scan.count += 1;
             current = info;
         }
-        position
+        (position, scan)
     }
 }
 

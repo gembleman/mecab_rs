@@ -11,7 +11,6 @@ const MAGIC_ID: u32 = 0xEF71_8F77;
 const DIC_VERSION: u32 = 102;
 const HEADER_SIZE: usize = 72;
 const TOKEN_SIZE: usize = 16;
-const MIN_FILE_SIZE: usize = 100;
 const VALUE_SIZE_BITS: u32 = 8;
 const VALUE_SIZE_MASK: i32 = 0xff;
 const OUTSIDE_TOKEN_TABLE: &str = "a double array entry points outside the token table";
@@ -42,17 +41,22 @@ fn is_utf8_charset(field: &[u8]) -> bool {
 
 #[derive(Clone, Copy)]
 pub(crate) struct PrefixHit {
-    pub(crate) value: i32,
+    first_token: usize,
+    token_count: usize,
     pub(crate) length: usize,
 }
 
 impl PrefixHit {
-    pub(crate) fn first_token(self) -> usize {
-        (self.value >> VALUE_SIZE_BITS).cast_unsigned() as usize
+    fn new(value: i32, length: usize) -> Self {
+        Self {
+            first_token: (value >> VALUE_SIZE_BITS).cast_unsigned() as usize,
+            token_count: (value & VALUE_SIZE_MASK).cast_unsigned() as usize,
+            length,
+        }
     }
 
-    pub(crate) fn token_count(self) -> usize {
-        (self.value & VALUE_SIZE_MASK).cast_unsigned() as usize
+    pub(crate) fn tokens(self) -> Range<usize> {
+        self.first_token..self.first_token + self.token_count
     }
 }
 
@@ -111,7 +115,7 @@ impl SystemDictionary {
         let map = map_file(path)?;
         let broken = |reason| Error::Format { file: path.to_path_buf(), reason };
         let bytes = &map[..];
-        if bytes.len() < MIN_FILE_SIZE
+        if bytes.len() < HEADER_SIZE
             || (read_u32(bytes, 0) ^ MAGIC_ID) as usize != bytes.len()
             || read_u32(bytes, VERSION_AT) != DIC_VERSION
         {
@@ -172,11 +176,11 @@ impl SystemDictionary {
         push_terminal(cells, token_total, base, key.len(), hits)
     }
 
-    pub(crate) fn holds_tokens_of(&self, hit: PrefixHit) -> bool {
-        hit.first_token() + hit.token_count() <= self.tokens.view(&self.map).len()
+    pub(crate) fn holds_tokens(&self, tokens: &Range<usize>) -> bool {
+        tokens.end <= self.tokens.view(&self.map).len()
     }
 
-    pub(crate) fn exact_match(&self, key: &[u8]) -> Option<i32> {
+    pub(crate) fn exact_match(&self, key: &[u8]) -> Option<Range<usize>> {
         let cells = self.cells.view(&self.map);
         let (mut base, _) = cell(cells, 0)?;
         for &byte in key {
@@ -187,7 +191,8 @@ impl SystemDictionary {
             base = next;
         }
         let (value, check) = cell(cells, i64::from(base))?;
-        (base.cast_unsigned() == check && value < 0).then_some(-value - 1)
+        let found = base.cast_unsigned() == check && value < 0;
+        found.then(|| PrefixHit::new(-value - 1, key.len()).tokens())
     }
 
     pub(crate) fn token(&self, index: usize) -> TokenRecord {
@@ -217,8 +222,8 @@ fn push_terminal(
         && value < 0
         && base.cast_unsigned() == check
     {
-        let hit = PrefixHit { value: -value - 1, length };
-        if hit.first_token() + hit.token_count() > token_total {
+        let hit = PrefixHit::new(-value - 1, length);
+        if hit.tokens().end > token_total {
             return Err(Error::Corrupt(OUTSIDE_TOKEN_TABLE));
         }
         hits.push(hit);

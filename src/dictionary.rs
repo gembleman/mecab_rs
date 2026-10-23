@@ -7,13 +7,13 @@ use memmap2::Mmap;
 use crate::char_property::CharProperty;
 use crate::error::Error;
 use crate::matrix::Matrix;
-use crate::system_dictionary::{DictionaryKind, PrefixHit, SystemDictionary, TokenRecord};
+use crate::system_dictionary::{DictionaryKind, SystemDictionary, TokenRecord};
 
 const DENSE_MATRIX_FILE: &str = "matrix.bin";
 const HOT_MATRIX_FILE: &str = "matrix.hot";
 const TEMPLATES_FILE: &str = "matrix.tpl";
 
-const OPTION_DEFAULT_MAX_GROUPING_SIZE: usize = 24;
+const DEFAULT_MAX_GROUPING_SIZE: usize = 24;
 const BOS_FEATURE_KEY: &[u8] = b"bos-feature";
 const UNK_FEATURE_KEY: &[u8] = b"unk-feature";
 
@@ -24,10 +24,6 @@ pub(crate) fn map_file(path: &Path) -> Result<Mmap, Error> {
 }
 
 const _: () = assert!(cfg!(target_endian = "little"));
-
-fn is_space(byte: u8) -> bool {
-    matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
-}
 
 fn dicrc_values(bytes: &[u8], path: &Path) -> Result<HashMap<Vec<u8>, Vec<u8>>, Error> {
     let mut values = HashMap::new();
@@ -43,11 +39,11 @@ fn dicrc_values(bytes: &[u8], path: &Path) -> Result<HashMap<Vec<u8>, Vec<u8>>, 
         };
         let key_end = line[..equals]
             .iter()
-            .rposition(|&byte| !is_space(byte))
+            .rposition(|byte| !byte.is_ascii_whitespace())
             .map_or(0, |at| at + 1);
         let value_start = line[equals + 1..]
             .iter()
-            .position(|&byte| !is_space(byte))
+            .position(|byte| !byte.is_ascii_whitespace())
             .map_or(line.len(), |at| equals + 1 + at);
         values
             .entry(line[..key_end].to_vec())
@@ -121,16 +117,13 @@ impl Dictionary {
         let broken_unknown = |reason| Error::Format { file: unknown_path.clone(), reason };
         let mut unknown_tokens = Vec::with_capacity(chars.category_count());
         for category in 0..chars.category_count() {
-            let value = unknown
+            let run = unknown
                 .exact_match(chars.name(category))
                 .ok_or_else(|| broken_unknown("a character category of char.bin is missing"))?;
-            let hit = PrefixHit { value, length: 0 };
-            if !unknown.holds_tokens_of(hit) {
+            if !unknown.holds_tokens(&run) {
                 return Err(broken_unknown("an unknown-word token is not valid"));
             }
-            let tokens = (hit.first_token()..hit.first_token() + hit.token_count())
-                .map(|index| unknown.token(index))
-                .collect();
+            let tokens = run.map(|index| unknown.token(index)).collect();
             unknown_tokens.push(tokens);
         }
         Ok(Self {
@@ -140,7 +133,7 @@ impl Dictionary {
             chars,
             unknown_tokens,
             bos_feature,
-            max_grouping_size: OPTION_DEFAULT_MAX_GROUPING_SIZE,
+            max_grouping_size: DEFAULT_MAX_GROUPING_SIZE,
         })
     }
 }
