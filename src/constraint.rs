@@ -1,7 +1,5 @@
 use crate::feature_match::partial_match;
 
-const POSITION_SLACK: usize = 4;
-
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 enum Boundary {
     #[default]
@@ -100,14 +98,14 @@ impl ConstraintSet {
 
     fn set_boundary(&mut self, text_len: usize, position: usize, boundary: Boundary) {
         if self.boundary.is_empty() {
-            self.boundary.resize(text_len + POSITION_SLACK, Boundary::Any);
+            self.boundary.resize(text_len + 1, Boundary::Any);
         }
         self.boundary[position] = boundary;
     }
 
     fn set_feature(&mut self, text_len: usize, begin: usize, end: usize, feature: &[u8]) {
         if self.feature_at.is_empty() {
-            self.feature_at.resize(text_len + POSITION_SLACK, None);
+            self.feature_at.resize(text_len + 1, None);
         }
         let end = end.min(text_len);
         self.set_boundary(text_len, begin, Boundary::Token);

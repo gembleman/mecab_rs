@@ -9,8 +9,6 @@ use crate::matrix::Matrix;
 use crate::nbest::{Agenda, LinkSpan, PathLink};
 use crate::system_dictionary::PrefixHit;
 
-const LATTICE_SLACK: usize = 4;
-
 fn later_first<I: DoubleEndedIterator>(candidates: I) -> std::iter::Rev<I> {
     candidates.rev()
 }
@@ -78,7 +76,6 @@ struct Span {
 pub(crate) struct Lattice {
     nodes: Vec<RawNode>,
     ends: Vec<Vec<LeftCandidate>>,
-    position_count: usize,
     hits: Vec<PrefixHit>,
     path: Vec<NodeId>,
     path_cost: i64,
@@ -144,12 +141,11 @@ impl Lattice {
         self.path.clear();
         self.links.clear();
         self.constraints.load(sentence_len, constraints);
-        self.position_count = sentence_len + LATTICE_SLACK;
         for ending in &mut self.ends {
             ending.clear();
         }
-        if self.ends.len() < self.position_count {
-            self.ends.resize_with(self.position_count, Vec::new);
+        if self.ends.len() <= sentence_len {
+            self.ends.resize_with(sentence_len + 1, Vec::new);
         }
     }
 
@@ -166,13 +162,13 @@ impl Lattice {
                 continue;
             }
             let begun = self.lookup(dictionary, sentence, position)?;
-            self.connect::<NBEST>(dictionary, position, begun)?;
+            self.connect::<NBEST>(dictionary, position, begun);
         }
         let eos_index = self.nodes.len();
         let eos = self.push_node(RawNode::boundary(NodeSource::Eos, sentence_len));
         let last_end = (0..=sentence_len).rev().find(|&at| !self.ends[at].is_empty());
         if let Some(position) = last_end {
-            self.connect::<NBEST>(dictionary, position, eos_index..eos_index + 1)?;
+            self.connect::<NBEST>(dictionary, position, eos_index..eos_index + 1);
         }
         Ok(eos)
     }
@@ -228,15 +224,14 @@ impl Lattice {
         dictionary: &Dictionary,
         position: usize,
         begun: Range<usize>,
-    ) -> Result<(), Error> {
+    ) {
         let mut lefts = std::mem::take(&mut self.ends[position]);
-        let connected = self.connect_rights::<NBEST>(dictionary, position, begun, &lefts);
+        self.connect_rights::<NBEST>(dictionary, position, begun, &lefts);
         let added = &mut self.ends[position];
         if !added.is_empty() {
             lefts.append(added);
         }
         std::mem::swap(added, &mut lefts);
-        connected
     }
 
     fn connect_rights<const NBEST: bool>(
@@ -245,15 +240,14 @@ impl Lattice {
         position: usize,
         begun: Range<usize>,
         lefts: &[LeftCandidate],
-    ) -> Result<(), Error> {
+    ) {
         match &dictionary.matrix {
             Matrix::Dense(dense) => {
                 for right_index in later_first(begun) {
                     let right_id = NodeId::from_index(right_index);
                     let column = dense.right_column(self.nodes[right_id].lc_attr);
-                    self.connect_right::<NBEST>(position, right_id, lefts, |rc| column[usize::from(rc)])?;
+                    self.connect_right::<NBEST>(position, right_id, lefts, |rc| column[usize::from(rc)]);
                 }
-                Ok(())
             }
             Matrix::Hot(hot) => {
                 let hot_left = hot.hot_left();
@@ -264,12 +258,11 @@ impl Lattice {
                     let cells = column.cells();
                     if lefts_are_hot && cells.len() == hot_left {
                         let cost = |rc: u16| cells[usize::from(rc)];
-                        self.connect_right::<NBEST>(position, right_id, lefts, cost)?;
+                        self.connect_right::<NBEST>(position, right_id, lefts, cost);
                     } else {
-                        self.connect_right::<NBEST>(position, right_id, lefts, column.into_cost_fn())?;
+                        self.connect_right::<NBEST>(position, right_id, lefts, column.into_cost_fn());
                     }
                 }
-                Ok(())
             }
         }
     }
@@ -280,7 +273,7 @@ impl Lattice {
         right_id: NodeId,
         lefts: &[LeftCandidate],
         mut connection_cost: impl FnMut(u16) -> i16,
-    ) -> Result<(), Error> {
+    ) {
         let right_node = self.nodes[right_id];
         let word_cost = i32::from(right_node.wcost);
         let mut best: Option<(i32, NodeId)> = None;
@@ -296,20 +289,14 @@ impl Lattice {
                 self.links.push(PathLink { left_node: left.id, cost: local });
             }
         }
-        let Some((best_cost, best)) = best else {
-            return Err(Error::TooLongSentence);
-        };
+        let (best_cost, best) = best.expect("a connected position has a left candidate");
         let target = right_node.rlength as usize + position;
-        if target >= self.position_count {
-            return Err(Error::NodeEndOutOfRange);
-        }
         let node = &mut self.nodes[right_id];
         node.prev = Some(best);
         node.cost = best_cost;
         node.links = LinkSpan::new(links_start, self.links.len());
         let ending = LeftCandidate { rc_attr: right_node.rc_attr, cost: best_cost, id: right_id };
         self.ends[target].push(ending);
-        Ok(())
     }
 
     fn lookup(

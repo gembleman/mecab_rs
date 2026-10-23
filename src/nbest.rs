@@ -18,11 +18,13 @@ pub(super) struct LinkSpan {
 
 impl LinkSpan {
     pub(super) fn new(start: usize, end: usize) -> Self {
-        Self { start: start as u32, len: (end - start) as u32 }
+        let start = u32::try_from(start).expect("path links fit in u32");
+        let len = u32::try_from(end - start as usize).expect("path links fit in u32");
+        Self { start, len }
     }
 
     pub(super) fn range(self) -> Range<usize> {
-        self.start as usize..(self.start + self.len) as usize
+        self.start as usize..self.start as usize + self.len as usize
     }
 }
 

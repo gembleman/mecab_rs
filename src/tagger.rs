@@ -22,6 +22,16 @@ pub enum NodeKind {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FeatureId(u64);
 
+fn check_text(text: &str) -> Result<(), Error> {
+    if u32::try_from(text.len()).is_err() {
+        return Err(Error::TextTooLong);
+    }
+    if text.contains('\0') {
+        return Err(Error::NulInText);
+    }
+    Ok(())
+}
+
 pub struct Tagger<D> {
     dictionary: D,
     lattice: Lattice,
@@ -42,9 +52,7 @@ impl<D: Deref<Target = Dictionary>> Tagger<D> {
         constraints: &[Constraint<'_>],
         rank: usize,
     ) -> Result<Path<'t, 'x>, Error> {
-        if text.contains('\0') {
-            return Err(Error::NulInText);
-        }
+        check_text(text)?;
         self.lattice.parse(&self.dictionary, text, constraints, rank)?;
         Ok(Path {
             frame: Frame {
@@ -63,9 +71,7 @@ impl<D: Deref<Target = Dictionary>> Tagger<D> {
         text: &'x str,
         constraints: &[Constraint<'_>],
     ) -> Result<NBest<'t, 'x>, Error> {
-        if text.contains('\0') {
-            return Err(Error::NulInText);
-        }
+        check_text(text)?;
         self.lattice.start_nbest(&self.dictionary, text, constraints)?;
         Ok(NBest { dictionary: &self.dictionary, lattice: &mut self.lattice, text })
     }
