@@ -100,7 +100,7 @@ impl CharProperty {
     }
 
     pub(crate) fn char_info(&self, text: &[u8], begin: usize, end: usize) -> (CharInfo, usize) {
-        let (code, width) = decode_utf8(text, begin, end.wrapping_sub(begin));
+        let (code, width) = decode_utf8(text, begin, end - begin);
         (self.info_of_code(code), width)
     }
 

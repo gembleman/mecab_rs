@@ -14,7 +14,6 @@ const TOKEN_SIZE: usize = 16;
 const MIN_FILE_SIZE: usize = 100;
 const VALUE_SIZE_BITS: u32 = 8;
 const VALUE_SIZE_MASK: i32 = 0xff;
-const MAX_PREFIX_HITS: usize = 512;
 const OUTSIDE_TOKEN_TABLE: &str = "a double array entry points outside the token table";
 const VERSION_AT: usize = 4;
 const KIND_AT: usize = 8;
@@ -217,7 +216,6 @@ fn push_terminal(
     if let Some((value, check)) = cell(cells, i64::from(base))
         && value < 0
         && base.cast_unsigned() == check
-        && hits.len() < MAX_PREFIX_HITS
     {
         let hit = PrefixHit { value: -value - 1, length };
         if hit.first_token() + hit.token_count() > token_total {

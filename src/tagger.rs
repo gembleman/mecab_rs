@@ -156,11 +156,11 @@ impl<'t, 'x> Node<'t, 'x> {
     }
 
     pub fn length(&self) -> usize {
-        usize::from(self.raw.length)
+        self.raw.length as usize
     }
 
     pub fn rlength(&self) -> usize {
-        usize::from(self.raw.rlength)
+        self.raw.rlength as usize
     }
 
     pub fn feature(&self) -> Result<&'t str, Utf8Error> {

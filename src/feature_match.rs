@@ -1,5 +1,3 @@
-const MAX_INPUT_BYTES: usize = 8191;
-const MAX_COLUMNS: usize = 64;
 const WILDCARD: &[u8] = b"*";
 const QUOTE: u8 = b'"';
 const SEPARATOR: u8 = b',';
@@ -35,12 +33,11 @@ impl<'a> Column<'a> {
 struct Columns<'a> {
     source: &'a [u8],
     at: usize,
-    produced: usize,
 }
 
 impl<'a> Columns<'a> {
     fn new(source: &'a [u8]) -> Self {
-        Self { source: &source[..source.len().min(MAX_INPUT_BYTES)], at: 0, produced: 0 }
+        Self { source, at: 0 }
     }
 
     fn separator_from(&self, from: usize) -> usize {
@@ -67,14 +64,12 @@ impl<'a> Iterator for Columns<'a> {
     type Item = Column<'a>;
 
     fn next(&mut self) -> Option<Column<'a>> {
-        if self.at >= self.source.len() || self.produced == MAX_COLUMNS {
+        if self.at >= self.source.len() {
             return None;
         }
         while matches!(self.source.get(self.at), Some(b' ' | b'\t')) {
             self.at += 1;
         }
-        self.produced += 1;
-        let last = self.produced == MAX_COLUMNS;
         let column;
         if self.source.get(self.at) == Some(&QUOTE) {
             let start = self.at + 1;
@@ -82,9 +77,9 @@ impl<'a> Iterator for Columns<'a> {
             column = Column { content: &self.source[start..closing], quoted: true };
             self.at = self.separator_from((closing + 1).min(self.source.len()));
         } else {
-            let end = if last { self.source.len() } else { self.separator_from(self.at) };
+            let end = self.separator_from(self.at);
             column = Column { content: &self.source[self.at..end], quoted: false };
-            self.at = self.separator_from(self.at);
+            self.at = end;
         }
         self.at += 1;
         Some(column)

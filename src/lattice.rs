@@ -9,7 +9,6 @@ use crate::matrix::Matrix;
 use crate::nbest::{Agenda, PathLink};
 use crate::system_dictionary::PrefixHit;
 
-const MAX_LOOKUP_BYTES: usize = 65535;
 const LATTICE_SLACK: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,8 +23,8 @@ pub(crate) enum NodeSource {
 #[derive(Clone, Copy)]
 pub(crate) struct RawNode {
     pub(crate) surface_start: u32,
-    pub(crate) length: u16,
-    pub(crate) rlength: u16,
+    pub(crate) length: u32,
+    pub(crate) rlength: u32,
     pub(crate) lc_attr: u16,
     pub(crate) rc_attr: u16,
     pub(crate) wcost: i16,
@@ -290,7 +289,7 @@ impl Lattice {
         for left in lefts.iter().rev() {
             let connection = connection_cost(left.rc_attr);
             let local = i32::from(connection) + word_cost;
-            let cost = left.cost.wrapping_add(local);
+            let cost = left.cost + local;
             if cost < best_cost {
                 best = Some(left.id);
                 best_cost = cost;
@@ -304,7 +303,7 @@ impl Lattice {
         let Some(best) = best else {
             return Err(Error::TooLongSentence);
         };
-        let target = usize::from(right_node.rlength) + position;
+        let target = right_node.rlength as usize + position;
         if target >= self.position_count {
             return Err(Error::NodeEndOutOfRange);
         }
@@ -326,11 +325,7 @@ impl Lattice {
         let chars = &dictionary.chars;
         let sentence_len = sentence.len();
         let first = self.nodes.len();
-        let mut end = if sentence_len - begin >= MAX_LOOKUP_BYTES {
-            begin + MAX_LOOKUP_BYTES
-        } else {
-            sentence_len
-        };
+        let mut end = sentence_len;
         let partial = self.constraints.is_active();
         if partial
             && let Some(boundary) = (begin + 1..sentence_len)
@@ -361,8 +356,8 @@ impl Lattice {
                 }
                 let node = RawNode {
                     surface_start: surface as u32,
-                    length: hit.length as u16,
-                    rlength: (surface - begin + hit.length) as u16,
+                    length: hit.length as u32,
+                    rlength: (surface - begin + hit.length) as u32,
                     lc_attr: token.lc_attr,
                     rc_attr: token.rc_attr,
                     wcost: token.wcost,
@@ -454,8 +449,8 @@ impl Lattice {
         }
         self.push_node(RawNode {
             surface_start: surface as u32,
-            length: (cursor - surface) as u16,
-            rlength: (cursor - begin) as u16,
+            length: (cursor - surface) as u32,
+            rlength: (cursor - begin) as u32,
             lc_attr: 0,
             rc_attr: 0,
             wcost: 0,
@@ -486,8 +481,8 @@ impl Lattice {
             }
             let node = RawNode {
                 surface_start: span.surface as u32,
-                length: (span.end - span.surface) as u16,
-                rlength: (span.end - span.begin) as u16,
+                length: (span.end - span.surface) as u32,
+                rlength: (span.end - span.begin) as u32,
                 lc_attr: token.lc_attr,
                 rc_attr: token.rc_attr,
                 wcost: token.wcost,
