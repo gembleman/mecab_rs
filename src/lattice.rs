@@ -26,10 +26,10 @@ pub(crate) enum NodeSource {
 pub(crate) struct RawNode {
     pub(crate) surface_start: u32,
     pub(crate) length: u32,
-    pub(crate) rlength: u32,
-    pub(crate) lc_attr: u16,
-    pub(crate) rc_attr: u16,
-    pub(crate) wcost: i16,
+    pub(crate) length_with_space: u32,
+    pub(crate) left_id: u16,
+    pub(crate) right_id: u16,
+    pub(crate) word_cost: i16,
     pub(crate) pos_id: u16,
     pub(crate) source: NodeSource,
     pub(crate) char_type: u8,
@@ -44,10 +44,10 @@ impl RawNode {
         Self {
             surface_start: surface_start as u32,
             length: 0,
-            rlength: 0,
-            lc_attr: 0,
-            rc_attr: 0,
-            wcost: 0,
+            length_with_space: 0,
+            left_id: 0,
+            right_id: 0,
+            word_cost: 0,
             pos_id: 0,
             source,
             char_type: 0,
@@ -61,7 +61,7 @@ impl RawNode {
 
 #[derive(Clone, Copy)]
 struct LeftCandidate {
-    rc_attr: u16,
+    right_id: u16,
     cost: i32,
     id: NodeId,
 }
@@ -90,12 +90,7 @@ impl Lattice {
         dictionary: &Dictionary,
         text: &str,
         constraints: &[Constraint<'_>],
-        rank: usize,
     ) -> Result<(), Error> {
-        if rank > 1 {
-            self.start_nbest(dictionary, text, constraints)?;
-            return self.select_nbest_path(rank);
-        }
         self.reset(text, constraints);
         let eos = self.build::<false>(dictionary, text.as_bytes())?;
         let mut cursor = Some(eos);
@@ -156,7 +151,7 @@ impl Lattice {
     ) -> Result<NodeId, Error> {
         let sentence_len = sentence.len();
         let bos = self.push_node(RawNode::boundary(NodeSource::Bos, 0));
-        self.ends[0].push(LeftCandidate { rc_attr: 0, cost: 0, id: bos });
+        self.ends[0].push(LeftCandidate { right_id: 0, cost: 0, id: bos });
         for position in 0..sentence_len {
             if self.ends[position].is_empty() {
                 continue;
@@ -187,15 +182,6 @@ impl Lattice {
 
     pub(crate) fn constraints(&self) -> &ConstraintSet {
         &self.constraints
-    }
-
-    fn select_nbest_path(&mut self, rank: usize) -> Result<(), Error> {
-        for _ in 0..rank {
-            if !self.next_nbest_path() {
-                return Err(Error::NoPath { rank });
-            }
-        }
-        Ok(())
     }
 
     fn advance_nbest(&mut self) -> Option<ElementId> {
@@ -245,19 +231,21 @@ impl Lattice {
             Matrix::Dense(dense) => {
                 for right_index in later_first(begun) {
                     let right_id = NodeId::from_index(right_index);
-                    let column = dense.right_column(self.nodes[right_id].lc_attr);
-                    self.connect_right::<NBEST>(position, right_id, lefts, |rc| column[usize::from(rc)]);
+                    let column = dense.right_column(self.nodes[right_id].left_id);
+                    self.connect_right::<NBEST>(position, right_id, lefts, |left_right_id| {
+                        column[usize::from(left_right_id)]
+                    });
                 }
             }
             Matrix::Hot(hot) => {
                 let hot_left = hot.hot_left();
-                let lefts_are_hot = lefts.iter().all(|left| usize::from(left.rc_attr) < hot_left);
+                let lefts_are_hot = lefts.iter().all(|left| usize::from(left.right_id) < hot_left);
                 for right_index in later_first(begun) {
                     let right_id = NodeId::from_index(right_index);
-                    let column = hot.right_column(self.nodes[right_id].lc_attr);
+                    let column = hot.right_column(self.nodes[right_id].left_id);
                     let cells = column.cells();
                     if lefts_are_hot && cells.len() == hot_left {
-                        let cost = |rc: u16| cells[usize::from(rc)];
+                        let cost = |left_right_id: u16| cells[usize::from(left_right_id)];
                         self.connect_right::<NBEST>(position, right_id, lefts, cost);
                     } else {
                         self.connect_right::<NBEST>(position, right_id, lefts, column.into_cost_fn());
@@ -275,11 +263,11 @@ impl Lattice {
         mut connection_cost: impl FnMut(u16) -> i16,
     ) {
         let right_node = self.nodes[right_id];
-        let word_cost = i32::from(right_node.wcost);
+        let word_cost = i32::from(right_node.word_cost);
         let mut best: Option<(i32, NodeId)> = None;
         let links_start = self.links.len();
         for left in later_first(lefts.iter()) {
-            let connection = connection_cost(left.rc_attr);
+            let connection = connection_cost(left.right_id);
             let local = i32::from(connection) + word_cost;
             let cost = left.cost + local;
             if best.is_none_or(|(best_cost, _)| cost < best_cost) {
@@ -290,12 +278,12 @@ impl Lattice {
             }
         }
         let (best_cost, best) = best.expect("a connected position has a left candidate");
-        let target = right_node.rlength as usize + position;
+        let target = right_node.length_with_space as usize + position;
         let node = &mut self.nodes[right_id];
         node.prev = Some(best);
         node.cost = best_cost;
         node.links = LinkSpan::new(links_start, self.links.len());
-        let ending = LeftCandidate { rc_attr: right_node.rc_attr, cost: best_cost, id: right_id };
+        let ending = LeftCandidate { right_id: right_node.right_id, cost: best_cost, id: right_id };
         self.ends[target].push(ending);
     }
 
@@ -339,10 +327,10 @@ impl Lattice {
                 let node = RawNode {
                     surface_start: surface as u32,
                     length: hit.length as u32,
-                    rlength: (surface - begin + hit.length) as u32,
-                    lc_attr: token.lc_attr,
-                    rc_attr: token.rc_attr,
-                    wcost: token.wcost,
+                    length_with_space: (surface - begin + hit.length) as u32,
+                    left_id: token.left_id,
+                    right_id: token.right_id,
+                    word_cost: token.word_cost,
                     pos_id: token.pos_id,
                     source: NodeSource::System,
                     char_type: char_info.default_type() as u8,
@@ -431,10 +419,10 @@ impl Lattice {
         self.push_node(RawNode {
             surface_start: surface as u32,
             length: (cursor - surface) as u32,
-            rlength: (cursor - begin) as u32,
-            lc_attr: 0,
-            rc_attr: 0,
-            wcost: 0,
+            length_with_space: (cursor - begin) as u32,
+            left_id: 0,
+            right_id: 0,
+            word_cost: 0,
             pos_id: 0,
             source: NodeSource::Constrained,
             char_type: char_info.default_type() as u8,
@@ -463,10 +451,10 @@ impl Lattice {
             let node = RawNode {
                 surface_start: span.surface as u32,
                 length: (span.end - span.surface) as u32,
-                rlength: (span.end - span.begin) as u32,
-                lc_attr: token.lc_attr,
-                rc_attr: token.rc_attr,
-                wcost: token.wcost,
+                length_with_space: (span.end - span.begin) as u32,
+                left_id: token.left_id,
+                right_id: token.right_id,
+                word_cost: token.word_cost,
                 pos_id: token.pos_id,
                 source: NodeSource::Unknown,
                 char_type: char_info.default_type() as u8,

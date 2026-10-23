@@ -62,10 +62,10 @@ impl PrefixHit {
 
 #[derive(Clone, Copy)]
 pub(crate) struct TokenRecord {
-    pub(crate) lc_attr: u16,
-    pub(crate) rc_attr: u16,
+    pub(crate) left_id: u16,
+    pub(crate) right_id: u16,
     pub(crate) pos_id: u16,
-    pub(crate) wcost: i16,
+    pub(crate) word_cost: i16,
     pub(crate) feature: u32,
 }
 
@@ -81,18 +81,18 @@ struct RawToken {
 impl RawToken {
     fn record(&self) -> TokenRecord {
         TokenRecord {
-            lc_attr: self.word as u16,
-            rc_attr: (self.word >> 16) as u16,
+            left_id: self.word as u16,
+            right_id: (self.word >> 16) as u16,
             pos_id: self.costs as u16,
-            wcost: ((self.costs >> 16) as u16).cast_signed(),
+            word_cost: ((self.costs >> 16) as u16).cast_signed(),
             feature: self.feature,
         }
     }
 
     fn is_valid(&self, left_size: usize, right_size: usize, features_len: usize) -> bool {
         let token = self.record();
-        usize::from(token.lc_attr) < right_size
-            && usize::from(token.rc_attr) < left_size
+        usize::from(token.left_id) < right_size
+            && usize::from(token.right_id) < left_size
             && (token.feature as usize) < features_len
     }
 }

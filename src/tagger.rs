@@ -43,17 +43,16 @@ impl<D: Deref<Target = Dictionary>> Tagger<D> {
     }
 
     pub fn parse<'t, 'x>(&'t mut self, text: &'x str) -> Result<Path<'t, 'x>, Error> {
-        self.parse_with(text, &[], 1)
+        self.parse_with(text, &[])
     }
 
     pub fn parse_with<'t, 'x>(
         &'t mut self,
         text: &'x str,
         constraints: &[Constraint<'_>],
-        rank: usize,
     ) -> Result<Path<'t, 'x>, Error> {
         check_text(text)?;
-        self.lattice.parse(&self.dictionary, text, constraints, rank)?;
+        self.lattice.parse(&self.dictionary, text, constraints)?;
         Ok(Path {
             frame: Frame {
                 dictionary: &self.dictionary,
@@ -165,8 +164,8 @@ impl<'t, 'x> Node<'t, 'x> {
         self.raw.length as usize
     }
 
-    pub fn rlength(&self) -> usize {
-        self.raw.rlength as usize
+    pub fn length_with_space(&self) -> usize {
+        self.raw.length_with_space as usize
     }
 
     pub fn feature(&self) -> Result<&'t str, Utf8Error> {
@@ -193,11 +192,11 @@ impl<'t, 'x> Node<'t, 'x> {
     }
 
     pub fn left_id(&self) -> u16 {
-        self.raw.lc_attr
+        self.raw.left_id
     }
 
     pub fn right_id(&self) -> u16 {
-        self.raw.rc_attr
+        self.raw.right_id
     }
 
     pub fn pos_id(&self) -> u16 {
@@ -209,7 +208,7 @@ impl<'t, 'x> Node<'t, 'x> {
     }
 
     pub fn word_cost(&self) -> i16 {
-        self.raw.wcost
+        self.raw.word_cost
     }
 
     pub fn cost(&self) -> i32 {

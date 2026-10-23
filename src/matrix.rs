@@ -46,8 +46,8 @@ impl DenseMatrix {
         Ok(Self { map, costs, left_size, right_size })
     }
 
-    pub(crate) fn right_column(&self, right_lc_attr: u16) -> &[i16] {
-        let start = self.left_size * usize::from(right_lc_attr);
+    pub(crate) fn right_column(&self, right_left_id: u16) -> &[i16] {
+        let start = self.left_size * usize::from(right_left_id);
         &self.costs.view(&self.map)[start..start + self.left_size]
     }
 }
@@ -63,21 +63,21 @@ pub(crate) struct HotMatrix {
 pub(crate) struct HotColumn<'m> {
     cells: &'m [i16],
     templates: &'m MappedTemplates,
-    right_lc_attr: u16,
+    right_left_id: u16,
 }
 
 #[cold]
 #[inline(never)]
-fn cold_cost(templates: &MappedTemplates, left_rc_attr: u16, right_lc_attr: u16) -> i16 {
-    templates.cost(left_rc_attr, right_lc_attr)
+fn cold_cost(templates: &MappedTemplates, left_right_id: u16, right_left_id: u16) -> i16 {
+    templates.cost(left_right_id, right_left_id)
 }
 
 impl<'m> HotColumn<'m> {
     pub(crate) fn into_cost_fn(self) -> impl FnMut(u16) -> i16 + 'm {
-        let Self { cells, templates, right_lc_attr } = self;
-        move |left_rc_attr| match cells.get(usize::from(left_rc_attr)) {
+        let Self { cells, templates, right_left_id } = self;
+        move |left_right_id| match cells.get(usize::from(left_right_id)) {
             Some(&cost) => cost,
-            None => cold_cost(templates, left_rc_attr, right_lc_attr),
+            None => cold_cost(templates, left_right_id, right_left_id),
         }
     }
 
@@ -108,14 +108,14 @@ impl HotMatrix {
         self.hot_left
     }
 
-    pub(crate) fn right_column(&self, right_lc_attr: u16) -> HotColumn<'_> {
-        let row = usize::from(right_lc_attr);
+    pub(crate) fn right_column(&self, right_left_id: u16) -> HotColumn<'_> {
+        let row = usize::from(right_left_id);
         let cells = if row < self.hot_right {
             &self.costs.view(&self.map)[row * self.hot_left..(row + 1) * self.hot_left]
         } else {
             &[]
         };
-        HotColumn { cells, templates: &self.templates, right_lc_attr }
+        HotColumn { cells, templates: &self.templates, right_left_id }
     }
 }
 

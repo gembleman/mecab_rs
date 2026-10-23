@@ -325,10 +325,10 @@ impl ConnectionTemplates {
         connection_cost(self.slices(), self.cost_factor, left_node_rc, right_node_lc)
     }
 
-    fn fill_row_sums(&self, lc_attr: usize, hot_left: usize, scratch: &mut RowScratch) {
+    fn fill_row_sums(&self, right_left_id: usize, hot_left: usize, scratch: &mut RowScratch) {
         scratch.row[..hot_left].fill(0.0);
         for (part, lookup) in self.slices().zip(&mut scratch.lookups) {
-            let right_key = usize::from(part.right_projection[lc_attr]);
+            let right_key = usize::from(part.right_projection[right_left_id]);
             if right_key == part.right_count {
                 continue;
             }
@@ -383,8 +383,8 @@ impl ConnectionTemplates {
         let first = block * ROWS_PER_BLOCK;
         let last = (first + ROWS_PER_BLOCK).min(hot_right);
         let mut bytes = Vec::with_capacity((last - first) * hot_left * 2);
-        for lc_attr in first..last {
-            self.fill_row_sums(lc_attr, hot_left, scratch);
+        for right_left_id in first..last {
+            self.fill_row_sums(right_left_id, hot_left, scratch);
             for sum in &scratch.row[..hot_left] {
                 bytes.extend_from_slice(&to_cost(*sum, self.cost_factor).to_le_bytes());
             }

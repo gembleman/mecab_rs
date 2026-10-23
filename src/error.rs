@@ -9,7 +9,6 @@ pub enum Error {
     Format { file: PathBuf, reason: &'static str },
     Unsupported(&'static str),
     NulInText,
-    NoPath { rank: usize },
     TextTooLong,
     UnsatisfiableConstraint,
     Corrupt(&'static str),
@@ -24,7 +23,6 @@ impl fmt::Display for Error {
             }
             Self::Unsupported(what) => write!(formatter, "unsupported: {what}"),
             Self::NulInText => formatter.write_str("the input text contains a NUL character"),
-            Self::NoPath { rank } => write!(formatter, "there is no path of rank {rank}"),
             Self::TextTooLong => formatter.write_str("the input text is longer than u32::MAX bytes"),
             Self::UnsatisfiableConstraint => {
                 formatter.write_str("no node satisfies the given constraints")

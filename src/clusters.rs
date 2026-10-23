@@ -220,10 +220,10 @@ impl MappedClusters {
         if valid { Ok(clusters) } else { Err(reader.broken("a cluster key is out of range")) }
     }
 
-    pub(crate) fn cost(&self, file: &[u8], cost_factor: f64, rc: u16, lc: u16) -> Option<i16> {
+    pub(crate) fn cost(&self, file: &[u8], cost_factor: f64, left_right_id: u16, right_left_id: u16) -> Option<i16> {
         let count = self.shapes.len();
-        let left = &self.left_keys.view(file)[usize::from(rc) * count..][..count];
-        let right = &self.right_keys.view(file)[usize::from(lc) * count..][..count];
+        let left = &self.left_keys.view(file)[usize::from(left_right_id) * count..][..count];
+        let right = &self.right_keys.view(file)[usize::from(right_left_id) * count..][..count];
         let tables = self.tables.view(file);
         let mut sum = 0.0;
         for ((shape, &left), &right) in self.shapes.iter().zip(left).zip(right) {
