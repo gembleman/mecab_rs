@@ -11,6 +11,10 @@ use crate::system_dictionary::PrefixHit;
 
 const LATTICE_SLACK: usize = 4;
 
+fn later_first<I: DoubleEndedIterator>(candidates: I) -> std::iter::Rev<I> {
+    candidates.rev()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NodeSource {
     System,
@@ -248,7 +252,7 @@ impl Lattice {
     ) -> Result<(), Error> {
         match &dictionary.matrix {
             Matrix::Dense(dense) => {
-                for right_index in begun.rev() {
+                for right_index in later_first(begun) {
                     let right_id = NodeId::from_index(right_index);
                     let column = dense.right_column(self.nodes[right_id].lc_attr);
                     self.connect_right::<NBEST>(position, right_id, lefts, |rc| column[usize::from(rc)])?;
@@ -258,7 +262,7 @@ impl Lattice {
             Matrix::Hot(hot) => {
                 let hot_left = hot.hot_left();
                 let lefts_are_hot = lefts.iter().all(|left| usize::from(left.rc_attr) < hot_left);
-                for right_index in begun.rev() {
+                for right_index in later_first(begun) {
                     let right_id = NodeId::from_index(right_index);
                     let column = hot.right_column(self.nodes[right_id].lc_attr);
                     let cells = column.cells();
@@ -286,7 +290,7 @@ impl Lattice {
         let mut best_cost = i32::MAX;
         let mut best: Option<NodeId> = None;
         let mut lpath: Option<LinkId> = None;
-        for left in lefts.iter().rev() {
+        for left in later_first(lefts.iter()) {
             let connection = connection_cost(left.rc_attr);
             let local = i32::from(connection) + word_cost;
             let cost = left.cost + local;
