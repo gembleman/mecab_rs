@@ -6,9 +6,11 @@ pub(super) fn partial_match(constraint: &[u8], feature: &[u8]) -> bool {
     if constraint == WILDCARD {
         return true;
     }
-    Columns::new(constraint).zip(Columns::new(feature)).all(|(wanted, actual)| {
-        wanted.bytes().eq(WILDCARD.iter().copied()) || wanted.bytes().eq(actual.bytes())
-    })
+    Columns::new(constraint)
+        .zip(Columns::new(feature))
+        .all(|(wanted, actual)| {
+            wanted.bytes().eq(WILDCARD.iter().copied()) || wanted.bytes().eq(actual.bytes())
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -42,7 +44,9 @@ impl<'a> Columns<'a> {
 
     fn separator_from(&self, from: usize) -> usize {
         let tail = &self.source[from..];
-        tail.iter().position(|&byte| byte == SEPARATOR).map_or(self.source.len(), |o| from + o)
+        tail.iter()
+            .position(|&byte| byte == SEPARATOR)
+            .map_or(self.source.len(), |o| from + o)
     }
 
     fn closing_quote_from(&self, from: usize) -> usize {
@@ -74,11 +78,17 @@ impl<'a> Iterator for Columns<'a> {
         if self.source.get(self.at) == Some(&QUOTE) {
             let start = self.at + 1;
             let closing = self.closing_quote_from(start);
-            column = Column { content: &self.source[start..closing], quoted: true };
+            column = Column {
+                content: &self.source[start..closing],
+                quoted: true,
+            };
             self.at = self.separator_from((closing + 1).min(self.source.len()));
         } else {
             let end = self.separator_from(self.at);
-            column = Column { content: &self.source[self.at..end], quoted: false };
+            column = Column {
+                content: &self.source[self.at..end],
+                quoted: false,
+            };
             self.at = end;
         }
         self.at += 1;

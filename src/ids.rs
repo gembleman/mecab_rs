@@ -11,7 +11,7 @@ macro_rules! define_id {
                 Self(NonZero::new(index as u32 + 1).unwrap())
             }
 
-            fn index(self) -> usize {
+            pub(crate) fn index(self) -> usize {
                 self.0.get() as usize - 1
             }
         }

@@ -20,7 +20,11 @@ pub(crate) struct Section<T> {
 impl<T: Plain> Section<T> {
     pub(crate) fn new(file: &[u8], bytes: Range<usize>) -> Option<Self> {
         cast::<T>(file.get(bytes.clone())?)?;
-        Some(Self { start: bytes.start, end: bytes.end, element: PhantomData })
+        Some(Self {
+            start: bytes.start,
+            end: bytes.end,
+            element: PhantomData,
+        })
     }
 
     pub(crate) fn view<'f>(&self, file: &'f [u8]) -> &'f [T] {

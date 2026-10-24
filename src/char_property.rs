@@ -1,25 +1,20 @@
-use std::ops::RangeInclusive;
 use std::path::Path;
 
 use memmap2::Mmap;
 
+use crate::char_table::{
+    CODE_POINTS, EXTENDER_FLAG, HEADER_BYTES, MAGIC, MAX_PALETTE, NAME_BYTES, PALETTE_ENTRY_BYTES,
+    VERSION,
+};
 use crate::dictionary::map_file;
 use crate::error::Error;
-use crate::section::Section;
 
-const COUNT_BYTES: usize = 4;
-const NAME_BYTES: usize = 32;
-const TABLE_ENTRIES: usize = 0xffff;
-const ENTRY_BYTES: usize = 4;
 const TYPE_BITS: u32 = 18;
 const DEFAULT_TYPE_BITS: u32 = 8;
 const LENGTH_BITS: u32 = 4;
-const SPACE_CODE: u16 = 0x20;
-const IDEOGRAPHIC_PLANES: RangeInclusive<u32> = 0x2_0000..=0x3_ffff;
-const COMPATIBILITY_IDEOGRAPHS_SUPPLEMENT: RangeInclusive<u32> = 0x2_f800..=0x2_fa1f;
-const EXTENSION_A_IDEOGRAPH: u16 = 0x3400;
-const COMPATIBILITY_IDEOGRAPH: u16 = 0xf900;
-const UNCLASSIFIED_CODE: u16 = 0;
+const SPACE_CODE: u32 = 0x20;
+const FOUR_BYTE_LEAD: u8 = 0xf0;
+const BMP_LEN: usize = 0x1_0000;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CharInfo(u32);
@@ -57,27 +52,84 @@ pub(crate) struct Scan {
     pub(crate) count: usize,
 }
 
+#[derive(Clone, Copy, Default)]
+struct Class {
+    info: CharInfo,
+    extender: bool,
+}
+
 pub(crate) struct CharProperty {
     map: Mmap,
     category_count: usize,
-    table: Section<u32>,
+    palette: Vec<Class>,
+    table_start: usize,
 }
 
 impl CharProperty {
     pub(crate) fn open(path: &Path) -> Result<Self, Error> {
+        if !path.exists() {
+            return Err(Error::MissingCharTable {
+                path: path.to_path_buf(),
+            });
+        }
         let map = map_file(path)?;
-        let broken = |reason| Error::Format { file: path.to_path_buf(), reason };
-        let Some(&count) = map.first_chunk() else {
-            return Err(broken("the file is shorter than its header"));
+        Self::from_map(map, path)
+    }
+
+    fn from_map(map: Mmap, path: &Path) -> Result<Self, Error> {
+        let broken = |reason| Error::Format {
+            file: path.to_path_buf(),
+            reason,
         };
-        let category_count = u32::from_le_bytes(count) as usize;
-        let table_start = COUNT_BYTES + NAME_BYTES * category_count;
-        if table_start + ENTRY_BYTES * TABLE_ENTRIES != map.len() {
+        let word = |at: usize| {
+            let bytes = map.get(at..at + 4)?;
+            Some(u32::from_le_bytes(bytes.try_into().ok()?))
+        };
+        if map.len() < HEADER_BYTES || map[..4] != *MAGIC || word(4) != Some(VERSION) {
+            return Err(broken("the file is not a character table of this version"));
+        }
+        let category_count = word(8).unwrap_or(0) as usize;
+        let palette_len = word(12).unwrap_or(0) as usize;
+        if category_count == 0 || category_count > 0xff || palette_len == 0 {
+            return Err(broken("the category or palette count is out of range"));
+        }
+        if palette_len > MAX_PALETTE {
+            return Err(broken("the category or palette count is out of range"));
+        }
+        let palette_start = HEADER_BYTES + NAME_BYTES * category_count;
+        let table_start = palette_start + PALETTE_ENTRY_BYTES * palette_len;
+        if table_start + CODE_POINTS != map.len() {
             return Err(broken("the file size does not match the header"));
         }
-        let table = Section::new(&map, table_start..map.len())
-            .ok_or_else(|| broken("the character table is misaligned"))?;
-        Ok(Self { map, category_count, table })
+        let mut palette = Vec::with_capacity(palette_len);
+        for index in 0..palette_len {
+            let at = palette_start + PALETTE_ENTRY_BYTES * index;
+            let (info, flags) = (word(at).unwrap_or(0), word(at + 4).unwrap_or(0));
+            let info = CharInfo(info);
+            if info.default_type() >= category_count || flags & !EXTENDER_FLAG != 0 {
+                return Err(broken("a palette entry is not valid"));
+            }
+            palette.push(Class {
+                info,
+                extender: flags & EXTENDER_FLAG != 0,
+            });
+        }
+        let table = &map[table_start..];
+        if table.iter().any(|&index| usize::from(index) >= palette_len) {
+            return Err(broken("a character refers to a missing palette entry"));
+        }
+        if table[..BMP_LEN]
+            .iter()
+            .any(|&index| palette[usize::from(index)].extender)
+        {
+            return Err(broken("a code point of the BMP is an extender"));
+        }
+        Ok(Self {
+            map,
+            category_count,
+            palette,
+            table_start,
+        })
     }
 
     pub(crate) fn category_count(&self) -> usize {
@@ -85,23 +137,54 @@ impl CharProperty {
     }
 
     pub(crate) fn name(&self, index: usize) -> &[u8] {
-        let start = COUNT_BYTES + NAME_BYTES * index;
+        let start = HEADER_BYTES + NAME_BYTES * index;
         let bytes = &self.map[start..start + NAME_BYTES];
-        let length = bytes.iter().position(|&byte| byte == 0).unwrap_or(NAME_BYTES);
+        let length = bytes
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(NAME_BYTES);
         &bytes[..length]
     }
 
-    fn info_of_code(&self, code: u16) -> CharInfo {
-        self.table.view(&self.map).get(usize::from(code)).copied().map_or_else(CharInfo::default, CharInfo)
+    fn class_of_code(&self, code: u32) -> Class {
+        self.map
+            .get(self.table_start + code as usize)
+            .map_or_else(Class::default, |&index| self.palette[usize::from(index)])
     }
 
     pub(crate) fn space(&self) -> CharInfo {
-        self.info_of_code(SPACE_CODE)
+        self.class_of_code(SPACE_CODE).info
+    }
+
+    fn code_class(&self, text: &[u8], begin: usize, end: usize) -> (Class, usize) {
+        let (code, width) = decode_utf8(text, begin, end - begin);
+        (self.class_of_code(code), width)
+    }
+
+    fn extenders_width(&self, text: &[u8], begin: usize, end: usize) -> usize {
+        let mut position = begin;
+        while position < end && text[position] >= FOUR_BYTE_LEAD {
+            let (class, width) = self.code_class(text, position, end);
+            if !class.extender {
+                break;
+            }
+            position += width;
+        }
+        position - begin
+    }
+
+    pub(crate) fn extended_end(&self, text: &[u8], position: usize, limit: usize) -> usize {
+        if position < limit && text[position] >= FOUR_BYTE_LEAD {
+            position + self.extenders_width(text, position, limit)
+        } else {
+            position
+        }
     }
 
     pub(crate) fn char_info(&self, text: &[u8], begin: usize, end: usize) -> (CharInfo, usize) {
-        let (code, width) = decode_utf8(text, begin, end - begin);
-        (self.info_of_code(code), width)
+        let (class, width) = self.code_class(text, begin, end);
+        let extenders = self.extenders_width(text, begin + width, end);
+        (class.info, width + extenders)
     }
 
     pub(crate) fn seek_other_type(
@@ -111,52 +194,58 @@ impl CharProperty {
         end: usize,
         start: CharInfo,
     ) -> (usize, Scan) {
+        self.seek(text, begin, end, start, true)
+    }
+
+    pub(crate) fn skip_space(&self, text: &[u8], begin: usize, end: usize) -> (usize, Scan) {
+        self.seek(text, begin, end, self.space(), false)
+    }
+
+    fn seek(
+        &self,
+        text: &[u8],
+        begin: usize,
+        end: usize,
+        start: CharInfo,
+        absorb: bool,
+    ) -> (usize, Scan) {
         let mut position = begin;
         let mut current = start;
         let mut scan = Scan::default();
         while position < end {
-            let (info, width) = self.char_info(text, position, end);
-            scan.info = info;
+            let (class, single) = self.code_class(text, position, end);
+            let width = single + self.extenders_width(text, position + single, end);
+            scan.info = class.info;
             scan.width = width;
-            if !current.is_kind_of(info) {
+            if !current.is_kind_of(class.info) {
                 break;
             }
-            position += width;
+            position += if absorb { width } else { single };
             scan.count += 1;
-            current = info;
+            current = class.info;
         }
         (position, scan)
     }
 }
 
-fn bmp_stand_in(code: u32) -> u16 {
-    if COMPATIBILITY_IDEOGRAPHS_SUPPLEMENT.contains(&code) {
-        COMPATIBILITY_IDEOGRAPH
-    } else if IDEOGRAPHIC_PLANES.contains(&code) {
-        EXTENSION_A_IDEOGRAPH
-    } else {
-        UNCLASSIFIED_CODE
-    }
-}
-
-fn decode_utf8(text: &[u8], begin: usize, available: usize) -> (u16, usize) {
+fn decode_utf8(text: &[u8], begin: usize, available: usize) -> (u32, usize) {
     let byte = |offset: usize| text.get(begin + offset).copied().unwrap_or(0);
     let first = byte(0);
     if first < 0x80 {
-        (u16::from(first), 1)
+        (u32::from(first), 1)
     } else if available >= 2 && first & 0xe0 == 0xc0 {
-        (u16::from(first & 0x1f) << 6 | u16::from(byte(1) & 0x3f), 2)
+        (u32::from(first & 0x1f) << 6 | u32::from(byte(1) & 0x3f), 2)
     } else if available >= 3 && first & 0xf0 == 0xe0 {
-        let code = u16::from(first & 0x0f) << 12
-            | u16::from(byte(1) & 0x3f) << 6
-            | u16::from(byte(2) & 0x3f);
+        let code = u32::from(first & 0x0f) << 12
+            | u32::from(byte(1) & 0x3f) << 6
+            | u32::from(byte(2) & 0x3f);
         (code, 3)
     } else if available >= 4 && first & 0xf8 == 0xf0 {
         let code = u32::from(first & 0x07) << 18
             | u32::from(byte(1) & 0x3f) << 12
             | u32::from(byte(2) & 0x3f) << 6
             | u32::from(byte(3) & 0x3f);
-        (bmp_stand_in(code), 4)
+        (code, 4)
     } else {
         (0, 1)
     }

@@ -27,16 +27,23 @@ const UTF8_NAMES: [&[u8]; 2] = [b"utf-8", b"utf8"];
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DictionaryKind {
     System = 0,
+    User = 1,
     Unknown = 2,
 }
 
 fn read_u32(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(*bytes[at..].first_chunk().expect("the header is long enough"))
+    u32::from_le_bytes(
+        *bytes[at..]
+            .first_chunk()
+            .expect("the header is long enough"),
+    )
 }
 
 fn is_utf8_charset(field: &[u8]) -> bool {
     let name = field.split(|&byte| byte == 0).next().unwrap_or_default();
-    UTF8_NAMES.iter().any(|utf8| name.eq_ignore_ascii_case(utf8))
+    UTF8_NAMES
+        .iter()
+        .any(|utf8| name.eq_ignore_ascii_case(utf8))
 }
 
 #[derive(Clone, Copy)]
@@ -113,7 +120,10 @@ pub(crate) struct SystemDictionary {
 impl SystemDictionary {
     pub(crate) fn open(path: &Path, kind: DictionaryKind) -> Result<Self, Error> {
         let map = map_file(path)?;
-        let broken = |reason| Error::Format { file: path.to_path_buf(), reason };
+        let broken = |reason| Error::Format {
+            file: path.to_path_buf(),
+            reason,
+        };
         let bytes = &map[..];
         if bytes.len() < HEADER_SIZE
             || (read_u32(bytes, 0) ^ MAGIC_ID) as usize != bytes.len()
@@ -122,7 +132,7 @@ impl SystemDictionary {
             return Err(broken("the header, magic number or version is not valid"));
         }
         if read_u32(bytes, KIND_AT) != kind as u32 {
-            return Err(broken("the dictionary type does not match the file name"));
+            return Err(broken("the dictionary type is not the expected one"));
         }
         if !is_utf8_charset(&bytes[CHARSET]) {
             return Err(Error::Unsupported("a dictionary charset other than UTF-8"));
@@ -142,9 +152,18 @@ impl SystemDictionary {
         let features_len = features_end - tokens_end;
         let valid = |raw: &RawToken| raw.is_valid(left_size, right_size, features_len);
         if !tokens.view(&map).iter().all(valid) {
-            return Err(broken("a token context id or feature offset is out of range"));
+            return Err(broken(
+                "a token context id or feature offset is out of range",
+            ));
         }
-        Ok(Self { map, left_size, right_size, cells, tokens, features: tokens_end..features_end })
+        Ok(Self {
+            map,
+            left_size,
+            right_size,
+            cells,
+            tokens,
+            features: tokens_end..features_end,
+        })
     }
 
     pub(crate) fn left_size(&self) -> usize {
@@ -201,7 +220,10 @@ impl SystemDictionary {
 
     pub(crate) fn feature(&self, offset: u32) -> &[u8] {
         let rest = &self.map[self.features.start + offset as usize..self.features.end];
-        let length = rest.iter().position(|&byte| byte == 0).unwrap_or(rest.len());
+        let length = rest
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(rest.len());
         &rest[..length]
     }
 }

@@ -16,8 +16,15 @@ pub enum BoundaryKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Constraint<'a> {
-    Boundary { position: usize, kind: BoundaryKind },
-    Feature { start: usize, end: usize, pattern: &'a str },
+    Boundary {
+        position: usize,
+        kind: BoundaryKind,
+    },
+    Feature {
+        start: usize,
+        end: usize,
+        pattern: &'a str,
+    },
 }
 
 #[derive(Default)]
@@ -45,7 +52,11 @@ impl ConstraintSet {
                         self.set_boundary(text_len, position, boundary);
                     }
                 }
-                Constraint::Feature { start, end, pattern } => {
+                Constraint::Feature {
+                    start,
+                    end,
+                    pattern,
+                } => {
                     if start >= end || end > text_len || pattern.contains('\0') {
                         continue;
                     }
@@ -80,7 +91,12 @@ impl ConstraintSet {
         &self.bytes[start..end]
     }
 
-    pub(crate) fn admits<'f>(&self, begin: usize, end: usize, feature: impl FnOnce() -> &'f [u8]) -> bool {
+    pub(crate) fn admits<'f>(
+        &self,
+        begin: usize,
+        end: usize,
+        feature: impl FnOnce() -> &'f [u8],
+    ) -> bool {
         if self.is_inside_token(end) {
             return false;
         }

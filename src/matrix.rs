@@ -12,12 +12,17 @@ const HOT_HEADER_BYTES: usize = 8;
 const COST_BYTES: usize = 2;
 
 fn broken(path: &Path, reason: &'static str) -> Error {
-    Error::Format { file: path.to_path_buf(), reason }
+    Error::Format {
+        file: path.to_path_buf(),
+        reason,
+    }
 }
 
 fn header_sizes(map: &Mmap, path: &Path, words: usize) -> Result<[usize; 4], Error> {
     let mut sizes = [0; 4];
-    let header = map.get(..words * 2).ok_or_else(|| broken(path, "the file is shorter than its header"))?;
+    let header = map
+        .get(..words * 2)
+        .ok_or_else(|| broken(path, "the file is shorter than its header"))?;
     for (size, &word) in sizes.iter_mut().zip(header.as_chunks::<2>().0) {
         *size = usize::from(u16::from_le_bytes(word));
     }
@@ -43,7 +48,12 @@ impl DenseMatrix {
         }
         let costs = Section::new(&map, HEADER_BYTES..map.len())
             .ok_or_else(|| broken(path, "the cost table is misaligned"))?;
-        Ok(Self { map, costs, left_size, right_size })
+        Ok(Self {
+            map,
+            costs,
+            left_size,
+            right_size,
+        })
     }
 
     pub(crate) fn right_column(&self, right_left_id: u16) -> &[i16] {
@@ -74,7 +84,11 @@ fn cold_cost(templates: &MappedTemplates, left_right_id: u16, right_left_id: u16
 
 impl<'m> HotColumn<'m> {
     pub(crate) fn into_cost_fn(self) -> impl FnMut(u16) -> i16 + 'm {
-        let Self { cells, templates, right_left_id } = self;
+        let Self {
+            cells,
+            templates,
+            right_left_id,
+        } = self;
         move |left_right_id| match cells.get(usize::from(left_right_id)) {
             Some(&cost) => cost,
             None => cold_cost(templates, left_right_id, right_left_id),
@@ -89,9 +103,13 @@ impl<'m> HotColumn<'m> {
 impl HotMatrix {
     fn open(path: &Path, templates: MappedTemplates) -> Result<Self, Error> {
         let map = map_file(path)?;
-        let [left_size, right_size, hot_left, hot_right] = header_sizes(&map, path, HOT_HEADER_BYTES / 2)?;
+        let [left_size, right_size, hot_left, hot_right] =
+            header_sizes(&map, path, HOT_HEADER_BYTES / 2)?;
         if left_size != templates.left_size() || right_size != templates.right_size() {
-            return Err(broken(path, "the hot matrix size does not match the templates"));
+            return Err(broken(
+                path,
+                "the hot matrix size does not match the templates",
+            ));
         }
         if hot_left == 0 || hot_right == 0 || hot_left > left_size || hot_right > right_size {
             return Err(broken(path, "the hot block lies outside of the matrix"));
@@ -101,7 +119,13 @@ impl HotMatrix {
         }
         let costs = Section::new(&map, HOT_HEADER_BYTES..map.len())
             .ok_or_else(|| broken(path, "the cost table is misaligned"))?;
-        Ok(Self { map, costs, templates, hot_left, hot_right })
+        Ok(Self {
+            map,
+            costs,
+            templates,
+            hot_left,
+            hot_right,
+        })
     }
 
     pub(crate) fn hot_left(&self) -> usize {
@@ -115,7 +139,11 @@ impl HotMatrix {
         } else {
             &[]
         };
-        HotColumn { cells, templates: &self.templates, right_left_id }
+        HotColumn {
+            cells,
+            templates: &self.templates,
+            right_left_id,
+        }
     }
 }
 

@@ -82,10 +82,23 @@ fn validate(part: &TemplatePart, left_size: usize, right_size: usize) -> Result<
         && part.indptr.first() == Some(&0)
         && part.indptr.last().is_some_and(|&end| end as usize == nnz)
         && part.indptr.windows(2).all(|span| span[0] <= span[1])
-        && part.left_projection.iter().all(|&key| usize::from(key) <= part.left_count)
-        && part.right_projection.iter().all(|&key| usize::from(key) <= part.right_count)
-        && part.left_index.iter().all(|&key| usize::from(key) < part.left_count);
-    if consistent { Ok(()) } else { Err(Error::Corrupt("a connection template is inconsistent")) }
+        && part
+            .left_projection
+            .iter()
+            .all(|&key| usize::from(key) <= part.left_count)
+        && part
+            .right_projection
+            .iter()
+            .all(|&key| usize::from(key) <= part.right_count)
+        && part
+            .left_index
+            .iter()
+            .all(|&key| usize::from(key) < part.left_count);
+    if consistent {
+        Ok(())
+    } else {
+        Err(Error::Corrupt("a connection template is inconsistent"))
+    }
 }
 
 pub(crate) fn to_cost(sum: f64, cost_factor: f64) -> i16 {
@@ -110,7 +123,9 @@ impl PartSlices<'_> {
         }
         let left_key = self.left_projection[usize::from(left_node_rc)];
         let span = self.indptr[right_key] as usize..self.indptr[right_key + 1] as usize;
-        let found = self.left_index[span.clone()].binary_search(&left_key).ok()?;
+        let found = self.left_index[span.clone()]
+            .binary_search(&left_key)
+            .ok()?;
         Some(self.weight[span.start + found])
     }
 }
@@ -172,12 +187,18 @@ pub(crate) struct TemplateReader<'a> {
 
 impl TemplateReader<'_> {
     pub(crate) fn broken(&self, reason: &'static str) -> Error {
-        Error::Format { file: self.path.to_path_buf(), reason }
+        Error::Format {
+            file: self.path.to_path_buf(),
+            reason,
+        }
     }
 
     pub(crate) fn bytes<const WIDTH: usize>(&mut self) -> Result<[u8; WIDTH], Error> {
         let end = self.offset + WIDTH;
-        let bytes = self.file.get(self.offset..end).ok_or_else(|| self.broken("the file ends inside a header"))?;
+        let bytes = self
+            .file
+            .get(self.offset..end)
+            .ok_or_else(|| self.broken("the file ends inside a header"))?;
         self.offset = end;
         Ok(bytes.try_into().expect("the slice has the requested width"))
     }
@@ -187,9 +208,15 @@ impl TemplateReader<'_> {
     }
 
     pub(crate) fn section<T: Plain>(&mut self, count: usize) -> Result<Section<T>, Error> {
-        let length = count.checked_mul(size_of::<T>()).ok_or_else(|| self.broken("an array is too long"))?;
-        let end = self.offset.checked_add(length).ok_or_else(|| self.broken("an array is too long"))?;
-        let section = Section::new(self.file, self.offset..end).ok_or_else(|| self.broken("an array is misplaced"))?;
+        let length = count
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| self.broken("an array is too long"))?;
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| self.broken("an array is too long"))?;
+        let section = Section::new(self.file, self.offset..end)
+            .ok_or_else(|| self.broken("an array is misplaced"))?;
         self.offset = end + padding_after(length);
         Ok(section)
     }
@@ -208,8 +235,14 @@ impl MappedTemplates {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
         let map = map_file(path)?;
-        let mut reader = TemplateReader { file: &map, path, offset: 0 };
-        if reader.bytes::<4>()? != *TEMPLATE_MAGIC || u32::from_le_bytes(reader.bytes()?) != TEMPLATE_VERSION {
+        let mut reader = TemplateReader {
+            file: &map,
+            path,
+            offset: 0,
+        };
+        if reader.bytes::<4>()? != *TEMPLATE_MAGIC
+            || u32::from_le_bytes(reader.bytes()?) != TEMPLATE_VERSION
+        {
             return Err(reader.broken("the file is not a template file of this version"));
         }
         let cost_factor = f64::from_le_bytes(reader.bytes()?);
@@ -242,12 +275,24 @@ impl MappedTemplates {
         }
         let clusters = match cluster_count {
             0 => None,
-            count => Some(MappedClusters::read(&mut reader, count, left_size, right_size)?),
+            count => Some(MappedClusters::read(
+                &mut reader,
+                count,
+                left_size,
+                right_size,
+            )?),
         };
         if reader.offset != map.len() {
             return Err(reader.broken("the file has trailing bytes"));
         }
-        Ok(Self { map, cost_factor, left_size, right_size, parts, clusters })
+        Ok(Self {
+            map,
+            cost_factor,
+            left_size,
+            right_size,
+            parts,
+            clusters,
+        })
     }
 
     pub fn left_size(&self) -> usize {
@@ -259,10 +304,9 @@ impl MappedTemplates {
     }
 
     pub fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
-        let clustered = self
-            .clusters
-            .as_ref()
-            .and_then(|clusters| clusters.cost(&self.map, self.cost_factor, left_node_rc, right_node_lc));
+        let clustered = self.clusters.as_ref().and_then(|clusters| {
+            clusters.cost(&self.map, self.cost_factor, left_node_rc, right_node_lc)
+        });
         clustered.unwrap_or_else(|| self.exact_cost(left_node_rc, right_node_lc))
     }
 
@@ -277,8 +321,14 @@ impl PartSlices<'_> {
         self.indptr.first() == Some(&0)
             && self.indptr.last().is_some_and(|&end| end as usize == nnz)
             && self.indptr.windows(2).all(|span| span[0] <= span[1])
-            && self.left_projection.iter().all(|&key| usize::from(key) <= self.left_count)
-            && self.right_projection.iter().all(|&key| usize::from(key) <= self.right_count)
+            && self
+                .left_projection
+                .iter()
+                .all(|&key| usize::from(key) <= self.left_count)
+            && self
+                .right_projection
+                .iter()
+                .all(|&key| usize::from(key) <= self.right_count)
     }
 }
 
@@ -298,7 +348,12 @@ impl ConnectionTemplates {
                 sort_spans(part);
             }
         }
-        Ok(Self { cost_factor, left_size, right_size, parts })
+        Ok(Self {
+            cost_factor,
+            left_size,
+            right_size,
+            parts,
+        })
     }
 
     pub fn left_size(&self) -> usize {
@@ -356,11 +411,20 @@ impl ConnectionTemplates {
         output: &mut impl Write,
     ) -> io::Result<()> {
         let slices: Vec<PartSlices> = self.slices().collect();
-        let plans = if cluster_count == 0 { Vec::new() } else { plan_clusters(&slices, cluster_count) };
+        let plans = if cluster_count == 0 {
+            Vec::new()
+        } else {
+            plan_clusters(&slices, cluster_count)
+        };
         output.write_all(TEMPLATE_MAGIC)?;
         output.write_all(&TEMPLATE_VERSION.to_le_bytes())?;
         output.write_all(&self.cost_factor.to_le_bytes())?;
-        for count in [self.left_size, self.right_size, self.parts.len(), plans.len()] {
+        for count in [
+            self.left_size,
+            self.right_size,
+            self.parts.len(),
+            plans.len(),
+        ] {
             output.write_all(&(count as u32).to_le_bytes())?;
         }
         for part in &self.parts {
@@ -379,7 +443,13 @@ impl ConnectionTemplates {
         write_clusters(&slices, &plans, self.left_size, self.right_size, output)
     }
 
-    fn render_block(&self, block: usize, hot_left: usize, hot_right: usize, scratch: &mut RowScratch) -> Vec<u8> {
+    fn render_block(
+        &self,
+        block: usize,
+        hot_left: usize,
+        hot_right: usize,
+        scratch: &mut RowScratch,
+    ) -> Vec<u8> {
         let first = block * ROWS_PER_BLOCK;
         let last = (first + ROWS_PER_BLOCK).min(hot_right);
         let mut bytes = Vec::with_capacity((last - first) * hot_left * 2);
@@ -400,7 +470,10 @@ impl ConnectionTemplates {
         output: &mut impl Write,
     ) -> io::Result<()> {
         if hot_left > self.left_size || hot_right > self.right_size {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "the hot block exceeds the matrix"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the hot block exceeds the matrix",
+            ));
         }
         for size in [self.left_size, self.right_size, hot_left, hot_right] {
             output.write_all(&(size as u16).to_le_bytes())?;
@@ -454,7 +527,11 @@ impl RowScratch {
     fn new(templates: &ConnectionTemplates) -> Self {
         Self {
             row: vec![0.0; templates.left_size],
-            lookups: templates.parts.iter().map(|part| vec![0.0; part.left_count + 1]).collect(),
+            lookups: templates
+                .parts
+                .iter()
+                .map(|part| vec![0.0; part.left_count + 1])
+                .collect(),
         }
     }
 }

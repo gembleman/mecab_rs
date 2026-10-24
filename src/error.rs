@@ -5,8 +5,22 @@ use std::path::PathBuf;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    Io { path: PathBuf, source: io::Error },
-    Format { file: PathBuf, reason: &'static str },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Format {
+        file: PathBuf,
+        reason: &'static str,
+    },
+    CharDef {
+        file: PathBuf,
+        line: usize,
+        reason: String,
+    },
+    MissingCharTable {
+        path: PathBuf,
+    },
     Unsupported(&'static str),
     NulInText,
     TextTooLong,
@@ -17,13 +31,40 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io { path, source } => write!(formatter, "cannot read {}: {source}", path.display()),
-            Self::Format { file, reason } => {
-                write!(formatter, "invalid dictionary file {}: {reason}", file.display())
+            Self::Io { path, source } => {
+                write!(formatter, "cannot read {}: {source}", path.display())
             }
+            Self::Format { file, reason } => {
+                write!(
+                    formatter,
+                    "invalid dictionary file {}: {reason}",
+                    file.display()
+                )
+            }
+            Self::CharDef {
+                file,
+                line: 0,
+                reason,
+            } => {
+                write!(formatter, "invalid {}: {reason}", file.display())
+            }
+            Self::CharDef { file, line, reason } => {
+                write!(
+                    formatter,
+                    "invalid {} at line {line}: {reason}",
+                    file.display()
+                )
+            }
+            Self::MissingCharTable { path } => write!(
+                formatter,
+                "{} does not exist: this crate reads char.uni instead of char.bin; create it                  with `mecab_rs::migrate_char_table` or the `mecab-rs-migrate` binary",
+                path.display()
+            ),
             Self::Unsupported(what) => write!(formatter, "unsupported: {what}"),
             Self::NulInText => formatter.write_str("the input text contains a NUL character"),
-            Self::TextTooLong => formatter.write_str("the input text is longer than u32::MAX bytes"),
+            Self::TextTooLong => {
+                formatter.write_str("the input text is longer than u32::MAX bytes")
+            }
             Self::UnsatisfiableConstraint => {
                 formatter.write_str("no node satisfies the given constraints")
             }

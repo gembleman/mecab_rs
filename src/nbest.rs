@@ -47,7 +47,11 @@ impl Agenda {
     pub(super) fn start(&mut self, eos: NodeId) {
         self.elements.clear();
         self.heap.clear();
-        self.elements.push(Element { node: eos, next: None, path_cost: 0 });
+        self.elements.push(Element {
+            node: eos,
+            next: None,
+            path_cost: 0,
+        });
         self.heap.push(Reverse((0, 0)));
     }
 
@@ -66,7 +70,11 @@ impl Agenda {
     pub(super) fn extend(&mut self, top: ElementId, node: NodeId, node_cost: i32, step_cost: i32) {
         let path_cost = i64::from(step_cost) + self.path_cost(top);
         let sequence = self.elements.len();
-        self.elements.push(Element { node, next: Some(top), path_cost });
+        self.elements.push(Element {
+            node,
+            next: Some(top),
+            path_cost,
+        });
         let estimate = i64::from(node_cost) + path_cost;
         self.heap.push(Reverse((estimate, sequence)));
     }

@@ -5,6 +5,7 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use crate::char_property::CharProperty;
+use crate::char_table::CHAR_TABLE_FILE;
 use crate::error::Error;
 use crate::matrix::Matrix;
 use crate::system_dictionary::{DictionaryKind, SystemDictionary, TokenRecord};
@@ -13,12 +14,16 @@ const DENSE_MATRIX_FILE: &str = "matrix.bin";
 const HOT_MATRIX_FILE: &str = "matrix.hot";
 const TEMPLATES_FILE: &str = "matrix.tpl";
 
+const MAX_USER_DICTIONARIES: usize = u8::MAX as usize;
 const DEFAULT_MAX_GROUPING_SIZE: usize = 24;
 const BOS_FEATURE_KEY: &[u8] = b"bos-feature";
 const UNK_FEATURE_KEY: &[u8] = b"unk-feature";
 
 pub(crate) fn map_file(path: &Path) -> Result<Mmap, Error> {
-    let io_error = |source| Error::Io { path: path.to_path_buf(), source };
+    let io_error = |source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    };
     let file = File::open(path).map_err(io_error)?;
     unsafe { Mmap::map(&file) }.map_err(io_error)
 }
@@ -54,11 +59,13 @@ fn dicrc_values(bytes: &[u8], path: &Path) -> Result<HashMap<Vec<u8>, Vec<u8>>, 
 
 pub struct Dictionary {
     pub(crate) system: SystemDictionary,
+    pub(crate) users: Vec<SystemDictionary>,
     pub(crate) unknown: SystemDictionary,
     pub(crate) matrix: Matrix,
     pub(crate) chars: CharProperty,
     pub(crate) unknown_tokens: Vec<Box<[TokenRecord]>>,
     pub(crate) bos_feature: Vec<u8>,
+    pub(crate) unknown_feature: Option<Vec<u8>>,
     pub(crate) max_grouping_size: usize,
 }
 
@@ -72,54 +79,85 @@ impl Dictionary {
     }
 
     pub fn open(directory: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::open_with_user(directory, &[] as &[&Path])
+    }
+
+    pub fn open_with_user<P: AsRef<Path>>(
+        directory: impl AsRef<Path>,
+        user_dictionaries: &[P],
+    ) -> Result<Self, Error> {
         let directory = directory.as_ref();
+        let users: Vec<&Path> = user_dictionaries.iter().map(AsRef::as_ref).collect();
+        if users.len() > MAX_USER_DICTIONARIES {
+            return Err(Error::Unsupported("more than 255 user dictionaries"));
+        }
         let hot_path = directory.join(HOT_MATRIX_FILE);
         let templates_path = directory.join(TEMPLATES_FILE);
         if hot_path.exists() && templates_path.exists() {
-            Self::open_matrix(directory, HOT_MATRIX_FILE, |path| Matrix::open_hot(path, &templates_path))
+            Self::open_matrix(directory, &users, HOT_MATRIX_FILE, |path| {
+                Matrix::open_hot(path, &templates_path)
+            })
         } else {
-            Self::open_matrix(directory, DENSE_MATRIX_FILE, Matrix::open_dense)
+            Self::open_matrix(directory, &users, DENSE_MATRIX_FILE, Matrix::open_dense)
         }
     }
 
     fn open_matrix(
         directory: &Path,
+        user_paths: &[&Path],
         matrix_file: &str,
         open_matrix: impl FnOnce(&Path) -> Result<Matrix, Error>,
     ) -> Result<Self, Error> {
         let dicrc = directory.join("dicrc");
-        let bytes = fs::read(&dicrc)
-            .map_err(|source| Error::Io { path: dicrc.clone(), source })?;
+        let bytes = fs::read(&dicrc).map_err(|source| Error::Io {
+            path: dicrc.clone(),
+            source,
+        })?;
         let values = dicrc_values(&bytes, &dicrc)?;
-        if values.get(UNK_FEATURE_KEY).is_some_and(|value| !value.is_empty()) {
-            return Err(Error::Unsupported("the unk-feature setting in dicrc"));
-        }
+        let unknown_feature = values
+            .get(UNK_FEATURE_KEY)
+            .filter(|value| !value.is_empty())
+            .cloned();
         let bos_feature = values
             .get(BOS_FEATURE_KEY)
             .filter(|value| !value.is_empty())
             .cloned()
-            .ok_or_else(|| Error::Format { file: dicrc.clone(), reason: "bos-feature is missing" })?;
+            .ok_or_else(|| Error::Format {
+                file: dicrc.clone(),
+                reason: "bos-feature is missing",
+            })?;
         let system = SystemDictionary::open(&directory.join("sys.dic"), DictionaryKind::System)?;
+        let users = user_paths
+            .iter()
+            .map(|path| SystemDictionary::open(path, DictionaryKind::User))
+            .collect::<Result<Vec<_>, _>>()?;
         let unknown_path = directory.join("unk.dic");
         let unknown = SystemDictionary::open(&unknown_path, DictionaryKind::Unknown)?;
         let matrix_path = directory.join(matrix_file);
         let matrix = open_matrix(&matrix_path)?;
-        let chars = CharProperty::open(&directory.join("char.bin"))?;
+        let chars = CharProperty::open(&directory.join(CHAR_TABLE_FILE))?;
         let matches_matrix = |dictionary: &SystemDictionary| {
-            dictionary.left_size() == matrix.left_size() && dictionary.right_size() == matrix.right_size()
+            dictionary.left_size() == matrix.left_size()
+                && dictionary.right_size() == matrix.right_size()
         };
-        if !matches_matrix(&system) || !matches_matrix(&unknown) {
+        if !matches_matrix(&system)
+            || !matches_matrix(&unknown)
+            || !users.iter().all(matches_matrix)
+        {
             return Err(Error::Format {
                 file: matrix_path,
-                reason: "the matrix size does not match sys.dic or unk.dic",
+                reason: "the matrix size does not match sys.dic, unk.dic or a user dictionary",
             });
         }
-        let broken_unknown = |reason| Error::Format { file: unknown_path.clone(), reason };
+        let broken_unknown = |reason| Error::Format {
+            file: unknown_path.clone(),
+            reason,
+        };
         let mut unknown_tokens = Vec::with_capacity(chars.category_count());
         for category in 0..chars.category_count() {
             let run = unknown
                 .exact_match(chars.name(category))
-                .ok_or_else(|| broken_unknown("a character category of char.bin is missing"))?;
+                .ok_or_else(|| broken_unknown("a character category of char.uni is missing"))?;
             if !unknown.holds_tokens(&run) {
                 return Err(broken_unknown("an unknown-word token is not valid"));
             }
@@ -128,11 +166,13 @@ impl Dictionary {
         }
         Ok(Self {
             system,
+            users,
             unknown,
             matrix,
             chars,
             unknown_tokens,
             bos_feature,
+            unknown_feature,
             max_grouping_size: DEFAULT_MAX_GROUPING_SIZE,
         })
     }
