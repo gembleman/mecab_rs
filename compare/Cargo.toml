@@ -1,0 +1,32 @@
+[package]
+name = "compare"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Same-condition speed comparison of mecab_rs, vibrato, lindera and sudachi.rs"
+
+# Not part of the mecab_rs build.
+[workspace]
+
+[dependencies]
+mecab_rs = { path = ".." }
+vibrato = { git = "https://github.com/daac-tools/vibrato.git", rev = "6d80c52a2e5c200fc0c7091840487ee55faf9aaa", default-features = false }
+lindera = { git = "https://github.com/lindera/lindera.git", rev = "2c20c389b6d640053dda2af66c2c109fd3e17a9b", default-features = false, features = ["mmap"] }
+sudachi = { git = "https://github.com/WorksApplications/sudachi.rs.git", rev = "1c21940d1ca6b045eb211ecc1cdb767326f3783f" }
+zstd = "0.12"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+incremental = false
+
+[[bin]]
+name = "compare"
+path = "src/main.rs"
+
+[[bin]]
+name = "build-dicts"
+path = "src/build_dicts.rs"
