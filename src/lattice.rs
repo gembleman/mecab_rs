@@ -101,25 +101,6 @@ pub(crate) struct Lattice {
     links: Vec<PathLink>,
     agenda: Agenda,
     marginals: Marginals,
-    relaxed: Vec<Relaxed>,
-    relax_stamp: u32,
-}
-
-#[derive(Clone, Copy)]
-struct Relaxed {
-    stamp: u32,
-    cost: i32,
-    id: NodeId,
-}
-
-impl Default for Relaxed {
-    fn default() -> Self {
-        Self {
-            stamp: 0,
-            cost: 0,
-            id: NodeId::from_index(0),
-        }
-    }
 }
 
 #[derive(Default)]
@@ -387,15 +368,6 @@ impl Lattice {
         begun: Range<usize>,
         lefts: &[LeftCandidate],
     ) {
-        let right_size = dictionary.matrix.right_size();
-        if self.relaxed.len() < right_size {
-            self.relaxed.resize(right_size, Relaxed::default());
-        }
-        self.relax_stamp = self.relax_stamp.wrapping_add(1);
-        if self.relax_stamp == 0 {
-            self.relaxed.fill(Relaxed::default());
-            self.relax_stamp = 1;
-        }
         match &dictionary.matrix {
             Matrix::Dense(dense) => {
                 for right_index in later_first(begun) {
@@ -461,24 +433,16 @@ impl Lattice {
             }
             (best_cost, best)
         } else {
-            let slot = &mut self.relaxed[usize::from(right_node.left_id)];
-            if slot.stamp != self.relax_stamp {
-                let mut best_cost = i32::MAX;
-                let mut best = lefts[0].id;
-                for left in lefts {
-                    let cost = left.cost + i32::from(connection_cost(left.right_id));
-                    if cost <= best_cost {
-                        best_cost = cost;
-                        best = left.id;
-                    }
+            let mut best_cost = i32::MAX;
+            let mut best = lefts[0].id;
+            for left in lefts {
+                let cost = left.cost + i32::from(connection_cost(left.right_id));
+                if cost <= best_cost {
+                    best_cost = cost;
+                    best = left.id;
                 }
-                *slot = Relaxed {
-                    stamp: self.relax_stamp,
-                    cost: best_cost,
-                    id: best,
-                };
             }
-            (slot.cost + word_cost, slot.id)
+            (best_cost + word_cost, best)
         };
         let target = right_node.length_with_space as usize + position;
         let node = &mut self.nodes[right_id];
