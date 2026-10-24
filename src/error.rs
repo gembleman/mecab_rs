@@ -21,6 +21,10 @@ pub enum Error {
     MissingCharTable {
         path: PathBuf,
     },
+    Rebuild {
+        path: PathBuf,
+        reason: String,
+    },
     Unsupported(&'static str),
     NulInText,
     TextTooLong,
@@ -60,6 +64,13 @@ impl fmt::Display for Error {
                 "{} does not exist: this crate reads char.uni instead of char.bin; create it                  with `mecab_rs::migrate_char_table` or the `mecab-rs-migrate` binary",
                 path.display()
             ),
+            Self::Rebuild { path, reason } => {
+                write!(
+                    formatter,
+                    "cannot rebuild from {}: {reason}",
+                    path.display()
+                )
+            }
             Self::Unsupported(what) => write!(formatter, "unsupported: {what}"),
             Self::NulInText => formatter.write_str("the input text contains a NUL character"),
             Self::TextTooLong => {

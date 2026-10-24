@@ -2,7 +2,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use mecab_rs::CharTable;
+use mecab_rs::{CharTable, rebuild};
 
 const USAGE: &str = "usage: mecab-rs-migrate <dictionary-directory> [--char-def <file>]
 
@@ -10,16 +10,376 @@ Converts <dictionary-directory>/char.bin into <dictionary-directory>/char.uni. R
 above the BMP of char.def (the one in the directory, or the given file) are applied on top of
 the built-in defaults; the other files of the directory are not touched.";
 
+const REBUILD_USAGE: &str = "
+dictionary rebuilding:
+  mecab-rs-migrate stats <dict-dir> <out-dir> <corpus>...
+      Analyzes every line of the corpora and writes right.tsv and left.tsv (id<TAB>count) to
+      <out-dir>. Needs char.uni in <dict-dir>.
+  mecab-rs-migrate renumber <dict-dir> <stats-dir> <out-dir> [--id-defs <dir>]
+      Renumbers left/right ids by frequency: patches sys.dic and unk.dic, rewrites
+      left-id.def/right-id.def and permutes matrix.bin; copies the other files.
+  mecab-rs-migrate slim <dict-dir> <out-dir> --keep <fields>
+  mecab-rs-migrate slim <dict-dir> <out-dir> <count> [--pad]
+      Rewrites sys.dic keeping only the listed feature fields (for example 0-7,9,10,12,20,22;
+      the others become `*`, in features of 29 fields only), or the first <count> fields.
+  mecab-rs-migrate templates <source-dir> <dict-dir> [--id-defs <dir>] [--hot L R] [--threads N]
+      Compiles the connection templates of <source-dir> (feature.def, model.def, dicrc) for
+      the id definitions in <id-defs-dir> (default: <source-dir>) and writes matrix.tpl and
+      matrix.hot into <dict-dir>. The hot block defaults to 7104 x 4992 (clamped).
+  mecab-rs-migrate pack-matrix <source-dir> <out.xz> [--id-defs <dir>]      (feature xz)
+  mecab-rs-migrate unpack-matrix <file.xz> <dict-dir> [--hot L R] [--threads N]   (feature xz)
+      Packs the compiled templates into one xz file, or writes matrix.tpl and matrix.hot
+      from such a file.
+  mecab-rs-migrate rebuild <unidic-full-dir> <out-dir> (--stats <dir> | --corpus <file>...)
+                         [--keep <fields>] [--hot L R] [--threads N] [--xz] [--matrix-bin]
+      One-shot build of the runtime files only (dicrc, char.bin, char.uni, license/, sys.dic,
+      unk.dic, left-id.def, right-id.def, right.tsv, left.tsv, matrix.tpl, matrix.hot): renumbers
+      by the stats (given, or counted from the corpora), slims with --keep, and compiles the
+      templates instead of writing matrix.bin. --xz also writes matrix.xz (feature xz),
+      --matrix-bin the permuted dense matrix.bin.";
+
+fn run_rebuild(command: &str, args: &[std::ffi::OsString]) -> Result<(), String> {
+    use std::time::Instant;
+
+    let path = |index: usize, what: &str| -> Result<PathBuf, String> {
+        args.get(index)
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("{command}: missing {what}"))
+    };
+    let start = Instant::now();
+    let shown = |error: mecab_rs::Error| error.to_string();
+    match command {
+        "stats" => {
+            let (dictionary, out) = (path(0, "<dict-dir>")?, path(1, "<out-dir>")?);
+            let corpora: Vec<PathBuf> = args[2..].iter().map(PathBuf::from).collect();
+            if corpora.is_empty() {
+                return Err("stats: no corpus given".into());
+            }
+            let stats = rebuild::collect_stats(&dictionary, &corpora).map_err(shown)?;
+            stats.write_tsv(&out).map_err(shown)?;
+            let seen = |counts: &[u64]| counts.iter().filter(|&&count| count > 0).count();
+            println!(
+                "lookups {} rc seen {} lc seen {}",
+                stats.right.iter().sum::<u64>(),
+                seen(&stats.right),
+                seen(&stats.left)
+            );
+        }
+        "renumber" => {
+            let (dictionary, stats, out) = (
+                path(0, "<dict-dir>")?,
+                path(1, "<stats-dir>")?,
+                path(2, "<out-dir>")?,
+            );
+            let id_defs = match args.get(3) {
+                None => None,
+                Some(flag) if flag == "--id-defs" => Some(path(4, "the --id-defs directory")?),
+                Some(other) => {
+                    return Err(format!("unexpected argument {}", other.to_string_lossy()));
+                }
+            };
+            if args.len() > 5 {
+                return Err("renumber: too many arguments".into());
+            }
+            let report =
+                rebuild::renumber(&dictionary, &stats, &out, id_defs.as_deref()).map_err(shown)?;
+            println!(
+                "renumbered {} x {} ids into {}",
+                report.left_size,
+                report.right_size,
+                out.display()
+            );
+        }
+        "slim" => {
+            let (dictionary, out) = (path(0, "<dict-dir>")?, path(1, "<out-dir>")?);
+            let keep = match args.get(2).and_then(|argument| argument.to_str()) {
+                Some("--keep") => {
+                    let spec = args.get(3).and_then(|spec| spec.to_str());
+                    rebuild::Keep::parse_fields(spec.ok_or("slim: --keep needs a field set")?)?
+                }
+                Some(count) => rebuild::Keep::Prefix {
+                    keep: count
+                        .parse()
+                        .map_err(|_| format!("slim: `{count}` is not a field count"))?,
+                    pad: args.get(3).is_some_and(|flag| flag == "--pad"),
+                },
+                None => return Err("slim: give --keep <fields> or a field count".into()),
+            };
+            let report = rebuild::slim(&dictionary, &out, &keep).map_err(shown)?;
+            println!(
+                "sys.dic features {} -> {} bytes, {} unique, file {} -> {}",
+                report.old_feature_size,
+                report.new_feature_size,
+                report.unique_features,
+                report.old_file_size,
+                report.new_file_size
+            );
+        }
+        _ => unreachable!(),
+    }
+    println!("{command}: {:.2} s", start.elapsed().as_secs_f64());
+    Ok(())
+}
+
+#[derive(Default)]
+struct MatrixArgs {
+    positional: Vec<PathBuf>,
+    id_defs: Option<PathBuf>,
+    stats: Option<PathBuf>,
+    corpora: Vec<PathBuf>,
+    keep: Option<rebuild::Keep>,
+    hot: Option<(usize, usize)>,
+    threads: Option<usize>,
+    xz: bool,
+    matrix_bin: bool,
+}
+
+fn parse_matrix_args(command: &str, args: &[std::ffi::OsString]) -> Result<MatrixArgs, String> {
+    let mut parsed = MatrixArgs::default();
+    let mut iterator = args.iter().peekable();
+    let number = |value: Option<&std::ffi::OsString>, flag: &str| -> Result<usize, String> {
+        value
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| format!("{command}: {flag} needs a number"))
+    };
+    let text = |value: Option<&std::ffi::OsString>, flag: &str| -> Result<PathBuf, String> {
+        value
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("{command}: {flag} needs a value"))
+    };
+    while let Some(argument) = iterator.next() {
+        match argument.to_str() {
+            Some("--id-defs") => parsed.id_defs = Some(text(iterator.next(), "--id-defs")?),
+            Some("--stats") => parsed.stats = Some(text(iterator.next(), "--stats")?),
+            Some("--corpus") => {
+                while let Some(file) = iterator
+                    .next_if(|next| !next.to_str().is_some_and(|text| text.starts_with("--")))
+                {
+                    parsed.corpora.push(file.into());
+                }
+                if parsed.corpora.is_empty() {
+                    return Err(format!("{command}: --corpus needs a file"));
+                }
+            }
+            Some("--keep") => {
+                let spec = text(iterator.next(), "--keep")?;
+                parsed.keep = Some(rebuild::Keep::parse_fields(&spec.to_string_lossy())?);
+            }
+            Some("--hot") => {
+                let left = number(iterator.next(), "--hot")?;
+                parsed.hot = Some((left, number(iterator.next(), "--hot")?));
+            }
+            Some("--threads") => parsed.threads = Some(number(iterator.next(), "--threads")?),
+            Some("--xz") => parsed.xz = true,
+            Some("--matrix-bin") => parsed.matrix_bin = true,
+            Some(flag) if flag.starts_with("--") => {
+                return Err(format!("{command}: unknown option {flag}"));
+            }
+            _ => parsed.positional.push(argument.into()),
+        }
+    }
+    Ok(parsed)
+}
+
+fn read_id_defs(source: &Path, id_defs: Option<&Path>) -> Result<(String, String), String> {
+    let read = |name: &str| {
+        let path = id_defs.unwrap_or(source).join(name);
+        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))
+    };
+    Ok((read("left-id.def")?, read("right-id.def")?))
+}
+
+fn compile(source: &Path, id_defs: Option<&Path>) -> Result<mecab_rs::ConnectionTemplates, String> {
+    let (left, right) = read_id_defs(source, id_defs)?;
+    rebuild::compile_templates(source, &left, &right).map_err(|error| error.to_string())
+}
+
+fn check_templates(
+    templates: &mecab_rs::ConnectionTemplates,
+    matrix: &Path,
+    threads: usize,
+) -> Result<(), String> {
+    let bytes = std::fs::read(matrix).map_err(|error| format!("{}: {error}", matrix.display()))?;
+    let (left_size, right_size) = (templates.left_size(), templates.right_size());
+    if bytes.len() != 4 + 2 * left_size * right_size
+        || usize::from(u16::from_le_bytes([bytes[0], bytes[1]])) != left_size
+        || usize::from(u16::from_le_bytes([bytes[2], bytes[3]])) != right_size
+    {
+        return Err("the matrix does not have the size of the templates".into());
+    }
+    let next_row = std::sync::atomic::AtomicUsize::new(0);
+    let mismatches = std::sync::atomic::AtomicUsize::new(0);
+    let first = std::sync::Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..threads.max(1) {
+            scope.spawn(|| {
+                loop {
+                    let row = next_row.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if row >= right_size {
+                        break;
+                    }
+                    let cells = &bytes[4 + 2 * row * left_size..][..2 * left_size];
+                    for (rc, cell) in cells.as_chunks::<2>().0.iter().enumerate() {
+                        let expected = i16::from_le_bytes(*cell);
+                        let found = templates.cost(rc as u16, row as u16);
+                        if expected != found {
+                            mismatches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            first
+                                .lock()
+                                .unwrap()
+                                .get_or_insert((rc, row, expected, found));
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let mismatches = mismatches.into_inner();
+    println!(
+        "compared {} cells, {mismatches} mismatches",
+        left_size * right_size
+    );
+    match first.into_inner().unwrap() {
+        Some((rc, lc, expected, found)) => Err(format!(
+            "first mismatch at rc {rc} lc {lc}: matrix {expected}, templates {found}"
+        )),
+        None => Ok(()),
+    }
+}
+
+fn run_matrix(command: &str, args: &[std::ffi::OsString]) -> Result<(), String> {
+    use std::time::Instant;
+
+    let parsed = parse_matrix_args(command, args)?;
+    let positional = |count: usize, usage: &str| -> Result<&[PathBuf], String> {
+        if parsed.positional.len() == count {
+            Ok(&parsed.positional)
+        } else {
+            Err(format!("{command}: expected {usage}"))
+        }
+    };
+    let threads = parsed.threads.unwrap_or_else(rebuild::default_threads);
+    let shown = |error: mecab_rs::Error| error.to_string();
+    let start = Instant::now();
+    match command {
+        "templates" => {
+            let [source, dictionary] = positional(2, "<source-dir> <dict-dir>")? else {
+                unreachable!()
+            };
+            let templates = compile(source, parsed.id_defs.as_deref())?;
+            println!("compiled in {:.2} s", start.elapsed().as_secs_f64());
+            std::fs::create_dir_all(dictionary).map_err(|error| error.to_string())?;
+            rebuild::write_matrix_files(&templates, dictionary, parsed.hot, threads)
+                .map_err(shown)?;
+        }
+        "check-templates" => {
+            let [source, matrix] = positional(2, "<source-dir> <matrix.bin>")? else {
+                unreachable!()
+            };
+            let templates = compile(source, parsed.id_defs.as_deref())?;
+            println!("compiled in {:.2} s", start.elapsed().as_secs_f64());
+            check_templates(&templates, matrix, threads)?;
+        }
+        "rebuild" => {
+            let [source, out] = positional(2, "<unidic-full-dir> <out-dir>")? else {
+                unreachable!()
+            };
+            let stats = match (&parsed.stats, parsed.corpora.is_empty()) {
+                (Some(directory), true) => rebuild::StatsSource::Directory(directory),
+                (None, false) => rebuild::StatsSource::Corpora(&parsed.corpora),
+                _ => return Err("rebuild: give either --stats <dir> or --corpus <file>...".into()),
+            };
+            let options = rebuild::RuntimeOptions {
+                source,
+                out,
+                stats,
+                keep: parsed.keep.clone(),
+                hot: parsed.hot,
+                threads,
+                xz: parsed.xz,
+                matrix_bin: parsed.matrix_bin,
+            };
+            let mut previous = Instant::now();
+            let report = rebuild::build_runtime(&options, &mut |step| {
+                println!("{step}: {:.2} s", previous.elapsed().as_secs_f64());
+                previous = Instant::now();
+            })
+            .map_err(shown)?;
+            println!(
+                "built {} x {} ids into {}",
+                report.left_size,
+                report.right_size,
+                out.display()
+            );
+            if let Some(slim) = report.slim {
+                println!(
+                    "sys.dic features {} -> {} bytes, file {} -> {}",
+                    slim.old_feature_size,
+                    slim.new_feature_size,
+                    slim.old_file_size,
+                    slim.new_file_size
+                );
+            }
+            if let Some(size) = report.xz_size {
+                println!("matrix.xz: {size} bytes");
+            }
+        }
+        #[cfg(feature = "xz")]
+        "pack-matrix" => {
+            let [source, out] = positional(2, "<source-dir> <out.xz>")? else {
+                unreachable!()
+            };
+            let templates = compile(source, parsed.id_defs.as_deref())?;
+            println!("compiled in {:.2} s", start.elapsed().as_secs_f64());
+            let size = rebuild::xz::pack(&templates, out).map_err(shown)?;
+            println!("{}: {size} bytes", out.display());
+        }
+        #[cfg(feature = "xz")]
+        "unpack-matrix" => {
+            let [pack, dictionary] = positional(2, "<file.xz> <dict-dir>")? else {
+                unreachable!()
+            };
+            std::fs::create_dir_all(dictionary).map_err(|error| error.to_string())?;
+            rebuild::xz::unpack(pack, dictionary, parsed.hot, threads).map_err(shown)?;
+        }
+        #[cfg(not(feature = "xz"))]
+        "pack-matrix" | "unpack-matrix" => {
+            return Err(format!(
+                "{command}: this build has no xz support; build with --features xz"
+            ));
+        }
+        _ => unreachable!(),
+    }
+    println!("{command}: {:.2} s", start.elapsed().as_secs_f64());
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
+    let all: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if let Some(command) = all.first().and_then(|first| first.to_str()) {
+        if matches!(command, "stats" | "renumber" | "slim") {
+            return run_rebuild(command, &all[1..]);
+        }
+        if matches!(
+            command,
+            "templates" | "rebuild" | "pack-matrix" | "unpack-matrix" | "check-templates"
+        ) {
+            return run_matrix(command, &all[1..]);
+        }
+    }
     let mut directory: Option<PathBuf> = None;
     let mut char_def: Option<PathBuf> = None;
-    let mut arguments = std::env::args_os().skip(1);
+    let mut arguments = all.into_iter();
     while let Some(argument) = arguments.next() {
         if argument == "--char-def" {
             let file = arguments.next().ok_or("--char-def needs a file")?;
             char_def = Some(file.into());
         } else if argument == "-h" || argument == "--help" {
-            println!("{USAGE}");
+            println!(
+                "{USAGE}
+{REBUILD_USAGE}"
+            );
             return Ok(());
         } else if directory.is_none() {
             directory = Some(argument.into());

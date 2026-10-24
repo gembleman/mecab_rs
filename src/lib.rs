@@ -10,6 +10,7 @@ mod lattice;
 mod matrix;
 mod nbest;
 mod partial;
+pub mod rebuild;
 mod section;
 mod system_dictionary;
 mod tagger;

@@ -364,6 +364,14 @@ impl ConnectionTemplates {
         self.right_size
     }
 
+    pub fn cost_factor(&self) -> f64 {
+        self.cost_factor
+    }
+
+    pub fn parts(&self) -> &[TemplatePart] {
+        &self.parts
+    }
+
     fn slices(&self) -> impl Iterator<Item = PartSlices<'_>> {
         self.parts.iter().map(|part| PartSlices {
             left_count: part.left_count,
