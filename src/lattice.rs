@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use crate::char_property::CharInfo;
+use crate::char_property::{CharInfo, SentenceChars};
 use crate::constraint::{Constraint, ConstraintSet};
 use crate::dictionary::Dictionary;
 use crate::error::Error;
@@ -92,6 +92,8 @@ struct Span {
 pub(crate) struct Lattice {
     nodes: Vec<RawNode>,
     ends: Vec<Vec<LeftCandidate>>,
+    ends_used: usize,
+    sentence_chars: SentenceChars,
     hits: Vec<PrefixHit>,
     path: Vec<NodeId>,
     path_cost: i64,
@@ -253,12 +255,13 @@ impl Lattice {
         self.links.clear();
         self.marginals.ready = false;
         self.constraints.load(sentence_len, constraints);
-        for ending in &mut self.ends {
+        for ending in &mut self.ends[..self.ends_used] {
             ending.clear();
         }
         if self.ends.len() <= sentence_len {
             self.ends.resize_with(sentence_len + 1, Vec::new);
         }
+        self.ends_used = sentence_len + 1;
     }
 
     fn build<const NBEST: bool>(
@@ -267,6 +270,7 @@ impl Lattice {
         sentence: &[u8],
     ) -> Result<NodeId, Error> {
         let sentence_len = sentence.len();
+        self.sentence_chars.fill(&dictionary.chars, sentence);
         let bos = self.push_node(RawNode::boundary(NodeSource::Bos, 0));
         self.ends[0].push(LeftCandidate {
             right_id: 0,
@@ -455,7 +459,12 @@ impl Lattice {
         {
             end = boundary;
         }
-        let (surface, scan) = chars.skip_space(sentence, begin, end);
+        let whole = end == sentence_len;
+        let (surface, scan) = if whole {
+            self.sentence_chars.skip_space(begin, chars.space())
+        } else {
+            chars.skip_space(sentence, begin, end)
+        };
         if surface == sentence_len {
             return Ok(first..first);
         }
@@ -507,8 +516,11 @@ impl Lattice {
         }
         if char_info.group() {
             let saved = after_char;
-            let (grouped_end, group_scan) =
-                chars.seek_other_type(sentence, after_char, end, char_info);
+            let (grouped_end, group_scan) = if whole {
+                self.sentence_chars.seek_other_type(after_char, char_info)
+            } else {
+                chars.seek_other_type(sentence, after_char, end, char_info)
+            };
             after_char = grouped_end;
             if group_scan.count <= dictionary.max_grouping_size {
                 let span = Span {
@@ -534,7 +546,11 @@ impl Lattice {
                 end: after_char,
             };
             self.add_unknown(dictionary, char_info, &span);
-            let (next_info, width) = chars.char_info(sentence, after_char, end);
+            let (next_info, width) = if whole {
+                self.sentence_chars.char_info(after_char)
+            } else {
+                chars.char_info(sentence, after_char, end)
+            };
             if !char_info.is_kind_of(next_info) {
                 break;
             }

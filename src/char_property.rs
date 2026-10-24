@@ -58,6 +58,115 @@ struct Class {
     extender: bool,
 }
 
+#[derive(Clone, Copy, Default)]
+struct Entry {
+    info: CharInfo,
+    extender: bool,
+    single: usize,
+    width: usize,
+    chain_end: usize,
+    chain_count: usize,
+    chain_last: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct SentenceChars {
+    entries: Vec<Entry>,
+}
+
+impl SentenceChars {
+    pub(crate) fn fill(&mut self, chars: &CharProperty, text: &[u8]) {
+        let length = text.len();
+        self.entries.clear();
+        self.entries.resize(length + 1, Entry::default());
+        self.entries[length] = Entry {
+            info: chars.class_of_code(0).info,
+            single: 1,
+            width: 1,
+            ..Entry::default()
+        };
+        for position in (0..length).rev() {
+            let (code, single) = decode_utf8(text, position, length - position);
+            let class = chars.class_of_code(code);
+            let following = self.entries[position + single];
+            let width = single
+                + if following.extender {
+                    following.width
+                } else {
+                    0
+                };
+            let next = position + width;
+            let after = self.entries[next];
+            let (chain_end, chain_count, chain_last) =
+                if next < length && class.info.is_kind_of(after.info) {
+                    (after.chain_end, after.chain_count + 1, after.chain_last)
+                } else {
+                    (next, 1, position)
+                };
+            self.entries[position] = Entry {
+                info: class.info,
+                extender: class.extender,
+                single,
+                width,
+                chain_end,
+                chain_count,
+                chain_last,
+            };
+        }
+    }
+
+    pub(crate) fn char_info(&self, position: usize) -> (CharInfo, usize) {
+        let entry = &self.entries[position];
+        (entry.info, entry.width)
+    }
+
+    pub(crate) fn seek_other_type(&self, begin: usize, start: CharInfo) -> (usize, Scan) {
+        let length = self.entries.len() - 1;
+        if begin >= length {
+            return (begin, Scan::default());
+        }
+        let entry = &self.entries[begin];
+        if !start.is_kind_of(entry.info) {
+            let scan = Scan {
+                info: entry.info,
+                width: entry.width,
+                count: 0,
+            };
+            return (begin, scan);
+        }
+        let described = &self.entries[if entry.chain_end < length {
+            entry.chain_end
+        } else {
+            entry.chain_last
+        }];
+        let scan = Scan {
+            info: described.info,
+            width: described.width,
+            count: entry.chain_count,
+        };
+        (entry.chain_end, scan)
+    }
+
+    pub(crate) fn skip_space(&self, begin: usize, space: CharInfo) -> (usize, Scan) {
+        let length = self.entries.len() - 1;
+        let mut position = begin;
+        let mut current = space;
+        let mut scan = Scan::default();
+        while position < length {
+            let entry = &self.entries[position];
+            scan.info = entry.info;
+            scan.width = entry.width;
+            if !current.is_kind_of(entry.info) {
+                break;
+            }
+            position += entry.single;
+            scan.count += 1;
+            current = entry.info;
+        }
+        (position, scan)
+    }
+}
+
 pub(crate) struct CharProperty {
     map: Mmap,
     category_count: usize,
