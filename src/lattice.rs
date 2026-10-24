@@ -101,6 +101,25 @@ pub(crate) struct Lattice {
     links: Vec<PathLink>,
     agenda: Agenda,
     marginals: Marginals,
+    relaxed: Vec<Relaxed>,
+    relax_stamp: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Relaxed {
+    stamp: u32,
+    cost: i32,
+    id: NodeId,
+}
+
+impl Default for Relaxed {
+    fn default() -> Self {
+        Self {
+            stamp: 0,
+            cost: 0,
+            id: NodeId::from_index(0),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -368,13 +387,23 @@ impl Lattice {
         begun: Range<usize>,
         lefts: &[LeftCandidate],
     ) {
+        let right_size = dictionary.matrix.right_size();
+        if self.relaxed.len() < right_size {
+            self.relaxed.resize(right_size, Relaxed::default());
+        }
+        self.relax_stamp = self.relax_stamp.wrapping_add(1);
+        if self.relax_stamp == 0 {
+            self.relaxed.fill(Relaxed::default());
+            self.relax_stamp = 1;
+        }
         match &dictionary.matrix {
             Matrix::Dense(dense) => {
                 for right_index in later_first(begun) {
                     let right_id = NodeId::from_index(right_index);
                     let column = dense.right_column(self.nodes[right_id].left_id);
                     self.connect_right::<NBEST>(position, right_id, lefts, |left_right_id| {
-                        column[usize::from(left_right_id)]
+                        debug_assert!(usize::from(left_right_id) < column.len());
+                        unsafe { *column.get_unchecked(usize::from(left_right_id)) }
                     });
                 }
             }
@@ -388,7 +417,9 @@ impl Lattice {
                     let column = hot.right_column(self.nodes[right_id].left_id);
                     let cells = column.cells();
                     if lefts_are_hot && cells.len() == hot_left {
-                        let cost = |left_right_id: u16| cells[usize::from(left_right_id)];
+                        let cost = |left_right_id: u16| unsafe {
+                            *cells.get_unchecked(usize::from(left_right_id))
+                        };
                         self.connect_right::<NBEST>(position, right_id, lefts, cost);
                     } else {
                         self.connect_right::<NBEST>(
@@ -412,23 +443,43 @@ impl Lattice {
     ) {
         let right_node = self.nodes[right_id];
         let word_cost = i32::from(right_node.word_cost);
-        let mut best: Option<(i32, NodeId)> = None;
         let links_start = self.links.len();
-        for left in later_first(lefts.iter()) {
-            let connection = connection_cost(left.right_id);
-            let local = i32::from(connection) + word_cost;
-            let cost = left.cost + local;
-            if best.is_none_or(|(best_cost, _)| cost < best_cost) {
-                best = Some((cost, left.id));
-            }
-            if NBEST {
+        let (best_cost, best) = if NBEST {
+            let mut best_cost = i32::MAX;
+            let mut best = lefts[0].id;
+            for left in later_first(lefts.iter()) {
+                let local = i32::from(connection_cost(left.right_id)) + word_cost;
+                let cost = left.cost + local;
+                if cost < best_cost {
+                    best_cost = cost;
+                    best = left.id;
+                }
                 self.links.push(PathLink {
                     left_node: left.id,
                     cost: local,
                 });
             }
-        }
-        let (best_cost, best) = best.expect("a connected position has a left candidate");
+            (best_cost, best)
+        } else {
+            let slot = &mut self.relaxed[usize::from(right_node.left_id)];
+            if slot.stamp != self.relax_stamp {
+                let mut best_cost = i32::MAX;
+                let mut best = lefts[0].id;
+                for left in lefts {
+                    let cost = left.cost + i32::from(connection_cost(left.right_id));
+                    if cost <= best_cost {
+                        best_cost = cost;
+                        best = left.id;
+                    }
+                }
+                *slot = Relaxed {
+                    stamp: self.relax_stamp,
+                    cost: best_cost,
+                    id: best,
+                };
+            }
+            (slot.cost + word_cost, slot.id)
+        };
         let target = right_node.length_with_space as usize + position;
         let node = &mut self.nodes[right_id];
         node.prev = Some(best);

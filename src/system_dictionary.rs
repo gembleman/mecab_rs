@@ -182,13 +182,16 @@ impl SystemDictionary {
         hits.clear();
         let cells = self.cells.view(&self.map);
         let token_total = self.tokens.view(&self.map).len();
-        let Some((mut base, _)) = cell(cells, 0) else {
+        let Some(&[root, _]) = cells.first() else {
             return Ok(());
         };
+        let mut base = root.cast_signed() as isize;
         for (consumed, &byte) in key.iter().enumerate() {
             push_terminal(cells, token_total, base, consumed, hits)?;
-            match cell(cells, i64::from(base) + i64::from(byte) + 1) {
-                Some((next, check)) if base.cast_unsigned() == check => base = next,
+            match cells.get(base.wrapping_add(byte as isize + 1).cast_unsigned()) {
+                Some(&[next, check]) if base.cast_unsigned() as u32 == check => {
+                    base = next.cast_signed() as isize;
+                }
                 _ => return Ok(()),
             }
         }
@@ -233,18 +236,19 @@ fn cell(cells: &[[u32; 2]], index: i64) -> Option<(i32, u32)> {
     Some((value.cast_signed(), check))
 }
 
+#[inline]
 fn push_terminal(
     cells: &[[u32; 2]],
     token_total: usize,
-    base: i32,
+    base: isize,
     length: usize,
     hits: &mut Vec<PrefixHit>,
 ) -> Result<(), Error> {
-    if let Some((value, check)) = cell(cells, i64::from(base))
-        && value < 0
-        && base.cast_unsigned() == check
+    if let Some(&[value, check]) = cells.get(base.cast_unsigned())
+        && value.cast_signed() < 0
+        && base.cast_unsigned() as u32 == check
     {
-        let hit = PrefixHit::new(-value - 1, length);
+        let hit = PrefixHit::new(-value.cast_signed() - 1, length);
         if hit.tokens().end > token_total {
             return Err(Error::Corrupt(OUTSIDE_TOKEN_TABLE));
         }
