@@ -8,6 +8,7 @@ mod error;
 mod feature_match;
 mod ids;
 mod lattice;
+pub mod learn;
 mod matrix;
 mod nbest;
 mod partial;

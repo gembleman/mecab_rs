@@ -29,6 +29,10 @@ pub enum Error {
         path: PathBuf,
         reason: String,
     },
+    Learn {
+        path: PathBuf,
+        reason: String,
+    },
     Unsupported(&'static str),
     NulInText,
     TextTooLong,
@@ -77,6 +81,9 @@ impl fmt::Display for Error {
             }
             Self::Build { path, reason } => {
                 write!(formatter, "cannot build from {}: {reason}", path.display())
+            }
+            Self::Learn { path, reason } => {
+                write!(formatter, "cannot learn from {}: {reason}", path.display())
             }
             Self::Unsupported(what) => write!(formatter, "unsupported: {what}"),
             Self::NulInText => formatter.write_str("the input text contains a NUL character"),
