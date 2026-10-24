@@ -17,11 +17,14 @@ dictionary rebuilding:
       <out-dir>. Needs char.uni in <dict-dir>.
   mecab-rs-migrate renumber <dict-dir> <stats-dir> <out-dir> [--id-defs <dir>]
       Renumbers left/right ids by frequency: patches sys.dic and unk.dic, rewrites
-      left-id.def/right-id.def and permutes matrix.bin; copies the other files.
+      left-id.def/right-id.def and permutes matrix.bin; copies only dicrc, char.bin, char.uni
+      and license/.
   mecab-rs-migrate slim <dict-dir> <out-dir> --keep <fields>
   mecab-rs-migrate slim <dict-dir> <out-dir> <count> [--pad]
       Rewrites sys.dic keeping only the listed feature fields (for example 0-7,9,10,12,20,22;
       the others become `*`, in features of 29 fields only), or the first <count> fields.
+      Copies the runtime files (dicrc, char.bin, char.uni, license/, unk.dic, left-id.def,
+      right-id.def, matrix.bin, matrix.hot, matrix.tpl, matrix.xz, right.tsv, left.tsv).
   mecab-rs-migrate templates <source-dir> <dict-dir> [--id-defs <dir>] [--hot L R] [--threads N]
       Compiles the connection templates of <source-dir> (feature.def, model.def, dicrc) for
       the id definitions in <id-defs-dir> (default: <source-dir>) and writes matrix.tpl and

@@ -29,6 +29,14 @@ const MAGIC_XOR: u32 = 0xEF71_8F77;
 const MATRIX_FILE: &str = "matrix.bin";
 const RIGHT_STATS: &str = "right.tsv";
 const LEFT_STATS: &str = "left.tsv";
+const ID_FREE_FILES: [&str; 4] = ["dicrc", "char.bin", "char.uni", "license"];
+const MATRIX_FILES: [&str; 5] = [
+    "matrix.hot",
+    "matrix.tpl",
+    "matrix.xz",
+    RIGHT_STATS,
+    LEFT_STATS,
+];
 
 fn io_error(path: &Path) -> impl FnOnce(io::Error) -> Error + '_ {
     move |source| Error::Io {
@@ -76,14 +84,14 @@ fn read_file(path: &Path) -> Result<Vec<u8>, Error> {
 
 #[derive(Clone, Copy)]
 enum CopyPolicy<'a> {
-    Except(&'a [&'a str]),
+    All,
     Only(&'a [&'a str]),
 }
 
 impl CopyPolicy<'_> {
     fn copies(self, name: &std::ffi::OsStr) -> bool {
         match self {
-            Self::Except(skipped) => !skipped.iter().any(|skipped| name == *skipped),
+            Self::All => true,
             Self::Only(wanted) => wanted.iter().any(|wanted| name == *wanted),
         }
     }
@@ -100,7 +108,7 @@ fn copy_entries(source: &Path, target: &Path, policy: CopyPolicy) -> Result<(), 
         let from = entry.path();
         let to = target.join(&name);
         if from.is_dir() {
-            copy_entries(&from, &to, CopyPolicy::Except(&[]))?;
+            copy_entries(&from, &to, CopyPolicy::All)?;
         } else {
             fs::copy(&from, &to).map_err(io_error(&from))?;
         }
@@ -449,10 +457,7 @@ pub fn renumber(
     prepare_output(dict_dir, out_dir)?;
     let stats = ContextStats::read_tsv(stats_dir)?;
     let plan = Renumbering::plan(dict_dir, &stats, stats_dir, id_defs_dir)?;
-    let mut skip = vec![MATRIX_FILE];
-    skip.extend(CONTEXT_FILES);
-    skip.extend(ID_DEF_FILES);
-    copy_entries(dict_dir, out_dir, CopyPolicy::Except(&skip))?;
+    copy_entries(dict_dir, out_dir, CopyPolicy::Only(&ID_FREE_FILES))?;
     plan.write_dictionaries(dict_dir, out_dir, None)?;
     plan.write_id_defs(out_dir)?;
     plan.write_matrix(dict_dir, out_dir)?;
@@ -629,7 +634,11 @@ pub fn slim_dictionary(
 
 pub fn slim(dict_dir: &Path, out_dir: &Path, keep: &Keep) -> Result<SlimReport, Error> {
     prepare_output(dict_dir, out_dir)?;
-    copy_entries(dict_dir, out_dir, CopyPolicy::Except(&["sys.dic"]))?;
+    let mut copied = Vec::from(ID_FREE_FILES);
+    copied.extend(["unk.dic", MATRIX_FILE]);
+    copied.extend(ID_DEF_FILES);
+    copied.extend(MATRIX_FILES);
+    copy_entries(dict_dir, out_dir, CopyPolicy::Only(&copied))?;
     let source = dict_dir.join("sys.dic");
     let data = read_file(&source)?;
     let (slimmed, report) = slim_dictionary(&data, &source, keep)?;
