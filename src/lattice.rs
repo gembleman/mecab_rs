@@ -373,10 +373,15 @@ impl Lattice {
                 for right_index in later_first(begun) {
                     let right_id = NodeId::from_index(right_index);
                     let column = dense.right_column(self.nodes[right_id].left_id);
-                    self.connect_right::<NBEST>(position, right_id, lefts, |left_right_id| {
-                        debug_assert!(usize::from(left_right_id) < column.len());
-                        unsafe { *column.get_unchecked(usize::from(left_right_id)) }
-                    });
+                    self.connect_right::<NBEST, false>(
+                        position,
+                        right_id,
+                        lefts,
+                        |left_right_id| {
+                            debug_assert!(usize::from(left_right_id) < column.len());
+                            unsafe { *column.get_unchecked(usize::from(left_right_id)) }
+                        },
+                    );
                 }
             }
             Matrix::Hot(hot) => {
@@ -392,9 +397,9 @@ impl Lattice {
                         let cost = |left_right_id: u16| unsafe {
                             *cells.get_unchecked(usize::from(left_right_id))
                         };
-                        self.connect_right::<NBEST>(position, right_id, lefts, cost);
+                        self.connect_right::<NBEST, true>(position, right_id, lefts, cost);
                     } else {
-                        self.connect_right::<NBEST>(
+                        self.connect_right::<NBEST, true>(
                             position,
                             right_id,
                             lefts,
@@ -406,7 +411,7 @@ impl Lattice {
         }
     }
 
-    fn connect_right<const NBEST: bool>(
+    fn connect_right<const NBEST: bool, const SELECT: bool>(
         &mut self,
         position: usize,
         right_id: NodeId,
@@ -437,7 +442,13 @@ impl Lattice {
             let mut best = lefts[0].id;
             for left in lefts {
                 let cost = left.cost + i32::from(connection_cost(left.right_id));
-                if cost <= best_cost {
+                if SELECT {
+                    (best_cost, best) = std::hint::select_unpredictable(
+                        cost <= best_cost,
+                        (cost, left.id),
+                        (best_cost, best),
+                    );
+                } else if cost <= best_cost {
                     best_cost = cost;
                     best = left.id;
                 }
