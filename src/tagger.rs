@@ -1,7 +1,6 @@
 use std::ops::Deref;
 use std::ops::Range;
 use std::slice;
-use std::str::Utf8Error;
 
 use crate::constraint::{Constraint, ConstraintSet};
 use crate::dictionary::Dictionary;
@@ -335,11 +334,7 @@ impl<'t, 'x> Node<'t, 'x> {
         self.raw.length_with_space as usize
     }
 
-    pub fn feature(&self) -> Result<&'t str, Utf8Error> {
-        str::from_utf8(self.feature_bytes())
-    }
-
-    pub fn feature_bytes(&self) -> &'t [u8] {
+    pub fn feature(&self) -> &'t str {
         let dictionary = self.frame.dictionary;
         match self.raw.source {
             NodeSource::System => dictionary.system.feature(self.raw.feature),
@@ -348,7 +343,7 @@ impl<'t, 'x> Node<'t, 'x> {
             }
             NodeSource::Unknown => dictionary.unknown.feature(self.raw.feature),
             NodeSource::UnknownFixed => dictionary.unknown_feature.as_deref().unwrap_or_default(),
-            NodeSource::Constrained => self.frame.constraints.feature_bytes(self.raw.feature),
+            NodeSource::Constrained => self.frame.constraints.feature_str(self.raw.feature),
             NodeSource::Bos | NodeSource::Eos => &dictionary.bos_feature,
         }
     }

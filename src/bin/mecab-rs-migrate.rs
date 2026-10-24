@@ -1,6 +1,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
 use mecab_rs::{CharTable, rebuild};
 
@@ -29,6 +30,9 @@ dictionary rebuilding:
       Compiles the connection templates of <source-dir> (feature.def, model.def, dicrc) for
       the id definitions in <id-defs-dir> (default: <source-dir>) and writes matrix.tpl and
       matrix.hot into <dict-dir>. The hot block defaults to 7104 x 4992 (clamped).
+  mecab-rs-migrate check-templates <source-dir> <matrix.bin> [--id-defs <dir>] [--threads N]
+      Compiles the templates like `templates` and compares the cost of every cell with the
+      dense matrix.bin; exits with an error at the first mismatch.
   mecab-rs-migrate pack-matrix <source-dir> <out.xz> [--id-defs <dir>]      (feature xz)
   mecab-rs-migrate unpack-matrix <file.xz> <dict-dir> [--hot L R] [--threads N]   (feature xz)
       Packs the compiled templates into one xz file, or writes matrix.tpl and matrix.hot
@@ -41,87 +45,98 @@ dictionary rebuilding:
       templates instead of writing matrix.bin. --xz also writes matrix.xz (feature xz),
       --matrix-bin the permuted dense matrix.bin.";
 
-fn run_rebuild(command: &str, args: &[std::ffi::OsString]) -> Result<(), String> {
-    use std::time::Instant;
+type Args = [std::ffi::OsString];
 
-    let path = |index: usize, what: &str| -> Result<PathBuf, String> {
-        args.get(index)
-            .map(PathBuf::from)
-            .ok_or_else(|| format!("{command}: missing {what}"))
-    };
-    let start = Instant::now();
-    let shown = |error: mecab_rs::Error| error.to_string();
-    match command {
-        "stats" => {
-            let (dictionary, out) = (path(0, "<dict-dir>")?, path(1, "<out-dir>")?);
-            let corpora: Vec<PathBuf> = args[2..].iter().map(PathBuf::from).collect();
-            if corpora.is_empty() {
-                return Err("stats: no corpus given".into());
-            }
-            let stats = rebuild::collect_stats(&dictionary, &corpora).map_err(shown)?;
-            stats.write_tsv(&out).map_err(shown)?;
-            let seen = |counts: &[u64]| counts.iter().filter(|&&count| count > 0).count();
-            println!(
-                "lookups {} rc seen {} lc seen {}",
-                stats.right.iter().sum::<u64>(),
-                seen(&stats.right),
-                seen(&stats.left)
-            );
-        }
-        "renumber" => {
-            let (dictionary, stats, out) = (
-                path(0, "<dict-dir>")?,
-                path(1, "<stats-dir>")?,
-                path(2, "<out-dir>")?,
-            );
-            let id_defs = match args.get(3) {
-                None => None,
-                Some(flag) if flag == "--id-defs" => Some(path(4, "the --id-defs directory")?),
-                Some(other) => {
-                    return Err(format!("unexpected argument {}", other.to_string_lossy()));
-                }
-            };
-            if args.len() > 5 {
-                return Err("renumber: too many arguments".into());
-            }
-            let report =
-                rebuild::renumber(&dictionary, &stats, &out, id_defs.as_deref()).map_err(shown)?;
-            println!(
-                "renumbered {} x {} ids into {}",
-                report.left_size,
-                report.right_size,
-                out.display()
-            );
-        }
-        "slim" => {
-            let (dictionary, out) = (path(0, "<dict-dir>")?, path(1, "<out-dir>")?);
-            let keep = match args.get(2).and_then(|argument| argument.to_str()) {
-                Some("--keep") => {
-                    let spec = args.get(3).and_then(|spec| spec.to_str());
-                    rebuild::Keep::parse_fields(spec.ok_or("slim: --keep needs a field set")?)?
-                }
-                Some(count) => rebuild::Keep::Prefix {
-                    keep: count
-                        .parse()
-                        .map_err(|_| format!("slim: `{count}` is not a field count"))?,
-                    pad: args.get(3).is_some_and(|flag| flag == "--pad"),
-                },
-                None => return Err("slim: give --keep <fields> or a field count".into()),
-            };
-            let report = rebuild::slim(&dictionary, &out, &keep).map_err(shown)?;
-            println!(
-                "sys.dic features {} -> {} bytes, {} unique, file {} -> {}",
-                report.old_feature_size,
-                report.new_feature_size,
-                report.unique_features,
-                report.old_file_size,
-                report.new_file_size
-            );
-        }
-        _ => unreachable!(),
+fn path_argument(command: &str, args: &Args, index: usize, what: &str) -> Result<PathBuf, String> {
+    args.get(index)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{command}: missing {what}"))
+}
+
+fn stats(args: &Args) -> Result<(), String> {
+    let (dictionary, out) = (
+        path_argument("stats", args, 0, "<dict-dir>")?,
+        path_argument("stats", args, 1, "<out-dir>")?,
+    );
+    let corpora: Vec<PathBuf> = args[2..].iter().map(PathBuf::from).collect();
+    if corpora.is_empty() {
+        return Err("stats: no corpus given".into());
     }
-    println!("{command}: {:.2} s", start.elapsed().as_secs_f64());
+    let stats = rebuild::collect_stats(&dictionary, &corpora).map_err(shown)?;
+    stats.write_tsv(&out).map_err(shown)?;
+    let seen = |counts: &[u64]| counts.iter().filter(|&&count| count > 0).count();
+    println!(
+        "lookups {} rc seen {} lc seen {}",
+        stats.right.iter().sum::<u64>(),
+        seen(&stats.right),
+        seen(&stats.left)
+    );
     Ok(())
+}
+
+fn renumber(args: &Args) -> Result<(), String> {
+    let (dictionary, stats, out) = (
+        path_argument("renumber", args, 0, "<dict-dir>")?,
+        path_argument("renumber", args, 1, "<stats-dir>")?,
+        path_argument("renumber", args, 2, "<out-dir>")?,
+    );
+    let id_defs = match args.get(3) {
+        None => None,
+        Some(flag) if flag == "--id-defs" => Some(path_argument(
+            "renumber",
+            args,
+            4,
+            "the --id-defs directory",
+        )?),
+        Some(other) => {
+            return Err(format!("unexpected argument {}", other.to_string_lossy()));
+        }
+    };
+    if args.len() > 5 {
+        return Err("renumber: too many arguments".into());
+    }
+    let report = rebuild::renumber(&dictionary, &stats, &out, id_defs.as_deref()).map_err(shown)?;
+    println!(
+        "renumbered {} x {} ids into {}",
+        report.left_size,
+        report.right_size,
+        out.display()
+    );
+    Ok(())
+}
+
+fn slim(args: &Args) -> Result<(), String> {
+    let (dictionary, out) = (
+        path_argument("slim", args, 0, "<dict-dir>")?,
+        path_argument("slim", args, 1, "<out-dir>")?,
+    );
+    let keep = match args.get(2).and_then(|argument| argument.to_str()) {
+        Some("--keep") => {
+            let spec = args.get(3).and_then(|spec| spec.to_str());
+            rebuild::Keep::parse_fields(spec.ok_or("slim: --keep needs a field set")?)?
+        }
+        Some(count) => rebuild::Keep::Prefix {
+            keep: count
+                .parse()
+                .map_err(|_| format!("slim: `{count}` is not a field count"))?,
+            pad: args.get(3).is_some_and(|flag| flag == "--pad"),
+        },
+        None => return Err("slim: give --keep <fields> or a field count".into()),
+    };
+    let report = rebuild::slim(&dictionary, &out, &keep).map_err(shown)?;
+    println!(
+        "sys.dic features {} -> {} bytes, {} unique, file {} -> {}",
+        report.old_feature_size,
+        report.new_feature_size,
+        report.unique_features,
+        report.old_file_size,
+        report.new_file_size
+    );
+    Ok(())
+}
+
+fn shown(error: mecab_rs::Error) -> String {
+    error.to_string()
 }
 
 #[derive(Default)]
@@ -251,126 +266,130 @@ fn check_templates(
     }
 }
 
-fn run_matrix(command: &str, args: &[std::ffi::OsString]) -> Result<(), String> {
-    use std::time::Instant;
+fn positional<'a, const COUNT: usize>(
+    command: &str,
+    parsed: &'a MatrixArgs,
+    usage: &str,
+) -> Result<[&'a PathBuf; COUNT], String> {
+    let found: Vec<&PathBuf> = parsed.positional.iter().collect();
+    found
+        .try_into()
+        .map_err(|_| format!("{command}: expected {usage}"))
+}
 
-    let parsed = parse_matrix_args(command, args)?;
-    let positional = |count: usize, usage: &str| -> Result<&[PathBuf], String> {
-        if parsed.positional.len() == count {
-            Ok(&parsed.positional)
-        } else {
-            Err(format!("{command}: expected {usage}"))
-        }
+fn threads_of(parsed: &MatrixArgs) -> usize {
+    parsed.threads.unwrap_or_else(rebuild::default_threads)
+}
+
+fn templates(args: &Args, start: Instant) -> Result<(), String> {
+    let parsed = parse_matrix_args("templates", args)?;
+    let [source, dictionary] = positional("templates", &parsed, "<source-dir> <dict-dir>")?;
+    let templates = compile(source, parsed.id_defs.as_deref())?;
+    println!("compiled in {:.2} s", start.elapsed().as_secs_f64());
+    std::fs::create_dir_all(dictionary).map_err(|error| error.to_string())?;
+    rebuild::write_matrix_files(&templates, dictionary, parsed.hot, threads_of(&parsed))
+        .map_err(shown)
+}
+
+fn check_templates_command(args: &Args, start: Instant) -> Result<(), String> {
+    let parsed = parse_matrix_args("check-templates", args)?;
+    let [source, matrix] = positional("check-templates", &parsed, "<source-dir> <matrix.bin>")?;
+    let templates = compile(source, parsed.id_defs.as_deref())?;
+    println!("compiled in {:.2} s", start.elapsed().as_secs_f64());
+    check_templates(&templates, matrix, threads_of(&parsed))
+}
+
+fn rebuild_command(args: &Args) -> Result<(), String> {
+    let parsed = parse_matrix_args("rebuild", args)?;
+    let [source, out] = positional("rebuild", &parsed, "<unidic-full-dir> <out-dir>")?;
+    let stats = match (&parsed.stats, parsed.corpora.is_empty()) {
+        (Some(directory), true) => rebuild::StatsSource::Directory(directory),
+        (None, false) => rebuild::StatsSource::Corpora(&parsed.corpora),
+        _ => return Err("rebuild: give either --stats <dir> or --corpus <file>...".into()),
     };
-    let threads = parsed.threads.unwrap_or_else(rebuild::default_threads);
-    let shown = |error: mecab_rs::Error| error.to_string();
-    let start = Instant::now();
-    match command {
-        "templates" => {
-            let [source, dictionary] = positional(2, "<source-dir> <dict-dir>")? else {
-                unreachable!()
-            };
-            let templates = compile(source, parsed.id_defs.as_deref())?;
-            println!("compiled in {:.2} s", start.elapsed().as_secs_f64());
-            std::fs::create_dir_all(dictionary).map_err(|error| error.to_string())?;
-            rebuild::write_matrix_files(&templates, dictionary, parsed.hot, threads)
-                .map_err(shown)?;
-        }
-        "check-templates" => {
-            let [source, matrix] = positional(2, "<source-dir> <matrix.bin>")? else {
-                unreachable!()
-            };
-            let templates = compile(source, parsed.id_defs.as_deref())?;
-            println!("compiled in {:.2} s", start.elapsed().as_secs_f64());
-            check_templates(&templates, matrix, threads)?;
-        }
-        "rebuild" => {
-            let [source, out] = positional(2, "<unidic-full-dir> <out-dir>")? else {
-                unreachable!()
-            };
-            let stats = match (&parsed.stats, parsed.corpora.is_empty()) {
-                (Some(directory), true) => rebuild::StatsSource::Directory(directory),
-                (None, false) => rebuild::StatsSource::Corpora(&parsed.corpora),
-                _ => return Err("rebuild: give either --stats <dir> or --corpus <file>...".into()),
-            };
-            let options = rebuild::RuntimeOptions {
-                source,
-                out,
-                stats,
-                keep: parsed.keep.clone(),
-                hot: parsed.hot,
-                threads,
-                xz: parsed.xz,
-                matrix_bin: parsed.matrix_bin,
-            };
-            let mut previous = Instant::now();
-            let report = rebuild::build_runtime(&options, &mut |step| {
-                println!("{step}: {:.2} s", previous.elapsed().as_secs_f64());
-                previous = Instant::now();
-            })
-            .map_err(shown)?;
-            println!(
-                "built {} x {} ids into {}",
-                report.left_size,
-                report.right_size,
-                out.display()
-            );
-            if let Some(slim) = report.slim {
-                println!(
-                    "sys.dic features {} -> {} bytes, file {} -> {}",
-                    slim.old_feature_size,
-                    slim.new_feature_size,
-                    slim.old_file_size,
-                    slim.new_file_size
-                );
-            }
-            if let Some(size) = report.xz_size {
-                println!("matrix.xz: {size} bytes");
-            }
-        }
-        #[cfg(feature = "xz")]
-        "pack-matrix" => {
-            let [source, out] = positional(2, "<source-dir> <out.xz>")? else {
-                unreachable!()
-            };
-            let templates = compile(source, parsed.id_defs.as_deref())?;
-            println!("compiled in {:.2} s", start.elapsed().as_secs_f64());
-            let size = rebuild::xz::pack(&templates, out).map_err(shown)?;
-            println!("{}: {size} bytes", out.display());
-        }
-        #[cfg(feature = "xz")]
-        "unpack-matrix" => {
-            let [pack, dictionary] = positional(2, "<file.xz> <dict-dir>")? else {
-                unreachable!()
-            };
-            std::fs::create_dir_all(dictionary).map_err(|error| error.to_string())?;
-            rebuild::xz::unpack(pack, dictionary, parsed.hot, threads).map_err(shown)?;
-        }
-        #[cfg(not(feature = "xz"))]
-        "pack-matrix" | "unpack-matrix" => {
-            return Err(format!(
-                "{command}: this build has no xz support; build with --features xz"
-            ));
-        }
-        _ => unreachable!(),
+    let options = rebuild::RuntimeOptions {
+        source,
+        out,
+        stats,
+        keep: parsed.keep.clone(),
+        hot: parsed.hot,
+        threads: threads_of(&parsed),
+        xz: parsed.xz,
+        matrix_bin: parsed.matrix_bin,
+    };
+    let mut previous = Instant::now();
+    let report = rebuild::build_runtime(&options, &mut |step| {
+        println!("{step}: {:.2} s", previous.elapsed().as_secs_f64());
+        previous = Instant::now();
+    })
+    .map_err(shown)?;
+    println!(
+        "built {} x {} ids into {}",
+        report.left_size,
+        report.right_size,
+        out.display()
+    );
+    if let Some(slim) = report.slim {
+        println!(
+            "sys.dic features {} -> {} bytes, file {} -> {}",
+            slim.old_feature_size, slim.new_feature_size, slim.old_file_size, slim.new_file_size
+        );
     }
-    println!("{command}: {:.2} s", start.elapsed().as_secs_f64());
+    if let Some(size) = report.xz_size {
+        println!("matrix.xz: {size} bytes");
+    }
     Ok(())
+}
+
+#[cfg(feature = "xz")]
+fn pack_matrix(args: &Args, start: Instant) -> Result<(), String> {
+    let parsed = parse_matrix_args("pack-matrix", args)?;
+    let [source, out] = positional("pack-matrix", &parsed, "<source-dir> <out.xz>")?;
+    let templates = compile(source, parsed.id_defs.as_deref())?;
+    println!("compiled in {:.2} s", start.elapsed().as_secs_f64());
+    let size = rebuild::xz::pack(&templates, out).map_err(shown)?;
+    println!("{}: {size} bytes", out.display());
+    Ok(())
+}
+
+#[cfg(feature = "xz")]
+fn unpack_matrix(args: &Args) -> Result<(), String> {
+    let parsed = parse_matrix_args("unpack-matrix", args)?;
+    let [pack, dictionary] = positional("unpack-matrix", &parsed, "<file.xz> <dict-dir>")?;
+    std::fs::create_dir_all(dictionary).map_err(|error| error.to_string())?;
+    rebuild::xz::unpack(pack, dictionary, parsed.hot, threads_of(&parsed)).map_err(shown)
 }
 
 fn run() -> Result<(), String> {
     let all: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if let Some(command) = all.first().and_then(|first| first.to_str()) {
-        if matches!(command, "stats" | "renumber" | "slim") {
-            return run_rebuild(command, &all[1..]);
-        }
-        if matches!(
-            command,
-            "templates" | "rebuild" | "pack-matrix" | "unpack-matrix" | "check-templates"
-        ) {
-            return run_matrix(command, &all[1..]);
-        }
+        let start = Instant::now();
+        let args = &all[1..];
+        let result = match command {
+            "stats" => stats(args),
+            "renumber" => renumber(args),
+            "slim" => slim(args),
+            "templates" => templates(args, start),
+            "check-templates" => check_templates_command(args, start),
+            "rebuild" => rebuild_command(args),
+            #[cfg(feature = "xz")]
+            "pack-matrix" => pack_matrix(args, start),
+            #[cfg(feature = "xz")]
+            "unpack-matrix" => unpack_matrix(args),
+            #[cfg(not(feature = "xz"))]
+            "pack-matrix" | "unpack-matrix" => Err(format!(
+                "{command}: this build has no xz support; build with --features xz"
+            )),
+            _ => return migrate_char_table(all),
+        };
+        result?;
+        println!("{command}: {:.2} s", start.elapsed().as_secs_f64());
+        return Ok(());
     }
+    migrate_char_table(all)
+}
+
+fn migrate_char_table(all: Vec<std::ffi::OsString>) -> Result<(), String> {
     let mut directory: Option<PathBuf> = None;
     let mut char_def: Option<PathBuf> = None;
     let mut arguments = all.into_iter();

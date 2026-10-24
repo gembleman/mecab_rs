@@ -1,10 +1,11 @@
 
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::fs;
+use std::io::{self, Write};
 use std::ops::RangeInclusive;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use crate::build::write_file;
 use crate::error::Error;
 
 pub(crate) const CHAR_TABLE_FILE: &str = "char.uni";
@@ -22,11 +23,11 @@ pub(crate) const BMP_LEN: usize = 0x1_0000;
 pub(crate) const EXTENDER_FLAG: u32 = 1;
 
 const BIN_TABLE_ENTRIES: usize = 0xffff;
-const TYPE_BITS: u32 = 18;
-const DEFAULT_TYPE_SHIFT: u32 = TYPE_BITS;
-const LENGTH_SHIFT: u32 = TYPE_BITS + 8;
-const GROUP_SHIFT: u32 = LENGTH_SHIFT + 4;
-const INVOKE_SHIFT: u32 = GROUP_SHIFT + 1;
+pub(crate) const TYPE_BITS: u32 = 18;
+pub(crate) const DEFAULT_TYPE_SHIFT: u32 = TYPE_BITS;
+pub(crate) const LENGTH_SHIFT: u32 = TYPE_BITS + 8;
+pub(crate) const GROUP_SHIFT: u32 = LENGTH_SHIFT + 4;
+pub(crate) const INVOKE_SHIFT: u32 = GROUP_SHIFT + 1;
 const MAX_CATEGORIES: usize = 18;
 
 const DEFAULT_CODE: usize = 0x0000;
@@ -349,23 +350,7 @@ impl CharTable {
 
     pub fn convert(char_bin: &Path, char_def: Option<&Path>, output: &Path) -> Result<(), Error> {
         let table = Self::from_mecab(char_bin, char_def)?;
-        let mut temporary = output.as_os_str().to_owned();
-        temporary.push(".tmp");
-        let temporary = PathBuf::from(temporary);
-        let written = (|| {
-            let mut writer = BufWriter::new(File::create(&temporary)?);
-            table.write(&mut writer)?;
-            writer.flush()?;
-            drop(writer);
-            fs::rename(&temporary, output)
-        })();
-        written.map_err(|source| {
-            let _ = fs::remove_file(&temporary);
-            Error::Io {
-                path: output.to_path_buf(),
-                source,
-            }
-        })
+        write_file(output, |writer| table.write(writer))
     }
 }
 

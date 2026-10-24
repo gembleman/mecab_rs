@@ -1,3 +1,4 @@
+pub mod build;
 mod char_property;
 pub mod char_table;
 mod clusters;

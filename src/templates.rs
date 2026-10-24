@@ -74,26 +74,20 @@ fn sort_spans(part: &mut TemplatePart) {
 }
 
 fn validate(part: &TemplatePart, left_size: usize, right_size: usize) -> Result<(), Error> {
-    let nnz = part.left_index.len();
+    let slices = PartSlices {
+        left_count: part.left_count,
+        right_count: part.right_count,
+        left_projection: &part.left_projection,
+        right_projection: &part.right_projection,
+        indptr: &part.indptr,
+        left_index: &part.left_index,
+        weight: &part.weight,
+    };
     let consistent = part.left_projection.len() == left_size
         && part.right_projection.len() == right_size
-        && part.weight.len() == nnz
+        && part.weight.len() == part.left_index.len()
         && part.indptr.len() == part.right_count + 1
-        && part.indptr.first() == Some(&0)
-        && part.indptr.last().is_some_and(|&end| end as usize == nnz)
-        && part.indptr.windows(2).all(|span| span[0] <= span[1])
-        && part
-            .left_projection
-            .iter()
-            .all(|&key| usize::from(key) <= part.left_count)
-        && part
-            .right_projection
-            .iter()
-            .all(|&key| usize::from(key) <= part.right_count)
-        && part
-            .left_index
-            .iter()
-            .all(|&key| usize::from(key) < part.left_count);
+        && slices.is_consistent();
     if consistent {
         Ok(())
     } else {
@@ -268,7 +262,7 @@ impl MappedTemplates {
                 left_index: reader.section(nnz)?,
                 weight: reader.section(nnz)?,
             };
-            if !part.slices(&map).is_consistent(nnz) {
+            if !part.slices(&map).is_consistent() {
                 return Err(reader.broken("a connection template is inconsistent"));
             }
             parts.push(part);
@@ -317,7 +311,8 @@ impl MappedTemplates {
 }
 
 impl PartSlices<'_> {
-    fn is_consistent(&self, nnz: usize) -> bool {
+    fn is_consistent(&self) -> bool {
+        let nnz = self.left_index.len();
         self.indptr.first() == Some(&0)
             && self.indptr.last().is_some_and(|&end| end as usize == nnz)
             && self.indptr.windows(2).all(|span| span[0] <= span[1])
@@ -329,6 +324,10 @@ impl PartSlices<'_> {
                 .right_projection
                 .iter()
                 .all(|&key| usize::from(key) <= self.right_count)
+            && self
+                .left_index
+                .iter()
+                .all(|&key| usize::from(key) < self.left_count)
     }
 }
 

@@ -1,5 +1,6 @@
 use std::ops::Range;
 use std::path::Path;
+use std::thread;
 
 use memmap2::Mmap;
 
@@ -7,10 +8,10 @@ use crate::dictionary::map_file;
 use crate::error::Error;
 use crate::section::{Plain, Section};
 
-const MAGIC_ID: u32 = 0xEF71_8F77;
-const DIC_VERSION: u32 = 102;
-const HEADER_SIZE: usize = 72;
-const TOKEN_SIZE: usize = 16;
+pub(crate) const MAGIC_ID: u32 = 0xEF71_8F77;
+pub(crate) const DIC_VERSION: u32 = 102;
+pub(crate) const HEADER_SIZE: usize = 72;
+pub(crate) const TOKEN_SIZE: usize = 16;
 const VALUE_SIZE_BITS: u32 = 8;
 const VALUE_SIZE_MASK: i32 = 0xff;
 const OUTSIDE_TOKEN_TABLE: &str = "a double array entry points outside the token table";
@@ -39,8 +40,14 @@ fn read_u32(bytes: &[u8], at: usize) -> u32 {
     )
 }
 
-fn is_utf8_charset(field: &[u8]) -> bool {
-    let name = field.split(|&byte| byte == 0).next().unwrap_or_default();
+fn charset_name(header: &[u8]) -> &[u8] {
+    header[CHARSET]
+        .split(|&byte| byte == 0)
+        .next()
+        .unwrap_or_default()
+}
+
+fn is_utf8_charset(name: &[u8]) -> bool {
     UTF8_NAMES
         .iter()
         .any(|utf8| name.eq_ignore_ascii_case(utf8))
@@ -96,11 +103,13 @@ impl RawToken {
         }
     }
 
-    fn is_valid(&self, left_size: usize, right_size: usize, features_len: usize) -> bool {
+    fn is_valid(&self, left_size: usize, right_size: usize, features: &[u8]) -> bool {
         let token = self.record();
         usize::from(token.left_id) < right_size
             && usize::from(token.right_id) < left_size
-            && (token.feature as usize) < features_len
+            && features
+                .get(token.feature as usize)
+                .is_some_and(|&byte| byte & 0xC0 != 0x80)
     }
 }
 
@@ -134,7 +143,7 @@ impl SystemDictionary {
         if read_u32(bytes, KIND_AT) != kind as u32 {
             return Err(broken("the dictionary type is not the expected one"));
         }
-        if !is_utf8_charset(&bytes[CHARSET]) {
+        if !is_utf8_charset(charset_name(bytes)) {
             return Err(Error::Unsupported("a dictionary charset other than UTF-8"));
         }
         let array_end = HEADER_SIZE + read_u32(bytes, ARRAY_BYTES_AT) as usize;
@@ -149,13 +158,18 @@ impl SystemDictionary {
             .ok_or_else(|| broken("the double array is misaligned"))?;
         let tokens = Section::new(bytes, array_end..tokens_end)
             .ok_or_else(|| broken("the token table is misaligned"))?;
-        let features_len = features_end - tokens_end;
-        let valid = |raw: &RawToken| raw.is_valid(left_size, right_size, features_len);
-        if !tokens.view(&map).iter().all(valid) {
-            return Err(broken(
-                "a token context id or feature offset is out of range",
-            ));
+        let features = &bytes[tokens_end..features_end];
+        if features.last().is_some_and(|&last| last != 0) {
+            return Err(broken("the features do not end with a NUL byte"));
         }
+        let checked = Checked {
+            cells: cells.view(&map),
+            tokens: tokens.view(&map),
+            features,
+            left_size,
+            right_size,
+        };
+        checked.run().map_err(broken)?;
         Ok(Self {
             map,
             left_size,
@@ -166,6 +180,10 @@ impl SystemDictionary {
         })
     }
 
+    pub(crate) fn charset(&self) -> &[u8] {
+        charset_name(&self.map)
+    }
+
     pub(crate) fn left_size(&self) -> usize {
         self.left_size
     }
@@ -174,32 +192,23 @@ impl SystemDictionary {
         self.right_size
     }
 
-    pub(crate) fn common_prefix_search(
-        &self,
-        key: &[u8],
-        hits: &mut Vec<PrefixHit>,
-    ) -> Result<(), Error> {
+    pub(crate) fn common_prefix_search(&self, key: &[u8], hits: &mut Vec<PrefixHit>) {
         hits.clear();
         let cells = self.cells.view(&self.map);
-        let token_total = self.tokens.view(&self.map).len();
         let Some(&[root, _]) = cells.first() else {
-            return Ok(());
+            return;
         };
         let mut base = root.cast_signed() as isize;
         for (consumed, &byte) in key.iter().enumerate() {
-            push_terminal(cells, token_total, base, consumed, hits)?;
+            push_terminal(cells, base, consumed, hits);
             match cells.get(base.wrapping_add(byte as isize + 1).cast_unsigned()) {
                 Some(&[next, check]) if base.cast_unsigned() as u32 == check => {
                     base = next.cast_signed() as isize;
                 }
-                _ => return Ok(()),
+                _ => return,
             }
         }
-        push_terminal(cells, token_total, base, key.len(), hits)
-    }
-
-    pub(crate) fn holds_tokens(&self, tokens: &Range<usize>) -> bool {
-        tokens.end <= self.tokens.view(&self.map).len()
+        push_terminal(cells, base, key.len(), hits);
     }
 
     pub(crate) fn exact_match(&self, key: &[u8]) -> Option<Range<usize>> {
@@ -221,13 +230,120 @@ impl SystemDictionary {
         self.tokens.view(&self.map)[index].record()
     }
 
-    pub(crate) fn feature(&self, offset: u32) -> &[u8] {
+    pub(crate) fn feature(&self, offset: u32) -> &str {
         let rest = &self.map[self.features.start + offset as usize..self.features.end];
         let length = rest
             .iter()
             .position(|&byte| byte == 0)
-            .unwrap_or(rest.len());
-        &rest[..length]
+            .expect("open checked that the features end with a NUL byte");
+        unsafe { str::from_utf8_unchecked(&rest[..length]) }
+    }
+}
+
+const PARALLEL_MIN_BYTES: usize = 1 << 22;
+const MAX_CHECK_THREADS: usize = 8;
+
+struct Checked<'a> {
+    cells: &'a [[u32; 2]],
+    tokens: &'a [RawToken],
+    features: &'a [u8],
+    left_size: usize,
+    right_size: usize,
+}
+
+impl Checked<'_> {
+    fn run(&self) -> Result<(), &'static str> {
+        let threads = if self.features.len() < PARALLEL_MIN_BYTES {
+            1
+        } else {
+            thread::available_parallelism().map_or(1, |count| count.get().min(MAX_CHECK_THREADS))
+        };
+        let pieces = self.feature_pieces(threads);
+        let token_chunk = self.tokens.len().div_ceil(threads).max(1);
+        let cell_chunk = self.cells.len().div_ceil(threads).max(1);
+        let (utf8, contexts, terminals) = if threads == 1 {
+            (
+                pieces.iter().all(|piece| str::from_utf8(piece).is_ok()),
+                self.tokens_valid(self.tokens),
+                self.terminals_valid(self.cells, 0),
+            )
+        } else {
+            thread::scope(|scope| {
+                let utf8: Vec<_> = pieces
+                    .iter()
+                    .map(|piece| scope.spawn(|| str::from_utf8(piece).is_ok()))
+                    .collect();
+                let contexts: Vec<_> = self
+                    .tokens
+                    .chunks(token_chunk)
+                    .map(|chunk| scope.spawn(|| self.tokens_valid(chunk)))
+                    .collect();
+                let terminals: Vec<_> = self
+                    .cells
+                    .chunks(cell_chunk)
+                    .enumerate()
+                    .map(|(number, chunk)| {
+                        scope.spawn(move || self.terminals_valid(chunk, number * cell_chunk))
+                    })
+                    .collect();
+                let joined = |handle: thread::ScopedJoinHandle<bool>| {
+                    handle.join().expect("a check thread panicked")
+                };
+                (
+                    utf8.into_iter().all(joined),
+                    contexts.into_iter().all(joined),
+                    terminals.into_iter().all(joined),
+                )
+            })
+        };
+        if !utf8 {
+            return Err("the features are not valid UTF-8");
+        }
+        if !contexts {
+            return Err(
+                "a token context id is out of range or a feature offset is not at a character boundary",
+            );
+        }
+        if !terminals {
+            return Err(OUTSIDE_TOKEN_TABLE);
+        }
+        Ok(())
+    }
+
+    fn terminals_valid(&self, cells: &[[u32; 2]], first: usize) -> bool {
+        cells.iter().enumerate().all(|(offset, &[value, check])| {
+            let value = value.cast_signed();
+            value >= 0
+                || check as usize != first + offset
+                || PrefixHit::new(!value, 0).tokens().end <= self.tokens.len()
+        })
+    }
+
+    fn feature_pieces(&self, count: usize) -> Vec<&[u8]> {
+        let mut pieces = Vec::with_capacity(count);
+        let mut start = 0;
+        for part in 1..count {
+            let target = self.features.len() / count * part;
+            if target <= start {
+                continue;
+            }
+            let end = self.features[target..]
+                .iter()
+                .position(|&byte| byte == 0)
+                .map_or(self.features.len(), |at| target + at + 1);
+            if end > start {
+                pieces.push(&self.features[start..end]);
+                start = end;
+            }
+        }
+        pieces.push(&self.features[start..]);
+        pieces
+    }
+
+    fn tokens_valid(&self, tokens: &[RawToken]) -> bool {
+        tokens
+            .iter()
+            .all(|raw| raw.is_valid(self.left_size, self.right_size, self.features))
     }
 }
 
@@ -237,22 +353,11 @@ fn cell(cells: &[[u32; 2]], index: i64) -> Option<(i32, u32)> {
 }
 
 #[inline]
-fn push_terminal(
-    cells: &[[u32; 2]],
-    token_total: usize,
-    base: isize,
-    length: usize,
-    hits: &mut Vec<PrefixHit>,
-) -> Result<(), Error> {
+fn push_terminal(cells: &[[u32; 2]], base: isize, length: usize, hits: &mut Vec<PrefixHit>) {
     if let Some(&[value, check]) = cells.get(base.cast_unsigned())
         && value.cast_signed() < 0
         && base.cast_unsigned() as u32 == check
     {
-        let hit = PrefixHit::new(-value.cast_signed() - 1, length);
-        if hit.tokens().end > token_total {
-            return Err(Error::Corrupt(OUTSIDE_TOKEN_TABLE));
-        }
-        hits.push(hit);
+        hits.push(PrefixHit::new(!value.cast_signed(), length));
     }
-    Ok(())
 }

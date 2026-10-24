@@ -17,30 +17,24 @@ macro_rules! define_id {
         }
 
         const _: () = assert!(size_of::<Option<$name>>() == 4);
+    };
+}
 
-        impl<T> Index<$name> for [T] {
+macro_rules! index_by {
+    ($name:ident, $container:ty) => {
+        impl<T> Index<$name> for $container {
             type Output = T;
 
             fn index(&self, id: $name) -> &T {
                 &self[id.index()]
             }
         }
+    };
+}
 
-        impl<T> IndexMut<$name> for [T] {
-            fn index_mut(&mut self, id: $name) -> &mut T {
-                &mut self[id.index()]
-            }
-        }
-
-        impl<T> Index<$name> for Vec<T> {
-            type Output = T;
-
-            fn index(&self, id: $name) -> &T {
-                &self[id.index()]
-            }
-        }
-
-        impl<T> IndexMut<$name> for Vec<T> {
+macro_rules! index_mut_by {
+    ($name:ident, $container:ty) => {
+        impl<T> IndexMut<$name> for $container {
             fn index_mut(&mut self, id: $name) -> &mut T {
                 &mut self[id.index()]
             }
@@ -50,3 +44,8 @@ macro_rules! define_id {
 
 define_id!(NodeId);
 define_id!(ElementId);
+
+index_by!(NodeId, [T]);
+index_by!(NodeId, Vec<T>);
+index_mut_by!(NodeId, Vec<T>);
+index_by!(ElementId, Vec<T>);

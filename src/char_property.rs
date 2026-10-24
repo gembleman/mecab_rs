@@ -3,18 +3,15 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use crate::char_table::{
-    CODE_POINTS, EXTENDER_FLAG, HEADER_BYTES, MAGIC, MAX_PALETTE, NAME_BYTES, PALETTE_ENTRY_BYTES,
+    BMP_LEN, CODE_POINTS, DEFAULT_TYPE_SHIFT, EXTENDER_FLAG, GROUP_SHIFT, HEADER_BYTES,
+    INVOKE_SHIFT, LENGTH_SHIFT, MAGIC, MAX_PALETTE, NAME_BYTES, PALETTE_ENTRY_BYTES, TYPE_BITS,
     VERSION,
 };
 use crate::dictionary::map_file;
 use crate::error::Error;
 
-const TYPE_BITS: u32 = 18;
-const DEFAULT_TYPE_BITS: u32 = 8;
-const LENGTH_BITS: u32 = 4;
 const SPACE_CODE: u32 = 0x20;
 const FOUR_BYTE_LEAD: u8 = 0xf0;
-const BMP_LEN: usize = 0x1_0000;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CharInfo(u32);
@@ -25,19 +22,19 @@ impl CharInfo {
     }
 
     pub(crate) fn default_type(self) -> usize {
-        ((self.0 >> TYPE_BITS) & ((1 << DEFAULT_TYPE_BITS) - 1)) as usize
+        ((self.0 >> DEFAULT_TYPE_SHIFT) & 0xff) as usize
     }
 
     pub(crate) fn length(self) -> usize {
-        ((self.0 >> (TYPE_BITS + DEFAULT_TYPE_BITS)) & ((1 << LENGTH_BITS) - 1)) as usize
+        ((self.0 >> LENGTH_SHIFT) & 0xf) as usize
     }
 
     pub(crate) fn group(self) -> bool {
-        (self.0 >> (TYPE_BITS + DEFAULT_TYPE_BITS + LENGTH_BITS)) & 1 == 1
+        (self.0 >> GROUP_SHIFT) & 1 == 1
     }
 
     pub(crate) fn invoke(self) -> bool {
-        (self.0 >> (TYPE_BITS + DEFAULT_TYPE_BITS + LENGTH_BITS + 1)) & 1 == 1
+        (self.0 >> INVOKE_SHIFT) & 1 == 1
     }
 
     pub(crate) fn is_kind_of(self, other: CharInfo) -> bool {
@@ -190,19 +187,17 @@ impl CharProperty {
             file: path.to_path_buf(),
             reason,
         };
-        let word = |at: usize| {
-            let bytes = map.get(at..at + 4)?;
-            Some(u32::from_le_bytes(bytes.try_into().ok()?))
-        };
-        if map.len() < HEADER_BYTES || map[..4] != *MAGIC || word(4) != Some(VERSION) {
+        let word = |at: usize| u32::from_le_bytes(*map[at..].first_chunk().expect("in range"));
+        if map.len() < HEADER_BYTES || map[..4] != *MAGIC || word(4) != VERSION {
             return Err(broken("the file is not a character table of this version"));
         }
-        let category_count = word(8).unwrap_or(0) as usize;
-        let palette_len = word(12).unwrap_or(0) as usize;
-        if category_count == 0 || category_count > 0xff || palette_len == 0 {
-            return Err(broken("the category or palette count is out of range"));
-        }
-        if palette_len > MAX_PALETTE {
+        let category_count = word(8) as usize;
+        let palette_len = word(12) as usize;
+        if category_count == 0
+            || category_count > 0xff
+            || palette_len == 0
+            || palette_len > MAX_PALETTE
+        {
             return Err(broken("the category or palette count is out of range"));
         }
         let palette_start = HEADER_BYTES + NAME_BYTES * category_count;
@@ -213,7 +208,7 @@ impl CharProperty {
         let mut palette = Vec::with_capacity(palette_len);
         for index in 0..palette_len {
             let at = palette_start + PALETTE_ENTRY_BYTES * index;
-            let (info, flags) = (word(at).unwrap_or(0), word(at + 4).unwrap_or(0));
+            let (info, flags) = (word(at), word(at + 4));
             let info = CharInfo(info);
             if info.default_type() >= category_count || flags & !EXTENDER_FLAG != 0 {
                 return Err(broken("a palette entry is not valid"));
@@ -256,9 +251,7 @@ impl CharProperty {
     }
 
     fn class_of_code(&self, code: u32) -> Class {
-        self.map
-            .get(self.table_start + code as usize)
-            .map_or_else(Class::default, |&index| self.palette[usize::from(index)])
+        self.palette[usize::from(self.map[self.table_start + code as usize])]
     }
 
     pub(crate) fn space(&self) -> CharInfo {

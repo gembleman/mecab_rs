@@ -5,7 +5,8 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::thread;
 
-use super::{bad, io_error, read_file, write_atomic};
+use super::{bad, io_error, read_file};
+use crate::build::write_file;
 use crate::{ConnectionTemplates, Error, TemplatePart};
 
 pub const DEFAULT_HOT_LEFT: usize = 7104;
@@ -400,10 +401,10 @@ pub fn write_matrix_files(
         hot_left.min(templates.left_size()),
         hot_right.min(templates.right_size()),
     );
-    write_atomic(&dict_dir.join(TEMPLATE_FILE), |writer| {
+    write_file(&dict_dir.join(TEMPLATE_FILE), |writer| {
         templates.write_templates(writer)
     })?;
-    write_atomic(&dict_dir.join(HOT_FILE), |writer| {
+    write_file(&dict_dir.join(HOT_FILE), |writer| {
         templates.write_hot_matrix(hot_left, hot_right, threads, writer)
     })
 }

@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 
 use super::templates::{compile_templates, write_matrix_files};
 use super::{
-    ContextStats, CopyPolicy, Keep, Renumbering, SlimReport, collect_stats, copy_entries,
-    prepare_output,
+    ContextStats, Keep, Renumbering, SlimReport, collect_stats, copy_entries, prepare_output,
 };
 use crate::{CharTable, Error};
 
@@ -53,11 +52,7 @@ pub fn build_runtime(
     let plan = Renumbering::plan(source, &stats, stats_dir, None)?;
     progress("plan");
 
-    copy_entries(
-        source,
-        out,
-        CopyPolicy::Only(&["dicrc", "char.bin", "license"]),
-    )?;
+    copy_entries(source, out, Some(&["dicrc", "char.bin", "license"]))?;
     let char_def = source.join("char.def");
     CharTable::convert(
         &source.join("char.bin"),

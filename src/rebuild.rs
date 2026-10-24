@@ -1,11 +1,13 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 
+use crate::build::{write_file, write_file_with};
+use crate::system_dictionary::{HEADER_SIZE, MAGIC_ID, TOKEN_SIZE};
 use crate::{Dictionary, Error, Tagger};
 
 mod runtime;
@@ -19,13 +21,10 @@ pub use templates::{
     write_matrix_files,
 };
 
-pub const HEADER_SIZE: usize = 72;
-pub const TOKEN_SIZE: usize = 16;
-pub const CONTEXT_FILES: [&str; 2] = ["sys.dic", "unk.dic"];
-pub const ID_DEF_FILES: [&str; 2] = ["left-id.def", "right-id.def"];
+const CONTEXT_FILES: [&str; 2] = ["sys.dic", "unk.dic"];
+const ID_DEF_FILES: [&str; 2] = ["left-id.def", "right-id.def"];
 pub const UNIDIC_FEATURE_COUNT: usize = 29;
 
-const MAGIC_XOR: u32 = 0xEF71_8F77;
 const MATRIX_FILE: &str = "matrix.bin";
 const RIGHT_STATS: &str = "right.tsv";
 const LEFT_STATS: &str = "left.tsv";
@@ -57,58 +56,22 @@ fn word(bytes: &[u8], index: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
 }
 
-fn write_atomic(
-    path: &Path,
-    write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
-) -> Result<(), Error> {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let temporary = path.with_file_name(format!(".{name}.tmp"));
-    let result = (|| {
-        let mut writer = BufWriter::with_capacity(1 << 23, File::create(&temporary)?);
-        write(&mut writer)?;
-        writer.flush()
-    })();
-    if let Err(source) = result {
-        let _ = fs::remove_file(&temporary);
-        return Err(Error::Io {
-            path: path.to_path_buf(),
-            source,
-        });
-    }
-    fs::rename(&temporary, path).map_err(io_error(path))
-}
-
 fn read_file(path: &Path) -> Result<Vec<u8>, Error> {
     fs::read(path).map_err(io_error(path))
 }
 
-#[derive(Clone, Copy)]
-enum CopyPolicy<'a> {
-    All,
-    Only(&'a [&'a str]),
-}
-
-impl CopyPolicy<'_> {
-    fn copies(self, name: &std::ffi::OsStr) -> bool {
-        match self {
-            Self::All => true,
-            Self::Only(wanted) => wanted.iter().any(|wanted| name == *wanted),
-        }
-    }
-}
-
-fn copy_entries(source: &Path, target: &Path, policy: CopyPolicy) -> Result<(), Error> {
+fn copy_entries(source: &Path, target: &Path, only: Option<&[&str]>) -> Result<(), Error> {
     fs::create_dir_all(target).map_err(io_error(target))?;
     for entry in fs::read_dir(source).map_err(io_error(source))? {
         let entry = entry.map_err(io_error(source))?;
         let name = entry.file_name();
-        if !policy.copies(&name) {
+        if only.is_some_and(|wanted| !wanted.iter().any(|wanted| name == *wanted)) {
             continue;
         }
         let from = entry.path();
         let to = target.join(&name);
         if from.is_dir() {
-            copy_entries(&from, &to, CopyPolicy::All)?;
+            copy_entries(&from, &to, None)?;
         } else {
             fs::copy(&from, &to).map_err(io_error(&from))?;
         }
@@ -129,7 +92,7 @@ fn prepare_output(dict_dir: &Path, out_dir: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn matrix_shape(dict_dir: &Path) -> Result<(usize, usize), Error> {
+fn matrix_shape(dict_dir: &Path) -> Result<(usize, usize), Error> {
     let path = dict_dir.join(MATRIX_FILE);
     let mut header = [0u8; 4];
     File::open(&path)
@@ -152,7 +115,7 @@ impl ContextStats {
     pub fn write_tsv(&self, directory: &Path) -> Result<(), Error> {
         fs::create_dir_all(directory).map_err(io_error(directory))?;
         for (name, counts) in [(RIGHT_STATS, &self.right), (LEFT_STATS, &self.left)] {
-            write_atomic(&directory.join(name), |writer| {
+            write_file(&directory.join(name), |writer| {
                 for (id, count) in counts.iter().enumerate() {
                     writeln!(writer, "{id}\t{count}")?;
                 }
@@ -224,7 +187,7 @@ pub fn collect_stats(dict_dir: &Path, corpora: &[PathBuf]) -> Result<ContextStat
 }
 
 
-pub fn order_by_frequency(counts: &[u64]) -> Vec<usize> {
+fn order_by_frequency(counts: &[u64]) -> Vec<usize> {
     let mut order: Vec<usize> = (1..counts.len()).collect();
     order.sort_by_key(|&id| (std::cmp::Reverse(counts[id]), id));
     if !counts.is_empty() {
@@ -233,7 +196,7 @@ pub fn order_by_frequency(counts: &[u64]) -> Vec<usize> {
     order
 }
 
-pub fn inverse_of(order: &[usize]) -> Vec<usize> {
+fn inverse_of(order: &[usize]) -> Vec<usize> {
     let mut inverse = vec![0; order.len()];
     for (new_id, &old_id) in order.iter().enumerate() {
         inverse[old_id] = new_id;
@@ -241,7 +204,7 @@ pub fn inverse_of(order: &[usize]) -> Vec<usize> {
     inverse
 }
 
-pub fn patch_tokens(
+fn patch_tokens(
     data: &mut [u8],
     path: &Path,
     new_lc: &[usize],
@@ -271,7 +234,7 @@ pub fn patch_tokens(
     Ok(())
 }
 
-pub fn renumber_id_def(text: &str, order: &[usize], path: &Path) -> Result<String, Error> {
+fn renumber_id_def(text: &str, order: &[usize], path: &Path) -> Result<String, Error> {
     let mut rows: Vec<&str> = text.split('\n').collect();
     if rows.last() == Some(&"") {
         rows.pop();
@@ -300,7 +263,7 @@ pub fn renumber_id_def(text: &str, order: &[usize], path: &Path) -> Result<Strin
     Ok(out)
 }
 
-pub fn write_permuted_matrix(
+fn write_permuted_matrix(
     writer: &mut impl Write,
     matrix: &[u8],
     path: &Path,
@@ -415,14 +378,14 @@ impl Renumbering {
                 data = slimmed;
                 report = Some(slim_report);
             }
-            write_atomic(&out_dir.join(name), |writer| writer.write_all(&data))?;
+            write_file(&out_dir.join(name), |writer| writer.write_all(&data))?;
         }
         Ok(report)
     }
 
     pub(crate) fn write_id_defs(&self, out_dir: &Path) -> Result<(), Error> {
         for (name, text) in &self.id_defs {
-            write_atomic(&out_dir.join(name), |writer| {
+            write_file(&out_dir.join(name), |writer| {
                 writer.write_all(text.as_bytes())
             })?;
         }
@@ -433,18 +396,15 @@ impl Renumbering {
         let matrix_path = dict_dir.join(MATRIX_FILE);
         let file = File::open(&matrix_path).map_err(io_error(&matrix_path))?;
         let matrix = unsafe { Mmap::map(&file) }.map_err(io_error(&matrix_path))?;
-        let mut permutation = Ok(());
-        write_atomic(&out_dir.join(MATRIX_FILE), |writer| {
-            permutation = write_permuted_matrix(
+        write_file_with(&out_dir.join(MATRIX_FILE), |writer| {
+            write_permuted_matrix(
                 writer,
                 &matrix,
                 &matrix_path,
                 &self.order_lc,
                 &self.order_rc,
-            );
-            Ok(())
-        })?;
-        permutation
+            )
+        })
     }
 }
 
@@ -457,7 +417,7 @@ pub fn renumber(
     prepare_output(dict_dir, out_dir)?;
     let stats = ContextStats::read_tsv(stats_dir)?;
     let plan = Renumbering::plan(dict_dir, &stats, stats_dir, id_defs_dir)?;
-    copy_entries(dict_dir, out_dir, CopyPolicy::Only(&ID_FREE_FILES))?;
+    copy_entries(dict_dir, out_dir, Some(&ID_FREE_FILES))?;
     plan.write_dictionaries(dict_dir, out_dir, None)?;
     plan.write_id_defs(out_dir)?;
     plan.write_matrix(dict_dir, out_dir)?;
@@ -468,7 +428,7 @@ pub fn renumber(
 }
 
 
-pub fn split_fields(text: &[u8]) -> Vec<(usize, usize)> {
+fn split_fields(text: &[u8]) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut quoted = false;
     let mut start = 0;
@@ -556,15 +516,11 @@ pub struct SlimReport {
     pub new_file_size: usize,
 }
 
-pub fn slim_dictionary(
-    data: &[u8],
-    path: &Path,
-    keep: &Keep,
-) -> Result<(Vec<u8>, SlimReport), Error> {
+fn slim_dictionary(data: &[u8], path: &Path, keep: &Keep) -> Result<(Vec<u8>, SlimReport), Error> {
     if data.len() < HEADER_SIZE {
         return Err(bad(path, "shorter than the 72-byte header"));
     }
-    if word(data, 0) ^ MAGIC_XOR != data.len() as u32 {
+    if word(data, 0) ^ MAGIC_ID != data.len() as u32 {
         return Err(bad(path, "magic does not match the file size"));
     }
     let (dsize, tsize, fsize) = (
@@ -620,7 +576,7 @@ pub fn slim_dictionary(
     out.extend_from_slice(&data[..token_start]);
     out.extend_from_slice(&tokens);
     out.extend_from_slice(&out_blob);
-    out[0..4].copy_from_slice(&(total as u32 ^ MAGIC_XOR).to_le_bytes());
+    out[0..4].copy_from_slice(&(total as u32 ^ MAGIC_ID).to_le_bytes());
     out[32..36].copy_from_slice(&(out_blob.len() as u32).to_le_bytes());
     let report = SlimReport {
         old_feature_size: fsize,
@@ -638,11 +594,11 @@ pub fn slim(dict_dir: &Path, out_dir: &Path, keep: &Keep) -> Result<SlimReport, 
     copied.extend(["unk.dic", MATRIX_FILE]);
     copied.extend(ID_DEF_FILES);
     copied.extend(MATRIX_FILES);
-    copy_entries(dict_dir, out_dir, CopyPolicy::Only(&copied))?;
+    copy_entries(dict_dir, out_dir, Some(&copied))?;
     let source = dict_dir.join("sys.dic");
     let data = read_file(&source)?;
     let (slimmed, report) = slim_dictionary(&data, &source, keep)?;
-    write_atomic(&out_dir.join("sys.dic"), |writer| {
+    write_file(&out_dir.join("sys.dic"), |writer| {
         writer.write_all(&slimmed)
     })?;
     Ok(report)

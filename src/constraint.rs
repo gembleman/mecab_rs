@@ -32,7 +32,7 @@ pub(crate) struct ConstraintSet {
     boundary: Vec<Boundary>,
     feature_at: Vec<Option<u32>>,
     spans: Vec<(usize, usize)>,
-    bytes: Vec<u8>,
+    bytes: String,
 }
 
 impl ConstraintSet {
@@ -60,7 +60,7 @@ impl ConstraintSet {
                     if start >= end || end > text_len || pattern.contains('\0') {
                         continue;
                     }
-                    self.set_feature(text_len, start, end, pattern.as_bytes());
+                    self.set_feature(text_len, start, end, pattern);
                 }
             }
         }
@@ -86,7 +86,7 @@ impl ConstraintSet {
         self.feature_at.get(begin).copied().flatten()
     }
 
-    pub(crate) fn feature_bytes(&self, index: u32) -> &[u8] {
+    pub(crate) fn feature_str(&self, index: u32) -> &str {
         let (start, end) = self.spans[index as usize];
         &self.bytes[start..end]
     }
@@ -95,7 +95,7 @@ impl ConstraintSet {
         &self,
         begin: usize,
         end: usize,
-        feature: impl FnOnce() -> &'f [u8],
+        feature: impl FnOnce() -> &'f str,
     ) -> bool {
         if self.is_inside_token(end) {
             return false;
@@ -105,7 +105,7 @@ impl ConstraintSet {
         };
         self.is_token_boundary(begin)
             && self.is_token_boundary(end)
-            && partial_match(self.feature_bytes(index), feature())
+            && partial_match(self.feature_str(index).as_bytes(), feature().as_bytes())
     }
 
     fn boundary_at(&self, position: usize) -> Boundary {
@@ -119,18 +119,17 @@ impl ConstraintSet {
         self.boundary[position] = boundary;
     }
 
-    fn set_feature(&mut self, text_len: usize, begin: usize, end: usize, feature: &[u8]) {
+    fn set_feature(&mut self, text_len: usize, begin: usize, end: usize, feature: &str) {
         if self.feature_at.is_empty() {
             self.feature_at.resize(text_len + 1, None);
         }
-        let end = end.min(text_len);
         self.set_boundary(text_len, begin, Boundary::Token);
         self.set_boundary(text_len, end, Boundary::Token);
         for inside in begin + 1..end {
             self.set_boundary(text_len, inside, Boundary::Inside);
         }
         let start = self.bytes.len();
-        self.bytes.extend_from_slice(feature);
+        self.bytes.push_str(feature);
         self.spans.push((start, self.bytes.len()));
         self.feature_at[begin] = Some((self.spans.len() - 1) as u32);
     }

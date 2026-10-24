@@ -504,9 +504,7 @@ impl Lattice {
             char_type: char_info.default_type() as u8,
             limit: end,
         };
-        dictionary
-            .system
-            .common_prefix_search(key, &mut self.hits)?;
+        dictionary.system.common_prefix_search(key, &mut self.hits);
         self.push_hits(
             dictionary,
             &dictionary.system,
@@ -515,7 +513,7 @@ impl Lattice {
             &found,
         );
         for (index, user) in dictionary.users.iter().enumerate() {
-            user.common_prefix_search(key, &mut self.hits)?;
+            user.common_prefix_search(key, &mut self.hits);
             self.push_hits(
                 dictionary,
                 user,
@@ -689,9 +687,7 @@ impl Lattice {
     }
 
     fn add_unknown(&mut self, dictionary: &Dictionary, char_info: CharInfo, span: &Span) {
-        let Some(tokens) = dictionary.unknown_tokens.get(char_info.default_type()) else {
-            return;
-        };
+        let tokens = &dictionary.unknown_tokens[char_info.default_type()];
         let source = if dictionary.unknown_feature.is_some() {
             NodeSource::UnknownFixed
         } else {

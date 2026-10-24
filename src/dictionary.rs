@@ -4,6 +4,7 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
+use crate::build::text::key_value;
 use crate::char_property::CharProperty;
 use crate::char_table::CHAR_TABLE_FILE;
 use crate::error::Error;
@@ -36,23 +37,13 @@ fn dicrc_values(bytes: &[u8], path: &Path) -> Result<HashMap<Vec<u8>, Vec<u8>>, 
         if line.is_empty() || line[0] == b';' || line[0] == b'#' {
             continue;
         }
-        let Some(equals) = line.iter().position(|&byte| byte == b'=') else {
+        let Some((key, value)) = key_value(line) else {
             return Err(Error::Format {
                 file: path.to_path_buf(),
                 reason: "a line has no '='",
             });
         };
-        let key_end = line[..equals]
-            .iter()
-            .rposition(|byte| !byte.is_ascii_whitespace())
-            .map_or(0, |at| at + 1);
-        let value_start = line[equals + 1..]
-            .iter()
-            .position(|byte| !byte.is_ascii_whitespace())
-            .map_or(line.len(), |at| equals + 1 + at);
-        values
-            .entry(line[..key_end].to_vec())
-            .or_insert_with(|| line[value_start..].to_vec());
+        values.entry(key.to_vec()).or_insert_with(|| value.to_vec());
     }
     Ok(values)
 }
@@ -64,8 +55,8 @@ pub struct Dictionary {
     pub(crate) matrix: Matrix,
     pub(crate) chars: CharProperty,
     pub(crate) unknown_tokens: Vec<Box<[TokenRecord]>>,
-    pub(crate) bos_feature: Vec<u8>,
-    pub(crate) unknown_feature: Option<Vec<u8>>,
+    pub(crate) bos_feature: String,
+    pub(crate) unknown_feature: Option<String>,
     pub(crate) max_grouping_size: usize,
 }
 
@@ -114,18 +105,23 @@ impl Dictionary {
             source,
         })?;
         let values = dicrc_values(&bytes, &dicrc)?;
+        let not_utf8 = |_| Error::Format {
+            file: dicrc.clone(),
+            reason: "bos-feature or unk-feature is not valid UTF-8",
+        };
         let unknown_feature = values
             .get(UNK_FEATURE_KEY)
             .filter(|value| !value.is_empty())
-            .cloned();
+            .map(|value| String::from_utf8(value.clone()).map_err(not_utf8))
+            .transpose()?;
         let bos_feature = values
             .get(BOS_FEATURE_KEY)
             .filter(|value| !value.is_empty())
-            .cloned()
             .ok_or_else(|| Error::Format {
                 file: dicrc.clone(),
                 reason: "bos-feature is missing",
             })?;
+        let bos_feature = String::from_utf8(bos_feature.clone()).map_err(not_utf8)?;
         let system = SystemDictionary::open(&directory.join("sys.dic"), DictionaryKind::System)?;
         let users = user_paths
             .iter()
@@ -158,9 +154,6 @@ impl Dictionary {
             let run = unknown
                 .exact_match(chars.name(category))
                 .ok_or_else(|| broken_unknown("a character category of char.uni is missing"))?;
-            if !unknown.holds_tokens(&run) {
-                return Err(broken_unknown("an unknown-word token is not valid"));
-            }
             let tokens = run.map(|index| unknown.token(index)).collect();
             unknown_tokens.push(tokens);
         }

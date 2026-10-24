@@ -4,7 +4,8 @@ use std::path::Path;
 
 use lzma_rust2::{XzOptions, XzReader, XzWriter};
 
-use super::{bad, io_error, write_atomic, write_matrix_files};
+use super::{bad, io_error, write_matrix_files};
+use crate::build::write_file;
 use crate::{ConnectionTemplates, Error, TemplatePart};
 
 const MAGIC: &[u8; 4] = b"MRCT";
@@ -17,7 +18,7 @@ const NICE_LEN: u32 = 273;
 const DEPTH_LIMIT: i32 = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Layout {
+enum Layout {
     PerTemplate = 0,
     ByField = 1,
 }
@@ -83,7 +84,7 @@ fn put_weights(
     }
 }
 
-pub fn payload(templates: &ConnectionTemplates, layout: Layout) -> Vec<u8> {
+fn payload(templates: &ConnectionTemplates, layout: Layout) -> Vec<u8> {
     let parts = templates.parts();
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
@@ -138,16 +139,7 @@ pub fn payload(templates: &ConnectionTemplates, layout: Layout) -> Vec<u8> {
     out
 }
 
-pub fn exception_count(templates: &ConnectionTemplates) -> usize {
-    templates
-        .parts()
-        .iter()
-        .flat_map(|part| &part.weight)
-        .filter(|&&weight| is_exception(weight))
-        .count()
-}
-
-pub fn compress(payload: &[u8]) -> Result<Vec<u8>, Error> {
+fn compress(payload: &[u8], path: &Path) -> Result<Vec<u8>, Error> {
     let mut options = XzOptions::with_preset(9);
     options.lzma_options.nice_len = NICE_LEN;
     options.lzma_options.depth_limit = DEPTH_LIMIT;
@@ -156,7 +148,7 @@ pub fn compress(payload: &[u8]) -> Result<Vec<u8>, Error> {
         .dict_size
         .max(u32::try_from(payload.len()).unwrap_or(u32::MAX));
     let failed = |error: std::io::Error| Error::Rebuild {
-        path: Default::default(),
+        path: path.to_path_buf(),
         reason: format!("xz: {error}"),
     };
     let mut writer = XzWriter::new(Vec::new(), options).map_err(failed)?;
@@ -166,8 +158,8 @@ pub fn compress(payload: &[u8]) -> Result<Vec<u8>, Error> {
 
 pub fn pack(templates: &ConnectionTemplates, path: &Path) -> Result<u64, Error> {
     let packed = std::thread::scope(|scope| {
-        let handles =
-            Layout::ALL.map(|layout| scope.spawn(move || compress(&payload(templates, layout))));
+        let handles = Layout::ALL
+            .map(|layout| scope.spawn(move || compress(&payload(templates, layout), path)));
         handles.map(|handle| {
             handle
                 .join()
@@ -181,11 +173,11 @@ pub fn pack(templates: &ConnectionTemplates, path: &Path) -> Result<u64, Error> 
     } else {
         first
     };
-    write_atomic(path, |writer| writer.write_all(&smaller))?;
+    write_file(path, |writer| writer.write_all(&smaller))?;
     Ok(std::fs::metadata(path).map_err(io_error(path))?.len())
 }
 
-pub fn decompress(path: &Path) -> Result<Vec<u8>, Error> {
+fn decompress(path: &Path) -> Result<Vec<u8>, Error> {
     let file = std::fs::File::open(path).map_err(io_error(path))?;
     let mut payload = Vec::new();
     XzReader::new(std::io::BufReader::new(file), false)
@@ -273,7 +265,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-pub fn parse_payload(payload: &[u8], path: &Path) -> Result<ConnectionTemplates, Error> {
+fn parse_payload(payload: &[u8], path: &Path) -> Result<ConnectionTemplates, Error> {
     let body_length = payload
         .len()
         .checked_sub(DIGEST_LEN)
@@ -381,7 +373,7 @@ pub fn parse_payload(payload: &[u8], path: &Path) -> Result<ConnectionTemplates,
     ConnectionTemplates::new(cost_factor, left_size, right_size, parts)
 }
 
-pub fn read_pack(path: &Path) -> Result<ConnectionTemplates, Error> {
+fn read_pack(path: &Path) -> Result<ConnectionTemplates, Error> {
     parse_payload(&decompress(path)?, path)
 }
 
