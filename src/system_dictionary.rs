@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io;
 use std::ops::Range;
 use std::path::Path;
 use std::thread;
@@ -102,15 +104,6 @@ impl RawToken {
             feature: self.feature,
         }
     }
-
-    fn is_valid(&self, left_size: usize, right_size: usize, features: &[u8]) -> bool {
-        let token = self.record();
-        usize::from(token.left_id) < right_size
-            && usize::from(token.right_id) < left_size
-            && features
-                .get(token.feature as usize)
-                .is_some_and(|&byte| byte & 0xC0 != 0x80)
-    }
 }
 
 const _: () = assert!(size_of::<RawToken>() == TOKEN_SIZE);
@@ -128,6 +121,14 @@ pub(crate) struct SystemDictionary {
 
 impl SystemDictionary {
     pub(crate) fn open(path: &Path, kind: DictionaryKind) -> Result<Self, Error> {
+        Self::open_checking_in_blocks(path, kind, CHECK_BLOCK_BYTES)
+    }
+
+    fn open_checking_in_blocks(
+        path: &Path,
+        kind: DictionaryKind,
+        block: usize,
+    ) -> Result<Self, Error> {
         let map = map_file(path)?;
         let broken = |reason| Error::Format {
             file: path.to_path_buf(),
@@ -158,18 +159,28 @@ impl SystemDictionary {
             .ok_or_else(|| broken("the double array is misaligned"))?;
         let tokens = Section::new(bytes, array_end..tokens_end)
             .ok_or_else(|| broken("the token table is misaligned"))?;
-        let features = &bytes[tokens_end..features_end];
-        if features.last().is_some_and(|&last| last != 0) {
-            return Err(broken("the features do not end with a NUL byte"));
+        let io_error = |source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        };
+        let file = File::open(path).map_err(io_error)?;
+        if features_end > tokens_end {
+            let mut last = [0];
+            read_exact_at(&file, &mut last, features_end as u64 - 1).map_err(io_error)?;
+            if last[0] != 0 {
+                return Err(broken("the features do not end with a NUL byte"));
+            }
         }
         let checked = Checked {
-            cells: cells.view(&map),
-            tokens: tokens.view(&map),
-            features,
+            path,
+            cells: HEADER_SIZE..array_end,
+            tokens: array_end..tokens_end,
+            features: tokens_end..features_end,
             left_size,
             right_size,
+            block,
         };
-        checked.run().map_err(broken)?;
+        checked.run().map_err(io_error)?.map_err(broken)?;
         Ok(Self {
             map,
             left_size,
@@ -242,109 +253,248 @@ impl SystemDictionary {
 
 const PARALLEL_MIN_BYTES: usize = 1 << 22;
 const MAX_CHECK_THREADS: usize = 8;
+const CHECK_BLOCK_BYTES: usize = 1 << 18;
+const CELL_SIZE: usize = 8;
+
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        #[cfg(windows)]
+        let count = std::os::windows::fs::FileExt::seek_read(file, buf, offset)?;
+        #[cfg(unix)]
+        let count = std::os::unix::fs::FileExt::read_at(file, buf, offset)?;
+        if count == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        buf = &mut buf[count..];
+        offset += count as u64;
+    }
+    Ok(())
+}
 
 struct Checked<'a> {
-    cells: &'a [[u32; 2]],
-    tokens: &'a [RawToken],
-    features: &'a [u8],
+    path: &'a Path,
+    cells: Range<usize>,
+    tokens: Range<usize>,
+    features: Range<usize>,
     left_size: usize,
     right_size: usize,
+    block: usize,
 }
 
 impl Checked<'_> {
-    fn run(&self) -> Result<(), &'static str> {
+    fn run(&self) -> io::Result<Result<(), &'static str>> {
         let threads = if self.features.len() < PARALLEL_MIN_BYTES {
             1
         } else {
             thread::available_parallelism().map_or(1, |count| count.get().min(MAX_CHECK_THREADS))
         };
-        let pieces = self.feature_pieces(threads);
-        let token_chunk = self.tokens.len().div_ceil(threads).max(1);
-        let cell_chunk = self.cells.len().div_ceil(threads).max(1);
-        let (utf8, contexts, terminals) = if threads == 1 {
-            (
-                pieces.iter().all(|piece| str::from_utf8(piece).is_ok()),
-                self.tokens_valid(self.tokens),
-                self.terminals_valid(self.cells, 0),
-            )
-        } else {
-            thread::scope(|scope| {
-                let utf8: Vec<_> = pieces
-                    .iter()
-                    .map(|piece| scope.spawn(|| str::from_utf8(piece).is_ok()))
-                    .collect();
-                let contexts: Vec<_> = self
-                    .tokens
-                    .chunks(token_chunk)
-                    .map(|chunk| scope.spawn(|| self.tokens_valid(chunk)))
-                    .collect();
-                let terminals: Vec<_> = self
-                    .cells
-                    .chunks(cell_chunk)
-                    .enumerate()
-                    .map(|(number, chunk)| {
-                        scope.spawn(move || self.terminals_valid(chunk, number * cell_chunk))
-                    })
-                    .collect();
-                let joined = |handle: thread::ScopedJoinHandle<bool>| {
-                    handle.join().expect("a check thread panicked")
-                };
-                (
-                    utf8.into_iter().all(joined),
-                    contexts.into_iter().all(joined),
-                    terminals.into_iter().all(joined),
-                )
-            })
-        };
+        let (tokens, cells) = in_parallel(
+            threads,
+            |part| self.tokens_part(part, threads),
+            |part| self.terminals_part(part, threads),
+        );
+        let mut offsets = Vec::new();
+        let mut contexts = true;
+        for result in tokens {
+            let (valid, part) = result?;
+            contexts &= valid;
+            offsets.extend(part);
+        }
+        let mut terminals = true;
+        for result in cells {
+            terminals &= result?;
+        }
+        offsets.sort_unstable();
+        offsets.dedup();
+        contexts &= offsets
+            .last()
+            .is_none_or(|&last| (last as usize) < self.features.len());
+        let (features, _) = in_parallel(
+            threads,
+            |part| self.features_part(part, threads, &offsets),
+            |_| (),
+        );
+        let mut utf8 = true;
+        for result in features {
+            let (valid, boundaries) = result?;
+            utf8 &= valid;
+            contexts &= boundaries;
+        }
         if !utf8 {
-            return Err("the features are not valid UTF-8");
+            return Ok(Err("the features are not valid UTF-8"));
         }
         if !contexts {
-            return Err(
+            return Ok(Err(
                 "a token context id is out of range or a feature offset is not at a character boundary",
-            );
+            ));
         }
         if !terminals {
-            return Err(OUTSIDE_TOKEN_TABLE);
+            return Ok(Err(OUTSIDE_TOKEN_TABLE));
         }
-        Ok(())
+        Ok(Ok(()))
     }
 
-    fn terminals_valid(&self, cells: &[[u32; 2]], first: usize) -> bool {
-        cells.iter().enumerate().all(|(offset, &[value, check])| {
-            let value = value.cast_signed();
-            value >= 0
-                || check as usize != first + offset
-                || PrefixHit::new(!value, 0).tokens().end <= self.tokens.len()
+    fn each_block(
+        &self,
+        section: usize,
+        size: usize,
+        range: Range<usize>,
+        mut check: impl FnMut(usize, &[u8]) -> bool,
+    ) -> io::Result<bool> {
+        let file = File::open(self.path)?;
+        let per_block = (self.block / size).max(1);
+        let mut buf = vec![0; per_block.min(range.len()) * size];
+        let mut index = range.start;
+        while index < range.end {
+            let count = per_block.min(range.end - index);
+            let bytes = &mut buf[..count * size];
+            read_exact_at(&file, bytes, (section + index * size) as u64)?;
+            if !check(index, bytes) {
+                return Ok(false);
+            }
+            index += count;
+        }
+        Ok(true)
+    }
+
+    fn tokens_part(&self, part: usize, parts: usize) -> io::Result<(bool, Vec<u32>)> {
+        let range = part_of(self.tokens.len() / TOKEN_SIZE, part, parts);
+        let mut offsets = Vec::with_capacity(range.len());
+        let valid = self.each_block(self.tokens.start, TOKEN_SIZE, range, |_, bytes| {
+            bytes.as_chunks::<TOKEN_SIZE>().0.iter().all(|raw| {
+                let token = RawToken {
+                    word: read_u32(raw, 0),
+                    costs: read_u32(raw, 4),
+                    feature: read_u32(raw, 8),
+                    reserved: 0,
+                }
+                .record();
+                offsets.push(token.feature);
+                usize::from(token.left_id) < self.right_size
+                    && usize::from(token.right_id) < self.left_size
+            })
+        })?;
+        Ok((valid, offsets))
+    }
+
+    fn terminals_part(&self, part: usize, parts: usize) -> io::Result<bool> {
+        let token_count = self.tokens.len() / TOKEN_SIZE;
+        let range = part_of(self.cells.len() / CELL_SIZE, part, parts);
+        self.each_block(self.cells.start, CELL_SIZE, range, |first, bytes| {
+            bytes
+                .as_chunks::<CELL_SIZE>()
+                .0
+                .iter()
+                .enumerate()
+                .all(|(offset, cell)| {
+                    let value = read_u32(cell, 0).cast_signed();
+                    value >= 0
+                        || read_u32(cell, 4) as usize != first + offset
+                        || PrefixHit::new(!value, 0).tokens().end <= token_count
+                })
         })
     }
 
-    fn feature_pieces(&self, count: usize) -> Vec<&[u8]> {
-        let mut pieces = Vec::with_capacity(count);
-        let mut start = 0;
-        for part in 1..count {
-            let target = self.features.len() / count * part;
-            if target <= start {
-                continue;
+    fn after_nul(&self, file: &File, from: usize) -> io::Result<usize> {
+        let length = self.features.len();
+        let mut buf = vec![0; self.block.min(length - from)];
+        let mut at = from;
+        while at < length {
+            let count = buf.len().min(length - at);
+            read_exact_at(file, &mut buf[..count], (self.features.start + at) as u64)?;
+            if let Some(nul) = buf[..count].iter().position(|&byte| byte == 0) {
+                return Ok(at + nul + 1);
             }
-            let end = self.features[target..]
-                .iter()
-                .position(|&byte| byte == 0)
-                .map_or(self.features.len(), |at| target + at + 1);
-            if end > start {
-                pieces.push(&self.features[start..end]);
-                start = end;
-            }
+            at += count;
         }
-        pieces.push(&self.features[start..]);
-        pieces
+        Ok(length)
     }
 
-    fn tokens_valid(&self, tokens: &[RawToken]) -> bool {
-        tokens
-            .iter()
-            .all(|raw| raw.is_valid(self.left_size, self.right_size, self.features))
+    fn features_part(
+        &self,
+        part: usize,
+        parts: usize,
+        offsets: &[u32],
+    ) -> io::Result<(bool, bool)> {
+        let file = File::open(self.path)?;
+        let length = self.features.len();
+        let start = match part {
+            0 => 0,
+            _ => self.after_nul(&file, length / parts * part)?,
+        };
+        let end = if part + 1 == parts {
+            length
+        } else {
+            self.after_nul(&file, length / parts * (part + 1))?
+        };
+        let offsets = &offsets[offsets.partition_point(|&offset| (offset as usize) < start)..];
+        let offsets = &offsets[..offsets.partition_point(|&offset| (offset as usize) < end)];
+        let mut next = offsets.iter().peekable();
+        let (mut utf8, mut boundaries) = (true, true);
+        let mut buf = Vec::new();
+        let mut position = start;
+        while position < end {
+            let count = self.block.min(end - position);
+            let buf_start = position - buf.len();
+            let old = buf.len();
+            buf.resize(old + count, 0);
+            read_exact_at(
+                &file,
+                &mut buf[old..],
+                (self.features.start + position) as u64,
+            )?;
+            position += count;
+            while let Some(&&offset) = next.peek()
+                && (offset as usize) < position
+            {
+                boundaries &= buf[offset as usize - buf_start] & 0xC0 != 0x80;
+                next.next();
+            }
+            let complete = buf
+                .iter()
+                .rposition(|&byte| byte == 0)
+                .map_or(0, |at| at + 1);
+            utf8 &= str::from_utf8(&buf[..complete]).is_ok();
+            buf.drain(..complete);
+            if !utf8 || !boundaries {
+                return Ok((utf8, boundaries));
+            }
+        }
+        utf8 &= str::from_utf8(&buf).is_ok();
+        Ok((utf8, boundaries))
     }
+}
+
+fn part_of(count: usize, part: usize, parts: usize) -> Range<usize> {
+    let chunk = count.div_ceil(parts).max(1);
+    (part * chunk).min(count)..((part + 1) * chunk).min(count)
+}
+
+fn join<T>(handle: thread::ScopedJoinHandle<T>) -> T {
+    handle.join().expect("a check thread panicked")
+}
+
+fn in_parallel<A: Send, B: Send>(
+    threads: usize,
+    first: impl Fn(usize) -> A + Sync,
+    second: impl Fn(usize) -> B + Sync,
+) -> (Vec<A>, Vec<B>) {
+    if threads == 1 {
+        return (vec![first(0)], vec![second(0)]);
+    }
+    thread::scope(|scope| {
+        let (first, second) = (&first, &second);
+        let firsts: Vec<_> = (0..threads)
+            .map(|part| scope.spawn(move || first(part)))
+            .collect();
+        let seconds: Vec<_> = (0..threads)
+            .map(|part| scope.spawn(move || second(part)))
+            .collect();
+        (
+            firsts.into_iter().map(join).collect(),
+            seconds.into_iter().map(join).collect(),
+        )
+    })
 }
 
 fn cell(cells: &[[u32; 2]], index: i64) -> Option<(i32, u32)> {
