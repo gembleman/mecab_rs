@@ -187,7 +187,6 @@ impl Matrix {
         HotMatrix::open(path, templates).map(Self::Hot)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn open_hot_int(path: &Path, int_templates_path: &Path) -> Result<Self, Error> {
         let templates = ColdPath::Int(Box::new(MappedIntTemplates::open(int_templates_path)?));
         HotMatrix::open(path, templates).map(Self::Hot)

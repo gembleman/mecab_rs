@@ -20,6 +20,7 @@ const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
 pub use crate::int_templates::MAX_SHIFT;
 pub const DEFAULT_SHIFTS: std::ops::RangeInclusive<u32> = 16..=26;
+pub const RUNTIME_SHIFT: u32 = 20;
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
     bytes.iter().fold(FNV_OFFSET, |state, &byte| {
@@ -746,6 +747,19 @@ pub fn read_int_pack(
     )
 }
 
+pub fn exact_int_templates(
+    templates: &ConnectionTemplates,
+    shift: u32,
+    threads: usize,
+    path: &Path,
+) -> Result<IntTemplates, Error> {
+    let plain = quantize(templates, shift, path)?;
+    let exceptions = find_exceptions(templates, None, std::slice::from_ref(&plain), threads)?
+        .pop()
+        .expect("one candidate gives one exception list");
+    plain.with_exceptions(exceptions)
+}
+
 pub fn write_int_files(
     templates: &IntTemplates,
     dict_dir: &Path,
@@ -758,6 +772,7 @@ pub fn write_int_files(
         hot_left.min(templates.left_size()),
         hot_right.min(templates.right_size()),
     );
+    super::templates::remove_stale(dict_dir, "matrix.tpl")?;
     write_file(&dict_dir.join("matrix.itp"), |writer| {
         templates.write_templates(writer)
     })?;

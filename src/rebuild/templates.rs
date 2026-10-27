@@ -16,7 +16,16 @@ pub const MAX_HOT_THREADS: usize = 8;
 const MODEL_HEADER_LINES: usize = 7;
 const NO_FIRE_LIMIT: usize = 0xFFFF;
 const TEMPLATE_FILE: &str = "matrix.tpl";
+const INT_TEMPLATE_FILE: &str = "matrix.itp";
 const HOT_FILE: &str = "matrix.hot";
+
+pub(super) fn remove_stale(dict_dir: &Path, name: &str) -> Result<(), Error> {
+    let path = dict_dir.join(name);
+    match std::fs::remove_file(&path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(io_error(&path)(error)),
+        _ => Ok(()),
+    }
+}
 
 pub fn default_threads() -> usize {
     thread::available_parallelism().map_or(1, |count| count.get().min(MAX_HOT_THREADS))
@@ -439,6 +448,7 @@ pub fn write_matrix_files(
         hot_left.min(templates.left_size()),
         hot_right.min(templates.right_size()),
     );
+    remove_stale(dict_dir, INT_TEMPLATE_FILE)?;
     write_file(&dict_dir.join(TEMPLATE_FILE), |writer| {
         templates.write_templates(writer)
     })?;

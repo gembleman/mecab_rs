@@ -14,6 +14,7 @@ use crate::system_dictionary::{DictionaryKind, SystemDictionary, TokenRecord};
 const DENSE_MATRIX_FILE: &str = "matrix.bin";
 const HOT_MATRIX_FILE: &str = "matrix.hot";
 const TEMPLATES_FILE: &str = "matrix.tpl";
+const INT_TEMPLATES_FILE: &str = "matrix.itp";
 
 const MAX_USER_DICTIONARIES: usize = u8::MAX as usize;
 const DEFAULT_MAX_GROUPING_SIZE: usize = 24;
@@ -83,8 +84,13 @@ impl Dictionary {
             return Err(Error::Unsupported("more than 255 user dictionaries"));
         }
         let hot_path = directory.join(HOT_MATRIX_FILE);
+        let int_templates_path = directory.join(INT_TEMPLATES_FILE);
         let templates_path = directory.join(TEMPLATES_FILE);
-        if hot_path.exists() && templates_path.exists() {
+        if hot_path.exists() && int_templates_path.exists() {
+            Self::open_matrix(directory, &users, HOT_MATRIX_FILE, |path| {
+                Matrix::open_hot_int(path, &int_templates_path)
+            })
+        } else if hot_path.exists() && templates_path.exists() {
             Self::open_matrix(directory, &users, HOT_MATRIX_FILE, |path| {
                 Matrix::open_hot(path, &templates_path)
             })

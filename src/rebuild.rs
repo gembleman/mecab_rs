@@ -30,9 +30,10 @@ const MATRIX_FILE: &str = "matrix.bin";
 const RIGHT_STATS: &str = "right.tsv";
 const LEFT_STATS: &str = "left.tsv";
 const ID_FREE_FILES: [&str; 4] = ["dicrc", "char.bin", "char.uni", "license"];
-const MATRIX_FILES: [&str; 5] = [
+const MATRIX_FILES: [&str; 6] = [
     "matrix.hot",
     "matrix.tpl",
+    "matrix.itp",
     "matrix.xz",
     RIGHT_STATS,
     LEFT_STATS,

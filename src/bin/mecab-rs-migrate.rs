@@ -49,12 +49,15 @@ dictionary rebuilding:
       writes matrix.itp and matrix.hot from it; check-int compares every cell of the decoded
       integer matrix with matrix.bin; bench-cold times the cold lookups of both template files.
   mecab-rs-migrate rebuild <unidic-full-dir> <out-dir> (--stats <dir> | --corpus <file>...)
-                         [--keep <fields>] [--hot L R] [--threads N] [--xz] [--matrix-bin]
+                         [--keep <fields>] [--hot L R] [--threads N] [--int [--shift N]]
+                         [--xz] [--matrix-bin]
       One-shot build of the runtime files only (dicrc, char.bin, char.uni, license/, sys.dic,
       unk.dic, left-id.def, right-id.def, right.tsv, left.tsv, matrix.tpl, matrix.hot): renumbers
       by the stats (given, or counted from the corpora), slims with --keep, and compiles the
-      templates instead of writing matrix.bin. --xz also writes matrix.xz (feature xz),
-      --matrix-bin the permuted dense matrix.bin.";
+      templates instead of writing matrix.bin. --int writes the integer templates matrix.itp
+      (grid 2^-20 unless --shift, every cell exact, about half of matrix.tpl) in place of
+      matrix.tpl. --xz also writes matrix.xz (feature xz), --matrix-bin the permuted dense
+      matrix.bin.";
 
 type Args = [std::ffi::OsString];
 
@@ -160,6 +163,7 @@ struct MatrixArgs {
     hot: Option<(usize, usize)>,
     threads: Option<usize>,
     xz: bool,
+    int: bool,
     matrix_bin: bool,
     shifts: Option<Vec<u32>>,
     reference: Option<PathBuf>,
@@ -221,6 +225,7 @@ fn parse_matrix_args(command: &str, args: &[std::ffi::OsString]) -> Result<Matri
             Some("--reference") => parsed.reference = Some(text(iterator.next(), "--reference")?),
             Some("--samples") => parsed.samples = Some(number(iterator.next(), "--samples")?),
             Some("--xz") => parsed.xz = true,
+            Some("--int") => parsed.int = true,
             Some("--matrix-bin") => parsed.matrix_bin = true,
             Some(flag) if flag.starts_with("--") => {
                 return Err(format!("{command}: unknown option {flag}"));
@@ -526,6 +531,12 @@ fn rebuild_command(args: &Args) -> Result<(), String> {
         keep: parsed.keep.clone(),
         hot: parsed.hot,
         threads: threads_of(&parsed),
+        int_shift: match parsed.shifts.as_deref() {
+            _ if !parsed.int => None,
+            None => Some(rebuild::int_matrix::RUNTIME_SHIFT),
+            Some(&[shift]) => Some(shift),
+            Some(_) => return Err("rebuild: --int takes one --shift".into()),
+        },
         xz: parsed.xz,
         matrix_bin: parsed.matrix_bin,
     };

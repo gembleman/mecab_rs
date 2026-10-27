@@ -1,6 +1,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::int_matrix::{exact_int_templates, write_int_files};
 use super::templates::{compile_templates, write_matrix_files};
 use super::{
     ContextStats, Keep, Renumbering, SlimReport, collect_stats, copy_entries, prepare_output,
@@ -19,6 +20,7 @@ pub struct RuntimeOptions<'a> {
     pub keep: Option<Keep>,
     pub hot: Option<(usize, usize)>,
     pub threads: usize,
+    pub int_shift: Option<u32>,
     pub xz: bool,
     pub matrix_bin: bool,
 }
@@ -73,8 +75,14 @@ pub fn build_runtime(
     };
     let templates = compile_templates(source, id_def("left-id.def"), id_def("right-id.def"))?;
     progress("compile templates");
-    write_matrix_files(&templates, out, options.hot, options.threads)?;
-    progress("matrix.tpl, matrix.hot");
+    if let Some(shift) = options.int_shift {
+        let int = exact_int_templates(&templates, shift, options.threads, out)?;
+        write_int_files(&int, out, options.hot, options.threads)?;
+        progress("matrix.itp, matrix.hot");
+    } else {
+        write_matrix_files(&templates, out, options.hot, options.threads)?;
+        progress("matrix.tpl, matrix.hot");
+    }
 
     #[cfg_attr(not(feature = "xz"), allow(unused_mut))]
     let mut xz_size = None;
