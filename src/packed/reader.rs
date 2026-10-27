@@ -17,13 +17,13 @@ use super::{
 use crate::char_table::{HEADER_BYTES as CHAR_TABLE_HEADER, MAGIC as CHAR_TABLE_MAGIC};
 use crate::dictionary::map_file;
 use crate::error::Error;
-use crate::int_templates::MappedIntTemplates;
 use crate::mapped_bytes::MappedBytes;
 use crate::section::Section;
 use crate::system_dictionary::PrefixHit;
 pub use crate::system_dictionary::TokenRecord;
 
 const CHUNK: usize = 1 << 20;
+const FEATURE_CHUNK: usize = 1 << 16;
 const PARAM_BYTES: usize = 8;
 const PARALLEL_MIN_BYTES: usize = 1 << 22;
 const MAX_CHECK_THREADS: usize = 8;
@@ -181,6 +181,10 @@ impl PackedDictionary {
             path,
             sections: sections.clone(),
         };
+        let map = Arc::new(map_file(path)?);
+        if map.len() as u64 != file_length {
+            return Err(broken("the file changed while it was opened"));
+        }
         let length = |section: usize| sections[section].len();
         if length(CHAR_INDEX) != BLOCK_COUNT * 2
             || length(CHAR_BLOCKS) == 0
@@ -304,21 +308,27 @@ impl PackedDictionary {
             "a parameter set has a context id outside the matrix",
         )?;
 
-        let valid_tokens = |_: usize, part: &[u8]| {
+        let mut next_start = 0;
+        let mut valid_tokens = |_: usize, part: &[u8]| {
             part.chunks_exact(token_bytes).all(|token| {
                 let (param, feature) = if token_bytes == 8 {
                     (u32_at(token, 0) as usize, u32_at(token, 4) as usize)
                 } else {
                     (usize::from(u16_at(token, 0)), u32_at(token, 2) as usize)
                 };
-                param < param_count
-                    && feature < features_length
-                    && starts.binary_search(&(feature as u32)).is_ok()
+                if param >= param_count || feature >= features_length {
+                    return false;
+                }
+                if starts.get(next_start) == Some(&(feature as u32)) {
+                    next_start += 1;
+                    return true;
+                }
+                starts.binary_search(&(feature as u32)).is_ok()
             })
         };
         let reason = "a token has a parameter set or a feature that does not exist";
-        source.chunks(TOKENS, token_bytes, valid_tokens, reason)?;
-        source.chunks(UNKNOWN_TOKENS, token_bytes, valid_tokens, reason)?;
+        source.chunks(TOKENS, token_bytes, &mut valid_tokens, reason)?;
+        source.chunks(UNKNOWN_TOKENS, token_bytes, &mut valid_tokens, reason)?;
         drop(starts);
         let unknown_starts = source.read_all(UNKNOWN_STARTS)?;
         let unknown_starts: Vec<u32> = unknown_starts
@@ -334,7 +344,7 @@ impl PackedDictionary {
             return Err(broken("the unknown tokens of the categories do not add up"));
         }
 
-        check_cells(&source, token_count)?;
+        check_cells(&source, &map[sections[CELLS].clone()], token_count)?;
 
         let dicrc = source.read_all(DICRC)?;
         if dicrc.len() < 8 {
@@ -351,20 +361,11 @@ impl PackedDictionary {
             return Err(broken("bos-feature or unk-feature is not valid UTF-8"));
         }
 
-        let map = Arc::new(map_file(path)?);
-        if map.len() as u64 != file_length {
-            return Err(broken("the file changed while it was opened"));
-        }
         let view_error = || broken("a section is misaligned");
         let char_index = Section::new(&map, sections[CHAR_INDEX].clone()).ok_or_else(view_error)?;
         let char_blocks =
             Section::new(&map, sections[CHAR_BLOCKS].clone()).ok_or_else(view_error)?;
         let cells = Section::new(&map, sections[CELLS].clone()).ok_or_else(view_error)?;
-        if hot && integer_templates {
-            let template = MappedBytes::from_arc(Arc::clone(&map), sections[TEMPLATES].clone())
-                .expect("the template section is inside the mapping");
-            MappedIntTemplates::from_mapped(template, path)?;
-        }
         let dicrc_start = sections[DICRC].start + 8;
         let mut dictionary = Self {
             map,
@@ -409,6 +410,19 @@ impl PackedDictionary {
     }
 
     #[inline]
+    pub fn view(&self) -> PackedView<'_> {
+        PackedView {
+            char_index: self.char_index.view(&self.map),
+            char_blocks: self.char_blocks.view(&self.map),
+            cells: self.cells.view(&self.map),
+            tokens: &self.map[self.sections[TOKENS].clone()],
+            params: &self.map[self.sections[PARAMS].clone()],
+            token_bytes: self.token_bytes,
+            ascii: &self.ascii,
+        }
+    }
+
+    #[inline]
     pub fn code_of(&self, char: char) -> u16 {
         let scalar = char as usize;
         let index = self.char_index.view(&self.map);
@@ -418,11 +432,9 @@ impl PackedDictionary {
     }
 
     pub fn common_prefix_search(&self, key: &[u8], hits: &mut Vec<Hit>) {
-        hits.clear();
-        self.walk_bytes(key, |hit| hits.push(hit));
+        self.view().common_prefix_search(key, hits);
     }
 
-    #[inline(always)]
     pub fn common_prefix_search_codes(&self, codes: &[u16], hits: &mut Vec<Hit>) {
         hits.clear();
         let mut cursor = Cursor::new(self.cells.view(&self.map));
@@ -441,63 +453,13 @@ impl PackedDictionary {
 
     pub fn exact_match(&self, key: &[u8]) -> Option<Range<usize>> {
         let mut found = None;
-        self.walk_bytes(key, |hit| found = Some(hit));
+        self.view().walk_bytes(key, |hit| found = Some(hit));
         found.filter(|hit| hit.length == key.len()).map(Hit::tokens)
-    }
-
-    #[inline(always)]
-    fn walk_bytes(&self, key: &[u8], mut found: impl FnMut(Hit)) {
-        let mut cursor = Cursor::new(self.cells.view(&self.map));
-        let mut at = 0;
-        while let Some(&first) = key.get(at) {
-            let (code, width) = if first < 0x80 {
-                (self.ascii[usize::from(first)], 1)
-            } else {
-                let Some((char, width)) = decode(&key[at..]) else {
-                    return;
-                };
-                (self.code_of(char), width)
-            };
-            at += width;
-            match cursor.step(code) {
-                Step::Stop => return,
-                Step::Inner => {}
-                Step::Key(first_token, token_count) => found(Hit {
-                    length: at,
-                    first_token: first_token as usize,
-                    token_count: token_count as usize,
-                }),
-            }
-        }
-    }
-
-    #[inline]
-    fn tokens(&self) -> &[u8] {
-        &self.map[self.sections[TOKENS].clone()]
-    }
-
-    fn token_at(&self, bytes: &[u8], index: usize) -> TokenRecord {
-        let width = self.token_bytes;
-        let token = &bytes[index * width..(index + 1) * width];
-        let (param, feature) = if width == 8 {
-            (u32_at(token, 0) as usize, u32_at(token, 4))
-        } else {
-            (usize::from(u16_at(token, 0)), u32_at(token, 2))
-        };
-        let params = &self.map[self.sections[PARAMS].clone()];
-        let param = &params[param * PARAM_BYTES..(param + 1) * PARAM_BYTES];
-        TokenRecord {
-            left_id: u16_at(param, 0),
-            right_id: u16_at(param, 2),
-            pos_id: u16_at(param, 4),
-            word_cost: u16_at(param, 6).cast_signed(),
-            feature,
-        }
     }
 
     #[inline]
     pub fn token(&self, index: usize) -> TokenRecord {
-        self.token_at(self.tokens(), index)
+        self.view().token(index)
     }
 
     pub fn category_count(&self) -> usize {
@@ -512,7 +474,8 @@ impl PackedDictionary {
             0..0
         };
         let bytes = &self.map[self.sections[UNKNOWN_TOKENS].clone()];
-        range.map(move |index| self.token_at(bytes, index))
+        let view = self.view();
+        range.map(move |index| view.token_at(bytes, index))
     }
 
     pub fn feature(&self, offset: u32) -> &str {
@@ -646,6 +609,82 @@ fn decode(bytes: &[u8]) -> Option<(char, usize)> {
     char::from_u32(scalar).map(|char| (char, width))
 }
 
+#[derive(Clone, Copy)]
+pub struct PackedView<'a> {
+    char_index: &'a [u16],
+    char_blocks: &'a [u16],
+    cells: &'a [[u32; 2]],
+    tokens: &'a [u8],
+    params: &'a [u8],
+    token_bytes: usize,
+    ascii: &'a [u16; 128],
+}
+
+impl PackedView<'_> {
+    #[inline]
+    fn code_of(&self, char: char) -> u16 {
+        let scalar = char as usize;
+        let block = usize::from(self.char_index[scalar / BLOCK_CODES]);
+        self.char_blocks[block * BLOCK_CODES + scalar % BLOCK_CODES]
+    }
+
+    #[inline]
+    pub fn common_prefix_search(&self, key: &[u8], hits: &mut Vec<Hit>) {
+        hits.clear();
+        self.walk_bytes(key, |hit| hits.push(hit));
+    }
+
+    #[inline(always)]
+    fn walk_bytes(&self, key: &[u8], mut found: impl FnMut(Hit)) {
+        let mut cursor = Cursor::new(self.cells);
+        let mut at = 0;
+        while let Some(&first) = key.get(at) {
+            let (code, width) = if first < 0x80 {
+                (self.ascii[usize::from(first)], 1)
+            } else {
+                let Some((char, width)) = decode(&key[at..]) else {
+                    return;
+                };
+                (self.code_of(char), width)
+            };
+            at += width;
+            match cursor.step(code) {
+                Step::Stop => return,
+                Step::Inner => {}
+                Step::Key(first_token, token_count) => found(Hit {
+                    length: at,
+                    first_token: first_token as usize,
+                    token_count: token_count as usize,
+                }),
+            }
+        }
+    }
+
+    #[inline]
+    pub fn token(&self, index: usize) -> TokenRecord {
+        self.token_at(self.tokens, index)
+    }
+
+    #[inline]
+    fn token_at(&self, bytes: &[u8], index: usize) -> TokenRecord {
+        let width = self.token_bytes;
+        let token = &bytes[index * width..(index + 1) * width];
+        let (param, feature) = if width == 8 {
+            (u32_at(token, 0) as usize, u32_at(token, 4))
+        } else {
+            (usize::from(u16_at(token, 0)), u32_at(token, 2))
+        };
+        let param = &self.params[param * PARAM_BYTES..(param + 1) * PARAM_BYTES];
+        TokenRecord {
+            left_id: u16_at(param, 0),
+            right_id: u16_at(param, 2),
+            pos_id: u16_at(param, 4),
+            word_cost: u16_at(param, 6).cast_signed(),
+            feature,
+        }
+    }
+}
+
 fn check_features(source: &Source, length: usize) -> Result<Vec<u32>, Error> {
     let threads = if length < PARALLEL_MIN_BYTES {
         1
@@ -671,12 +710,14 @@ fn check_features(source: &Source, length: usize) -> Result<Vec<u32>, Error> {
             .map(|handle| handle.join().expect("a check thread panicked"))
             .collect()
     });
-    let mut starts = Vec::new();
+    let parts = results.into_iter().collect::<Result<Vec<_>, _>>()?;
+    let mut starts =
+        Vec::with_capacity(usize::from(length > 0) + parts.iter().map(Vec::len).sum::<usize>());
     if length > 0 {
         starts.push(0);
     }
-    for result in results {
-        starts.extend(result?);
+    for part in parts {
+        starts.extend(part);
     }
     Ok(starts)
 }
@@ -700,12 +741,12 @@ fn check_feature_range(
     range: Range<usize>,
     length: usize,
 ) -> Result<Vec<u32>, Error> {
-    let mut buffer = vec![0u8; CHUNK.min(range.len())];
+    let mut buffer = vec![0u8; FEATURE_CHUNK.min(range.len())];
     let mut starts = Vec::new();
     let mut carry = 0;
     let mut done = range.start;
     while done < range.end {
-        let part = CHUNK.min(range.end - done);
+        let part = FEATURE_CHUNK.min(range.end - done);
         if buffer.len() < carry + part {
             buffer.resize(carry + part, 0);
         }
@@ -735,74 +776,45 @@ fn check_feature_range(
     Ok(starts)
 }
 
-fn check_cells(source: &Source, token_count: usize) -> Result<(), Error> {
-    let cell_count = source.sections[CELLS].len() / 8;
+fn check_cells(source: &Source, bytes: &[u8], token_count: usize) -> Result<(), Error> {
+    let units = bytes.as_chunks::<8>().0;
     let reason = "a double array unit points outside the token table";
     let valid_range =
         |first: u32, count: u32| count > 0 && first as usize + count as usize <= token_count;
-    let mut data = vec![0u64; cell_count.div_ceil(64)];
-    let mut read_error = None;
-    let first_pass = source.chunks(
-        CELLS,
-        8,
-        |first, part| {
-            for (offset, unit) in part.as_chunks::<8>().0.iter().enumerate() {
-                let index = first + offset;
-                let base = u32_at(unit, 0);
-                let check = u32_at(unit, 4);
-                if check == UNUSED_CHECK || check & TERMINAL_FLAG == 0 || check & INLINE_FLAG != 0 {
-                    continue;
-                }
-                let base = base as usize;
-                if base >= cell_count || base == index {
-                    return false;
-                }
-                let mut target = [0u8; 8];
-                if let Err(error) = source.read(CELLS, base * 8, &mut target) {
-                    read_error = Some(error);
-                    return false;
-                }
-                let tokens = u32_at(&target, 0);
-                let data_check = u32_at(&target, 4);
-                if data_check != index as u32
-                    || !valid_range(tokens & PARENT_MASK, tokens >> COUNT_SHIFT)
-                {
-                    return false;
-                }
-                data[base / 64] |= 1 << (base % 64);
-            }
-            true
-        },
-        reason,
-    );
-    if let Some(error) = read_error {
-        return Err(error);
+    let mut data = vec![0u64; units.len().div_ceil(64)];
+    for (index, unit) in units.iter().enumerate() {
+        let base = u32_at(unit, 0);
+        let check = u32_at(unit, 4);
+        if check == UNUSED_CHECK || check & TERMINAL_FLAG == 0 || check & INLINE_FLAG != 0 {
+            continue;
+        }
+        let base = base as usize;
+        if base >= units.len() || base == index {
+            return Err(source.broken(reason));
+        }
+        let tokens = u32_at(&units[base], 0);
+        let data_check = u32_at(&units[base], 4);
+        if data_check != index as u32 || !valid_range(tokens & PARENT_MASK, tokens >> COUNT_SHIFT) {
+            return Err(source.broken(reason));
+        }
+        data[base / 64] |= 1 << (base % 64);
     }
-    first_pass?;
-    source.chunks(
-        CELLS,
-        8,
-        |first, part| {
-            for (offset, unit) in part.as_chunks::<8>().0.iter().enumerate() {
-                let index = first + offset;
-                if data[index / 64] >> (index % 64) & 1 != 0 {
-                    continue;
-                }
-                let base = u32_at(unit, 0);
-                let check = u32_at(unit, 4);
-                if check == UNUSED_CHECK {
-                    continue;
-                }
-                let inline = check & INLINE_FLAG != 0;
-                let terminal = check & TERMINAL_FLAG != 0;
-                if inline && !terminal
-                    || inline && !valid_range(base, (check >> COUNT_SHIFT) & INLINE_COUNT_MASK)
-                {
-                    return false;
-                }
-            }
-            true
-        },
-        reason,
-    )
+    for (index, unit) in units.iter().enumerate() {
+        if data[index / 64] >> (index % 64) & 1 != 0 {
+            continue;
+        }
+        let base = u32_at(unit, 0);
+        let check = u32_at(unit, 4);
+        if check == UNUSED_CHECK {
+            continue;
+        }
+        let inline = check & INLINE_FLAG != 0;
+        let terminal = check & TERMINAL_FLAG != 0;
+        if inline && !terminal
+            || inline && !valid_range(base, (check >> COUNT_SHIFT) & INLINE_COUNT_MASK)
+        {
+            return Err(source.broken(reason));
+        }
+    }
+    Ok(())
 }

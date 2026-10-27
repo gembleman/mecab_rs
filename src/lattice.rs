@@ -2,12 +2,14 @@ use std::ops::Range;
 
 use crate::char_property::{CharInfo, SentenceChars};
 use crate::constraint::{Constraint, ConstraintSet};
-use crate::dictionary::{Dictionary, Lexicon, LexiconOps};
+use crate::dictionary::Dictionary;
 use crate::error::Error;
 use crate::ids::{ElementId, NodeId};
 use crate::matrix::Matrix;
 use crate::nbest::{Agenda, LinkSpan, PathLink};
+use crate::packed::{PackedDictionary, PackedView};
 use crate::system_dictionary::PrefixHit;
+use crate::system_dictionary::SystemDictionary;
 
 fn later_first<I: DoubleEndedIterator>(candidates: I) -> std::iter::Rev<I> {
     candidates.rev()
@@ -396,29 +398,24 @@ impl Lattice {
         dictionary: &Dictionary,
         sentence: &[u8],
     ) -> Result<NodeId, Error> {
-        match (&dictionary.system, &dictionary.unknown) {
-            (Lexicon::System(system), Lexicon::System(unknown)) => {
-                self.build_with::<NBEST, _, _>(dictionary, system, unknown, sentence)
-            }
-            (Lexicon::Packed(system), Lexicon::Packed(unknown)) => self.build_with::<NBEST, _, _>(
-                dictionary,
-                system.as_ref(),
-                unknown.as_ref(),
-                sentence,
-            ),
-            _ => unreachable!("system and unknown lexicons must use the same representation"),
-        }
+        self.build_with::<NBEST>(
+            dictionary,
+            &dictionary.system,
+            &dictionary.unknown,
+            sentence,
+        )
     }
 
     #[inline(always)]
-    fn build_with<const NBEST: bool, S: LexiconOps, U: LexiconOps>(
+    fn build_with<const NBEST: bool>(
         &mut self,
         dictionary: &Dictionary,
-        system: &S,
-        unknown: &U,
+        system: &PackedDictionary,
+        unknown: &PackedDictionary,
         sentence: &[u8],
     ) -> Result<NodeId, Error> {
         let sentence_len = sentence.len();
+        let view = system.view();
         self.sentence_chars.fill(&dictionary.chars, sentence);
         let bos = self.push_node(RawNode::boundary(NodeSource::Bos, 0));
         self.ends[0].push(LeftCandidate {
@@ -431,7 +428,7 @@ impl Lattice {
                 continue;
             }
             let begun =
-                self.lookup::<false, S, U>(dictionary, system, unknown, sentence, position)?;
+                self.lookup::<false>(dictionary, system, &view, unknown, sentence, position)?;
             self.connect::<NBEST>(dictionary, position, begun);
         }
         let eos_index = self.nodes.len();
@@ -446,29 +443,24 @@ impl Lattice {
     }
 
     fn build_best(&mut self, dictionary: &Dictionary, sentence: &[u8]) {
-        match (&dictionary.system, &dictionary.unknown) {
-            (Lexicon::System(system), Lexicon::System(unknown)) => {
-                self.build_best_with::<_, _>(dictionary, system, unknown, sentence)
-            }
-            (Lexicon::Packed(system), Lexicon::Packed(unknown)) => self.build_best_with::<_, _>(
-                dictionary,
-                system.as_ref(),
-                unknown.as_ref(),
-                sentence,
-            ),
-            _ => unreachable!("system and unknown lexicons must use the same representation"),
-        }
+        self.build_best_with(
+            dictionary,
+            &dictionary.system,
+            &dictionary.unknown,
+            sentence,
+        )
     }
 
     #[inline(always)]
-    fn build_best_with<S: LexiconOps, U: LexiconOps>(
+    fn build_best_with(
         &mut self,
         dictionary: &Dictionary,
-        system: &S,
-        unknown: &U,
+        system: &PackedDictionary,
+        unknown: &PackedDictionary,
         sentence: &[u8],
     ) {
         let sentence_len = sentence.len();
+        let view = system.view();
         self.sentence_chars.fill(&dictionary.chars, sentence);
         let boundary = Candidate {
             surface: 0,
@@ -497,7 +489,7 @@ impl Lattice {
             if !self.ends[position].is_empty() {
                 let first = self.best_nodes.len();
                 let found =
-                    self.lookup::<true, S, U>(dictionary, system, unknown, sentence, position);
+                    self.lookup::<true>(dictionary, system, &view, unknown, sentence, position);
                 debug_assert!(found.is_ok());
                 self.connect_best(dictionary, position, first);
             }
@@ -534,7 +526,7 @@ impl Lattice {
         let (head, tail) = ends.split_at_mut(position + 1);
         let lefts: &[LeftCandidate] = &head[position];
         match &dictionary.matrix {
-            Matrix::Dense(dense) => {
+            Matrix::PackedDense(dense) => {
                 for index in (first..best_nodes.len()).rev() {
                     let column = dense.right_column(best_nodes[index].candidate.left_id);
                     let (cost, best) = best_left::<false>(lefts, |id| {
@@ -544,15 +536,9 @@ impl Lattice {
                     store_best(best_nodes, tail, position, index, cost, best);
                 }
             }
-            Matrix::PackedDense(dense) => {
-                for index in (first..best_nodes.len()).rev() {
-                    let column = dense.right_column(best_nodes[index].candidate.left_id);
-                    let (cost, best) = best_left::<false>(lefts, |id| column[usize::from(id)]);
-                    store_best(best_nodes, tail, position, index, cost, best);
-                }
-            }
-            Matrix::Hot(hot) => {
+            Matrix::PackedHot(hot) => {
                 let hot_left = hot.hot_left();
+                let hot = hot.view();
                 let lefts_are_hot = lefts
                     .iter()
                     .all(|left| usize::from(left.right_id) < hot_left);
@@ -586,48 +572,6 @@ impl Lattice {
                     let cells = column.cells();
                     let (cost, best) = if lefts_are_hot && cells.len() == hot_left {
                         let cost = |id: u16| unsafe { *cells.get_unchecked(usize::from(id)) };
-                        best_left::<true>(lefts, cost)
-                    } else {
-                        best_left::<true>(lefts, column.into_cost_fn())
-                    };
-                    store_best(best_nodes, tail, position, next, cost, best);
-                }
-            }
-            Matrix::PackedHot(hot) => {
-                let hot_left = hot.hot_left();
-                let lefts_are_hot = lefts
-                    .iter()
-                    .all(|left| usize::from(left.right_id) < hot_left);
-                if lefts_are_hot {
-                    for node in &best_nodes[first..] {
-                        let cells = hot.right_column(node.candidate.left_id).cells();
-                        for left in lefts {
-                            prefetch(cells.as_ptr().wrapping_add(usize::from(left.right_id)));
-                        }
-                    }
-                }
-                let mut next = best_nodes.len();
-                while next > first {
-                    if lefts_are_hot && next - first >= GROUP {
-                        let indices: [usize; GROUP] = std::array::from_fn(|lane| next - 1 - lane);
-                        let columns = indices.map(|index| {
-                            hot.right_column(best_nodes[index].candidate.left_id)
-                                .cells()
-                        });
-                        if columns.iter().all(|cells| cells.len() == hot_left) {
-                            let found = best_lefts(lefts, columns);
-                            for (index, (cost, best)) in indices.into_iter().zip(found) {
-                                store_best(best_nodes, tail, position, index, cost, best);
-                            }
-                            next -= GROUP;
-                            continue;
-                        }
-                    }
-                    next -= 1;
-                    let column = hot.right_column(best_nodes[next].candidate.left_id);
-                    let cells = column.cells();
-                    let (cost, best) = if lefts_are_hot && cells.len() == hot_left {
-                        let cost = |id: u16| cells[usize::from(id)];
                         best_left::<true>(lefts, cost)
                     } else {
                         best_left::<true>(lefts, column.into_cost_fn())
@@ -768,7 +712,7 @@ impl Lattice {
         lefts: &[LeftCandidate],
     ) {
         match &dictionary.matrix {
-            Matrix::Dense(dense) => {
+            Matrix::PackedDense(dense) => {
                 for right_index in later_first(begun) {
                     let right_id = NodeId::from_index(right_index);
                     let column = dense.right_column(self.nodes[right_id].left_id);
@@ -783,20 +727,9 @@ impl Lattice {
                     );
                 }
             }
-            Matrix::PackedDense(dense) => {
-                for right_index in later_first(begun) {
-                    let right_id = NodeId::from_index(right_index);
-                    let column = dense.right_column(self.nodes[right_id].left_id);
-                    self.connect_right::<NBEST, false>(
-                        position,
-                        right_id,
-                        lefts,
-                        |left_right_id| column[usize::from(left_right_id)],
-                    );
-                }
-            }
-            Matrix::Hot(hot) => {
+            Matrix::PackedHot(hot) => {
                 let hot_left = hot.hot_left();
+                let hot = hot.view();
                 let lefts_are_hot = lefts
                     .iter()
                     .all(|left| usize::from(left.right_id) < hot_left);
@@ -808,28 +741,6 @@ impl Lattice {
                         let cost = |left_right_id: u16| unsafe {
                             *cells.get_unchecked(usize::from(left_right_id))
                         };
-                        self.connect_right::<NBEST, true>(position, right_id, lefts, cost);
-                    } else {
-                        self.connect_right::<NBEST, true>(
-                            position,
-                            right_id,
-                            lefts,
-                            column.into_cost_fn(),
-                        );
-                    }
-                }
-            }
-            Matrix::PackedHot(hot) => {
-                let hot_left = hot.hot_left();
-                let lefts_are_hot = lefts
-                    .iter()
-                    .all(|left| usize::from(left.right_id) < hot_left);
-                for right_index in later_first(begun) {
-                    let right_id = NodeId::from_index(right_index);
-                    let column = hot.right_column(self.nodes[right_id].left_id);
-                    let cells = column.cells();
-                    if lefts_are_hot && cells.len() == hot_left {
-                        let cost = |left_right_id: u16| cells[usize::from(left_right_id)];
                         self.connect_right::<NBEST, true>(position, right_id, lefts, cost);
                     } else {
                         self.connect_right::<NBEST, true>(
@@ -888,11 +799,12 @@ impl Lattice {
     }
 
     #[inline(always)]
-    fn lookup<const BEST: bool, S: LexiconOps, U: LexiconOps>(
+    fn lookup<const BEST: bool>(
         &mut self,
         dictionary: &Dictionary,
-        system: &S,
-        unknown: &U,
+        system: &PackedDictionary,
+        view: &PackedView<'_>,
+        unknown: &PackedDictionary,
         sentence: &[u8],
         begin: usize,
     ) -> Result<Range<usize>, Error> {
@@ -926,11 +838,18 @@ impl Lattice {
             char_type: char_info.default_type() as u8,
             limit: end,
         };
-        system.common_prefix_search(key, &mut self.hits);
-        self.push_hits::<BEST, _>(dictionary, system, NodeSource::System, sentence, &found);
+        view.common_prefix_search(key, &mut self.hits);
+        self.push_packed_hits::<BEST>(
+            dictionary,
+            system,
+            view,
+            NodeSource::System,
+            sentence,
+            &found,
+        );
         for (index, user) in dictionary.users.iter().enumerate() {
             user.common_prefix_search(key, &mut self.hits);
-            self.push_hits::<BEST, _>(
+            self.push_system_hits::<BEST>(
                 dictionary,
                 user,
                 NodeSource::User(index as u8),
@@ -949,7 +868,7 @@ impl Lattice {
                 surface,
                 end: after_char,
             };
-            self.add_unknown::<BEST, _>(dictionary, unknown, char_info, &span);
+            self.add_unknown::<BEST>(dictionary, unknown, char_info, &span);
             if self.node_count::<BEST>() > first {
                 return Ok(first..self.node_count::<BEST>());
             }
@@ -968,7 +887,7 @@ impl Lattice {
                     surface,
                     end: after_char,
                 };
-                self.add_unknown::<BEST, _>(dictionary, unknown, char_info, &span);
+                self.add_unknown::<BEST>(dictionary, unknown, char_info, &span);
             }
             group_end = Some(after_char);
             after_char = saved;
@@ -985,7 +904,7 @@ impl Lattice {
                 surface,
                 end: after_char,
             };
-            self.add_unknown::<BEST, _>(dictionary, unknown, char_info, &span);
+            self.add_unknown::<BEST>(dictionary, unknown, char_info, &span);
             let (next_info, width) = if whole {
                 self.sentence_chars.char_info(after_char)
             } else {
@@ -1002,7 +921,7 @@ impl Lattice {
                 surface,
                 end: after_char,
             };
-            self.add_unknown::<BEST, _>(dictionary, unknown, char_info, &span);
+            self.add_unknown::<BEST>(dictionary, unknown, char_info, &span);
         }
         if partial && self.node_count::<BEST>() == first {
             self.add_constrained_unknown(dictionary, unknown, sentence, begin, surface, end)?;
@@ -1011,10 +930,52 @@ impl Lattice {
     }
 
     #[inline]
-    fn push_hits<const BEST: bool, W: LexiconOps>(
+    fn push_packed_hits<const BEST: bool>(
         &mut self,
         dictionary: &Dictionary,
-        words: &W,
+        words: &PackedDictionary,
+        view: &PackedView<'_>,
+        source: NodeSource,
+        sentence: &[u8],
+        found: &Found,
+    ) {
+        for hit_index in 0..self.hits.len() {
+            let hit = self.hits[hit_index];
+            let end =
+                dictionary
+                    .chars
+                    .extended_end(sentence, found.surface + hit.length(), found.limit);
+            for token_index in hit.tokens() {
+                let token = view.token(token_index);
+                if !BEST
+                    && found.partial
+                    && !self
+                        .constraints
+                        .admits(found.begin, end, || words.feature(token.feature))
+                {
+                    continue;
+                }
+                let candidate = Candidate {
+                    surface: found.surface as u32,
+                    end: end as u32,
+                    feature: token.feature,
+                    left_id: token.left_id,
+                    right_id: token.right_id,
+                    pos_id: token.pos_id,
+                    word_cost: token.word_cost,
+                    source,
+                    char_type: found.char_type,
+                };
+                self.push_candidate::<BEST>(found.begin, candidate);
+            }
+        }
+    }
+
+    #[inline]
+    fn push_system_hits<const BEST: bool>(
+        &mut self,
+        dictionary: &Dictionary,
+        words: &SystemDictionary,
         source: NodeSource,
         sentence: &[u8],
         found: &Found,
@@ -1051,10 +1012,10 @@ impl Lattice {
         }
     }
 
-    fn add_constrained_unknown<U: LexiconOps>(
+    fn add_constrained_unknown(
         &mut self,
         dictionary: &Dictionary,
-        unknown: &U,
+        unknown: &PackedDictionary,
         sentence: &[u8],
         begin: usize,
         surface: usize,
@@ -1074,7 +1035,7 @@ impl Lattice {
             surface,
             end: cursor,
         };
-        self.add_unknown::<false, _>(dictionary, unknown, char_info, &span);
+        self.add_unknown::<false>(dictionary, unknown, char_info, &span);
         if self.nodes.len() > first {
             return Ok(());
         }
@@ -1100,10 +1061,10 @@ impl Lattice {
     }
 
     #[inline(always)]
-    fn add_unknown<const BEST: bool, U: LexiconOps>(
+    fn add_unknown<const BEST: bool>(
         &mut self,
         dictionary: &Dictionary,
-        unknown: &U,
+        unknown: &PackedDictionary,
         char_info: CharInfo,
         span: &Span,
     ) {

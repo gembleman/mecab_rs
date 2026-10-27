@@ -157,35 +157,47 @@ fn read_counts(path: &Path) -> Result<Vec<u64>, Error> {
 
 pub fn collect_stats(dict_dir: &Path, corpora: &[PathBuf]) -> Result<ContextStats, Error> {
     let (left_size, right_size) = matrix_shape(dict_dir)?;
-    let dictionary = Dictionary::open(dict_dir)?;
-    let mut tagger = Tagger::new(&dictionary);
-    let mut stats = ContextStats {
-        right: vec![0; left_size],
-        left: vec![0; right_size],
-    };
-    for corpus in corpora {
-        let bytes = read_file(corpus)?;
-        let text = std::str::from_utf8(&bytes).map_err(|_| bad(corpus, "not UTF-8"))?;
-        for line in text.split_terminator('\n') {
-            let sentence = line.strip_suffix('\r').unwrap_or(line);
-            let view = tagger.parse_lattice(sentence, &[])?;
-            for position in 0..=sentence.len() {
-                let ends = view.end_nodes(position);
-                let begins = view.begin_nodes(position);
-                if ends.len() == 0 || begins.len() == 0 {
-                    continue;
-                }
-                let (end_count, begin_count) = (ends.len() as u64, begins.len() as u64);
-                for node in ends {
-                    stats.right[usize::from(node.right_id())] += begin_count;
-                }
-                for node in begins {
-                    stats.left[usize::from(node.left_id())] += end_count;
+    let runtime = std::env::temp_dir().join(format!(
+        "mecab-rs-rebuild-{}-{}.mrd",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos())
+    ));
+    let result = (|| {
+        crate::packed::write_runtime(dict_dir, &runtime)?;
+        let dictionary = Dictionary::open(&runtime)?;
+        let mut tagger = Tagger::new(&dictionary);
+        let mut stats = ContextStats {
+            right: vec![0; left_size],
+            left: vec![0; right_size],
+        };
+        for corpus in corpora {
+            let bytes = read_file(corpus)?;
+            let text = std::str::from_utf8(&bytes).map_err(|_| bad(corpus, "not UTF-8"))?;
+            for line in text.split_terminator('\n') {
+                let sentence = line.strip_suffix('\r').unwrap_or(line);
+                let view = tagger.parse_lattice(sentence, &[])?;
+                for position in 0..=sentence.len() {
+                    let ends = view.end_nodes(position);
+                    let begins = view.begin_nodes(position);
+                    if ends.len() == 0 || begins.len() == 0 {
+                        continue;
+                    }
+                    let (end_count, begin_count) = (ends.len() as u64, begins.len() as u64);
+                    for node in ends {
+                        stats.right[usize::from(node.right_id())] += begin_count;
+                    }
+                    for node in begins {
+                        stats.left[usize::from(node.left_id())] += end_count;
+                    }
                 }
             }
         }
-    }
-    Ok(stats)
+        Ok(stats)
+    })();
+    let _ = fs::remove_file(&runtime);
+    result
 }
 
 

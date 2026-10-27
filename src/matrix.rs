@@ -1,8 +1,5 @@
 use std::path::Path;
 
-use memmap2::Mmap;
-
-use crate::dictionary::map_file;
 use crate::error::Error;
 use crate::int_templates::MappedIntTemplates;
 use crate::mapped_bytes::MappedBytes;
@@ -31,17 +28,11 @@ fn header_sizes(map: &[u8], path: &Path, words: usize) -> Result<[usize; 4], Err
     Ok(sizes)
 }
 
-pub(crate) struct DenseMatrix<S = Mmap> {
+pub(crate) struct DenseMatrix<S = MappedBytes> {
     map: S,
     costs: Section<i16>,
     left_size: usize,
     right_size: usize,
-}
-
-impl DenseMatrix<Mmap> {
-    fn open(path: &Path) -> Result<Self, Error> {
-        Self::from_source(map_file(path)?, path)
-    }
 }
 
 impl<S: SectionSource> DenseMatrix<S> {
@@ -69,7 +60,7 @@ impl<S: SectionSource> DenseMatrix<S> {
     }
 }
 
-pub(crate) enum ColdPath<S = Mmap> {
+pub(crate) enum ColdPath<S = MappedBytes> {
     Float(MappedTemplates<S>),
     Int(Box<MappedIntTemplates<S>>),
 }
@@ -90,7 +81,7 @@ impl<S: SectionSource> ColdPath<S> {
     }
 }
 
-pub(crate) struct HotMatrix<S = Mmap> {
+pub(crate) struct HotMatrix<S = MappedBytes> {
     map: S,
     costs: Section<i16>,
     templates: ColdPath<S>,
@@ -98,7 +89,7 @@ pub(crate) struct HotMatrix<S = Mmap> {
     hot_right: usize,
 }
 
-pub(crate) struct HotColumn<'m, S = Mmap> {
+pub(crate) struct HotColumn<'m, S = MappedBytes> {
     cells: &'m [i16],
     templates: &'m ColdPath<S>,
     right_left_id: u16,
@@ -135,12 +126,6 @@ impl<'m, S: SectionSource> HotColumn<'m, S> {
     }
 }
 
-impl HotMatrix<Mmap> {
-    fn open(path: &Path, templates: ColdPath) -> Result<Self, Error> {
-        Self::from_source(map_file(path)?, templates, path)
-    }
-}
-
 impl<S: SectionSource> HotMatrix<S> {
     fn from_source(map: S, templates: ColdPath<S>, path: &Path) -> Result<Self, Error> {
         let [left_size, right_size, hot_left, hot_right] =
@@ -172,24 +157,42 @@ impl<S: SectionSource> HotMatrix<S> {
         self.hot_left
     }
 
-    pub(crate) fn right_column(&self, right_left_id: u16) -> HotColumn<'_, S> {
+    #[inline]
+    pub(crate) fn view(&self) -> HotView<'_, S> {
+        HotView {
+            costs: self.costs.view_source(&self.map),
+            templates: &self.templates,
+            hot_left: self.hot_left,
+            hot_right: self.hot_right,
+        }
+    }
+}
+
+pub(crate) struct HotView<'m, S = MappedBytes> {
+    costs: &'m [i16],
+    templates: &'m ColdPath<S>,
+    hot_left: usize,
+    hot_right: usize,
+}
+
+impl<'m, S: SectionSource> HotView<'m, S> {
+    #[inline]
+    pub(crate) fn right_column(&self, right_left_id: u16) -> HotColumn<'m, S> {
         let row = usize::from(right_left_id);
         let cells = if row < self.hot_right {
-            &self.costs.view_source(&self.map)[row * self.hot_left..(row + 1) * self.hot_left]
+            &self.costs[row * self.hot_left..(row + 1) * self.hot_left]
         } else {
             &[]
         };
         HotColumn {
             cells,
-            templates: &self.templates,
+            templates: self.templates,
             right_left_id,
         }
     }
 }
 
 pub(crate) enum Matrix {
-    Dense(DenseMatrix<Mmap>),
-    Hot(HotMatrix<Mmap>),
     PackedDense(DenseMatrix<MappedBytes>),
     PackedHot(HotMatrix<MappedBytes>),
 }
@@ -233,24 +236,8 @@ impl Matrix {
         Self::from_mapped_hot(map, templates, true, path)
     }
 
-    pub(crate) fn open_dense(path: &Path) -> Result<Self, Error> {
-        DenseMatrix::open(path).map(Self::Dense)
-    }
-
-    pub(crate) fn open_hot(path: &Path, templates_path: &Path) -> Result<Self, Error> {
-        let templates = ColdPath::Float(MappedTemplates::open(templates_path)?);
-        HotMatrix::open(path, templates).map(Self::Hot)
-    }
-
-    pub(crate) fn open_hot_int(path: &Path, int_templates_path: &Path) -> Result<Self, Error> {
-        let templates = ColdPath::Int(Box::new(MappedIntTemplates::open(int_templates_path)?));
-        HotMatrix::open(path, templates).map(Self::Hot)
-    }
-
     pub(crate) fn left_size(&self) -> usize {
         match self {
-            Self::Dense(dense) => dense.left_size,
-            Self::Hot(hot) => hot.templates.left_size(),
             Self::PackedDense(dense) => dense.left_size,
             Self::PackedHot(hot) => hot.templates.left_size(),
         }
@@ -258,8 +245,6 @@ impl Matrix {
 
     pub(crate) fn right_size(&self) -> usize {
         match self {
-            Self::Dense(dense) => dense.right_size,
-            Self::Hot(hot) => hot.templates.right_size(),
             Self::PackedDense(dense) => dense.right_size,
             Self::PackedHot(hot) => hot.templates.right_size(),
         }
