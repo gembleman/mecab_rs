@@ -12,7 +12,6 @@ use memmap2::Mmap;
 use crate::clusters::{ClusterPlan, plan_projection_clusters, representatives};
 use crate::dictionary::map_file;
 use crate::error::Error;
-use crate::mapped_bytes::MappedBytes;
 use crate::section::{Section, SectionSource};
 use crate::templates::{TemplateReader, write_array};
 
@@ -798,12 +797,6 @@ impl MappedIntTemplates<Mmap> {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
         Self::from_source(map_file(path)?, path)
-    }
-}
-
-impl MappedIntTemplates<MappedBytes> {
-    pub(crate) fn from_mapped(map: MappedBytes, path: &Path) -> Result<Self, Error> {
-        Self::from_source(map, path)
     }
 }
 

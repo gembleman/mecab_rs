@@ -2,7 +2,6 @@ use std::path::Path;
 
 use crate::error::Error;
 use crate::int_runtime::{RuntimeIntTemplates, is_runtime_form};
-use crate::int_templates::MappedIntTemplates;
 use crate::mapped_bytes::MappedBytes;
 use crate::section::{Section, SectionSource};
 use crate::templates::MappedTemplates;
@@ -63,7 +62,6 @@ impl<S: SectionSource> DenseMatrix<S> {
 
 pub(crate) enum ColdPath<S = MappedBytes> {
     Float(MappedTemplates<S>),
-    Int(Box<MappedIntTemplates<S>>),
     Runtime(Box<RuntimeIntTemplates<S>>),
 }
 
@@ -71,7 +69,6 @@ impl<S: SectionSource> ColdPath<S> {
     fn left_size(&self) -> usize {
         match self {
             Self::Float(templates) => templates.left_size(),
-            Self::Int(templates) => templates.left_size(),
             Self::Runtime(templates) => templates.left_size(),
         }
     }
@@ -79,7 +76,6 @@ impl<S: SectionSource> ColdPath<S> {
     fn right_size(&self) -> usize {
         match self {
             Self::Float(templates) => templates.right_size(),
-            Self::Int(templates) => templates.right_size(),
             Self::Runtime(templates) => templates.right_size(),
         }
     }
@@ -108,7 +104,6 @@ fn cold_cost<S: SectionSource>(
 ) -> i16 {
     match templates {
         ColdPath::Float(templates) => templates.cost(left_right_id, right_left_id),
-        ColdPath::Int(templates) => templates.cost(left_right_id, right_left_id),
         ColdPath::Runtime(templates) => templates.cost(left_right_id, right_left_id),
     }
 }
@@ -225,10 +220,14 @@ impl Matrix {
         integer: bool,
         path: &Path,
     ) -> Result<Self, Error> {
-        let templates = if integer && is_runtime_form(&templates) {
+        let templates = if integer {
+            if !is_runtime_form(&templates) {
+                return Err(Error::Format {
+                    file: path.to_path_buf(),
+                    reason: "the integer templates are not in the runtime form",
+                });
+            }
             ColdPath::Runtime(Box::new(RuntimeIntTemplates::from_mapped(templates, path)?))
-        } else if integer {
-            ColdPath::Int(Box::new(MappedIntTemplates::from_mapped(templates, path)?))
         } else {
             ColdPath::Float(MappedTemplates::from_mapped(templates, path)?)
         };

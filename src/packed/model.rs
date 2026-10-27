@@ -3,12 +3,13 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, Write};
 
+use super::bits::{BitWriter, MAX_RECORD_BITS, PADDING, width_of};
 use super::features;
 use super::trie::{self, Entry};
 use super::{
-    BLOCK_CODES, BLOCK_COUNT, CELLS, CHAR_BLOCKS, CHAR_INDEX, CHAR_TABLE, DICRC, FEATURES,
-    FLAG_HOT_MATRIX, FLAG_INT_TEMPLATES, FLAG_WIDE_PARAMS, HEADER_BYTES, MAGIC, MATRIX, PARAMS,
-    SECTIONS, TEMPLATES, TOKENS, UNKNOWN_STARTS, UNKNOWN_TOKENS, VERSION,
+    BLOCK_CODES, BLOCK_COUNT, CELLS, CELLS_PADDING, CHAR_BLOCKS, CHAR_INDEX, CHAR_TABLE, DICRC,
+    FEATURES, FLAG_HOT_MATRIX, FLAG_INT_TEMPLATES, HEADER_BYTES, MAGIC, MATRIX, PARAMS, SECTIONS,
+    TEMPLATES, TOKENS, UNIT_BYTES, UNKNOWN_STARTS, UNKNOWN_TOKENS, VERSION,
 };
 use crate::Error;
 use crate::int_runtime::{is_runtime_form, runtime_form_of};
@@ -109,7 +110,6 @@ impl Model {
             .collect();
         let cells = trie::build(&entries)?;
 
-        let wide = self.params.len() > 1 << 16;
         let mut tokens: Vec<(u32, &str)> =
             Vec::with_capacity(self.token_features.len() + self.unknown_features.len());
         let mut next = self.token_features.iter();
@@ -125,12 +125,26 @@ impl Model {
         let (index, blocks) = char_map(&table);
         sections[CHAR_INDEX] = le_bytes(&index, u16::to_le_bytes).into();
         sections[CHAR_BLOCKS] = le_bytes(&blocks, u16::to_le_bytes).into();
-        sections[CELLS] = cells
-            .iter()
-            .flat_map(|unit| unit.iter().flat_map(|value| value.to_le_bytes()))
-            .collect::<Vec<u8>>()
-            .into();
-        sections[TOKENS] = encode_tokens(&self.token_params, system_starts, wide).into();
+        sections[CELLS] = encode_cells(&cells).into();
+        let param_bits = width_of(
+            (self.token_params.iter().chain(&self.unknown_params))
+                .copied()
+                .max()
+                .map_or(0, u64::from),
+        );
+        let feature_bits = width_of(
+            (system_starts.iter().chain(unknown_starts))
+                .copied()
+                .max()
+                .map_or(0, u64::from),
+        );
+        if param_bits + feature_bits > MAX_RECORD_BITS {
+            return Err(Error::Unsupported(
+                "a token needs more than 56 bits for its parameter set and feature",
+            ));
+        }
+        sections[TOKENS] =
+            encode_tokens(&self.token_params, system_starts, param_bits, feature_bits).into();
         sections[PARAMS] = self
             .params
             .iter()
@@ -145,14 +159,24 @@ impl Model {
             .into();
         sections[FEATURES] = encoded.bytes.into();
         sections[UNKNOWN_STARTS] = le_bytes(&self.unknown_starts, u32::to_le_bytes).into();
-        sections[UNKNOWN_TOKENS] = encode_tokens(&self.unknown_params, unknown_starts, wide).into();
+        sections[UNKNOWN_TOKENS] = encode_tokens(
+            &self.unknown_params,
+            unknown_starts,
+            param_bits,
+            feature_bits,
+        )
+        .into();
         sections[MATRIX] = Cow::Borrowed(&self.matrix);
         sections[TEMPLATES] = if self.integer_templates && !is_runtime_form(&self.templates) {
             let hot =
                 |at: usize| usize::from(u16::from_le_bytes([self.matrix[at], self.matrix[at + 1]]));
             match runtime_form_of(&self.templates, hot(4), hot(6)) {
                 Ok(bytes) => bytes.into(),
-                Err(Error::Unsupported(_)) => Cow::Borrowed(&self.templates),
+                Err(Error::Unsupported(_)) => {
+                    return Err(Error::Unsupported(
+                        "the integer templates have no runtime form (they have no clusters, or an exception differs from the computed cost by more than 1); run rebuild without --int or with a fitting shift",
+                    ));
+                }
                 Err(error) => return Err(error),
             }
         } else {
@@ -170,8 +194,7 @@ impl Model {
         let mut out = Vec::new();
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
-        let flags = (u32::from(wide) * FLAG_WIDE_PARAMS)
-            | (u32::from(!self.templates.is_empty()) * FLAG_HOT_MATRIX)
+        let flags = (u32::from(!self.templates.is_empty()) * FLAG_HOT_MATRIX)
             | (u32::from(self.integer_templates) * FLAG_INT_TEMPLATES);
         out.extend_from_slice(&flags.to_le_bytes());
         for count in [
@@ -179,8 +202,8 @@ impl Model {
             self.token_params.len() as u32,
             self.params.len() as u32,
             self.unknown_starts.len().saturating_sub(1) as u32,
-            0,
-            0,
+            param_bits,
+            feature_bits,
         ] {
             out.extend_from_slice(&count.to_le_bytes());
         }
@@ -198,17 +221,23 @@ impl Model {
     }
 }
 
-fn encode_tokens(params: &[u32], starts: &[u32], wide: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(params.len() * if wide { 8 } else { 6 });
-    for (&param, &start) in params.iter().zip(starts) {
-        if wide {
-            out.extend_from_slice(&param.to_le_bytes());
-        } else {
-            out.extend_from_slice(&(param as u16).to_le_bytes());
-        }
-        out.extend_from_slice(&start.to_le_bytes());
+fn encode_cells(cells: &[u64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(cells.len() * UNIT_BYTES + CELLS_PADDING);
+    for unit in cells {
+        out.extend_from_slice(&unit.to_le_bytes()[..UNIT_BYTES]);
     }
+    out.extend_from_slice(&[0; CELLS_PADDING]);
     out
+}
+
+fn encode_tokens(params: &[u32], starts: &[u32], param_bits: u32, feature_bits: u32) -> Vec<u8> {
+    let bits = (param_bits + feature_bits) as usize;
+    let mut out = BitWriter::with_capacity((params.len() * bits).div_ceil(8) + PADDING);
+    for (&param, &start) in params.iter().zip(starts) {
+        out.push(u64::from(param), param_bits);
+        out.push(u64::from(start), feature_bits);
+    }
+    out.finish()
 }
 
 fn char_map(table: &[u16]) -> (Vec<u16>, Vec<u16>) {

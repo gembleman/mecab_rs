@@ -1,13 +1,14 @@
 
 use super::{
-    COUNT_SHIFT, INLINE_COUNT_MASK, INLINE_FLAG, MAX_UNITS, PARENT_MASK, TERMINAL_FLAG,
-    UNUSED_CHECK,
+    INLINE_COUNT_MASK, INLINE_COUNT_SHIFT, INLINE_FLAG, MAX_UNITS, ROOT_LABEL, TERMINAL_FLAG,
+    UNUSED_LABEL, VALUE_MASK, label_of, unit,
 };
 use crate::Error;
 
 const NONE: u32 = u32::MAX;
 const FRONT_TRIES: usize = 6000;
 const TOO_BIG: &str = "the double array needs more than 16 million units";
+const FREE: u64 = unit(0, UNUSED_LABEL, 0);
 
 pub(super) struct Entry<'a> {
     pub(super) codes: &'a [u16],
@@ -45,7 +46,7 @@ impl Node {
     }
 
     fn is_inline(&self) -> bool {
-        self.is_terminal() && self.children == 0 && u32::from(self.count) <= INLINE_COUNT_MASK
+        self.is_terminal() && self.children == 0 && self.count <= INLINE_COUNT_MASK
     }
 
     fn needs_data_unit(&self) -> bool {
@@ -54,14 +55,30 @@ impl Node {
 }
 
 struct Units {
-    cells: Vec<[u32; 2]>,
+    cells: Vec<u64>,
     skip: Vec<u32>,
+    bases: Vec<bool>,
     cursor: usize,
 }
 
 impl Units {
     fn is_free(&self, index: usize) -> bool {
-        index >= self.cells.len() || self.cells[index][1] == UNUSED_CHECK
+        index >= self.cells.len() || label_of(self.cells[index]) == UNUSED_LABEL
+    }
+
+    fn base_is_taken(&self, base: usize) -> bool {
+        self.bases.get(base).copied().unwrap_or(false)
+    }
+
+    fn take_base(&mut self, base: usize) {
+        if base >= self.bases.len() {
+            self.bases.resize(base + 1, false);
+        }
+        self.bases[base] = true;
+    }
+
+    fn set_value(&mut self, index: usize, value: u32) {
+        self.cells[index] = self.cells[index] & !VALUE_MASK | u64::from(value);
     }
 
     fn next_free(&mut self, index: usize) -> usize {
@@ -85,28 +102,29 @@ impl Units {
         }
         if length > self.cells.len() {
             let from = self.cells.len() as u32;
-            self.cells.resize(length, [0, UNUSED_CHECK]);
+            self.cells.resize(length, FREE);
             self.skip.extend(from..length as u32);
         }
         Ok(())
     }
 
-    fn take(&mut self, index: usize, unit: [u32; 2]) {
+    fn take(&mut self, index: usize, unit: u64) {
         self.cells[index] = unit;
         self.skip[index] = index as u32 + 1;
     }
 }
 
-pub(super) fn build(entries: &[Entry]) -> Result<Vec<[u32; 2]>, Error> {
+pub(super) fn build(entries: &[Entry]) -> Result<Vec<u64>, Error> {
     let mut nodes = vec![Node::new(0)];
     link_trie(entries, &mut nodes)?;
     let mut units = Units {
         cells: Vec::new(),
         skip: Vec::new(),
+        bases: Vec::new(),
         cursor: 0,
     };
     units.grow(1)?;
-    units.take(0, [0, PARENT_MASK]);
+    units.take(0, unit(0, ROOT_LABEL, 0));
     let mut queue = vec![0u32];
     let mut codes: Vec<u16> = Vec::new();
     let mut children: Vec<u32> = Vec::new();
@@ -129,29 +147,26 @@ pub(super) fn build(entries: &[Entry]) -> Result<Vec<[u32; 2]>, Error> {
             continue;
         }
         let base = find_base(&mut units, &codes)?;
+        units.take_base(base);
         let parent = nodes[id].position;
-        units.cells[parent as usize][0] = base as u32;
+        units.set_value(parent as usize, base as u32);
         if nodes[id].needs_data_unit() {
             let node = &nodes[id];
-            let data = [
-                node.first_token | u32::from(node.count) << COUNT_SHIFT,
-                parent,
-            ];
-            units.take(base, data);
+            units.take(base, unit(node.first_token, 0, node.count));
         }
         for &child in &children {
             let node = &mut nodes[child as usize];
             let position = base + usize::from(node.code);
             node.position = position as u32;
             let (value, flags) = if node.is_inline() {
-                let count = u32::from(node.count) << COUNT_SHIFT;
+                let count = node.count << INLINE_COUNT_SHIFT;
                 (node.first_token, TERMINAL_FLAG | INLINE_FLAG | count)
             } else if node.is_terminal() {
                 (0, TERMINAL_FLAG)
             } else {
                 (0, 0)
             };
-            units.take(position, [value, parent | flags]);
+            units.take(position, unit(value, node.code, flags));
             queue.push(child);
         }
     }
@@ -168,7 +183,7 @@ fn link_trie(entries: &[Entry], nodes: &mut Vec<Node>) -> Result<(), Error> {
             .zip(previous)
             .take_while(|(a, b)| a == b)
             .count();
-        if entry.first_token > PARENT_MASK {
+        if entry.first_token > VALUE_MASK as u32 {
             return Err(Error::Unsupported("more than 16 million tokens"));
         }
         if codes.is_empty() || shared == codes.len() || entry.count == 0 {
@@ -204,9 +219,10 @@ fn find_base(units: &mut Units, codes: &[u16]) -> Result<usize, Error> {
     let mut jumped = false;
     let base = loop {
         let base = candidate - first;
-        if codes[1..]
-            .iter()
-            .all(|&code| units.is_free(base + usize::from(code)))
+        if !units.base_is_taken(base)
+            && codes[1..]
+                .iter()
+                .all(|&code| units.is_free(base + usize::from(code)))
         {
             break base;
         }

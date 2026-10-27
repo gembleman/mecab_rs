@@ -6,17 +6,19 @@ use std::sync::Arc;
 
 use memmap2::Mmap;
 
+use super::bits::{MAX_RECORD_BITS, mask_of, section_bytes};
 use super::features::{FeatureView, Layout as FeatureLayout, NumSpec, check as feature_check};
 use super::{
-    BLOCK_CODES, BLOCK_COUNT, CELLS, CHAR_BLOCKS, CHAR_INDEX, CHAR_TABLE, COUNT_SHIFT, DICRC,
-    FEATURES, FLAG_HOT_MATRIX, FLAG_INT_TEMPLATES, FLAG_WIDE_PARAMS, HEADER_BYTES,
-    INLINE_COUNT_MASK, INLINE_FLAG, MAGIC, MATRIX, MAX_UNITS, PARAMS, PARENT_MASK, SECTION_NAMES,
-    SECTIONS, TEMPLATES, TERMINAL_FLAG, TOKENS, UNKNOWN_STARTS, UNKNOWN_TOKENS, UNUSED_CHECK,
-    VERSION,
+    BLOCK_CODES, BLOCK_COUNT, CELLS, CELLS_PADDING, CHAR_BLOCKS, CHAR_INDEX, CHAR_TABLE, DICRC,
+    FEATURES, FLAG_HOT_MATRIX, FLAG_INT_TEMPLATES, FLAGS_SHIFT, HEADER_BYTES, INLINE_COUNT_MASK,
+    INLINE_COUNT_SHIFT, INLINE_FLAG, MAGIC, MATRIX, MAX_UNITS, PARAMS, SECTION_NAMES, SECTIONS,
+    TEMPLATES, TERMINAL_FLAG, TOKENS, UNIT_BYTES, UNKNOWN_STARTS, UNKNOWN_TOKENS, UNUSED_LABEL,
+    VALUE_MASK, VERSION, label_of,
 };
 use crate::char_table::{HEADER_BYTES as CHAR_TABLE_HEADER, MAGIC as CHAR_TABLE_MAGIC};
 use crate::dictionary::map_file;
 use crate::error::Error;
+use crate::int_runtime::is_runtime_form;
 use crate::mapped_bytes::MappedBytes;
 use crate::section::Section;
 use crate::system_dictionary::PrefixHit;
@@ -120,9 +122,10 @@ pub struct PackedDictionary {
     sections: [Range<usize>; SECTIONS],
     char_index: Section<u16>,
     char_blocks: Section<u16>,
-    cells: Section<[u32; 2]>,
-    token_bytes: usize,
+    cells: Section<u8>,
+    format: TokenFormat,
     token_count: usize,
+    unknown_count: usize,
     left_size: usize,
     right_size: usize,
     category_count: usize,
@@ -152,23 +155,32 @@ impl PackedDictionary {
             return Err(broken("the file is shorter than its header"));
         }
         read_at(&file, &mut header, 0).map_err(io_error)?;
-        if header[..8] != *MAGIC || u32_at(&header, 8) != VERSION {
-            return Err(broken("the magic number or the version is not valid"));
+        if header[..8] != *MAGIC {
+            return Err(broken("the magic number is not valid"));
+        }
+        if u32_at(&header, 8) != VERSION {
+            return Err(broken(
+                "the file has another format version; pack the dictionary again",
+            ));
         }
         let flags = u32_at(&header, 12);
-        if flags & !(FLAG_WIDE_PARAMS | FLAG_HOT_MATRIX | FLAG_INT_TEMPLATES) != 0 {
+        if flags & !(FLAG_HOT_MATRIX | FLAG_INT_TEMPLATES) != 0 {
             return Err(broken("the flags are not valid"));
         }
         if flags & FLAG_INT_TEMPLATES != 0 && flags & FLAG_HOT_MATRIX == 0 {
             return Err(broken("integer templates require a hot matrix"));
         }
-        let token_bytes = if flags & FLAG_WIDE_PARAMS != 0 { 8 } else { 6 };
         let code_count = u32_at(&header, 16) as usize;
         let token_count = u32_at(&header, 20) as usize;
         let param_count = u32_at(&header, 24) as usize;
         let category_count = u32_at(&header, 28) as usize;
-        if u32_at(&header, 32) != 0 || u32_at(&header, 36) != 0 {
-            return Err(broken("a reserved field is not zero"));
+        let (param_bits, feature_bits) = (u32_at(&header, 32), u32_at(&header, 36));
+        if param_bits == 0 || feature_bits == 0 || param_bits > 32 || feature_bits > 32 {
+            return Err(broken("the widths of the token fields are not valid"));
+        }
+        let format = TokenFormat::new(param_bits, feature_bits);
+        if format.bits > MAX_RECORD_BITS as usize {
+            return Err(broken("the widths of the token fields are not valid"));
         }
         let mut sections: [Range<usize>; SECTIONS] = Default::default();
         let mut end = HEADER_BYTES as u64;
@@ -195,21 +207,18 @@ impl PackedDictionary {
         if length(CHAR_INDEX) != BLOCK_COUNT * 2
             || length(CHAR_BLOCKS) == 0
             || length(CHAR_BLOCKS) % (BLOCK_CODES * 2) != 0
-            || length(CELLS) == 0
-            || length(CELLS) % 8 != 0
-            || length(CELLS) / 8 > MAX_UNITS
-            || length(TOKENS) != token_count * token_bytes
+            || length(CELLS) < UNIT_BYTES + CELLS_PADDING
+            || !(length(CELLS) - CELLS_PADDING).is_multiple_of(UNIT_BYTES)
+            || (length(CELLS) - CELLS_PADDING) / UNIT_BYTES > MAX_UNITS
+            || length(TOKENS) as u64 != section_bytes(token_count, format.bits)
             || length(PARAMS) != param_count * PARAM_BYTES
             || length(UNKNOWN_STARTS) != (category_count + 1) * 4
-            || length(UNKNOWN_TOKENS) % token_bytes != 0
             || code_count == 0
             || code_count > 1 << 16
             || token_count > MAX_UNITS
-            || (token_bytes == 6 && param_count > 1 << 16)
         {
             return Err(broken("the size of a section does not match the header"));
         }
-        let unknown_count = length(UNKNOWN_TOKENS) / token_bytes;
 
         let mut matrix_header = [0u8; 4];
         if length(MATRIX) < 4 {
@@ -241,8 +250,7 @@ impl PackedDictionary {
                 return Err(broken("the integer templates are empty"));
             }
             source.read(TEMPLATES, 0, &mut templates_header)?;
-            if templates_header[..4] != *b"MXIT"
-                || !matches!(u32_at(&templates_header, 4), 1 | 2)
+            if !is_runtime_form(&templates_header)
                 || u32_at(&templates_header, 16) as usize != left_size
                 || u32_at(&templates_header, 20) as usize != right_size
             {
@@ -312,19 +320,6 @@ impl PackedDictionary {
             "a parameter set has a context id outside the matrix",
         )?;
 
-        let valid_tokens = |_: usize, part: &[u8]| {
-            part.chunks_exact(token_bytes).all(|token| {
-                let (param, feature) = if token_bytes == 8 {
-                    (u32_at(token, 0) as usize, u32_at(token, 4) as usize)
-                } else {
-                    (usize::from(u16_at(token, 0)), u32_at(token, 2) as usize)
-                };
-                param < param_count && checked.is_record(feature)
-            })
-        };
-        let reason = "a token has a parameter set or a feature that does not exist";
-        source.chunks(TOKENS, token_bytes, valid_tokens, reason)?;
-        source.chunks(UNKNOWN_TOKENS, token_bytes, valid_tokens, reason)?;
         let unknown_starts = source.read_all(UNKNOWN_STARTS)?;
         let unknown_starts: Vec<u32> = unknown_starts
             .as_chunks::<4>()
@@ -332,12 +327,27 @@ impl PackedDictionary {
             .iter()
             .map(|&word| u32::from_le_bytes(word))
             .collect();
-        if unknown_starts[0] != 0
-            || unknown_starts.windows(2).any(|pair| pair[0] > pair[1])
-            || unknown_starts[category_count] as usize != unknown_count
-        {
+        if unknown_starts[0] != 0 || unknown_starts.windows(2).any(|pair| pair[0] > pair[1]) {
             return Err(broken("the unknown tokens of the categories do not add up"));
         }
+        let unknown_count = unknown_starts[category_count] as usize;
+        if length(UNKNOWN_TOKENS) as u64 != section_bytes(unknown_count, format.bits) {
+            return Err(broken("the unknown tokens of the categories do not add up"));
+        }
+
+        let valid_token = |param: u64, feature: u64| {
+            param < param_count as u64 && checked.is_record(feature as usize)
+        };
+        let reason = "a token has a parameter set or a feature that does not exist";
+        check_tokens(&source, TOKENS, token_count, format, valid_token, reason)?;
+        check_tokens(
+            &source,
+            UNKNOWN_TOKENS,
+            unknown_count,
+            format,
+            valid_token,
+            reason,
+        )?;
 
         check_cells(&source, &map[sections[CELLS].clone()], token_count)?;
 
@@ -367,8 +377,9 @@ impl PackedDictionary {
             char_index,
             char_blocks,
             cells,
-            token_bytes,
+            format,
             token_count,
+            unknown_count,
             left_size,
             right_size,
             category_count,
@@ -413,8 +424,9 @@ impl PackedDictionary {
             char_blocks: self.char_blocks.view(&self.map),
             cells: self.cells.view(&self.map),
             tokens: &self.map[self.sections[TOKENS].clone()],
+            token_count: self.token_count,
             params: &self.map[self.sections[PARAMS].clone()],
-            token_bytes: self.token_bytes,
+            format: self.format,
             ascii: &self.ascii,
         }
     }
@@ -472,7 +484,8 @@ impl PackedDictionary {
         };
         let bytes = &self.map[self.sections[UNKNOWN_TOKENS].clone()];
         let view = self.view();
-        range.map(move |index| view.token_at(bytes, index))
+        let count = self.unknown_count;
+        range.map(move |index| view.token_at(bytes, count, index))
     }
 
     #[inline]
@@ -571,19 +584,25 @@ enum Step {
     Key(u32, u32),
 }
 
+const NO_CHILDREN: usize = 1 << 25;
+
+#[inline(always)]
+fn unit_at(cells: &[u8], index: usize) -> Option<u64> {
+    let bytes = cells.get(index * UNIT_BYTES..index * UNIT_BYTES + 8)?;
+    Some(u64::from_le_bytes(*bytes.first_chunk()?))
+}
+
 struct Cursor<'a> {
-    cells: &'a [[u32; 2]],
-    node: u32,
-    base: u32,
+    cells: &'a [u8],
+    base: usize,
 }
 
 impl<'a> Cursor<'a> {
     #[inline(always)]
-    fn new(cells: &'a [[u32; 2]]) -> Self {
+    fn new(cells: &'a [u8]) -> Self {
         Self {
             cells,
-            node: 0,
-            base: cells[0][0],
+            base: unit_at(cells, 0).map_or(NO_CHILDREN, |root| (root & VALUE_MASK) as usize),
         }
     }
 
@@ -592,21 +611,28 @@ impl<'a> Cursor<'a> {
         if code == 0 {
             return Step::Stop;
         }
-        let index = (self.base as usize).wrapping_add(usize::from(code));
-        let Some(&[next_base, check]) = self.cells.get(index) else {
+        let Some(unit) = unit_at(self.cells, self.base + usize::from(code)) else {
             return Step::Stop;
         };
-        if check & PARENT_MASK != self.node {
+        if label_of(unit) != code {
             return Step::Stop;
         }
-        self.node = index as u32;
-        self.base = next_base;
-        if check & TERMINAL_FLAG == 0 {
+        let value = (unit & VALUE_MASK) as u32;
+        let flags = (unit >> FLAGS_SHIFT) as u8;
+        self.base = value as usize;
+        if flags & TERMINAL_FLAG == 0 {
             Step::Inner
-        } else if check & INLINE_FLAG != 0 {
-            Step::Key(next_base, (check >> COUNT_SHIFT) & INLINE_COUNT_MASK)
-        } else if let Some(&[data, _]) = self.cells.get(next_base as usize) {
-            Step::Key(data & PARENT_MASK, data >> COUNT_SHIFT)
+        } else if flags & INLINE_FLAG != 0 {
+            self.base = NO_CHILDREN;
+            Step::Key(
+                value,
+                u32::from((flags >> INLINE_COUNT_SHIFT) & INLINE_COUNT_MASK),
+            )
+        } else if let Some(data) = unit_at(self.cells, value as usize) {
+            Step::Key(
+                (data & VALUE_MASK) as u32,
+                (data >> FLAGS_SHIFT) as u8 as u32,
+            )
         } else {
             Step::Stop
         }
@@ -643,10 +669,11 @@ fn decode(bytes: &[u8]) -> Option<(char, usize)> {
 pub struct PackedView<'a> {
     char_index: &'a [u16],
     char_blocks: &'a [u16],
-    cells: &'a [[u32; 2]],
+    cells: &'a [u8],
     tokens: &'a [u8],
+    token_count: usize,
     params: &'a [u8],
-    token_bytes: usize,
+    format: TokenFormat,
     ascii: &'a [u16; 128],
 }
 
@@ -692,13 +719,13 @@ impl PackedView<'_> {
 
     #[inline]
     pub fn token(&self, index: usize) -> TokenRecord {
-        self.token_at(self.tokens, index)
+        self.token_at(self.tokens, self.token_count, index)
     }
 
     #[inline]
     pub fn tokens(&self, range: Range<usize>) -> impl Iterator<Item = TokenRecord> {
         assert!(
-            range.start <= range.end && range.end <= self.tokens.len() / self.token_bytes,
+            range.start <= range.end && range.end <= self.token_count,
             "token range out of range"
         );
         let view = *self;
@@ -708,30 +735,20 @@ impl PackedView<'_> {
     }
 
     #[inline]
-    fn token_at(&self, bytes: &[u8], index: usize) -> TokenRecord {
-        assert!(
-            index < bytes.len() / self.token_bytes,
-            "token index out of range"
-        );
+    fn token_at(&self, bytes: &[u8], count: usize, index: usize) -> TokenRecord {
+        assert!(index < count, "token index out of range");
         unsafe { self.token_unchecked(bytes, index) }
     }
 
     #[inline(always)]
     unsafe fn token_unchecked(&self, bytes: &[u8], index: usize) -> TokenRecord {
-        let width = self.token_bytes;
+        let format = self.format;
+        let bit = index * format.bits;
         unsafe {
-            let token = bytes.as_ptr().add(index * width);
-            let (param, feature) = if width == 8 {
-                (
-                    u32::from_le(token.cast::<u32>().read_unaligned()) as usize,
-                    u32::from_le(token.add(4).cast::<u32>().read_unaligned()),
-                )
-            } else {
-                (
-                    usize::from(u16::from_le(token.cast::<u16>().read_unaligned())),
-                    u32::from_le(token.add(2).cast::<u32>().read_unaligned()),
-                )
-            };
+            let word = u64::from_le(bytes.as_ptr().add(bit >> 3).cast::<u64>().read_unaligned())
+                >> (bit & 7);
+            let param = (word & format.param_mask) as usize;
+            let feature = ((word >> format.param_bits) & format.feature_mask) as u32;
             let record = self.params.as_ptr().add(param * PARAM_BYTES);
             let word = |at: usize| u16::from_le(record.add(at).cast::<u16>().read_unaligned());
             TokenRecord {
@@ -745,43 +762,92 @@ impl PackedView<'_> {
     }
 }
 
-fn check_cells(source: &Source, bytes: &[u8], token_count: usize) -> Result<(), Error> {
-    let units = bytes.as_chunks::<8>().0;
-    let reason = "a double array unit points outside the token table";
-    let valid_range =
-        |first: u32, count: u32| count > 0 && first as usize + count as usize <= token_count;
-    let mut data = vec![0u64; units.len().div_ceil(64)];
-    for (index, unit) in units.iter().enumerate() {
-        let base = u32_at(unit, 0);
-        let check = u32_at(unit, 4);
-        if check == UNUSED_CHECK || check & TERMINAL_FLAG == 0 || check & INLINE_FLAG != 0 {
-            continue;
+#[derive(Clone, Copy)]
+struct TokenFormat {
+    param_bits: u32,
+    bits: usize,
+    param_mask: u64,
+    feature_mask: u64,
+}
+
+impl TokenFormat {
+    fn new(param_bits: u32, feature_bits: u32) -> Self {
+        Self {
+            param_bits,
+            bits: (param_bits + feature_bits) as usize,
+            param_mask: mask_of(param_bits),
+            feature_mask: mask_of(feature_bits),
         }
-        let base = base as usize;
-        if base >= units.len() || base == index {
-            return Err(source.broken(reason));
-        }
-        let tokens = u32_at(&units[base], 0);
-        let data_check = u32_at(&units[base], 4);
-        if data_check != index as u32 || !valid_range(tokens & PARENT_MASK, tokens >> COUNT_SHIFT) {
-            return Err(source.broken(reason));
-        }
-        data[base / 64] |= 1 << (base % 64);
     }
-    for (index, unit) in units.iter().enumerate() {
-        if data[index / 64] >> (index % 64) & 1 != 0 {
-            continue;
+}
+
+fn check_tokens(
+    source: &Source,
+    section: usize,
+    count: usize,
+    format: TokenFormat,
+    valid: impl Fn(u64, u64) -> bool,
+    reason: &'static str,
+) -> Result<(), Error> {
+    let bits = format.bits;
+    let step = ((CHUNK * 8 / bits) & !7).max(8);
+    let mut buffer = vec![0u8; (step * bits).div_ceil(8) + 8];
+    let mut done = 0;
+    while done < count {
+        let tokens = step.min(count - done);
+        let bytes = (tokens * bits).div_ceil(8);
+        source.read(section, done * bits / 8, &mut buffer[..bytes])?;
+        buffer[bytes..].fill(0);
+        for token in 0..tokens {
+            let at = token * bits;
+            let word = buffer
+                .get(at >> 3..)
+                .and_then(|rest| rest.first_chunk())
+                .map_or(0, |&word| u64::from_le_bytes(word))
+                >> (at & 7);
+            let param = word & format.param_mask;
+            let feature = (word >> format.param_bits) & format.feature_mask;
+            if !valid(param, feature) {
+                return Err(source.broken(reason));
+            }
         }
-        let base = u32_at(unit, 0);
-        let check = u32_at(unit, 4);
-        if check == UNUSED_CHECK {
-            continue;
-        }
-        let inline = check & INLINE_FLAG != 0;
-        let terminal = check & TERMINAL_FLAG != 0;
-        if inline && !terminal
-            || inline && !valid_range(base, (check >> COUNT_SHIFT) & INLINE_COUNT_MASK)
-        {
+        done += tokens;
+    }
+    Ok(())
+}
+
+fn check_cells(source: &Source, bytes: &[u8], token_count: usize) -> Result<(), Error> {
+    let units = bytes.as_chunks::<UNIT_BYTES>().0;
+    let reason = "a double array unit is not valid";
+    let valid_range = |first: u32, count: usize| count > 0 && first as usize + count <= token_count;
+    let decode = |chunk: &[u8; UNIT_BYTES]| {
+        let [a, b, c, d, e, f] = *chunk;
+        u64::from_le_bytes([a, b, c, d, e, f, 0, 0])
+    };
+    for chunk in units {
+        let unit = decode(chunk);
+        let label = label_of(unit);
+        let value = (unit & VALUE_MASK) as u32;
+        let flags = (unit >> FLAGS_SHIFT) as u8;
+        let valid = if label == UNUSED_LABEL {
+            true
+        } else if label == 0 {
+            valid_range(value, usize::from(flags))
+        } else if flags & TERMINAL_FLAG == 0 {
+            flags == 0
+        } else if flags & INLINE_FLAG != 0 {
+            flags >> 7 == 0
+                && valid_range(
+                    value,
+                    usize::from((flags >> INLINE_COUNT_SHIFT) & INLINE_COUNT_MASK),
+                )
+        } else {
+            flags == TERMINAL_FLAG
+                && units
+                    .get(value as usize)
+                    .is_some_and(|data| label_of(decode(data)) == 0)
+        };
+        if !valid {
             return Err(source.broken(reason));
         }
     }
