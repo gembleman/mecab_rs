@@ -6,16 +6,27 @@ pub struct PartialInput<'a> {
     constraints: Vec<Constraint<'a>>,
 }
 
+const END_OF_SENTENCE_LINE: &str = "EOS";
+
+fn split_line(line: &str) -> Option<(&str, Option<&str>)> {
+    match line.split_once('\t') {
+        Some((surface, rest)) => {
+            let feature_pattern = rest.split('\t').next().unwrap_or(rest);
+            Some((surface, Some(feature_pattern)))
+        }
+        None if line == END_OF_SENTENCE_LINE => None,
+        None => Some((line, None)),
+    }
+}
+
 impl<'a> PartialInput<'a> {
     pub fn parse(input: &'a str) -> Self {
         let input = input.split('\0').next().unwrap_or_default();
         let mut sentence = String::with_capacity(input.len());
         let mut constraints = Vec::new();
         for line in input.split('\n') {
-            let (surface, feature) = match line.split_once('\t') {
-                Some((surface, rest)) => (surface, Some(rest.split('\t').next().unwrap_or(rest))),
-                None if line == "EOS" => break,
-                None => (line, None),
+            let Some((surface, feature)) = split_line(line) else {
+                break;
             };
             let start = sentence.len();
             let end = start + surface.len();

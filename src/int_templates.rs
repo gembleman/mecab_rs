@@ -1,4 +1,3 @@
-
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::Path;
@@ -23,6 +22,8 @@ const ROWS_PER_CHUNK: usize = 16;
 pub const DEFAULT_CLUSTER_COUNT: usize = 12;
 const ROWS_PER_BLOCK: usize = 64;
 const MAX_COST: i64 = 32767;
+const MAX_KEYS: usize = 0xFFFF;
+const CELL_SUM_BOUND: u128 = 1 << 62;
 pub const MAX_SHIFT: u32 = 40;
 pub const MAX_COST_FACTOR: u32 = 1 << 24;
 
@@ -207,7 +208,7 @@ fn validate<'a>(
     exception_cells: &[u32],
 ) -> Result<(), Error> {
     let corrupt = Error::Corrupt("the integer templates are inconsistent");
-    if left_size == 0 || right_size == 0 || left_size > 0xFFFF || right_size > 0xFFFF {
+    if left_size == 0 || right_size == 0 || left_size > MAX_KEYS || right_size > MAX_KEYS {
         return Err(Error::Corrupt("the template matrix size is out of range"));
     }
     if shift > MAX_SHIFT || cost_factor > MAX_COST_FACTOR {
@@ -220,7 +221,7 @@ fn validate<'a>(
         }
         magnitude += part.max_weight();
     }
-    if u128::from(magnitude) * u128::from(cost_factor) >= 1 << 62 {
+    if u128::from(magnitude) * u128::from(cost_factor) >= CELL_SUM_BOUND {
         return Err(corrupt);
     }
     let cells = left_size * right_size;
@@ -814,7 +815,7 @@ impl<S: SectionSource> MappedIntTemplates<S> {
         let part_count = reader.count()?;
         let exception_count = reader.count()?;
         let cluster_count = reader.count()?;
-        if left_size == 0 || right_size == 0 || left_size > 0xFFFF || right_size > 0xFFFF {
+        if left_size == 0 || right_size == 0 || left_size > MAX_KEYS || right_size > MAX_KEYS {
             return Err(reader.broken("the template matrix size is out of range"));
         }
         let mut parts = Vec::with_capacity(part_count.min(MAX_PARTS));

@@ -1,4 +1,3 @@
-
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
@@ -9,7 +8,18 @@ const CHAR_PROPERTY_DEF_DEFAULT: &str = "DEFAULT 1 0 0\nSPACE   0 1 0\n0x0020 SP
 pub(super) const UNK_DEF_DEFAULT: &str = "DEFAULT,0,0,0,*\nSPACE,0,0,0,*\n";
 const TABLE_ENTRIES: usize = 0xffff;
 const NAME_BYTES: usize = 32;
-const TYPE_MASK: u32 = (1 << 18) - 1;
+const TYPE_MASK_BITS: u32 = 18;
+const TYPE_MASK: u32 = (1 << TYPE_MASK_BITS) - 1;
+const DEFAULT_TYPE_SHIFT: u32 = TYPE_MASK_BITS;
+const DEFAULT_TYPE_BITS: u32 = 0xff;
+const LENGTH_SHIFT: u32 = 26;
+const LENGTH_BITS: u32 = 0xf;
+const GROUP_SHIFT: u32 = 30;
+const INVOKE_SHIFT: u32 = 31;
+const MAX_CATEGORIES: usize = 18;
+const MAX_DEF_COLUMNS: usize = 512;
+const COUNT_BYTES: usize = 4;
+const ENTRY_BYTES: usize = 4;
 
 #[derive(Clone, Copy)]
 struct CharInfo {
@@ -23,20 +33,20 @@ struct CharInfo {
 impl CharInfo {
     fn pack(self) -> u32 {
         (self.type_mask & TYPE_MASK)
-            | (self.default_type & 0xff) << 18
-            | (self.length & 0xf) << 26
-            | (self.group & 1) << 30
-            | (self.invoke & 1) << 31
+            | (self.default_type & DEFAULT_TYPE_BITS) << DEFAULT_TYPE_SHIFT
+            | (self.length & LENGTH_BITS) << LENGTH_SHIFT
+            | (self.group & 1) << GROUP_SHIFT
+            | (self.invoke & 1) << INVOKE_SHIFT
     }
 }
 
-struct Range {
+struct CodeRange {
     low: i32,
     high: i32,
     categories: Vec<Vec<u8>>,
 }
 
-fn atohex(text: &[u8], path: &Path) -> Result<i32, Error> {
+fn parse_hex_code(text: &[u8], path: &Path) -> Result<i32, Error> {
     let no_hex = || {
         failure(
             path,
@@ -57,7 +67,7 @@ fn atohex(text: &[u8], path: &Path) -> Result<i32, Error> {
     Ok(value)
 }
 
-fn encode(
+fn char_info_of_categories(
     categories: &[Vec<u8>],
     table: &BTreeMap<Vec<u8>, CharInfo>,
     path: &Path,
@@ -82,7 +92,67 @@ fn encode(
     Ok(base)
 }
 
-pub(super) fn compile(char_def: &Path, unk_def: &Path) -> Result<Vec<u8>, Error> {
+struct CharDef {
+    ranges: Vec<CodeRange>,
+    categories: BTreeMap<Vec<u8>, CharInfo>,
+    order: Vec<Vec<u8>>,
+}
+
+fn parse_code_range(
+    first: &[u8],
+    columns: &[usize],
+    line: &[u8],
+    source: &Path,
+    categories: &BTreeMap<Vec<u8>, CharInfo>,
+) -> Result<CodeRange, Error> {
+    let (low, high) = match first.windows(2).position(|pair| pair == b"..") {
+        Some(dots) => (&first[..dots], &first[dots + 2..]),
+        None => (first, first),
+    };
+    let low = parse_hex_code(low, source)?;
+    let high = parse_hex_code(high, source)?;
+    let in_table = |code: i32| (0..TABLE_ENTRIES as i32).contains(&code);
+    if !(in_table(low) && in_table(high) && low <= high) {
+        return Err(failure(
+            source,
+            format!("range error: low={low} high={high}"),
+        ));
+    }
+    let mut names = Vec::new();
+    for &column in &columns[1..] {
+        let name = cstr(line, column);
+        if name.first() == Some(&b'#') {
+            break;
+        }
+        if !categories.contains_key(name) {
+            return Err(failure(
+                source,
+                format!("category [{}] is undefined", String::from_utf8_lossy(name)),
+            ));
+        }
+        names.push(name.to_vec());
+    }
+    Ok(CodeRange {
+        low,
+        high,
+        categories: names,
+    })
+}
+
+fn parse_category(columns: &[usize], line: &[u8], definition_index: usize) -> CharInfo {
+    const INVOKE_COLUMN: usize = 1;
+    const GROUP_COLUMN: usize = 2;
+    const LENGTH_COLUMN: usize = 3;
+    CharInfo {
+        type_mask: 0,
+        default_type: definition_index as u32,
+        length: atoi(cstr(line, columns[LENGTH_COLUMN])) as u32,
+        group: atoi(cstr(line, columns[GROUP_COLUMN])) as u32,
+        invoke: atoi(cstr(line, columns[INVOKE_COLUMN])) as u32,
+    }
+}
+
+fn read_char_def(char_def: &Path) -> Result<CharDef, Error> {
     let mut lines = if char_def.is_file() {
         Lines::open(char_def, Some(BUF_SIZE))?
     } else {
@@ -93,7 +163,7 @@ pub(super) fn compile(char_def: &Path, unk_def: &Path) -> Result<Vec<u8>, Error>
         Lines::builtin(CHAR_PROPERTY_DEF_DEFAULT, char_def, Some(BUF_SIZE))
     };
     let source = lines.path().to_path_buf();
-    let mut ranges: Vec<Range> = Vec::new();
+    let mut ranges: Vec<CodeRange> = Vec::new();
     let mut categories: BTreeMap<Vec<u8>, CharInfo> = BTreeMap::new();
     let mut order: Vec<Vec<u8>> = Vec::new();
     while let Some(line) = lines.next_line()? {
@@ -101,43 +171,19 @@ pub(super) fn compile(char_def: &Path, unk_def: &Path) -> Result<Vec<u8>, Error>
             continue;
         }
         let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
-        let columns = tokenize2(line, b"\t ", 512);
+        let columns = tokenize2(line, b"\t ", MAX_DEF_COLUMNS);
         if columns.len() < 2 {
             return Err(failure(&source, format!("format error: {shown}")));
         }
         let first = cstr(line, columns[0]);
         if first.starts_with(b"0x") {
-            let (low, high) = match first.windows(2).position(|pair| pair == b"..") {
-                Some(at) => (&first[..at], &first[at + 2..]),
-                None => (first, first),
-            };
-            let low = atohex(low, &source)?;
-            let high = atohex(high, &source)?;
-            if !((0..0xffff).contains(&low) && (0..0xffff).contains(&high) && low <= high) {
-                return Err(failure(
-                    &source,
-                    format!("range error: low={low} high={high}"),
-                ));
-            }
-            let mut names = Vec::new();
-            for &column in &columns[1..] {
-                let name = cstr(line, column);
-                if name.first() == Some(&b'#') {
-                    break;
-                }
-                if !categories.contains_key(name) {
-                    return Err(failure(
-                        &source,
-                        format!("category [{}] is undefined", String::from_utf8_lossy(name)),
-                    ));
-                }
-                names.push(name.to_vec());
-            }
-            ranges.push(Range {
-                low,
-                high,
-                categories: names,
-            });
+            ranges.push(parse_code_range(
+                first,
+                &columns,
+                line,
+                &source,
+                &categories,
+            )?);
         } else {
             if columns.len() < 4 {
                 return Err(failure(&source, format!("format error: {shown}")));
@@ -151,20 +197,28 @@ pub(super) fn compile(char_def: &Path, unk_def: &Path) -> Result<Vec<u8>, Error>
                     ),
                 ));
             }
-            let info = CharInfo {
-                type_mask: 0,
-                default_type: order.len() as u32,
-                length: atoi(cstr(line, columns[3])) as u32,
-                group: atoi(cstr(line, columns[2])) as u32,
-                invoke: atoi(cstr(line, columns[1])) as u32,
-            };
+            let info = parse_category(&columns, line, order.len());
             categories.insert(first.to_vec(), info);
             order.push(first.to_vec());
         }
     }
+    Ok(CharDef {
+        ranges,
+        categories,
+        order,
+    })
+}
 
-    if categories.len() >= 18 {
-        return Err(failure(char_def, "too many categories(>= 18)"));
+fn require_categories_complete(
+    categories: &BTreeMap<Vec<u8>, CharInfo>,
+    char_def: &Path,
+    unk_def: &Path,
+) -> Result<(), Error> {
+    if categories.len() >= MAX_CATEGORIES {
+        return Err(failure(
+            char_def,
+            format!("too many categories(>= {MAX_CATEGORIES})"),
+        ));
     }
     for required in ["DEFAULT", "SPACE"] {
         if !categories.contains_key(required.as_bytes()) {
@@ -217,15 +271,26 @@ pub(super) fn compile(char_def: &Path, unk_def: &Path) -> Result<Vec<u8>, Error>
             ));
         }
     }
+    Ok(())
+}
 
-    let default = encode(&[b"DEFAULT".to_vec()], &categories, char_def)?;
+pub(super) fn compile(char_def: &Path, unk_def: &Path) -> Result<Vec<u8>, Error> {
+    let CharDef {
+        ranges,
+        categories,
+        order,
+    } = read_char_def(char_def)?;
+    require_categories_complete(&categories, char_def, unk_def)?;
+
+    let default = char_info_of_categories(&[b"DEFAULT".to_vec()], &categories, char_def)?;
     let mut table = vec![default; TABLE_ENTRIES];
     for range in &ranges {
-        let info = encode(&range.categories, &categories, char_def)?;
+        let info = char_info_of_categories(&range.categories, &categories, char_def)?;
         table[range.low as usize..=range.high as usize].fill(info);
     }
 
-    let mut bytes = Vec::with_capacity(4 + NAME_BYTES * order.len() + 4 * TABLE_ENTRIES);
+    let mut bytes =
+        Vec::with_capacity(COUNT_BYTES + NAME_BYTES * order.len() + ENTRY_BYTES * TABLE_ENTRIES);
     bytes.extend_from_slice(&(categories.len() as u32).to_le_bytes());
     for name in &order {
         let mut padded = [0u8; NAME_BYTES];
@@ -237,6 +302,29 @@ pub(super) fn compile(char_def: &Path, unk_def: &Path) -> Result<Vec<u8>, Error>
         bytes.extend_from_slice(&info.pack().to_le_bytes());
     }
     Ok(bytes)
+}
+
+fn utf8_to_ucs2(text: &[u8], begin: usize, end: usize) -> (u32, usize) {
+    let len = end.wrapping_sub(begin);
+    let byte = |index: usize| u32::from(text.get(begin + index).copied().unwrap_or(0));
+    if byte(0) < 0x80 {
+        (byte(0), 1)
+    } else if len >= 2 && byte(0) & 0xe0 == 0xc0 {
+        ((byte(0) & 0x1f) << 6 | (byte(1) & 0x3f), 2)
+    } else if len >= 3 && byte(0) & 0xf0 == 0xe0 {
+        (
+            (byte(0) & 0x0f) << 12 | (byte(1) & 0x3f) << 6 | (byte(2) & 0x3f),
+            3,
+        )
+    } else if len >= 4 && byte(0) & 0xf8 == 0xf0 {
+        (0, 4)
+    } else if len >= 5 && byte(0) & 0xfc == 0xf8 {
+        (0, 5)
+    } else if len >= 6 && byte(0) & 0xfe == 0xfc {
+        (0, 6)
+    } else {
+        (0, 1)
+    }
 }
 
 pub(crate) struct CharProperty {
@@ -254,18 +342,18 @@ impl CharProperty {
             .first_chunk::<4>()
             .map(|count| u32::from_le_bytes(*count) as usize)
             .ok_or_else(|| failure(path, "invalid file size"))?;
-        let table_at = 4 + NAME_BYTES * categories;
-        if bytes.len() != table_at + 4 * 0xffff {
+        let table_at = COUNT_BYTES + NAME_BYTES * categories;
+        if bytes.len() != table_at + ENTRY_BYTES * TABLE_ENTRIES {
             return Err(failure(path, "invalid file size"));
         }
-        let names = bytes[4..table_at]
+        let names = bytes[COUNT_BYTES..table_at]
             .as_chunks::<NAME_BYTES>()
             .0
             .iter()
             .map(|name| cstr(name, 0).to_vec())
             .collect();
         let table = bytes[table_at..]
-            .as_chunks::<4>()
+            .as_chunks::<ENTRY_BYTES>()
             .0
             .iter()
             .map(|entry| u32::from_le_bytes(*entry))
@@ -286,30 +374,11 @@ impl CharProperty {
     }
 
     pub(crate) fn char_info(&self, text: &[u8], begin: usize, end: usize) -> (u32, usize) {
-        let len = end.wrapping_sub(begin);
-        let byte = |index: usize| u32::from(text.get(begin + index).copied().unwrap_or(0));
-        let (code, length) = if byte(0) < 0x80 {
-            (byte(0), 1)
-        } else if len >= 2 && byte(0) & 0xe0 == 0xc0 {
-            ((byte(0) & 0x1f) << 6 | (byte(1) & 0x3f), 2)
-        } else if len >= 3 && byte(0) & 0xf0 == 0xe0 {
-            (
-                (byte(0) & 0x0f) << 12 | (byte(1) & 0x3f) << 6 | (byte(2) & 0x3f),
-                3,
-            )
-        } else if len >= 4 && byte(0) & 0xf8 == 0xf0 {
-            (0, 4)
-        } else if len >= 5 && byte(0) & 0xfc == 0xf8 {
-            (0, 5)
-        } else if len >= 6 && byte(0) & 0xfe == 0xfc {
-            (0, 6)
-        } else {
-            (0, 1)
-        };
+        let (code, length) = utf8_to_ucs2(text, begin, end);
         (self.table.get(code as usize).copied().unwrap_or(0), length)
     }
 
     pub(crate) fn default_type(&self, text: &[u8]) -> u8 {
-        (self.char_info(text, 0, text.len()).0 >> 18) as u8
+        (self.char_info(text, 0, text.len()).0 >> DEFAULT_TYPE_SHIFT) as u8
     }
 }

@@ -1,4 +1,3 @@
-
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -97,15 +96,20 @@ fn progress_bar(
     *previous = percentage;
 }
 
+const LEXICON_COLUMNS: usize = 5;
+const SURFACE_COLUMN: usize = 0;
+const FEATURE_COLUMN: usize = 4;
+const NOT_FOUND: i32 = -1;
+
 fn entry(line: &mut [u8], path: &Path) -> Result<(Vec<u8>, Vec<u8>), Error> {
     let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
-    let columns = tokenize_csv(line, 5);
-    if columns.len() != 5 {
+    let columns = tokenize_csv(line, LEXICON_COLUMNS);
+    if columns.len() != LEXICON_COLUMNS {
         return Err(failure(path, format!("format error: {shown}")));
     }
     Ok((
-        cstr(line, columns[0]).to_vec(),
-        cstr(line, columns[4]).to_vec(),
+        cstr(line, columns[SURFACE_COLUMN]).to_vec(),
+        cstr(line, columns[FEATURE_COLUMN]).to_vec(),
     ))
 }
 
@@ -241,8 +245,12 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
             while let Some(line) = lines.next_line()? {
                 let (mut word, feature) = entry(line, source)?;
                 let rewritten = rewrite(&mut rewriter, &feature)?;
-                let left = ids.left.get(&rewritten.left).copied().unwrap_or(-1);
-                let right = ids.right.get(&rewritten.right).copied().unwrap_or(-1);
+                let left = ids.left.get(&rewritten.left).copied().unwrap_or(NOT_FOUND);
+                let right = ids
+                    .right
+                    .get(&rewritten.right)
+                    .copied()
+                    .unwrap_or(NOT_FOUND);
                 if left <= 0 {
                     return Err(failure(
                         source,

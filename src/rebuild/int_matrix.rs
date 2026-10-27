@@ -1,4 +1,3 @@
-
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -542,9 +541,11 @@ fn log2_binomial(n: f64, k: f64) -> f64 {
     (ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0)) / std::f64::consts::LN_2
 }
 
+const STIRLING_MIN_ARG: f64 = 15.0;
+
 fn ln_gamma(mut x: f64) -> f64 {
     let mut shift = 0.0;
-    while x < 15.0 {
+    while x < STIRLING_MIN_ARG {
         shift -= x.ln();
         x += 1.0;
     }

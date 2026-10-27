@@ -1,4 +1,3 @@
-
 use std::path::Path;
 
 use super::{Config, failure};
@@ -8,25 +7,35 @@ use crate::system_dictionary::{DictionaryKind, PrefixHit, SystemDictionary};
 
 const DEFAULT_MAX_GROUPING_SIZE: usize = 24;
 const MAX_LOOKUP_BYTES: usize = 65535;
+const U16_MASK: usize = 0xffff;
+
+const TYPE_BITS: u32 = 18;
+const TYPE_MASK: u32 = (1 << TYPE_BITS) - 1;
+const DEFAULT_TYPE_SHIFT: u32 = TYPE_BITS;
+const DEFAULT_TYPE_MASK: u32 = 0xff;
+const LENGTH_SHIFT: u32 = 26;
+const LENGTH_MASK: u32 = 0xf;
+const GROUP_BIT: u32 = 30;
+const INVOKE_BIT: u32 = 31;
 
 fn default_type(info: u32) -> usize {
-    ((info >> 18) & 0xff) as usize
+    ((info >> DEFAULT_TYPE_SHIFT) & DEFAULT_TYPE_MASK) as usize
 }
 
 fn length(info: u32) -> usize {
-    ((info >> 26) & 0xf) as usize
+    ((info >> LENGTH_SHIFT) & LENGTH_MASK) as usize
 }
 
 fn group(info: u32) -> bool {
-    (info >> 30) & 1 == 1
+    (info >> GROUP_BIT) & 1 == 1
 }
 
 fn invoke(info: u32) -> bool {
-    (info >> 31) & 1 == 1
+    (info >> INVOKE_BIT) & 1 == 1
 }
 
 fn is_kind_of(info: u32, other: u32) -> bool {
-    info & other & ((1 << 18) - 1) != 0
+    info & other & TYPE_MASK != 0
 }
 
 pub(super) const NORMAL: u8 = 0;
@@ -53,9 +62,9 @@ pub(super) struct Found {
 
 struct Seek {
     at: usize,
-    fail: u32,
-    mblen: usize,
-    clen: usize,
+    stop_info: u32,
+    stop_width: usize,
+    chars_passed: usize,
 }
 
 pub(super) struct Tokenizer {
@@ -131,20 +140,20 @@ impl Tokenizer {
     fn seek_to_other_type(&self, text: &[u8], begin: usize, end: usize, start: u32) -> Seek {
         let mut seek = Seek {
             at: begin,
-            fail: 0,
-            mblen: 0,
-            clen: 0,
+            stop_info: 0,
+            stop_width: 0,
+            chars_passed: 0,
         };
         let mut current = start;
         while seek.at < end {
             let (info, width) = self.chars.char_info(text, seek.at, end);
-            seek.fail = info;
-            seek.mblen = width;
+            seek.stop_info = info;
+            seek.stop_width = width;
             if !is_kind_of(current, info) {
                 break;
             }
             seek.at += width;
-            seek.clen += 1;
+            seek.chars_passed += 1;
             current = info;
         }
         seek
@@ -159,8 +168,8 @@ impl Tokenizer {
         };
         let Seek {
             at: begin2,
-            fail: cinfo,
-            mblen,
+            stop_info: cinfo,
+            stop_width,
             ..
         } = self.seek_to_other_type(text, begin, end, self.space);
 
@@ -184,7 +193,7 @@ impl Tokenizer {
             return;
         }
 
-        let mut begin3 = begin2 + mblen;
+        let mut begin3 = begin2 + stop_width;
         let mut group_begin3 = None;
 
         if begin3 > end {
@@ -198,7 +207,7 @@ impl Tokenizer {
             let tmp = begin3;
             let grouped = self.seek_to_other_type(text, begin3, end, cinfo);
             begin3 = grouped.at;
-            if grouped.clen <= self.max_grouping_size {
+            if grouped.chars_passed <= self.max_grouping_size {
                 self.add_unknown(found, cinfo, begin, begin2, begin3);
             }
             group_begin3 = Some(begin3);
@@ -239,8 +248,8 @@ impl Tokenizer {
             let token = self.unknown.token(index);
             found.push(Found {
                 position: begin2,
-                length: (begin3 - begin2) & 0xffff,
-                rlength: (begin3 - begin) & 0xffff,
+                length: (begin3 - begin2) & U16_MASK,
+                rlength: (begin3 - begin) & U16_MASK,
                 kind: UNKNOWN,
                 char_type: category as u8,
                 feature: if self.unknown_feature.is_some() {

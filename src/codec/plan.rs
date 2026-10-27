@@ -1,6 +1,7 @@
-
 use super::coder::Coder;
-use super::model::{Kind, LidSpec, MAX_STR_STEPS, Model, Plan, Step, canonical_i64, canonical_u64};
+use super::model::{
+    FIXED_COLS, Kind, LidSpec, MAX_STR_STEPS, Model, Plan, Step, canonical_i64, canonical_u64,
+};
 use super::table::{Lexicon, Parsed};
 use super::text::is_kana;
 use std::collections::HashSet;
@@ -8,6 +9,14 @@ use std::collections::HashSet;
 type Sample = Vec<(u32, bool)>;
 
 const SAMPLE_ROWS: usize = 30_000;
+const SMALL_SAMPLE_ROWS: usize = 20_000;
+const CAT_MAX_DISTINCT: usize = 20_000;
+const STR_MAX_DISTINCT_CAT: usize = 64;
+const ALIGN_MIN_KANA_SHARE: f64 = 0.3;
+const MIN_ORDER_PAIRS: usize = 20;
+const STR_SOURCE_LIMIT: usize = 199;
+const LID_ORDER_CANDIDATES: usize = 3;
+const MAX_POS_COLS: usize = 6;
 
 fn build_sample(parsed: &Parsed, groups: &[(usize, usize)], target: usize) -> Sample {
     let rows = parsed.order.len();
@@ -129,7 +138,7 @@ fn ascending_rate(
         .collect();
     pairs.sort();
     pairs.dedup_by(|a, b| a.0 == b.0);
-    if pairs.len() < 20 {
+    if pairs.len() < MIN_ORDER_PAIRS {
         return 0.0;
     }
     let good = pairs.windows(2).filter(|w| w[0].1 <= w[1].1).count();
@@ -183,11 +192,15 @@ pub fn choose_plan(parsed: &Parsed, groups: &[(usize, usize)]) -> Plan {
     if n == 0 {
         return plan;
     }
-    let p = if n > 4 { 6.min(n - 4) } else { 0 };
+    let p = if n > FIXED_COLS {
+        MAX_POS_COLS.min(n - FIXED_COLS)
+    } else {
+        0
+    };
     plan.pos_cols = p;
     let sample = build_sample(parsed, groups, SAMPLE_ROWS);
-    let small = sample.len() < 20_000;
-    let pos_range = 4..4 + p;
+    let small = sample.len() < SMALL_SAMPLE_ROWS;
+    let pos_range = FIXED_COLS..FIXED_COLS + p;
     let info: Vec<ColInfo> = (0..n).map(|c| col_info(lex, &sample, c)).collect();
 
     let mut num_steps = Vec::new();
@@ -196,7 +209,7 @@ pub fn choose_plan(parsed: &Parsed, groups: &[(usize, usize)]) -> Plan {
     for c in pos_range.clone() {
         taken[c] = true;
     }
-    if n >= 4 && (1..4).all(|c| info[c].all_int) {
+    if n >= FIXED_COLS && (1..FIXED_COLS).all(|c| info[c].all_int) {
         num_steps.push(Step {
             col: 1,
             kind: Kind::Num { mode: 1 },
@@ -209,7 +222,7 @@ pub fn choose_plan(parsed: &Parsed, groups: &[(usize, usize)]) -> Plan {
             col: 3,
             kind: Kind::Num { mode: 2 },
         });
-        taken[1..4].fill(true);
+        taken[1..FIXED_COLS].fill(true);
     }
     let rest: Vec<usize> = (1..n).filter(|&c| !taken[c]).collect();
 
@@ -229,7 +242,7 @@ pub fn choose_plan(parsed: &Parsed, groups: &[(usize, usize)]) -> Plan {
         };
         let mut kinds = Vec::new();
         for &c in &cands {
-            if small || info[c].distinct <= 20_000 {
+            if small || info[c].distinct <= CAT_MAX_DISTINCT {
                 probe.steps.push(Step {
                     col: c,
                     kind: Kind::Cat,
@@ -254,7 +267,7 @@ pub fn choose_plan(parsed: &Parsed, groups: &[(usize, usize)]) -> Plan {
     let mut str_cands: Vec<usize> = Vec::new();
     for &c in &cands {
         let has_cat = alt_cost.iter().any(|a| a.0 == c && a.1 == Kind::Cat);
-        if small || info[c].distinct > 64 || !has_cat {
+        if small || info[c].distinct > STR_MAX_DISTINCT_CAT || !has_cat {
             str_cands.push(c);
         }
     }
@@ -268,7 +281,7 @@ pub fn choose_plan(parsed: &Parsed, groups: &[(usize, usize)]) -> Plan {
         let mut srcs = Vec::new();
         for &c in &str_cands {
             for align in [false, true] {
-                if align && info[c].kana_share <= 0.3 {
+                if align && info[c].kana_share <= ALIGN_MIN_KANA_SHARE {
                     continue;
                 }
                 srcs.push((probe.steps.len(), srcs_of(c)));
@@ -290,7 +303,13 @@ pub fn choose_plan(parsed: &Parsed, groups: &[(usize, usize)]) -> Plan {
     let all_cols: Vec<usize> = str_cands.clone();
     let full = str_pass(&|c| {
         let mut v = vec![0];
-        v.extend(all_cols.iter().copied().filter(|&x| x != c).take(199));
+        v.extend(
+            all_cols
+                .iter()
+                .copied()
+                .filter(|&x| x != c)
+                .take(STR_SOURCE_LIMIT),
+        );
         v
     });
     let mut align_col = None;
@@ -337,13 +356,10 @@ pub fn choose_plan(parsed: &Parsed, groups: &[(usize, usize)]) -> Plan {
             continue;
         }
         match best {
-            Some((cost, Kind::Num { mode })) => {
-                let _ = cost;
-                num0_steps.push(Step {
-                    col: c,
-                    kind: Kind::Num { mode },
-                })
-            }
+            Some((_, Kind::Num { mode })) => num0_steps.push(Step {
+                col: c,
+                kind: Kind::Num { mode },
+            }),
             Some((cost, kind)) => cat_steps.push((Step { col: c, kind }, cost)),
             None => cat_steps.push((
                 Step {
@@ -472,7 +488,7 @@ pub fn choose_plan(parsed: &Parsed, groups: &[(usize, usize)]) -> Plan {
         cand.extend(specs);
         best = lid_trial(lex, &sample, &plan, a, &cand);
         let mut cand = vec![best.clone()];
-        for x in scored.iter().take(3) {
+        for x in scored.iter().take(LID_ORDER_CANDIDATES) {
             cand.push(spec_with(Some(x.1), best.key.clone(), None));
         }
         best = lid_trial(lex, &sample, &plan, a, &cand);
@@ -491,7 +507,7 @@ pub fn choose_plan(parsed: &Parsed, groups: &[(usize, usize)]) -> Plan {
     plan.steps.extend(num_steps);
     let mut covered = vec![false; n];
     covered[0] = true;
-    for flag in covered.iter_mut().take(4 + p).skip(4) {
+    for flag in covered.iter_mut().take(FIXED_COLS + p).skip(FIXED_COLS) {
         *flag = true;
     }
     for st in &plan.steps {
@@ -510,7 +526,7 @@ pub fn choose_plan(parsed: &Parsed, groups: &[(usize, usize)]) -> Plan {
             ..Default::default()
         };
         for c in 1..n {
-            if !(4..4 + p).contains(&c) {
+            if !(FIXED_COLS..FIXED_COLS + p).contains(&c) {
                 safe.steps.push(Step {
                     col: c,
                     kind: Kind::Cat,

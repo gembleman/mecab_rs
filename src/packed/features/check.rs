@@ -1,16 +1,18 @@
-
 use std::ops::Range;
 use std::thread;
 
 use super::{
-    HEADER_BYTES, Layout, MAX_NUMERIC, MAX_SLOTS, NumSpec, OP_COPY, OP_EMPTY, OP_HIGH, OP_INLINE,
-    OP_KEY, OP_NUM, OP_REF, OP_STAR, RECORD_PADDING, SPEC_BYTES, SYNC_EVERY, find_byte, read_bits,
+    HEADER_BYTES, Layout, MAX_NUMERIC, MAX_SLOTS, NumSpec, OP_COPY, OP_COPY_MAX, OP_EMPTY, OP_HIGH,
+    OP_HIGH_MAX, OP_INLINE, OP_KEY, OP_NUM, OP_NUM_MAX, OP_REF, OP_STAR, RECORD_PADDING,
+    SPEC_BYTES, SYNC_EVERY, find_byte, read_bits,
 };
 use crate::Error;
 use crate::packed::reader::Source;
 
-const CHUNK: usize = 1 << 16;
+const READ_CHUNK: usize = 1 << 16;
 const RECORD_CHUNK: usize = 1 << 18;
+const BOUNDARY_SCAN_BYTES: usize = 4096;
+const INITIAL_RECORD_WINDOW: usize = 128;
 const PARALLEL_MIN_BYTES: usize = 1 << 22;
 const PARALLEL_MIN_RECORDS: usize = 1 << 15;
 const MAX_THREADS: usize = 8;
@@ -143,11 +145,11 @@ pub(in crate::packed) fn check(source: &Source, section: usize) -> Result<Checke
             match op {
                 OP_REF | OP_INLINE => slots = (slots + 1).min(MAX_SLOTS),
                 OP_EMPTY | OP_STAR | OP_KEY => {}
-                OP_COPY..=0x1F if usize::from(op - OP_COPY) < slots => {}
-                OP_NUM..=0x23 if usize::from(op - OP_NUM) < specs.len() => {
+                OP_COPY..=OP_COPY_MAX if usize::from(op - OP_COPY) < slots => {}
+                OP_NUM..=OP_NUM_MAX if usize::from(op - OP_NUM) < specs.len() => {
                     numbers |= 1 << (op - OP_NUM);
                 }
-                OP_HIGH..=0x33
+                OP_HIGH..=OP_HIGH_MAX
                     if usize::from(op - OP_HIGH) < MAX_NUMERIC
                         && numbers >> (op - OP_HIGH) & 1 != 0 => {}
                 _ => {
@@ -247,7 +249,7 @@ fn next_boundary(
     from: usize,
     length: usize,
 ) -> Result<usize, Error> {
-    let mut buffer = vec![0u8; 4096];
+    let mut buffer = vec![0u8; BOUNDARY_SCAN_BYTES];
     let mut at = from.saturating_sub(1);
     while at < length {
         let part = buffer.len().min(length - at);
@@ -268,11 +270,11 @@ fn check_string_range(
 ) -> Result<(usize, Vec<u64>), Error> {
     let first_word = range.start >> 6;
     let mut words = vec![0u64; (range.end >> 6) + 1 - first_word];
-    let mut buffer = vec![0u8; CHUNK.min(range.len())];
+    let mut buffer = vec![0u8; READ_CHUNK.min(range.len())];
     let mut carry = 0;
     let mut done = range.start;
     while done < range.end {
-        let part = CHUNK.min(range.end - done);
+        let part = READ_CHUNK.min(range.end - done);
         if buffer.len() < carry + part {
             buffer.resize(carry + part, 0);
         }
@@ -451,7 +453,7 @@ fn parse_record(record: &[u8], tables: &Tables) -> Result<usize, Fail> {
                 }
                 bit = (start + length + 1) * 8;
             }
-            OP_NUM..=0x23 => {
+            OP_NUM..=OP_NUM_MAX => {
                 let spec = &tables.specs[usize::from(op - OP_NUM)];
                 bit += spec.hi_bits as usize;
                 let index = read(bit, spec.lo_bits)?;
@@ -488,7 +490,7 @@ fn walk_records(
     let mut window = Window::default();
     let mut at = range.start;
     for _ in 0..expected {
-        let mut need = 128usize;
+        let mut need = INITIAL_RECORD_WINDOW;
         let length = loop {
             let available = total - at;
             window.ensure(source, section, base + at, available, need.min(available))?;

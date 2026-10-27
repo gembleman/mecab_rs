@@ -14,7 +14,7 @@ pub(crate) const MAGIC_ID: u32 = 0xEF71_8F77;
 pub(crate) const DIC_VERSION: u32 = 102;
 pub(crate) const HEADER_SIZE: usize = 72;
 pub(crate) const TOKEN_SIZE: usize = 16;
-const VALUE_SIZE_BITS: u32 = 8;
+pub(crate) const VALUE_SIZE_BITS: u32 = 8;
 const VALUE_SIZE_MASK: i32 = 0xff;
 const OUTSIDE_TOKEN_TABLE: &str = "a double array entry points outside the token table";
 const VERSION_AT: usize = 4;
@@ -131,7 +131,7 @@ impl SystemDictionary {
     fn open_checking_in_blocks(
         path: &Path,
         kind: DictionaryKind,
-        block: usize,
+        read_block_bytes: usize,
     ) -> Result<Self, Error> {
         let map = map_file(path)?;
         let broken = |reason| Error::Format {
@@ -169,9 +169,10 @@ impl SystemDictionary {
         };
         let file = File::open(path).map_err(io_error)?;
         if features_end > tokens_end {
-            let mut last = [0];
-            read_exact_at(&file, &mut last, features_end as u64 - 1).map_err(io_error)?;
-            if last[0] != 0 {
+            let mut last_feature_byte = [0];
+            read_exact_at(&file, &mut last_feature_byte, features_end as u64 - 1)
+                .map_err(io_error)?;
+            if last_feature_byte[0] != 0 {
                 return Err(broken("the features do not end with a NUL byte"));
             }
         }
@@ -182,7 +183,7 @@ impl SystemDictionary {
             features: tokens_end..features_end,
             left_size,
             right_size,
-            block,
+            read_block_bytes,
         };
         checked.run().map_err(io_error)?.map_err(broken)?;
         Ok(Self {
@@ -216,7 +217,7 @@ impl SystemDictionary {
         let mut base = root.cast_signed() as isize;
         for (consumed, &byte) in key.iter().enumerate() {
             push_terminal(cells, base, consumed, hits);
-            match cells.get(base.wrapping_add(byte as isize + 1).cast_unsigned()) {
+            match cells.get(child_index(base, byte)) {
                 Some(&[next, check]) if base.cast_unsigned() as u32 == check => {
                     base = next.cast_signed() as isize;
                 }
@@ -282,7 +283,7 @@ struct Checked<'a> {
     features: Range<usize>,
     left_size: usize,
     right_size: usize,
-    block: usize,
+    read_block_bytes: usize,
 }
 
 impl Checked<'_> {
@@ -298,19 +299,19 @@ impl Checked<'_> {
             |part| self.terminals_part(part, threads),
         );
         let mut offsets = Vec::new();
-        let mut contexts = true;
+        let mut contexts_in_range = true;
         for result in tokens {
             let (valid, part) = result?;
-            contexts &= valid;
+            contexts_in_range &= valid;
             offsets.extend(part);
         }
-        let mut terminals = true;
+        let mut terminals_in_token_table = true;
         for result in cells {
-            terminals &= result?;
+            terminals_in_token_table &= result?;
         }
         offsets.sort_unstable();
         offsets.dedup();
-        contexts &= offsets
+        contexts_in_range &= offsets
             .last()
             .is_none_or(|&last| (last as usize) < self.features.len());
         let (features, _) = in_parallel(
@@ -318,21 +319,21 @@ impl Checked<'_> {
             |part| self.features_part(part, threads, &offsets),
             |_| (),
         );
-        let mut utf8 = true;
+        let mut features_are_utf8 = true;
         for result in features {
             let (valid, boundaries) = result?;
-            utf8 &= valid;
-            contexts &= boundaries;
+            features_are_utf8 &= valid;
+            contexts_in_range &= boundaries;
         }
-        if !utf8 {
+        if !features_are_utf8 {
             return Ok(Err("the features are not valid UTF-8"));
         }
-        if !contexts {
+        if !contexts_in_range {
             return Ok(Err(
                 "a token context id is out of range or a feature offset is not at a character boundary",
             ));
         }
-        if !terminals {
+        if !terminals_in_token_table {
             return Ok(Err(OUTSIDE_TOKEN_TABLE));
         }
         Ok(Ok(()))
@@ -346,7 +347,7 @@ impl Checked<'_> {
         mut check: impl FnMut(usize, &[u8]) -> bool,
     ) -> io::Result<bool> {
         let file = File::open(self.path)?;
-        let per_block = (self.block / size).max(1);
+        let per_block = (self.read_block_bytes / size).max(1);
         let mut buf = vec![0; per_block.min(range.len()) * size];
         let mut index = range.start;
         while index < range.end {
@@ -392,16 +393,17 @@ impl Checked<'_> {
                 .enumerate()
                 .all(|(offset, cell)| {
                     let value = read_u32(cell, 0).cast_signed();
-                    value >= 0
-                        || read_u32(cell, 4) as usize != first + offset
-                        || PrefixHit::new(!value, 0).tokens().end <= token_count
+                    let check = read_u32(cell, 4) as usize;
+                    let is_terminal = value < 0 && check == first + offset;
+                    let hit_value = !value;
+                    !is_terminal || PrefixHit::new(hit_value, 0).tokens().end <= token_count
                 })
         })
     }
 
     fn after_nul(&self, file: &File, from: usize) -> io::Result<usize> {
         let length = self.features.len();
-        let mut buf = vec![0; self.block.min(length - from)];
+        let mut buf = vec![0; self.read_block_bytes.min(length - from)];
         let mut at = from;
         while at < length {
             let count = buf.len().min(length - at);
@@ -434,11 +436,11 @@ impl Checked<'_> {
         let offsets = &offsets[offsets.partition_point(|&offset| (offset as usize) < start)..];
         let offsets = &offsets[..offsets.partition_point(|&offset| (offset as usize) < end)];
         let mut next = offsets.iter().peekable();
-        let (mut utf8, mut boundaries) = (true, true);
+        let (mut features_are_utf8, mut boundaries) = (true, true);
         let mut buf = Vec::new();
         let mut position = start;
         while position < end {
-            let count = self.block.min(end - position);
+            let count = self.read_block_bytes.min(end - position);
             let buf_start = position - buf.len();
             let old = buf.len();
             buf.resize(old + count, 0);
@@ -458,14 +460,14 @@ impl Checked<'_> {
                 .iter()
                 .rposition(|&byte| byte == 0)
                 .map_or(0, |at| at + 1);
-            utf8 &= str::from_utf8(&buf[..complete]).is_ok();
+            features_are_utf8 &= str::from_utf8(&buf[..complete]).is_ok();
             buf.drain(..complete);
-            if !utf8 || !boundaries {
-                return Ok((utf8, boundaries));
+            if !features_are_utf8 || !boundaries {
+                return Ok((features_are_utf8, boundaries));
             }
         }
-        utf8 &= str::from_utf8(&buf).is_ok();
-        Ok((utf8, boundaries))
+        features_are_utf8 &= str::from_utf8(&buf).is_ok();
+        Ok((features_are_utf8, boundaries))
     }
 }
 
@@ -504,6 +506,11 @@ fn in_parallel<A: Send, B: Send>(
 fn cell(cells: &[[u32; 2]], index: i64) -> Option<(i32, u32)> {
     let [value, check] = *cells.get(usize::try_from(index).ok()?)?;
     Some((value.cast_signed(), check))
+}
+
+#[inline(always)]
+fn child_index(base: isize, byte: u8) -> usize {
+    base.wrapping_add(byte as isize + 1).cast_unsigned()
 }
 
 #[inline]

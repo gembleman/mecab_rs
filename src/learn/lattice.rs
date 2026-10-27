@@ -1,14 +1,14 @@
-
 use std::io::Write;
 
-use super::features::{FeatureIndex, Features};
+use super::features::{FeatureIndex, Features, ID_LIST_END};
 use super::tokenizer::{BOS, EOS, Found, NORMAL, Tokenizer, UNKNOWN};
 use super::{failure, surface_and_feature};
 use crate::build::text::{Lines, cstr};
 use crate::error::Error;
 
 pub(super) const NIL: u32 = u32::MAX;
-const PADDING: usize = 8;
+const TEXT_PADDING: usize = 8;
+const WORST_COST: f64 = -1e37;
 
 #[derive(Clone)]
 struct Node {
@@ -274,14 +274,14 @@ impl Sentence {
 
         let length = sentence.len();
         let mut text = sentence;
-        text.extend_from_slice(&[0; PADDING]);
+        text.extend_from_slice(&[0; TEXT_PADDING]);
         let mut this = Self {
             text,
             length,
             nodes: Vec::new(),
             paths: Vec::new(),
-            begin_list: vec![NIL; length + PADDING],
-            end_list: vec![NIL; length + PADDING],
+            begin_list: vec![NIL; length + TEXT_PADDING],
+            end_list: vec![NIL; length + TEXT_PADDING],
             answer: Vec::new(),
         };
         let bos_feature = reader.features.intern(&reader.tokenizer.bos_feature);
@@ -357,7 +357,7 @@ impl Sentence {
             let pool = reader.index.pool();
             let mut count = |start: u32| {
                 let mut at = start as usize;
-                while pool[at] != -1 {
+                while pool[at] != ID_LIST_END {
                     let id = pool[at] as usize;
                     if id >= observed.len() {
                         observed.resize(id + 1, 0.0);
@@ -412,14 +412,14 @@ impl Sentence {
                 let mut wcost = 0.0;
                 if self.nodes[node as usize].kind != EOS {
                     let mut at = self.nodes[node as usize].fvector as usize;
-                    while pool[at] != -1 {
+                    while pool[at] != ID_LIST_END {
                         wcost += alpha[pool[at] as usize];
                         at += 1;
                     }
                 }
                 self.nodes[node as usize].wcost = wcost;
 
-                let mut best_cost = -1e37;
+                let mut best_cost = WORST_COST;
                 let mut best = NIL;
                 let mut path = self.nodes[node as usize].lpath;
                 while path != NIL {
@@ -427,7 +427,7 @@ impl Sentence {
                         let record = &self.paths[path as usize];
                         let mut cost = self.nodes[record.rnode as usize].wcost;
                         let mut at = record.fvector as usize;
-                        while pool[at] != -1 {
+                        while pool[at] != ID_LIST_END {
                             cost += alpha[pool[at] as usize];
                             at += 1;
                         }
@@ -456,9 +456,7 @@ impl Sentence {
         }
     }
 
-    pub(super) fn gradient(&mut self, pool: &[i32], alpha: &[f64], expected: &mut [f64]) -> f64 {
-        self.viterbi(pool, alpha);
-
+    fn forward(&mut self) {
         for position in 0..=self.length {
             let mut node = self.begin_list[position];
             while node != NIL {
@@ -478,7 +476,9 @@ impl Sentence {
                 node = self.nodes[node as usize].bnext;
             }
         }
+    }
 
+    fn backward(&mut self) {
         for position in (0..=self.length).rev() {
             let mut node = self.end_list[position];
             while node != NIL {
@@ -498,6 +498,12 @@ impl Sentence {
                 node = self.nodes[node as usize].enext;
             }
         }
+    }
+
+    pub(super) fn gradient(&mut self, pool: &[i32], alpha: &[f64], expected: &mut [f64]) -> f64 {
+        self.viterbi(pool, alpha);
+        self.forward();
+        self.backward();
 
         let mut z = self.nodes[self.begin_list[self.length] as usize].alpha;
 
@@ -512,13 +518,13 @@ impl Sentence {
                         let right = &self.nodes[record.rnode as usize];
                         let weight = (left.alpha + record.cost + right.beta - z).exp();
                         let mut at = record.fvector as usize;
-                        while pool[at] != -1 {
+                        while pool[at] != ID_LIST_END {
                             expected[pool[at] as usize] += weight;
                             at += 1;
                         }
                         if right.kind != EOS {
                             let mut at = right.fvector as usize;
-                            while pool[at] != -1 {
+                            while pool[at] != ID_LIST_END {
                                 expected[pool[at] as usize] += weight;
                                 at += 1;
                             }

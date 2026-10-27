@@ -1,4 +1,3 @@
-
 pub(super) const PADDING: usize = 7;
 
 pub(super) const MAX_RECORD_BITS: u32 = 56;

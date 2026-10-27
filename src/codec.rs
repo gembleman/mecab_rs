@@ -1,4 +1,3 @@
-
 mod coder;
 mod model;
 mod plan;
@@ -18,7 +17,12 @@ pub use model::{Kind, LidSpec, Plan, Step};
 pub use table::Lexicon;
 
 const MAGIC: &[u8; 4] = b"MLX1";
-const STORED: u8 = 4;
+const FLAG_NO_FINAL_NEWLINE: u8 = 1;
+const FLAG_GROUPED: u8 = 2;
+const FLAG_STORED: u8 = 4;
+const FLAGS_KNOWN: u8 = 7;
+const MAX_KEY_COUNT: usize = 1 << 31;
+const PREALLOC_KEY_LIMIT: usize = 1 << 24;
 
 #[derive(Clone, Default)]
 pub struct EncodeOptions {
@@ -258,7 +262,7 @@ pub fn encode_with(csv: &[u8], opts: &EncodeOptions) -> (Vec<u8>, Report) {
 fn stored(text: &[u8], no_final_newline: bool, grouped: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len() + 32);
     out.extend_from_slice(MAGIC);
-    out.push(no_final_newline as u8 | (grouped as u8) << 1 | STORED);
+    out.push(no_final_newline as u8 | (grouped as u8) << 1 | FLAG_STORED);
     put_varint(&mut out, text.len() as u64);
     out.extend_from_slice(&fnv1a(FNV_OFFSET, text).to_le_bytes());
     out.extend_from_slice(text);
@@ -286,7 +290,7 @@ fn read_header(data: &[u8]) -> Result<Header, Error> {
         return corrupt("not a lexicon stream");
     }
     let flags = data[4];
-    if flags & !7 != 0 {
+    if flags & !FLAGS_KNOWN != 0 {
         return corrupt("unknown flags");
     }
     let mut pos = 5;
@@ -300,10 +304,10 @@ fn read_header(data: &[u8]) -> Result<Header, Error> {
         return corrupt("truncated header");
     };
     pos += 8;
-    if flags & STORED != 0 {
+    if flags & FLAG_STORED != 0 {
         return Ok(Header {
-            no_final_newline: flags & 1 != 0,
-            grouped: flags & 2 != 0,
+            no_final_newline: flags & FLAG_NO_FINAL_NEWLINE != 0,
+            grouped: flags & FLAG_GROUPED != 0,
             stored: true,
             text_len,
             digest,
@@ -326,8 +330,8 @@ fn read_header(data: &[u8]) -> Result<Header, Error> {
     };
     Ok(Header {
         stored: false,
-        no_final_newline: flags & 1 != 0,
-        grouped: flags & 2 != 0,
+        no_final_newline: flags & FLAG_NO_FINAL_NEWLINE != 0,
+        grouped: flags & FLAG_GROUPED != 0,
         text_len,
         digest,
         n_keys: n_keys as usize,
@@ -365,11 +369,11 @@ fn decode_unchecked(data: &[u8]) -> Result<(Lexicon, Header), Error> {
     let n_cols = h.plan.n_cols;
     let mut lex = Lexicon::new(n_cols);
     lex.no_final_newline = h.no_final_newline;
-    if h.n_keys > (1 << 31) || (n_cols == 0 && h.n_keys > 0) {
+    if h.n_keys > MAX_KEY_COUNT || (n_cols == 0 && h.n_keys > 0) {
         return corrupt("bad key count");
     }
     let mut km = KeyModel::new();
-    let mut keys: Vec<String> = Vec::with_capacity(h.n_keys.min(1 << 24));
+    let mut keys: Vec<String> = Vec::with_capacity(h.n_keys.min(PREALLOC_KEY_LIMIT));
     let mut buf = String::new();
     for _ in 0..h.n_keys {
         km.code_key(&mut c, "", &mut buf);

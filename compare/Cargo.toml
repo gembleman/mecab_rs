@@ -5,7 +5,6 @@ edition = "2021"
 publish = false
 description = "Same-condition speed comparison of mecab_rs, vibrato, lindera and sudachi.rs"
 
-# Not part of the mecab_rs build.
 [workspace]
 
 [dependencies]

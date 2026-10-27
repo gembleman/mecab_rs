@@ -1,9 +1,9 @@
-
 pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 pub fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {
-        h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        h = (h ^ b as u64).wrapping_mul(FNV_PRIME);
     }
     h
 }
@@ -134,10 +134,7 @@ impl Lexicon {
             }
             emitted += 1;
             if emitted < total || !self.no_final_newline {
-                sink(
-                    b"
-",
-                );
+                sink(b"\n");
             }
         };
         match order {
@@ -156,10 +153,7 @@ impl Lexicon {
             emitted += 1;
             sink(l);
             if emitted < total || !self.no_final_newline {
-                sink(
-                    b"
-",
-                );
+                sink(b"\n");
             }
         }
     }

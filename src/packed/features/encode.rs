@@ -1,18 +1,19 @@
-
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
 use super::{
     BitWriter, Counts, Layout, MAX_NUMERIC, MAX_SLOTS, NumSpec, OP_COPY, OP_EMPTY, OP_HIGH,
-    OP_INLINE, OP_KEY, OP_NUM, OP_REF, OP_STAR, SYNC_EVERY, bits_for, push_piece,
+    OP_INLINE, OP_KEY, OP_NUM, OP_NUM_MAX, OP_REF, OP_STAR, SYNC_EVERY, bits_for, push_piece,
 };
 use crate::Error;
 
 const MAX_FIELDS: usize = 256;
-const SMALL_LIMIT: usize = 256;
+const FOLD_MAX_VALUES: usize = 256;
 const MAX_TEMPLATES: usize = 1 << 16;
 const MAX_LOW_PARTS: usize = 1 << 16;
 const ABSENT: u16 = u16::MAX;
+const HASH_MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
+const FINAL_MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
 
 pub(in crate::packed) struct Encoded {
     pub(in crate::packed) bytes: Vec<u8>,
@@ -24,15 +25,15 @@ fn is_key(value: &[u8], key: &[u8]) -> bool {
 }
 
 #[derive(Default)]
-struct Fast(u64);
+struct SmallKeyHasher(u64);
 
-impl Fast {
+impl SmallKeyHasher {
     fn add(&mut self, word: u64) {
-        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(HASH_MULTIPLIER);
     }
 }
 
-impl Hasher for Fast {
+impl Hasher for SmallKeyHasher {
     fn write(&mut self, bytes: &[u8]) {
         let (chunks, rest) = bytes.as_chunks::<8>();
         for &chunk in chunks {
@@ -66,13 +67,13 @@ impl Hasher for Fast {
     fn finish(&self) -> u64 {
         let mut hash = self.0;
         hash ^= hash >> 32;
-        hash = hash.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        hash = hash.wrapping_mul(FINAL_MULTIPLIER);
         hash ^ (hash >> 29)
     }
 }
 
-type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<Fast>>;
-type FastSet<K> = HashSet<K, BuildHasherDefault<Fast>>;
+type SmallKeyMap<K, V> = HashMap<K, V, BuildHasherDefault<SmallKeyHasher>>;
+type SmallKeySet<K> = HashSet<K, BuildHasherDefault<SmallKeyHasher>>;
 
 pub(in crate::packed) fn split_fields(text: &[u8], fields: &mut Vec<(usize, usize)>) {
     fields.clear();
@@ -128,8 +129,8 @@ fn parse_number(field: &[u8]) -> Option<u64> {
 
 struct Stat<'a> {
     present: usize,
-    values: FastMap<&'a [u8], u16>,
-    ids: Vec<u16>,
+    values: SmallKeyMap<&'a [u8], u16>,
+    value_ids: Vec<u16>,
     overflow: bool,
     numeric: bool,
 }
@@ -138,8 +139,8 @@ impl<'a> Stat<'a> {
     fn new(entries: usize) -> Self {
         Self {
             present: 0,
-            values: FastMap::default(),
-            ids: vec![ABSENT; entries],
+            values: SmallKeyMap::default(),
+            value_ids: vec![ABSENT; entries],
             overflow: false,
             numeric: true,
         }
@@ -154,15 +155,15 @@ impl<'a> Stat<'a> {
             return;
         }
         if let Some(&id) = self.values.get(value) {
-            self.ids[entry] = id;
-        } else if self.values.len() >= SMALL_LIMIT {
+            self.value_ids[entry] = id;
+        } else if self.values.len() >= FOLD_MAX_VALUES {
             self.overflow = true;
-            self.values = FastMap::default();
-            self.ids = Vec::new();
+            self.values = SmallKeyMap::default();
+            self.value_ids = Vec::new();
         } else {
             let id = self.values.len() as u16;
             self.values.insert(value, id);
-            self.ids[entry] = id;
+            self.value_ids[entry] = id;
         }
     }
 
@@ -179,11 +180,11 @@ enum Class {
     High(usize),
 }
 
-fn choose_split(values: &[u64], forced: Option<u32>) -> (u32, Vec<u64>) {
+fn choose_split(values: &[u64], preferred_shift: Option<u32>) -> (u32, Vec<u64>) {
     let maximum = values.iter().copied().max().unwrap_or(0);
     let top = 64 - maximum.leading_zeros();
     let mut best = (f64::MAX, 0u32);
-    let mut lows: FastSet<u64> = FastSet::default();
+    let mut lows: SmallKeySet<u64> = SmallKeySet::default();
     for shift in 0..top.max(1) {
         let (hi_bits, count) = if shift == 0 {
             (top, 1)
@@ -209,19 +210,19 @@ fn choose_split(values: &[u64], forced: Option<u32>) -> (u32, Vec<u64>) {
         }
     }
     let mut shift = best.1;
-    if let Some(forced) = forced {
-        let mask = (1u64 << forced) - 1;
-        let mut set: FastSet<u64> = FastSet::default();
+    if let Some(preferred_shift) = preferred_shift {
+        let mask = (1u64 << preferred_shift) - 1;
+        let mut set: SmallKeySet<u64> = SmallKeySet::default();
         set.extend(values.iter().map(|&value| value & mask));
         if set.len() <= MAX_LOW_PARTS {
-            shift = forced;
+            shift = preferred_shift;
         }
     }
     let mut table: Vec<u64> = if shift == 0 {
         vec![0]
     } else {
         let mask = (1u64 << shift) - 1;
-        let mut set: FastSet<u64> = FastSet::default();
+        let mut set: SmallKeySet<u64> = SmallKeySet::default();
         set.extend(values.iter().map(|&value| value & mask));
         set.into_iter().collect()
     };
@@ -251,7 +252,7 @@ fn text_op<'a>(value: &'a [u8], slots: &mut Vec<&'a [u8]>) -> TextOp {
     }
 }
 
-fn number_of(map: &mut FastMap<Vec<u8>, u32>, list: &mut Vec<Vec<u8>>, bytes: &[u8]) -> u32 {
+fn intern_bytes(map: &mut SmallKeyMap<Vec<u8>, u32>, list: &mut Vec<Vec<u8>>, bytes: &[u8]) -> u32 {
     if let Some(&number) = map.get(bytes) {
         return number;
     }
@@ -308,7 +309,7 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
     }
 
     let mut joint: Vec<u32> = {
-        let mut known: FastMap<u16, u32> = FastMap::default();
+        let mut known: SmallKeyMap<u16, u32> = SmallKeyMap::default();
         field_counts
             .iter()
             .map(|&number| {
@@ -321,13 +322,13 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
     order.sort_by_key(|&field| (stats[field].values.len(), field));
     let mut classes = vec![Class::Text; stats.len()];
     for field in order {
-        let mut known: FastMap<(u32, u16), u32> = FastMap::default();
+        let mut known: SmallKeyMap<(u32, u16), u32> = SmallKeyMap::default();
         let mut next = Vec::with_capacity(count);
         for (entry, &previous) in joint.iter().enumerate() {
             let length = known.len() as u32;
             next.push(
                 *known
-                    .entry((previous, stats[field].ids[entry]))
+                    .entry((previous, stats[field].value_ids[entry]))
                     .or_insert(length),
             );
             if known.len() > MAX_TEMPLATES {
@@ -341,7 +342,7 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
     }
     drop(joint);
     for stat in &mut stats {
-        stat.ids = Vec::new();
+        stat.value_ids = Vec::new();
     }
 
     let candidates: Vec<usize> = (0..stats.len())
@@ -380,14 +381,15 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
             .filter(|&entry| has(entry))
             .map(|entry| values[slot][entry])
             .collect();
-        let forced = candidates
-            .iter()
-            .enumerate()
-            .skip(slot + 1)
-            .find_map(|(other, &later)| {
-                shifted_copy(&values[slot], &values[other], &field_counts, field, later)
-            });
-        let (shift, low_table) = choose_split(&present, forced);
+        let preferred_shift =
+            candidates
+                .iter()
+                .enumerate()
+                .skip(slot + 1)
+                .find_map(|(other, &later)| {
+                    shifted_copy(&values[slot], &values[other], &field_counts, field, later)
+                });
+        let (shift, low_table) = choose_split(&present, preferred_shift);
         let maximum = present.iter().copied().max().unwrap_or(0);
         let hi_bits = 64 - (maximum >> shift).leading_zeros();
         let spec = NumSpec {
@@ -408,7 +410,7 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
     }
 
     let mut variants: Vec<(usize, &[u8])> = Vec::new();
-    let mut variant_of: FastMap<(u32, &[u8]), u32> = FastMap::default();
+    let mut variant_of: SmallKeyMap<(u32, &[u8]), u32> = SmallKeyMap::default();
     let mut starts_of: Vec<u32> = Vec::with_capacity(tokens.len());
     for &(feature, key) in tokens {
         let entry = feature as usize;
@@ -430,7 +432,7 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
     }
     drop(variant_of);
 
-    let mut uses: FastMap<&[u8], u32> = FastMap::default();
+    let mut string_uses: SmallKeyMap<&[u8], u32> = SmallKeyMap::default();
     let mut slots: Vec<&[u8]> = Vec::new();
     for &(entry, key) in &variants {
         let text = entries[entry];
@@ -443,17 +445,17 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
                     continue;
                 }
                 if let TextOp::New = text_op(value, &mut slots) {
-                    *uses.entry(value).or_insert(0) += 1;
+                    *string_uses.entry(value).or_insert(0) += 1;
                 }
             }
         }
     }
 
-    let mut templates: FastMap<Vec<u8>, u32> = FastMap::default();
+    let mut templates: SmallKeyMap<Vec<u8>, u32> = SmallKeyMap::default();
     let mut template_list: Vec<Vec<u8>> = Vec::new();
-    let mut shapes: FastMap<Vec<u8>, u32> = FastMap::default();
+    let mut shapes: SmallKeyMap<Vec<u8>, u32> = SmallKeyMap::default();
     let mut shape_list: Vec<Vec<u8>> = Vec::new();
-    let mut known_strings: FastMap<&[u8], u32> = FastMap::default();
+    let mut known_strings: SmallKeyMap<&[u8], u32> = SmallKeyMap::default();
     let mut area: Vec<u8> = Vec::new();
     let mut entry_template: Vec<u32> = Vec::with_capacity(variants.len());
     let mut entry_shape: Vec<u32> = Vec::with_capacity(variants.len());
@@ -488,7 +490,7 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
                     TextOp::Star => ops.push(OP_STAR),
                     TextOp::Empty => ops.push(OP_EMPTY),
                     TextOp::Copy(slot) => ops.push(OP_COPY + slot),
-                    TextOp::New if uses[value] == 1 => {
+                    TextOp::New if string_uses[value] == 1 => {
                         ops.push(OP_INLINE);
                         inline.push(value);
                     }
@@ -521,12 +523,12 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         if area.len() > u32::MAX as usize {
             return Err(Error::Unsupported("feature strings of more than 4 GiB"));
         }
-        entry_template.push(number_of(&mut templates, &mut template_list, &program));
-        entry_shape.push(number_of(&mut shapes, &mut shape_list, &ops));
+        entry_template.push(intern_bytes(&mut templates, &mut template_list, &program));
+        entry_shape.push(intern_bytes(&mut shapes, &mut shape_list, &ops));
     }
     drop(values);
     drop(known_strings);
-    drop(uses);
+    drop(string_uses);
 
     let template_bits = bits_for(template_list.len() as u64);
     let shape_bits = bits_for(shape_list.len() as u64);
@@ -552,7 +554,7 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
                     writer.put_bytes(inline[next_inline]);
                     next_inline += 1;
                 }
-                OP_NUM..=0x23 => {
+                OP_NUM..=OP_NUM_MAX => {
                     let (high, index) = numbers[next_number];
                     next_number += 1;
                     let spec = &stored[usize::from(op - OP_NUM)].spec;

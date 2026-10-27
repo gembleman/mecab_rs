@@ -1,4 +1,3 @@
-
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -93,7 +92,7 @@ pub(crate) struct Settings {
     node_format: bool,
 }
 
-fn lexical_int(text: &[u8]) -> i32 {
+fn int_or_zero(text: &[u8]) -> i32 {
     std::str::from_utf8(text)
         .ok()
         .and_then(|text| {
@@ -114,7 +113,7 @@ impl Settings {
             ));
         }
         let mut lines = Lines::open(&dicrc, None)?;
-        let mut values: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         while let Some(line) = lines.next_line()? {
             let line = text::cstr(line, 0);
             if line.is_empty() || line[0] == b';' || line[0] == b'#' {
@@ -126,33 +125,34 @@ impl Settings {
                     format!("format error: {}", String::from_utf8_lossy(line)),
                 ));
             };
-            if !values.iter().any(|(name, _)| name == key) {
-                values.push((key.to_vec(), value.to_vec()));
+            let already_set = entries.iter().any(|(name, _)| name == key);
+            if !already_set {
+                entries.push((key.to_vec(), value.to_vec()));
             }
         }
         let get = |key: &str| {
-            values
+            entries
                 .iter()
                 .find(|(name, _)| name == key.as_bytes())
                 .map(|(_, value)| value.as_slice())
         };
-        let text = |key: &str| {
+        let text_of = |key: &str| {
             get(key)
                 .map(|value| String::from_utf8_lossy(value).into_owned())
                 .unwrap_or_default()
         };
-        let mut config_charset = text("config-charset");
+        let mut config_charset = text_of("config-charset");
         if config_charset.is_empty() {
             config_charset.clone_from(&options.dictionary_charset);
         }
         let model = options.model.clone().or_else(|| {
-            let named = text("model");
+            let named = text_of("model");
             (!named.is_empty()).then(|| PathBuf::from(named))
         });
         Ok(Self {
             dic_dir: dic_dir.to_path_buf(),
             options: options.clone(),
-            cost_factor: get("cost-factor").map_or(0, lexical_int),
+            cost_factor: get("cost-factor").map_or(0, int_or_zero),
             config_charset,
             model,
             node_format: get("node-format").is_some_and(|value| !value.is_empty()),
@@ -217,6 +217,9 @@ impl Settings {
     }
 }
 
+const WRITE_BUFFER_BYTES: usize = 1 << 23;
+const MIN_CSV_NAME_LEN: usize = 5;
+
 pub(crate) fn write_file_with<E: From<Error>>(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<(), E>,
@@ -231,7 +234,7 @@ pub(crate) fn write_file_with<E: From<Error>>(
     let temporary = path.with_file_name(format!(".{name}.tmp"));
     let result = (|| {
         let file = File::create(&temporary).map_err(io_error)?;
-        let mut writer = BufWriter::with_capacity(1 << 23, file);
+        let mut writer = BufWriter::with_capacity(WRITE_BUFFER_BYTES, file);
         write(&mut writer)?;
         writer.flush().map_err(io_error)
     })();
@@ -266,7 +269,7 @@ pub(crate) fn csv_files(dic_dir: &Path) -> Result<Vec<PathBuf>, Error> {
             source,
         })?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.len() >= 5 && name.to_ascii_lowercase().ends_with(".csv") {
+        if name.len() >= MIN_CSV_NAME_LEN && name.to_ascii_lowercase().ends_with(".csv") {
             names.push(name);
         }
     }
@@ -274,7 +277,7 @@ pub(crate) fn csv_files(dic_dir: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(names.into_iter().map(|name| dic_dir.join(name)).collect())
 }
 
-fn record(report: &mut BuildReport, inputs: &[PathBuf], counts: Vec<usize>) {
+fn record_inputs_read(report: &mut BuildReport, inputs: &[PathBuf], counts: Vec<usize>) {
     report.read.extend(inputs.iter().cloned().zip(counts));
 }
 
@@ -296,60 +299,97 @@ pub fn compile_system(
     let mut report = BuildReport::default();
 
     if parts.char_category || parts.unknown {
-        let bin = out_dir.join("char.bin");
-        let definition = dic_dir.join("char.def");
-        let bytes = char_def::compile(&definition, &dic_dir.join("unk.def"))?;
-        write_file(&bin, |file| file.write_all(&bytes))?;
-        let uni = out_dir.join("char.uni");
-        CharTable::convert(
-            &bin,
-            definition.is_file().then_some(definition.as_path()),
-            &uni,
-        )?;
-        report.written.extend([bin, uni]);
+        write_char_tables(dic_dir, out_dir, &mut report)?;
     }
-
     if parts.unknown {
-        let unknown = vec![dic_dir.join("unk.def")];
-        let output = out_dir.join("unk.dic");
-        let counts = dictionary::compile(&settings, DictionaryKind::Unknown, &unknown, &output)?;
-        record(&mut report, &unknown, counts);
-        report.written.push(output);
+        write_unknown_dictionary(&settings, out_dir, &mut report)?;
     }
-
     if parts.model {
-        let text = dic_dir.join("model.def");
-        if text.is_file() {
-            let output = out_dir.join("model.bin");
-            let bytes = model::convert(&text, &options.dictionary_charset, &options.charset)?;
-            write_file(&output, |file| file.write_all(&bytes))?;
-            report.written.push(output);
-        } else {
-            eprintln!("{} is not found. skipped.", text.display());
-        }
+        write_model(&settings, out_dir, &mut report)?;
     }
-
     if parts.system {
-        let inputs = csv_files(dic_dir)?;
-        if inputs.is_empty() {
-            return Err(failure(dic_dir, "no dictionaries are specified"));
-        }
-        let output = out_dir.join("sys.dic");
-        let counts = dictionary::compile(&settings, DictionaryKind::System, &inputs, &output)?;
-        record(&mut report, &inputs, counts);
-        report.written.push(output);
+        write_system_dictionary(&settings, out_dir, &mut report)?;
     }
-
     if parts.matrix {
-        let output = out_dir.join("matrix.bin");
-        write_file_with(&output, |file| {
-            matrix::compile(&dic_dir.join("matrix.def"), &output, file)
-        })?;
-        report.written.push(output);
+        write_matrix(dic_dir, out_dir, &mut report)?;
     }
 
     copy_dicrc(dic_dir, out_dir)?;
     Ok(report)
+}
+
+fn write_char_tables(
+    dic_dir: &Path,
+    out_dir: &Path,
+    report: &mut BuildReport,
+) -> Result<(), Error> {
+    let bin = out_dir.join("char.bin");
+    let definition = dic_dir.join("char.def");
+    let bytes = char_def::compile(&definition, &dic_dir.join("unk.def"))?;
+    write_file(&bin, |file| file.write_all(&bytes))?;
+    let uni = out_dir.join("char.uni");
+    CharTable::convert(
+        &bin,
+        definition.is_file().then_some(definition.as_path()),
+        &uni,
+    )?;
+    report.written.extend([bin, uni]);
+    Ok(())
+}
+
+fn write_unknown_dictionary(
+    settings: &Settings,
+    out_dir: &Path,
+    report: &mut BuildReport,
+) -> Result<(), Error> {
+    let unknown = vec![settings.dic_dir.join("unk.def")];
+    let output = out_dir.join("unk.dic");
+    let counts = dictionary::compile(settings, DictionaryKind::Unknown, &unknown, &output)?;
+    record_inputs_read(report, &unknown, counts);
+    report.written.push(output);
+    Ok(())
+}
+
+fn write_model(settings: &Settings, out_dir: &Path, report: &mut BuildReport) -> Result<(), Error> {
+    let text = settings.dic_dir.join("model.def");
+    if !text.is_file() {
+        eprintln!("{} is not found. skipped.", text.display());
+        return Ok(());
+    }
+    let output = out_dir.join("model.bin");
+    let bytes = model::convert(
+        &text,
+        &settings.options.dictionary_charset,
+        &settings.options.charset,
+    )?;
+    write_file(&output, |file| file.write_all(&bytes))?;
+    report.written.push(output);
+    Ok(())
+}
+
+fn write_system_dictionary(
+    settings: &Settings,
+    out_dir: &Path,
+    report: &mut BuildReport,
+) -> Result<(), Error> {
+    let inputs = csv_files(&settings.dic_dir)?;
+    if inputs.is_empty() {
+        return Err(failure(&settings.dic_dir, "no dictionaries are specified"));
+    }
+    let output = out_dir.join("sys.dic");
+    let counts = dictionary::compile(settings, DictionaryKind::System, &inputs, &output)?;
+    record_inputs_read(report, &inputs, counts);
+    report.written.push(output);
+    Ok(())
+}
+
+fn write_matrix(dic_dir: &Path, out_dir: &Path, report: &mut BuildReport) -> Result<(), Error> {
+    let output = out_dir.join("matrix.bin");
+    write_file_with(&output, |file| {
+        matrix::compile(&dic_dir.join("matrix.def"), &output, file)
+    })?;
+    report.written.push(output);
+    Ok(())
 }
 
 fn copy_dicrc(dic_dir: &Path, out_dir: &Path) -> Result<(), Error> {
@@ -377,7 +417,7 @@ pub fn compile_user(
     }
     let counts = dictionary::compile(&settings, DictionaryKind::User, csv_files, output)?;
     let mut report = BuildReport::default();
-    record(&mut report, csv_files, counts);
+    record_inputs_read(&mut report, csv_files, counts);
     report.written.push(output.to_path_buf());
     Ok(report)
 }
@@ -394,7 +434,7 @@ pub fn assign_user_costs(
     }
     let counts = dictionary::assign_costs(&settings, csv_files, output)?;
     let mut report = BuildReport::default();
-    record(&mut report, csv_files, counts);
+    record_inputs_read(&mut report, csv_files, counts);
     report.written.push(output.to_path_buf());
     Ok(report)
 }

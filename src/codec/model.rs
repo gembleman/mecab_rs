@@ -1,4 +1,3 @@
-
 use super::coder::{Coder, Flag, UintModel, unzigzag, zigzag};
 use super::ppm::{FastMap, Interner, NOVEL, Ppm, hash_bytes, mix};
 use super::text::{CharModel, is_kana, kata};
@@ -17,14 +16,9 @@ pub struct LidSpec {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
     Cat,
-    Str {
-        align: bool,
-        recent: u8,
-    },
+    Str { align: bool, recent: u8 },
     Lid(LidSpec),
-    Num {
-        mode: u8,
-    },
+    Num { mode: u8 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,7 +107,7 @@ impl Plan {
         let pos_cols = get_varint(b, pos)? as usize;
         let cat_ctx = get_opt(b, pos)?;
         let n = get_varint(b, pos)? as usize;
-        if n_cols > 1 << 20 || n > n_cols || 4 + pos_cols > n_cols.max(4) {
+        if n_cols > 1 << 20 || n > n_cols || FIXED_COLS + pos_cols > n_cols.max(FIXED_COLS) {
             return None;
         }
         let mut steps = Vec::new();
@@ -182,7 +176,11 @@ impl Plan {
         if self.n_cols > 0 {
             coded[0] = true;
         }
-        for flag in coded.iter_mut().take(4 + self.pos_cols).skip(4) {
+        for flag in coded
+            .iter_mut()
+            .take(FIXED_COLS + self.pos_cols)
+            .skip(FIXED_COLS)
+        {
             *flag = true;
         }
         let mut strings = 0;
@@ -252,8 +250,8 @@ struct StrState {
     read_chars: CharModel,
     recent: Vec<String>,
     limit: usize,
-    pending: Option<(u32, Cand)>,
-    ex: u32,
+    group_plan: Option<(u32, Cand)>,
+    group_exact: u32,
     align_stats: [f64; 4],
     seg_ppm: Ppm,
     segs: Interner,
@@ -389,8 +387,8 @@ impl Model {
                         runs: Interner::default(),
                         read_chars: CharModel::new(2),
                         recent: Vec::new(),
-                        pending: None,
-                        ex: 0,
+                        group_plan: None,
+                        group_exact: 0,
                         align_stats: [0.0; 4],
                         seg_ppm: Ppm::default(),
                         segs: Interner::default(),
@@ -615,7 +613,7 @@ impl Model {
                 .steps
                 .iter()
                 .any(|s| matches!(s.kind, Kind::Num { .. } | Kind::Lid(_)));
-            sh.row_irr = has_numbers && self.row_flag.code(c, irr, 30000);
+            sh.row_irr = has_numbers && self.row_flag.code(c, irr, IRREGULAR_FLAG_LIMIT);
         }
         let sbundle = self.active.is_none() && !self.sgroup.steps.is_empty();
         if sbundle {
@@ -687,7 +685,7 @@ fn code_pos(
     sh.scratch.clear();
     if !dec {
         for i in 0..p {
-            put_str(&mut sh.scratch, &sh.cur[4 + i]);
+            put_str(&mut sh.scratch, &sh.cur[FIXED_COLS + i]);
         }
     }
     let sym = if dec {
@@ -720,13 +718,13 @@ fn code_pos(
                         NOVEL
                     } else {
                         comp_intern[i]
-                            .find(sh.cur[4 + i].as_bytes())
+                            .find(sh.cur[FIXED_COLS + i].as_bytes())
                             .unwrap_or(NOVEL)
                     };
                     let fid = match comp_ppm[i].code(c, &ctxs, fsym) {
                         Some(f) => f,
                         None => {
-                            comp_chars.code_str(c, &[], &sh.cur[4 + i], &mut sh.tmp);
+                            comp_chars.code_str(c, &[], &sh.cur[FIXED_COLS + i], &mut sh.tmp);
                             match comp_intern[i].find(sh.tmp.as_bytes()) {
                                 Some(f) => f,
                                 None => comp_intern[i].add(sh.tmp.as_bytes()),
@@ -739,7 +737,7 @@ fn code_pos(
                         .to_string();
                     h = mix(h, hash_bytes(f.as_bytes()));
                     put_str(&mut sh.scratch, &f);
-                    sh.cur[4 + i] = f;
+                    sh.cur[FIXED_COLS + i] = f;
                 }
                 match intern.find(&sh.scratch) {
                     Some(i) => i,
@@ -757,8 +755,8 @@ fn code_pos(
         for i in 0..p {
             let n = get_varint(b, &mut pos).unwrap_or(0) as usize;
             let end = (pos + n).min(b.len());
-            sh.cur[4 + i].clear();
-            sh.cur[4 + i].push_str(std::str::from_utf8(&b[pos..end]).unwrap_or(""));
+            sh.cur[FIXED_COLS + i].clear();
+            sh.cur[FIXED_COLS + i].push_str(std::str::from_utf8(&b[pos..end]).unwrap_or(""));
             pos = end;
         }
     }
@@ -768,7 +766,7 @@ fn code_pos(
     }
     let mut h = 0u64;
     for i in 0..p {
-        h = mix(h, hash_bytes(sh.cur[4 + i].as_bytes()));
+        h = mix(h, hash_bytes(sh.cur[FIXED_COLS + i].as_bytes()));
         if i == 0 {
             sh.p0 = h;
         }
@@ -1043,7 +1041,7 @@ fn code_str_group(
                 (&mut steps[si], &plan_steps[si].kind)
             {
                 let (ex, cand) = plan_str(st, sh, plan_steps[si].col, *align);
-                st.pending = Some((ex, cand));
+                st.group_plan = Some((ex, cand));
                 sh.scratch.extend_from_slice(&(ex as u16).to_le_bytes());
             }
         }
@@ -1068,10 +1066,10 @@ fn code_str_group(
             sh.scratch.clear();
             for &si in &g.steps {
                 if let StepState::Str(st) = &mut steps[si] {
-                    let want = st.pending.map_or(0, |p| p.0);
+                    let want = st.group_plan.map_or(0, |p| p.0);
                     let ex = code_ex(st, sh, c, want);
-                    st.pending = st.pending.map(|p| (ex, p.1));
-                    st.ex = ex;
+                    st.group_plan = st.group_plan.map(|p| (ex, p.1));
+                    st.group_exact = ex;
                     sh.scratch.extend_from_slice(&(ex as u16).to_le_bytes());
                 }
             }
@@ -1086,10 +1084,10 @@ fn code_str_group(
     let b = g.vecs.get(id);
     for (k, &si) in g.steps.iter().enumerate() {
         if let StepState::Str(st) = &mut steps[si] {
-            st.ex = b
+            st.group_exact = b
                 .get(2 * k..2 * k + 2)
                 .map_or(0, |x| u16::from_le_bytes([x[0], x[1]]) as u32);
-            if st.ex == 0 {
+            if st.group_exact == 0 {
                 st.tuple_ppm
                     .prefetch(mix(mix(24, sh.pos_hash), sh.sgroup as u64));
                 st.tuple_ppm.prefetch(mix(20, sh.pos_hash));
@@ -1109,6 +1107,9 @@ fn code_ex(st: &mut StrState, sh: &mut Shared, c: &mut Coder, want: u32) -> u32 
 }
 
 const MAX_RECENT: usize = 8;
+pub const FIXED_COLS: usize = 4;
+const IRREGULAR_FLAG_LIMIT: u32 = 30000;
+const LO_BITS_MAX: u8 = 24;
 pub const MAX_STR_STEPS: usize = 200;
 
 fn remember(recent: &mut Vec<String>, limit: usize, v: &str) {
@@ -1139,9 +1140,9 @@ fn code_str(
 ) {
     let dec = c.is_decoder();
     let nsrc = st.srcs.len();
-    let pending = st.pending.take();
+    let pending = st.group_plan.take();
     let (ex, cand) = if grouped {
-        (st.ex, pending.map_or((0, 0, 0, 0), |p| p.1))
+        (st.group_exact, pending.map_or((0, 0, 0, 0), |p| p.1))
     } else {
         let (want, cand) = if dec {
             (0, (0, 0, 0, 0))
@@ -1392,7 +1393,11 @@ fn code_num(st: &mut NumState, sh: &mut Shared, c: &mut Coder, col: usize, mode:
     } else {
         canonical_i64(&sh.cur[col])
     };
-    if sh.row_irr && st.irregular.code(c, !dec && parsed.is_none(), 30000) {
+    if sh.row_irr
+        && st
+            .irregular
+            .code(c, !dec && parsed.is_none(), IRREGULAR_FLAG_LIMIT)
+    {
         sh.raw_chars.code_str(c, &[], &sh.cur[col], &mut sh.tmp);
         if dec {
             sh.cur[col] = sh.tmp.clone();
@@ -1585,7 +1590,10 @@ fn code_lid(st: &mut LidState, sh: &mut Shared, c: &mut Coder, col: usize, spec:
     } else {
         canonical_u64(&sh.cur[col])
     };
-    let irregular = sh.row_irr && st.irregular.code(c, !dec && parsed.is_none(), 30000);
+    let irregular = sh.row_irr
+        && st
+            .irregular
+            .code(c, !dec && parsed.is_none(), IRREGULAR_FLAG_LIMIT);
     if irregular {
         sh.raw_chars.code_str(c, &[], &sh.cur[col], &mut sh.tmp);
         if dec {
@@ -1667,7 +1675,7 @@ fn code_lid(st: &mut LidState, sh: &mut Shared, c: &mut Coder, col: usize, spec:
                 }
             }
         }
-        let split = shift.min(24) as u32;
+        let split = shift.min(LO_BITS_MAX) as u32;
         let ctxs = [
             mix(mix(41, sh.pos_hash), sh.shape),
             mix(42, sh.pos_hash),
@@ -1706,9 +1714,11 @@ fn code_lid(st: &mut LidState, sh: &mut Shared, c: &mut Coder, col: usize, spec:
         }
         if let Some(p) = partner {
             let bad = sh.row_irr
-                && st
-                    .partner_bad
-                    .code(c, !dec && canonical_u64(&sh.cur[p]) != Some(new_id), 30000);
+                && st.partner_bad.code(
+                    c,
+                    !dec && canonical_u64(&sh.cur[p]) != Some(new_id),
+                    IRREGULAR_FLAG_LIMIT,
+                );
             if bad {
                 sh.raw_chars.code_str(c, &[], &sh.cur[p], &mut sh.tmp);
                 if dec {

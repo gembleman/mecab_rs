@@ -1,4 +1,3 @@
-
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
@@ -75,6 +74,9 @@ impl Config {
     }
 }
 
+const SIGNIFICANT_DIGITS: i32 = 6;
+const LOWEST_FIXED_EXPONENT: i32 = -4;
+
 pub(crate) fn format_g(value: f64) -> String {
     if value == 0.0 {
         return if value.is_sign_negative() { "-0" } else { "0" }.to_owned();
@@ -89,10 +91,13 @@ pub(crate) fn format_g(value: f64) -> String {
         }
         .to_owned();
     }
-    let scientific = format!("{value:.5e}");
+    let scientific = format!(
+        "{value:.*e}",
+        usize::try_from(SIGNIFICANT_DIGITS - 1).expect("at least 0")
+    );
     let (mantissa, exponent) = scientific.split_once('e').expect("an exponent");
     let exponent: i32 = exponent.parse().expect("a number");
-    if !(-4..6).contains(&exponent) {
+    if !(LOWEST_FIXED_EXPONENT..SIGNIFICANT_DIGITS).contains(&exponent) {
         let mantissa = if mantissa.contains('.') {
             mantissa.trim_end_matches('0').trim_end_matches('.')
         } else {
@@ -101,7 +106,7 @@ pub(crate) fn format_g(value: f64) -> String {
         let sign = if exponent < 0 { '-' } else { '+' };
         return format!("{mantissa}e{sign}{:02}", exponent.abs());
     }
-    let decimals = usize::try_from(5 - exponent).expect("at least 0");
+    let decimals = usize::try_from(SIGNIFICANT_DIGITS - 1 - exponent).expect("at least 0");
     let fixed = format!("{value:.decimals$}");
     if fixed.contains('.') {
         fixed.trim_end_matches('0').trim_end_matches('.').to_owned()

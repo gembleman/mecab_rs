@@ -1,4 +1,3 @@
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -7,21 +6,23 @@ use super::text::{
 };
 use crate::error::Error;
 
+const MAX_PATTERN_COLUMNS: usize = 512;
+
 struct RewritePattern {
     source: Vec<Vec<u8>>,
     destination: Vec<Vec<u8>>,
 }
 
-fn columns(text: &[u8], max: usize) -> Vec<Vec<u8>> {
+fn split_columns(text: &[u8], max_columns: usize) -> Vec<Vec<u8>> {
     let mut buffer = text[..text.len().min(BUF_SIZE - 1)].to_vec();
     buffer.push(0);
-    tokenize_csv(&mut buffer, max)
+    tokenize_csv(&mut buffer, max_columns)
         .into_iter()
         .map(|start| cstr(&buffer, start).to_vec())
         .collect()
 }
 
-fn matches(pattern: &[u8], text: &[u8]) -> bool {
+fn pattern_matches(pattern: &[u8], text: &[u8]) -> bool {
     if pattern.first() == Some(&b'*') || pattern == text {
         return true;
     }
@@ -33,11 +34,42 @@ fn matches(pattern: &[u8], text: &[u8]) -> bool {
     false
 }
 
+fn expand_template(template: &[u8], input: &[&[u8]]) -> Result<Vec<u8>, String> {
+    let mut element = Vec::new();
+    let mut cursor = 0;
+    while cursor < template.len() {
+        if template[cursor] == b'$' {
+            cursor += 1;
+            let mut number = 0usize;
+            while cursor < template.len() && template[cursor].is_ascii_digit() {
+                number = number
+                    .wrapping_mul(10)
+                    .wrapping_add(usize::from(template[cursor] - b'0'));
+                cursor += 1;
+            }
+            if number == 0 || number > input.len() {
+                return Err(format!(
+                    " out of range: [{}] {number}",
+                    String::from_utf8_lossy(template)
+                ));
+            }
+            element.extend_from_slice(input[number - 1]);
+            if cursor < template.len() {
+                element.push(template[cursor]);
+            }
+        } else {
+            element.push(template[cursor]);
+        }
+        cursor += 1;
+    }
+    Ok(element)
+}
+
 impl RewritePattern {
     fn new(source: &[u8], destination: &[u8]) -> Self {
         Self {
-            source: columns(source, 512),
-            destination: columns(destination, 512),
+            source: split_columns(source, MAX_PATTERN_COLUMNS),
+            destination: split_columns(destination, MAX_PATTERN_COLUMNS),
         }
     }
 
@@ -46,39 +78,13 @@ impl RewritePattern {
             return Ok(false);
         }
         for (pattern, text) in self.source.iter().zip(input) {
-            if !matches(pattern, text) {
+            if !pattern_matches(pattern, text) {
                 return Ok(false);
             }
         }
         output.clear();
         for (index, template) in self.destination.iter().enumerate() {
-            let mut element = Vec::new();
-            let mut at = 0;
-            while at < template.len() {
-                if template[at] == b'$' {
-                    at += 1;
-                    let mut number = 0usize;
-                    while at < template.len() && template[at].is_ascii_digit() {
-                        number = number
-                            .wrapping_mul(10)
-                            .wrapping_add(usize::from(template[at] - b'0'));
-                        at += 1;
-                    }
-                    if number == 0 || number > input.len() {
-                        return Err(format!(
-                            " out of range: [{}] {number}",
-                            String::from_utf8_lossy(template)
-                        ));
-                    }
-                    element.extend_from_slice(input[number - 1]);
-                    if at < template.len() {
-                        element.push(template[at]);
-                    }
-                } else {
-                    element.push(template[at]);
-                }
-                at += 1;
-            }
+            let mut element = expand_template(template, input)?;
             escape_csv_element(&mut element);
             output.extend_from_slice(&element);
             if index + 1 != self.destination.len() {
@@ -101,6 +107,14 @@ impl RewriteRules {
         }
         Ok(false)
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RewriteSection {
+    BeforeAny,
+    Unigram,
+    Left,
+    Right,
 }
 
 fn rule_of(line: &mut [u8], path: &Path) -> Result<RewritePattern, Error> {
@@ -155,22 +169,24 @@ impl Rewriter {
             right: RewriteRules::default(),
             cache: HashMap::new(),
         };
-        let mut section = 0;
+        let mut section = RewriteSection::BeforeAny;
         while let Some(line) = lines.next_line()? {
             if line[0] == 0 || line[0] == b'#' {
                 continue;
             }
             match cstr(line, 0) {
-                b"[unigram rewrite]" => section = 1,
-                b"[left rewrite]" => section = 2,
-                b"[right rewrite]" => section = 3,
+                b"[unigram rewrite]" => section = RewriteSection::Unigram,
+                b"[left rewrite]" => section = RewriteSection::Left,
+                b"[right rewrite]" => section = RewriteSection::Right,
                 _ => {
                     let rule = rule_of(line, path)?;
                     match section {
-                        1 => rewriter.unigram.0.push(rule),
-                        2 => rewriter.left.0.push(rule),
-                        3 => rewriter.right.0.push(rule),
-                        _ => return Err(failure(path, "no sections found")),
+                        RewriteSection::Unigram => rewriter.unigram.0.push(rule),
+                        RewriteSection::Left => rewriter.left.0.push(rule),
+                        RewriteSection::Right => rewriter.right.0.push(rule),
+                        RewriteSection::BeforeAny => {
+                            return Err(failure(path, "no sections found"));
+                        }
                     }
                 }
             }
@@ -201,7 +217,8 @@ impl Rewriter {
             return Ok(found.clone());
         }
         let result = self.rewrite(feature, path)?;
-        if result.0 {
+        let (matched, _) = &result;
+        if *matched {
             self.cache.insert(feature.to_vec(), result.clone());
         }
         Ok(result)
@@ -264,11 +281,11 @@ impl PosIds {
 pub(super) struct ContextIds {
     left: HashMap<Vec<u8>, i32>,
     right: HashMap<Vec<u8>, i32>,
-    left_path: std::path::PathBuf,
-    right_path: std::path::PathBuf,
+    left_path: PathBuf,
+    right_path: PathBuf,
 }
 
-fn open_map(path: &Path) -> Result<HashMap<Vec<u8>, i32>, Error> {
+fn read_id_table(path: &Path) -> Result<HashMap<Vec<u8>, i32>, Error> {
     let mut lines = Lines::open(path, None)?;
     let mut map = HashMap::new();
     while let Some(line) = lines.next_line()? {
@@ -286,8 +303,8 @@ fn open_map(path: &Path) -> Result<HashMap<Vec<u8>, i32>, Error> {
 impl ContextIds {
     pub(super) fn open(left: &Path, right: &Path) -> Result<Self, Error> {
         Ok(Self {
-            left: open_map(left)?,
-            right: open_map(right)?,
+            left: read_id_table(left)?,
+            right: read_id_table(right)?,
             left_path: left.to_path_buf(),
             right_path: right.to_path_buf(),
         })

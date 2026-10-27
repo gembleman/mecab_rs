@@ -1,4 +1,3 @@
-
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
@@ -6,6 +5,8 @@ use std::path::{Path, PathBuf};
 use crate::error::Error;
 
 pub(crate) const BUF_SIZE: usize = 8192;
+const READ_BUFFER_BYTES: usize = 1 << 20;
+const VERTICAL_TAB: u8 = 0x0b;
 
 pub(crate) fn failure(path: &Path, reason: impl Into<String>) -> Error {
     Error::Build {
@@ -19,11 +20,11 @@ pub(crate) fn key_value(line: &[u8]) -> Option<(&[u8], &[u8])> {
     let key_end = line[..equals]
         .iter()
         .rposition(|byte| !byte.is_ascii_whitespace())
-        .map_or(0, |at| at + 1);
+        .map_or(0, |offset| offset + 1);
     let value_start = line[equals + 1..]
         .iter()
         .position(|byte| !byte.is_ascii_whitespace())
-        .map_or(line.len(), |at| equals + 1 + at);
+        .map_or(line.len(), |offset| equals + 1 + offset);
     Some((&line[..key_end], &line[value_start..]))
 }
 
@@ -43,7 +44,7 @@ fn strlen(buffer: &[u8]) -> usize {
 pub(crate) fn atoi(text: &[u8]) -> i32 {
     let mut rest = text;
     while let [first, tail @ ..] = rest
-        && (first.is_ascii_whitespace() || *first == 0x0b)
+        && (first.is_ascii_whitespace() || *first == VERTICAL_TAB)
     {
         rest = tail;
     }
@@ -74,7 +75,7 @@ pub(crate) fn atof(text: &[u8]) -> f64 {
             .take_while(|b| b.is_ascii_digit())
             .count()
     };
-    while end < text.len() && (text[end].is_ascii_whitespace() || text[end] == 0x0b) {
+    while end < text.len() && (text[end].is_ascii_whitespace() || text[end] == VERTICAL_TAB) {
         end += 1;
     }
     let start = end;
@@ -113,72 +114,72 @@ fn find(buffer: &[u8], from: usize, to: usize, byte: u8) -> usize {
     buffer[from..to]
         .iter()
         .position(|&candidate| candidate == byte)
-        .map_or(to, |at| from + at)
+        .map_or(to, |offset| from + offset)
 }
 
-pub(crate) fn tokenize_csv(buffer: &mut [u8], max: usize) -> Vec<usize> {
+pub(crate) fn tokenize_csv(buffer: &mut [u8], max_columns: usize) -> Vec<usize> {
     let end_of_string = strlen(buffer);
-    let mut max = max;
+    let mut columns_left = max_columns;
     let mut columns = Vec::new();
-    let mut at = 0;
-    while at < end_of_string {
-        while buffer[at] == b' ' || buffer[at] == b'\t' {
-            at += 1;
+    let mut offset = 0;
+    while offset < end_of_string {
+        while buffer[offset] == b' ' || buffer[offset] == b'\t' {
+            offset += 1;
         }
         let start;
         let end;
-        if buffer[at] == b'"' {
-            at += 1;
-            start = at;
+        if buffer[offset] == b'"' {
+            offset += 1;
+            start = offset;
             let mut written = start;
-            while at < end_of_string {
-                if buffer[at] == b'"' {
-                    at += 1;
-                    if buffer[at] != b'"' {
+            while offset < end_of_string {
+                if buffer[offset] == b'"' {
+                    offset += 1;
+                    if buffer[offset] != b'"' {
                         break;
                     }
                 }
-                buffer[written] = buffer[at];
+                buffer[written] = buffer[offset];
                 written += 1;
-                at += 1;
+                offset += 1;
             }
-            at = find(buffer, at, end_of_string, b',');
+            offset = find(buffer, offset, end_of_string, b',');
             end = written;
         } else {
-            start = at;
-            at = find(buffer, at, end_of_string, b',');
-            end = at;
+            start = offset;
+            offset = find(buffer, offset, end_of_string, b',');
+            end = offset;
         }
-        if max > 1 {
+        if columns_left > 1 {
             buffer[end] = 0;
         }
-        max -= 1;
+        columns_left -= 1;
         columns.push(start);
-        if max == 0 {
+        if columns_left == 0 {
             break;
         }
-        at += 1;
+        offset += 1;
     }
     columns
 }
 
-pub(crate) fn tokenize2(buffer: &mut [u8], delimiters: &[u8], max: usize) -> Vec<usize> {
+pub(crate) fn tokenize2(buffer: &mut [u8], delimiters: &[u8], max_columns: usize) -> Vec<usize> {
     let end_of_string = strlen(buffer);
     let mut columns = Vec::new();
-    let mut at = 0;
-    while columns.len() < max {
-        let next = buffer[at..end_of_string]
+    let mut offset = 0;
+    while columns.len() < max_columns {
+        let next = buffer[offset..end_of_string]
             .iter()
             .position(|byte| delimiters.contains(byte))
-            .map_or(end_of_string, |found| at + found);
+            .map_or(end_of_string, |found| offset + found);
         buffer[next] = 0;
-        if buffer[at] != 0 {
-            columns.push(at);
+        if buffer[offset] != 0 {
+            columns.push(offset);
         }
         if next == end_of_string {
             break;
         }
-        at = next + 1;
+        offset = next + 1;
     }
     columns
 }
@@ -201,36 +202,36 @@ pub(crate) struct Lines {
     reader: Box<dyn BufRead>,
     path: PathBuf,
     buffer: Vec<u8>,
-    limit: Option<usize>,
+    c_buffer_size: Option<usize>,
 }
 
 impl Lines {
-    pub(crate) fn open(path: &Path, limit: Option<usize>) -> Result<Self, Error> {
+    pub(crate) fn open(path: &Path, c_buffer_size: Option<usize>) -> Result<Self, Error> {
         let file = File::open(path).map_err(|source| Error::Io {
             path: path.to_path_buf(),
             source,
         })?;
         Ok(Self::new(
-            Box::new(BufReader::with_capacity(1 << 20, file)),
+            Box::new(BufReader::with_capacity(READ_BUFFER_BYTES, file)),
             path,
-            limit,
+            c_buffer_size,
         ))
     }
 
-    pub(crate) fn builtin(text: &'static str, path: &Path, limit: Option<usize>) -> Self {
-        Self::new(Box::new(Cursor::new(text.as_bytes())), path, limit)
+    pub(crate) fn builtin(text: &'static str, path: &Path, c_buffer_size: Option<usize>) -> Self {
+        Self::new(Box::new(Cursor::new(text.as_bytes())), path, c_buffer_size)
     }
 
-    pub(crate) fn stdin(path: &Path, limit: Option<usize>) -> Self {
-        Self::new(Box::new(BufReader::new(io::stdin())), path, limit)
+    pub(crate) fn stdin(path: &Path, c_buffer_size: Option<usize>) -> Self {
+        Self::new(Box::new(BufReader::new(io::stdin())), path, c_buffer_size)
     }
 
-    fn new(reader: Box<dyn BufRead>, path: &Path, limit: Option<usize>) -> Self {
+    fn new(reader: Box<dyn BufRead>, path: &Path, c_buffer_size: Option<usize>) -> Self {
         Self {
             reader,
             path: path.to_path_buf(),
             buffer: Vec::new(),
-            limit,
+            c_buffer_size,
         }
     }
 
@@ -256,12 +257,12 @@ impl Lines {
                 self.buffer.pop();
             }
         }
-        if let Some(limit) = self.limit
-            && self.buffer.len() >= limit - 1
+        if let Some(size) = self.c_buffer_size
+            && self.buffer.len() > size - 2
         {
             return Err(failure(
                 &self.path,
-                format!("a line is longer than {} bytes", limit - 2),
+                format!("a line is longer than {} bytes", size - 2),
             ));
         }
         self.buffer.push(0);

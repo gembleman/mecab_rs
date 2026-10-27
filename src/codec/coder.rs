@@ -1,5 +1,7 @@
-
 const TOP: u32 = 1 << 24;
+const UINT_FLAG_LIMIT: u32 = 1024;
+const UINT_MAX_BITS: usize = 63;
+const UINT_SLOTS: usize = UINT_MAX_BITS + 2;
 pub const MAX_TOTAL: u32 = 1 << 16;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -225,15 +227,15 @@ impl Flag {
 
 #[derive(Clone)]
 pub struct UintModel {
-    len: [Flag; 65],
-    top: [[Flag; 2]; 65],
+    len: [Flag; UINT_SLOTS],
+    top: [[Flag; 2]; UINT_SLOTS],
 }
 
 impl Default for UintModel {
     fn default() -> Self {
         UintModel {
-            len: [Flag::default(); 65],
-            top: [[Flag::default(); 2]; 65],
+            len: [Flag::default(); UINT_SLOTS],
+            top: [[Flag::default(); 2]; UINT_SLOTS],
         }
     }
 }
@@ -244,20 +246,20 @@ impl UintModel {
         let n = if c.is_decoder() {
             0
         } else {
-            63 - w.leading_zeros() as usize
+            UINT_MAX_BITS - w.leading_zeros() as usize
         };
         let mut len = 0usize;
-        while len < 63 && self.len[len].code(c, n > len, 1024) {
+        while len < UINT_MAX_BITS && self.len[len].code(c, n > len, UINT_FLAG_LIMIT) {
             len += 1;
         }
         if len == 0 {
             return 0;
         }
         let mut x = 1u64;
-        let b1 = self.top[len][0].code(c, (w >> (len - 1)) & 1 == 1, 1024) as u64;
+        let b1 = self.top[len][0].code(c, (w >> (len - 1)) & 1 == 1, UINT_FLAG_LIMIT) as u64;
         x = (x << 1) | b1;
         if len >= 2 {
-            let b2 = self.top[len][1].code(c, (w >> (len - 2)) & 1 == 1, 1024) as u64;
+            let b2 = self.top[len][1].code(c, (w >> (len - 2)) & 1 == 1, UINT_FLAG_LIMIT) as u64;
             x = (x << 1) | b2;
             if len >= 3 {
                 let rest = len as u32 - 2;

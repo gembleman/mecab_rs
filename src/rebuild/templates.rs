@@ -1,4 +1,3 @@
-
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -15,6 +14,7 @@ pub const MAX_HOT_THREADS: usize = 8;
 
 const MODEL_HEADER_LINES: usize = 7;
 const NO_FIRE_LIMIT: usize = 0xFFFF;
+const READ_BUFFER_BYTES: usize = 1 << 20;
 const TEMPLATE_FILE: &str = "matrix.tpl";
 const INT_TEMPLATE_FILE: &str = "matrix.itp";
 const HOT_FILE: &str = "matrix.hot";
@@ -220,7 +220,7 @@ fn read_weights(model_def: &Path, sources: &mut [Source]) -> Result<(), Error> {
         by_name.entry(source.name.clone()).or_default().push(index);
     }
     let file = File::open(model_def).map_err(io_error(model_def))?;
-    let mut reader = BufReader::with_capacity(1 << 20, file);
+    let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, file);
     let mut line = Vec::new();
     let mut number = 0usize;
     loop {

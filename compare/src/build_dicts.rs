@@ -1,4 +1,3 @@
-
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::BufReader;
@@ -21,7 +20,10 @@ fn build_vibrato(src: &Path, lex: impl std::io::Read, out: &str) -> Result<(), B
     let mut f = zstd::Encoder::new(File::create(out)?, 19)?;
     dict.write(&mut f)?;
     f.finish()?;
-    eprintln!("vibrato: written (zstd 19) in {:.1}s", t.elapsed().as_secs_f64());
+    eprintln!(
+        "vibrato: written (zstd 19) in {:.1}s",
+        t.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -43,9 +45,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         (Some("lindera"), 5) => return build_lindera(&PathBuf::from(&a[2]), &a[3], &a[4]),
         (_, 5) => {}
         _ => {
-            eprintln!("usage: build-dicts <utf8-ipadic-dir> <lindera-metadata.json> <out-vibrato.zst> <out-lindera-dir>");
+            eprintln!(
+                "usage: build-dicts <utf8-ipadic-dir> <lindera-metadata.json> <out-vibrato.zst> <out-lindera-dir>"
+            );
             eprintln!("       build-dicts vibrato <src-dir> <out-vibrato.zst>");
-            eprintln!("       build-dicts lindera <src-dir> <lindera-metadata.json> <out-lindera-dir>");
+            eprintln!(
+                "       build-dicts lindera <src-dir> <lindera-metadata.json> <out-lindera-dir>"
+            );
             std::process::exit(2);
         }
     }

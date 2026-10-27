@@ -1,4 +1,3 @@
-
 use std::fs;
 use std::hint::black_box;
 use std::path::PathBuf;
@@ -168,7 +167,11 @@ impl Engine for Sudachi<'_> {
         for m in self.morphemes.iter() {
             a.tokens += 1;
             a.surface_bytes += m.surface().len() as u64;
-            a.feature_bytes += m.part_of_speech().iter().map(|s| s.len() as u64).sum::<u64>()
+            a.feature_bytes += m
+                .part_of_speech()
+                .iter()
+                .map(|s| s.len() as u64)
+                .sum::<u64>()
                 + m.reading_form().len() as u64
                 + m.dictionary_form().len() as u64;
         }
@@ -182,7 +185,6 @@ impl Engine for Sudachi<'_> {
         }
     }
 }
-
 
 #[derive(Clone, Copy, Default)]
 struct Mem {
@@ -209,10 +211,18 @@ fn memory() -> Mem {
         fn GetCurrentProcess() -> isize;
         fn K32GetProcessMemoryInfo(process: isize, counters: *mut Counters, cb: u32) -> i32;
     }
-    let mut c = Counters { cb: size_of::<Counters>() as u32, ..Default::default() };
+    let mut c = Counters {
+        cb: size_of::<Counters>() as u32,
+        ..Default::default()
+    };
     let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
     assert!(ok != 0, "K32GetProcessMemoryInfo failed");
-    Mem { ws: c.ws, peak_ws: c.peak_ws, private: c.pagefile, peak_private: c.peak_pagefile }
+    Mem {
+        ws: c.ws,
+        peak_ws: c.peak_ws,
+        private: c.pagefile,
+        peak_private: c.peak_pagefile,
+    }
 }
 
 #[cfg(not(windows))]
@@ -224,7 +234,12 @@ fn mem_json(base: Mem, loaded: Mem, end: Mem) -> String {
     let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
     format!(
         "{{\"base_ws_mb\":{:.2},\"base_private_mb\":{:.2},\"loaded_ws_mb\":{:.2},\"loaded_private_mb\":{:.2},\"peak_ws_mb\":{:.2},\"peak_private_mb\":{:.2}}}",
-        mb(base.ws), mb(base.private), mb(loaded.ws), mb(loaded.private), mb(end.peak_ws), mb(end.peak_private)
+        mb(base.ws),
+        mb(base.private),
+        mb(loaded.ws),
+        mb(loaded.private),
+        mb(end.peak_ws),
+        mb(end.peak_private)
     )
 }
 
@@ -366,9 +381,24 @@ fn main() {
             let mut d = mecab_rs::Dictionary::open(&o.dict).expect("open mecab_rs dictionary");
             d.set_max_grouping_size(o.max_grouping);
             let load_s = t.elapsed().as_secs_f64();
-            let mut es = MecabRs { tagger: mecab_rs::Tagger::new(&d), feature_buffer: String::new() };
-            let mut ef = MecabRs { tagger: mecab_rs::Tagger::new(&d), feature_buffer: String::new() };
-            report(&o, base, "mecab_rs 0.1.0", load_s, &lines, n_bytes, &mut es, &mut ef);
+            let mut es = MecabRs {
+                tagger: mecab_rs::Tagger::new(&d),
+                feature_buffer: String::new(),
+            };
+            let mut ef = MecabRs {
+                tagger: mecab_rs::Tagger::new(&d),
+                feature_buffer: String::new(),
+            };
+            report(
+                &o,
+                base,
+                "mecab_rs 0.1.0",
+                load_s,
+                &lines,
+                n_bytes,
+                &mut es,
+                &mut ef,
+            );
         }
         "vibrato" => {
             let t = Instant::now();
@@ -379,9 +409,22 @@ fn main() {
                 .expect("ignore_space")
                 .max_grouping_len(o.max_grouping);
             let load_s = t.elapsed().as_secs_f64();
-            let mut es = Vibrato { worker: tk.new_worker() };
-            let mut ef = Vibrato { worker: tk.new_worker() };
-            report(&o, base, "vibrato 0.5.2", load_s, &lines, n_bytes, &mut es, &mut ef);
+            let mut es = Vibrato {
+                worker: tk.new_worker(),
+            };
+            let mut ef = Vibrato {
+                worker: tk.new_worker(),
+            };
+            report(
+                &o,
+                base,
+                "vibrato 0.5.2",
+                load_s,
+                &lines,
+                n_bytes,
+                &mut es,
+                &mut ef,
+            );
         }
         "lindera" => {
             let t = Instant::now();
@@ -390,9 +433,22 @@ fn main() {
             let seg = lindera::segmenter::Segmenter::new(lindera::mode::Mode::Normal, dict, None)
                 .max_grouping_len(Some(o.max_grouping));
             let load_s = t.elapsed().as_secs_f64();
-            let mut es = Lindera { worker: seg.new_worker() };
-            let mut ef = Lindera { worker: seg.new_worker() };
-            report(&o, base, "lindera 7.0.0", load_s, &lines, n_bytes, &mut es, &mut ef);
+            let mut es = Lindera {
+                worker: seg.new_worker(),
+            };
+            let mut ef = Lindera {
+                worker: seg.new_worker(),
+            };
+            report(
+                &o,
+                base,
+                "lindera 7.0.0",
+                load_s,
+                &lines,
+                n_bytes,
+                &mut es,
+                &mut ef,
+            );
         }
         "sudachi" => {
             use sudachi::analysis::stateful_tokenizer::StatefulTokenizer;
@@ -403,10 +459,25 @@ fn main() {
             let d = SDict::from_cfg(&cfg).expect("load sudachi dictionary");
             let load_s = t.elapsed().as_secs_f64();
             let ts = StatefulTokenizer::create(&d, false, sudachi::analysis::Mode::C);
-            let mut es = Sudachi { tokenizer: ts, morphemes: MorphemeList::empty(&d) };
+            let mut es = Sudachi {
+                tokenizer: ts,
+                morphemes: MorphemeList::empty(&d),
+            };
             let tf = StatefulTokenizer::create(&d, false, sudachi::analysis::Mode::C);
-            let mut ef = Sudachi { tokenizer: tf, morphemes: MorphemeList::empty(&d) };
-            report(&o, base, "sudachi.rs 0.7.1-a1 (mode C)", load_s, &lines, n_bytes, &mut es, &mut ef);
+            let mut ef = Sudachi {
+                tokenizer: tf,
+                morphemes: MorphemeList::empty(&d),
+            };
+            report(
+                &o,
+                base,
+                "sudachi.rs 0.7.1-a1 (mode C)",
+                load_s,
+                &lines,
+                n_bytes,
+                &mut es,
+                &mut ef,
+            );
         }
         other => panic!("unknown tool {other}"),
     }

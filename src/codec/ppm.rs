@@ -1,4 +1,3 @@
-
 use super::coder::Coder;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -12,7 +11,7 @@ impl Hasher for IdHasher {
     }
     fn write(&mut self, bytes: &[u8]) {
         for &b in bytes {
-            self.0 = (self.0 ^ b as u64).wrapping_mul(0x100000001b3);
+            self.0 = (self.0 ^ b as u64).wrapping_mul(FNV_PRIME);
         }
     }
     fn write_u64(&mut self, x: u64) {
@@ -85,7 +84,7 @@ impl Interner {
     }
 }
 
-const LIMIT: u32 = 60000;
+const TOTAL_LIMIT: u32 = 60000;
 const MAX_SYMBOLS: u32 = 24000;
 pub const NOVEL: u32 = u32::MAX;
 const MAX_LEVELS: usize = 8;
@@ -93,6 +92,11 @@ const MAX_LEVELS: usize = 8;
 const BIG_AT: u32 = 24;
 const BIG: u32 = u32::MAX;
 const HIT_INC: u32 = 2;
+const FNV_PRIME: u64 = 0x100_0000_01b3;
+const EXCLUSION_CAP: usize = 48;
+const EXCLUSION_SCAN_MAX: usize = 24;
+const BIG_INITIAL_CAP: usize = 64;
+const INITIAL_SLOTS: usize = 32;
 
 #[derive(Clone, Copy, Default)]
 struct Table {
@@ -163,7 +167,7 @@ impl Big {
             pos_of: FastMap::default(),
             pos_ready: false,
         };
-        b.rebuild(64);
+        b.rebuild(BIG_INITIAL_CAP);
         b
     }
 
@@ -279,8 +283,8 @@ pub struct Ppm {
 impl Default for Ppm {
     fn default() -> Self {
         Ppm {
-            slots: vec![Slot::default(); 32],
-            mask: 31,
+            slots: vec![Slot::default(); INITIAL_SLOTS],
+            mask: INITIAL_SLOTS - 1,
             used: 0,
             arena: Vec::new(),
             bigs: Vec::new(),
@@ -361,7 +365,7 @@ impl Ppm {
         }
         self.nvisited = 0;
         self.hit = false;
-        let mut excl = [0u32; 48];
+        let mut excl = [0u32; EXCLUSION_CAP];
         let mut nex = 0usize;
         for &h in ctxs {
             let si = self.slot_for(h);
@@ -443,7 +447,7 @@ impl Ppm {
                     c.put(tot, dist, total);
                 }
             }
-            if entries.len() <= 24 {
+            if entries.len() <= EXCLUSION_SCAN_MAX {
                 for e in entries {
                     if nex < excl.len() && !excl[..nex].contains(&e.0) {
                         excl[nex] = e.0;
@@ -490,7 +494,7 @@ impl Ppm {
                 continue;
             }
             t.total += inc;
-            if t.total + t.len > LIMIT {
+            if t.total + t.len > TOTAL_LIMIT {
                 if t.cap == BIG {
                     t.total = self.bigs[t.start as usize].halve();
                 } else {

@@ -1,11 +1,12 @@
-
-const FTOL: f64 = 1e-4;
-const XTOL: f64 = 1e-16;
-const EPS: f64 = 1e-7;
-const GTOL: f64 = 0.9;
-const STPMIN: f64 = 1e-20;
-const STPMAX: f64 = 1e20;
-const MSIZE: i32 = 5;
+const DECREASE_TOLERANCE: f64 = 1e-4;
+const WIDTH_TOLERANCE: f64 = 1e-16;
+const CONVERGENCE_TOLERANCE: f64 = 1e-7;
+const CURVATURE_TOLERANCE: f64 = 0.9;
+const MIN_STEP: f64 = 1e-20;
+const MAX_STEP: f64 = 1e20;
+const HISTORY_SIZE: i32 = 5;
+const STEP_BOUND_RATIO: f64 = 0.66;
+const REQUEST_EVALUATION: i32 = -1;
 
 fn ddot(size: usize, x: &[f64], y: &[f64]) -> f64 {
     let mut sum = 0.0;
@@ -162,7 +163,7 @@ fn mcstep(
     stpf = stpmin.max(stpf);
     *stp = stpf;
     if *brackt && bound {
-        let d1 = *stx + (*sty - *stx) * 0.66;
+        let d1 = *stx + (*sty - *stx) * STEP_BOUND_RATIO;
         if *sty > *stx {
             *stp = d1.min(*stp);
         } else {
@@ -205,12 +206,12 @@ impl Mcsrch {
         nfev: &mut i32,
         wa: &mut [f64],
     ) {
-        const P5: f64 = 0.5;
-        const P66: f64 = 0.66;
-        const XTRAPF: f64 = 4.0;
-        const MAXFEV: i32 = 20;
+        const HALF: f64 = 0.5;
+        const WIDTH_SHRINK_RATIO: f64 = 0.66;
+        const EXTRAPOLATION_FACTOR: f64 = 4.0;
+        const MAX_EVALUATIONS: i32 = 20;
 
-        let mut resume = *info == -1;
+        let mut resume = *info == REQUEST_EVALUATION;
         if !resume {
             self.infoc = 1;
             if size == 0 || *stp <= 0.0 {
@@ -224,9 +225,9 @@ impl Mcsrch {
             self.stage1 = true;
             *nfev = 0;
             self.finit = f;
-            self.dgtest = FTOL * self.dginit;
-            self.width = STPMAX - STPMIN;
-            self.width1 = self.width / P5;
+            self.dgtest = DECREASE_TOLERANCE * self.dginit;
+            self.width = MAX_STEP - MIN_STEP;
+            self.width1 = self.width / HALF;
             wa[..size].copy_from_slice(&x[..size]);
             self.stx = 0.0;
             self.fx = self.finit;
@@ -243,17 +244,17 @@ impl Mcsrch {
                     self.stmax = self.stx.max(self.sty);
                 } else {
                     self.stmin = self.stx;
-                    self.stmax = *stp + XTRAPF * (*stp - self.stx);
+                    self.stmax = *stp + EXTRAPOLATION_FACTOR * (*stp - self.stx);
                 }
 
-                *stp = stp.max(STPMIN);
-                *stp = stp.min(STPMAX);
+                *stp = stp.max(MIN_STEP);
+                *stp = stp.min(MAX_STEP);
 
                 if (self.brackt
                     && ((*stp <= self.stmin || *stp >= self.stmax)
-                        || *nfev >= MAXFEV - 1
+                        || *nfev >= MAX_EVALUATIONS - 1
                         || self.infoc == 0))
-                    || (self.brackt && (self.stmax - self.stmin <= XTOL * self.stmax))
+                    || (self.brackt && (self.stmax - self.stmin <= WIDTH_TOLERANCE * self.stmax))
                 {
                     *stp = self.stx;
                 }
@@ -261,7 +262,7 @@ impl Mcsrch {
                 for j in 0..size {
                     x[j] = wa[j] + *stp * s[j];
                 }
-                *info = -1;
+                *info = REQUEST_EVALUATION;
                 return;
             }
             resume = false;
@@ -274,19 +275,19 @@ impl Mcsrch {
             if self.brackt && ((*stp <= self.stmin || *stp >= self.stmax) || self.infoc == 0) {
                 *info = 6;
             }
-            if *stp == STPMAX && f <= ftest1 && dg <= self.dgtest {
+            if *stp == MAX_STEP && f <= ftest1 && dg <= self.dgtest {
                 *info = 5;
             }
-            if *stp == STPMIN && (f > ftest1 || dg >= self.dgtest) {
+            if *stp == MIN_STEP && (f > ftest1 || dg >= self.dgtest) {
                 *info = 4;
             }
-            if *nfev >= MAXFEV {
+            if *nfev >= MAX_EVALUATIONS {
                 *info = 3;
             }
-            if self.brackt && self.stmax - self.stmin <= XTOL * self.stmax {
+            if self.brackt && self.stmax - self.stmin <= WIDTH_TOLERANCE * self.stmax {
                 *info = 2;
             }
-            if f <= ftest1 && dg.abs() <= GTOL * (-self.dginit) {
+            if f <= ftest1 && dg.abs() <= CURVATURE_TOLERANCE * (-self.dginit) {
                 *info = 1;
             }
 
@@ -294,7 +295,10 @@ impl Mcsrch {
                 return;
             }
 
-            if self.stage1 && f <= ftest1 && dg >= FTOL.min(GTOL) * self.dginit {
+            if self.stage1
+                && f <= ftest1
+                && dg >= DECREASE_TOLERANCE.min(CURVATURE_TOLERANCE) * self.dginit
+            {
                 self.stage1 = false;
             }
 
@@ -343,8 +347,8 @@ impl Mcsrch {
             }
 
             if self.brackt {
-                if (self.sty - self.stx).abs() >= P66 * self.width1 {
-                    *stp = self.stx + P5 * (self.sty - self.stx);
+                if (self.sty - self.stx).abs() >= WIDTH_SHRINK_RATIO * self.width1 {
+                    *stp = self.stx + HALF * (self.sty - self.stx);
                 }
                 self.width1 = self.width;
                 self.width = (self.sty - self.stx).abs();
@@ -378,8 +382,10 @@ impl Lbfgs {
     pub(super) fn optimize(&mut self, size: usize, x: &mut [f64], f: f64, g: &[f64]) -> i32 {
         if self.w.is_empty() {
             self.iflag = 0;
-            self.w
-                .resize(size * (2 * MSIZE as usize + 1) + 2 * MSIZE as usize, 0.0);
+            self.w.resize(
+                size * (2 * HISTORY_SIZE as usize + 1) + 2 * HISTORY_SIZE as usize,
+                0.0,
+            );
             self.diag.resize(size, 0.0);
         } else if self.diag.len() != size {
             eprintln!("size of array is different");
@@ -400,10 +406,10 @@ impl Lbfgs {
     }
 
     fn step(&mut self, size: usize, x: &mut [f64], f: f64, g: &[f64]) {
-        let msize = MSIZE;
+        let msize = HISTORY_SIZE;
         let n = size as i32;
 
-        let at = |index: i32| -> usize { (index - 1) as usize };
+        let one_based = |index: i32| -> usize { (index - 1) as usize };
         let mcsrch = self.mcsrch.get_or_insert_with(Mcsrch::default);
         let diag = &mut self.diag;
         let w = &mut self.w;
@@ -417,7 +423,7 @@ impl Lbfgs {
             self.ispt = n + (msize << 1);
             self.iypt = self.ispt + n * msize;
             for i in 1..=n {
-                w[at(self.ispt + i)] = -g[at(i)] * diag[at(i)];
+                w[one_based(self.ispt + i)] = -g[one_based(i)] * diag[one_based(i)];
             }
             self.stp1 = 1.0 / ddot(size, g, g).sqrt();
         }
@@ -427,7 +433,10 @@ impl Lbfgs {
                 self.iter += 1;
                 self.info = 0;
                 if self.iter != 1 {
-                    let (a, b) = (at(self.iypt + self.npt + 1), at(self.ispt + self.npt + 1));
+                    let (a, b) = (
+                        one_based(self.iypt + self.npt + 1),
+                        one_based(self.ispt + self.npt + 1),
+                    );
                     let ys = ddot(size, &w[a..], &w[b..]);
                     let yy = ddot(size, &w[a..], &w[a..]);
                     for value in diag.iter_mut() {
@@ -438,10 +447,10 @@ impl Lbfgs {
                     if self.point == 0 {
                         cp = msize;
                     }
-                    w[at(n + cp)] = 1.0 / ys;
+                    w[one_based(n + cp)] = 1.0 / ys;
 
                     for i in 1..=n {
-                        w[at(i)] = -g[at(i)];
+                        w[one_based(i)] = -g[one_based(i)];
                     }
 
                     let bound = (self.iter - 1).min(msize);
@@ -452,28 +461,28 @@ impl Lbfgs {
                         if cp == -1 {
                             cp = msize - 1;
                         }
-                        let sq = ddot(size, &w[at(self.ispt + cp * n + 1)..], &w[..]);
+                        let sq = ddot(size, &w[one_based(self.ispt + cp * n + 1)..], &w[..]);
                         let inmc = n + msize + cp + 1;
                         let iycn = self.iypt + cp * n;
-                        w[at(inmc)] = w[at(n + cp + 1)] * sq;
-                        let d = -w[at(inmc)];
+                        w[one_based(inmc)] = w[one_based(n + cp + 1)] * sq;
+                        let d = -w[one_based(inmc)];
                         for i in 0..size {
-                            w[i] += d * w[at(iycn + 1) + i];
+                            w[i] += d * w[one_based(iycn + 1) + i];
                         }
                     }
 
                     for i in 1..=n {
-                        w[at(i)] = diag[at(i)] * w[at(i)];
+                        w[one_based(i)] = diag[one_based(i)] * w[one_based(i)];
                     }
 
                     for _ in 1..=bound {
-                        let yr = ddot(size, &w[at(self.iypt + cp * n + 1)..], &w[..]);
-                        let mut beta = w[at(n + cp + 1)] * yr;
+                        let yr = ddot(size, &w[one_based(self.iypt + cp * n + 1)..], &w[..]);
+                        let mut beta = w[one_based(n + cp + 1)] * yr;
                         let inmc = n + msize + cp + 1;
-                        beta = w[at(inmc)] - beta;
+                        beta = w[one_based(inmc)] - beta;
                         let iscn = self.ispt + cp * n;
                         for i in 0..size {
-                            w[i] += beta * w[at(iscn + 1) + i];
+                            w[i] += beta * w[one_based(iscn + 1) + i];
                         }
                         cp += 1;
                         if cp == msize {
@@ -482,7 +491,7 @@ impl Lbfgs {
                     }
 
                     for i in 1..=n {
-                        w[at(self.ispt + self.point * n + i)] = w[at(i)];
+                        w[one_based(self.ispt + self.point * n + i)] = w[one_based(i)];
                     }
                 }
 
@@ -492,12 +501,12 @@ impl Lbfgs {
                     self.stp = self.stp1;
                 }
                 for i in 1..=n {
-                    w[at(i)] = g[at(i)];
+                    w[one_based(i)] = g[one_based(i)];
                 }
             }
             resume = false;
 
-            let direction = at(self.ispt + self.point * n + 1);
+            let direction = one_based(self.ispt + self.point * n + 1);
             mcsrch.search(
                 size,
                 x,
@@ -509,7 +518,7 @@ impl Lbfgs {
                 &mut self.nfev,
                 diag,
             );
-            if self.info == -1 {
+            if self.info == REQUEST_EVALUATION {
                 self.iflag = 1;
                 return;
             }
@@ -524,8 +533,9 @@ impl Lbfgs {
 
             self.npt = self.point * n;
             for i in 1..=n {
-                w[at(self.ispt + self.npt + i)] = self.stp * w[at(self.ispt + self.npt + i)];
-                w[at(self.iypt + self.npt + i)] = g[at(i)] - w[at(i)];
+                w[one_based(self.ispt + self.npt + i)] =
+                    self.stp * w[one_based(self.ispt + self.npt + i)];
+                w[one_based(self.iypt + self.npt + i)] = g[one_based(i)] - w[one_based(i)];
             }
             self.point += 1;
             if self.point == msize {
@@ -534,7 +544,7 @@ impl Lbfgs {
 
             let gnorm = ddot(size, g, g).sqrt();
             let xnorm = 1.0f64.max(ddot(size, x, x).sqrt());
-            if gnorm / xnorm <= EPS {
+            if gnorm / xnorm <= CONVERGENCE_TOLERANCE {
                 self.iflag = 0;
                 return;
             }

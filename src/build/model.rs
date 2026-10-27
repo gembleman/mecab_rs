@@ -1,13 +1,16 @@
-
 use std::path::Path;
 
 use super::Charset;
 use super::text::{BUF_SIZE, Lines, atof, cstr, failure, tokenize_csv, tokenize2};
 use crate::error::Error;
 
-const BUFFER_SIZE: usize = 2048;
-const COLUMN_LIMIT: usize = 64;
+const FEATURE_BUFFER_BYTES: usize = 2048;
+const MAX_FEATURE_COLUMNS: usize = 64;
 const CHARSET_BYTES: usize = 32;
+const COUNT_BYTES: usize = 4;
+const WEIGHT_BYTES: usize = 8;
+const FINGERPRINT_BYTES: usize = 8;
+const ENTRY_BYTES: usize = WEIGHT_BYTES + FINGERPRINT_BYTES;
 const FINGERPRINT_SEED: u32 = 0xfd14_deff;
 
 fn rotl(value: u32, shift: u32) -> u32 {
@@ -104,12 +107,12 @@ fn charset_field(charset: &str) -> [u8; CHARSET_BYTES] {
     field
 }
 
-pub(crate) fn convert(
-    text_model: &Path,
-    dictionary_charset: &str,
-    charset: &str,
-) -> Result<Vec<u8>, Error> {
-    let mut lines = Lines::open(text_model, Some(BUF_SIZE))?;
+struct ModelEntry {
+    fingerprint: u64,
+    weight: f64,
+}
+
+fn read_model_charset(lines: &mut Lines, text_model: &Path) -> Result<Vec<u8>, Error> {
     let mut model_charset = Vec::new();
     while let Some(line) = lines.next_line()? {
         if line[0] == 0 {
@@ -124,44 +127,71 @@ pub(crate) fn convert(
             model_charset = cstr(line, found[1]).get(1..).unwrap_or_default().to_vec();
         }
     }
-    if !dictionary_charset.is_empty() {
-        let model = Charset::decode(&String::from_utf8_lossy(&model_charset));
-        if model != Charset::decode(dictionary_charset) {
-            return Err(failure(
-                text_model,
-                format!(
-                    "dictionary charset and model charset are different. dictionary_charset={dictionary_charset} model_charset={}",
-                    String::from_utf8_lossy(&model_charset)
-                ),
-            ));
-        }
-    }
+    Ok(model_charset)
+}
 
-    let mut entries: Vec<(u64, f64)> = Vec::new();
+fn require_same_charset(
+    text_model: &Path,
+    dictionary_charset: &str,
+    model_charset: &[u8],
+) -> Result<(), Error> {
+    if dictionary_charset.is_empty() {
+        return Ok(());
+    }
+    let model = Charset::decode(&String::from_utf8_lossy(model_charset));
+    if model != Charset::decode(dictionary_charset) {
+        return Err(failure(
+            text_model,
+            format!(
+                "dictionary charset and model charset are different. dictionary_charset={dictionary_charset} model_charset={}",
+                String::from_utf8_lossy(model_charset)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn read_entries(lines: &mut Lines, text_model: &Path) -> Result<Vec<ModelEntry>, Error> {
+    let mut entries = Vec::new();
     while let Some(line) = lines.next_line()? {
         let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
         let found = tokenize2(line, b"\t", 2);
         if found.len() != 2 {
             return Err(failure(text_model, format!("format error: {shown}")));
         }
-        entries.push((
-            fingerprint(cstr(line, found[1])),
-            atof(cstr(line, found[0])),
-        ));
+        entries.push(ModelEntry {
+            fingerprint: fingerprint(cstr(line, found[1])),
+            weight: atof(cstr(line, found[0])),
+        });
     }
+    Ok(entries)
+}
+
+pub(crate) fn convert(
+    text_model: &Path,
+    dictionary_charset: &str,
+    charset: &str,
+) -> Result<Vec<u8>, Error> {
+    let mut lines = Lines::open(text_model, Some(BUF_SIZE))?;
+    let model_charset = read_model_charset(&mut lines, text_model)?;
+    require_same_charset(text_model, dictionary_charset, &model_charset)?;
+    let mut entries = read_entries(&mut lines, text_model)?;
     entries.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        a.fingerprint.cmp(&b.fingerprint).then_with(|| {
+            a.weight
+                .partial_cmp(&b.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     });
 
-    let mut bytes = Vec::with_capacity(4 + CHARSET_BYTES + entries.len() * 16);
+    let mut bytes = Vec::with_capacity(COUNT_BYTES + CHARSET_BYTES + entries.len() * ENTRY_BYTES);
     bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&charset_field(charset));
-    for &(_, weight) in &entries {
-        bytes.extend_from_slice(&weight.to_le_bytes());
+    for entry in &entries {
+        bytes.extend_from_slice(&entry.weight.to_le_bytes());
     }
-    for &(key, _) in &entries {
-        bytes.extend_from_slice(&key.to_le_bytes());
+    for entry in &entries {
+        bytes.extend_from_slice(&entry.fingerprint.to_le_bytes());
     }
     Ok(bytes)
 }
@@ -202,24 +232,24 @@ pub(crate) struct CostModel {
     templates: Templates,
 }
 
-fn column<'a>(
-    templ: &[u8],
-    at: &mut usize,
+fn template_column<'a>(
+    template: &[u8],
+    cursor: &mut usize,
     columns: &[&'a [u8]],
     path: &Path,
 ) -> Result<Option<&'a [u8]>, Error> {
-    *at += 1;
-    let optional = templ.get(*at) == Some(&b'?');
+    *cursor += 1;
+    let optional = template.get(*cursor) == Some(&b'?');
     if optional {
-        *at += 1;
+        *cursor += 1;
     }
-    if templ.get(*at) != Some(&b'[') {
+    if template.get(*cursor) != Some(&b'[') {
         return Err(failure(path, "getIndex(): unmatched '['"));
     }
-    *at += 1;
+    *cursor += 1;
     let mut number = 0usize;
     loop {
-        match templ.get(*at).copied().unwrap_or(0) {
+        match template.get(*cursor).copied().unwrap_or(0) {
             digit @ b'0'..=b'9' => {
                 number = number
                     .wrapping_mul(10)
@@ -237,11 +267,11 @@ fn column<'a>(
             }
             _ => return Err(failure(path, "unmatched '['")),
         }
-        *at += 1;
+        *cursor += 1;
     }
 }
 
-fn escaped(byte: u8) -> u8 {
+fn escape_value(byte: u8) -> u8 {
     match byte {
         b'a' => 0x07,
         b'b' => 0x08,
@@ -256,11 +286,25 @@ fn escaped(byte: u8) -> u8 {
     }
 }
 
-fn csv_columns(feature: &[u8]) -> (Vec<u8>, Vec<usize>) {
-    let mut buffer = feature[..feature.len().min(BUFFER_SIZE - 1)].to_vec();
-    buffer.push(0);
-    let found = tokenize_csv(&mut buffer, COLUMN_LIMIT);
-    (buffer, found)
+struct CsvColumns {
+    buffer: Vec<u8>,
+    starts: Vec<usize>,
+}
+
+impl CsvColumns {
+    fn cut(feature: &[u8]) -> Self {
+        let mut buffer = feature[..feature.len().min(FEATURE_BUFFER_BYTES - 1)].to_vec();
+        buffer.push(0);
+        let starts = tokenize_csv(&mut buffer, MAX_FEATURE_COLUMNS);
+        Self { buffer, starts }
+    }
+
+    fn columns(&self) -> Vec<&[u8]> {
+        self.starts
+            .iter()
+            .map(|&start| cstr(&self.buffer, start))
+            .collect()
+    }
 }
 
 fn up_to_nul(key: &[u8]) -> &[u8] {
@@ -275,25 +319,27 @@ pub(crate) fn unigram_keys(
     feature_def: &Path,
     mut add: impl FnMut(&[u8]),
 ) -> Result<(), Error> {
-    let (buffer, found) = csv_columns(ufeature);
-    let columns: Vec<&[u8]> = found.iter().map(|&start| cstr(&buffer, start)).collect();
+    let cut = CsvColumns::cut(ufeature);
+    let columns = cut.columns();
     let mut key = Vec::new();
-    'templates: for templ in templates {
+    'templates: for template in templates {
         key.clear();
-        let mut at = 0;
-        while at < templ.len() {
-            match templ[at] {
+        let mut cursor = 0;
+        while cursor < template.len() {
+            match template[cursor] {
                 b'\\' => {
-                    at += 1;
-                    key.push(escaped(templ.get(at).copied().unwrap_or(0)));
+                    cursor += 1;
+                    key.push(escape_value(template.get(cursor).copied().unwrap_or(0)));
                 }
                 b'%' => {
-                    at += 1;
-                    match templ.get(at).copied().unwrap_or(0) {
-                        b'F' => match column(templ, &mut at, &columns, feature_def)? {
-                            Some(text) => key.extend_from_slice(text),
-                            None => continue 'templates,
-                        },
+                    cursor += 1;
+                    match template.get(cursor).copied().unwrap_or(0) {
+                        b'F' => {
+                            match template_column(template, &mut cursor, &columns, feature_def)? {
+                                Some(text) => key.extend_from_slice(text),
+                                None => continue 'templates,
+                            }
+                        }
                         b't' => key.extend_from_slice(char_type.to_string().as_bytes()),
                         b'u' => key.extend_from_slice(ufeature),
                         b'w' => key.extend_from_slice(surface),
@@ -307,7 +353,7 @@ pub(crate) fn unigram_keys(
                 }
                 other => key.push(other),
             }
-            at += 1;
+            cursor += 1;
         }
         add(up_to_nul(&key));
     }
@@ -321,37 +367,33 @@ pub(crate) fn bigram_keys(
     feature_def: &Path,
     mut add: impl FnMut(&[u8]),
 ) -> Result<(), Error> {
-    let (left_buffer, left_found) = csv_columns(rfeature);
-    let (right_buffer, right_found) = csv_columns(lfeature);
-    let left: Vec<&[u8]> = left_found
-        .iter()
-        .map(|&start| cstr(&left_buffer, start))
-        .collect();
-    let right: Vec<&[u8]> = right_found
-        .iter()
-        .map(|&start| cstr(&right_buffer, start))
-        .collect();
+    let left_cut = CsvColumns::cut(rfeature);
+    let right_cut = CsvColumns::cut(lfeature);
+    let left = left_cut.columns();
+    let right = right_cut.columns();
     let mut key = Vec::new();
-    'templates: for templ in templates {
+    'templates: for template in templates {
         key.clear();
-        let mut at = 0;
-        while at < templ.len() {
-            match templ[at] {
+        let mut cursor = 0;
+        while cursor < template.len() {
+            match template[cursor] {
                 b'\\' => {
-                    at += 1;
-                    key.push(escaped(templ.get(at).copied().unwrap_or(0)));
+                    cursor += 1;
+                    key.push(escape_value(template.get(cursor).copied().unwrap_or(0)));
                 }
                 b'%' => {
-                    at += 1;
-                    match templ.get(at).copied().unwrap_or(0) {
-                        b'L' => match column(templ, &mut at, &left, feature_def)? {
+                    cursor += 1;
+                    match template.get(cursor).copied().unwrap_or(0) {
+                        b'L' => match template_column(template, &mut cursor, &left, feature_def)? {
                             Some(text) => key.extend_from_slice(text),
                             None => continue 'templates,
                         },
-                        b'R' => match column(templ, &mut at, &right, feature_def)? {
-                            Some(text) => key.extend_from_slice(text),
-                            None => continue 'templates,
-                        },
+                        b'R' => {
+                            match template_column(template, &mut cursor, &right, feature_def)? {
+                                Some(text) => key.extend_from_slice(text),
+                                None => continue 'templates,
+                            }
+                        }
                         b'l' => key.extend_from_slice(lfeature),
                         b'r' => key.extend_from_slice(rfeature),
                         other => {
@@ -364,7 +406,7 @@ pub(crate) fn bigram_keys(
                 }
                 other => key.push(other),
             }
-            at += 1;
+            cursor += 1;
         }
         add(up_to_nul(&key));
     }
@@ -382,12 +424,13 @@ impl CostModel {
             path: model.to_path_buf(),
             source,
         })?;
-        let words = bytes
+        let entry_count = bytes
             .first_chunk::<4>()
             .map(|count| u32::from_le_bytes(*count) as usize);
-        let binary = words.is_some_and(|count| count * 16 + 4 + CHARSET_BYTES == bytes.len());
-        let bytes = if binary {
-            let name = cstr(&bytes[4..4 + CHARSET_BYTES], 0);
+        let is_binary = entry_count
+            .is_some_and(|count| count * ENTRY_BYTES + COUNT_BYTES + CHARSET_BYTES == bytes.len());
+        let bytes = if is_binary {
+            let name = cstr(&bytes[COUNT_BYTES..COUNT_BYTES + CHARSET_BYTES], 0);
             if Charset::decode(&String::from_utf8_lossy(name)) != Charset::decode(charset) {
                 return Err(failure(
                     model,
@@ -401,15 +444,15 @@ impl CostModel {
         } else {
             convert(model, dictionary_charset, charset)?
         };
-        let count = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-        let body = &bytes[4 + CHARSET_BYTES..];
-        let weights = body[..count * 8]
+        let count = u32::from_le_bytes(bytes[..COUNT_BYTES].try_into().unwrap()) as usize;
+        let body = &bytes[COUNT_BYTES + CHARSET_BYTES..];
+        let weights = body[..count * WEIGHT_BYTES]
             .as_chunks::<8>()
             .0
             .iter()
             .map(|word| f64::from_le_bytes(*word))
             .collect();
-        let keys = body[count * 8..]
+        let keys = body[count * WEIGHT_BYTES..]
             .as_chunks::<8>()
             .0
             .iter()
@@ -424,10 +467,10 @@ impl CostModel {
         })
     }
 
-    fn id(&self, key: &[u8]) -> Option<usize> {
-        let print = fingerprint(key);
-        let at = self.keys.partition_point(|&candidate| candidate < print);
-        (self.keys.get(at) == Some(&print)).then_some(at)
+    fn feature_index_of(&self, key: &[u8]) -> Option<usize> {
+        let wanted = fingerprint(key);
+        let index = self.keys.partition_point(|&candidate| candidate < wanted);
+        (self.keys.get(index) == Some(&wanted)).then_some(index)
     }
 
     pub(crate) fn cost(
@@ -444,7 +487,7 @@ impl CostModel {
             b"",
             feature_def,
             |key| {
-                if let Some(id) = self.id(key) {
+                if let Some(id) = self.feature_index_of(key) {
                     total += self.weights[id];
                 }
             },
@@ -465,7 +508,7 @@ impl CostModel {
             lfeature,
             feature_def,
             |key| {
-                if let Some(id) = self.id(key) {
+                if let Some(id) = self.feature_index_of(key) {
                     total += self.weights[id];
                 }
             },

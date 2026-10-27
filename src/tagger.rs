@@ -11,9 +11,9 @@ use crate::lattice::{Lattice, NodeSource, RawNode};
 
 pub const DEFAULT_THETA: f32 = 0.75;
 
-const UNKNOWN_FEATURE_FLAG: u64 = 1 << 32;
-const FIXED_FEATURE_ID: u64 = 1 << 33;
-const USER_FEATURE_SHIFT: u32 = 40;
+const UNKNOWN_FEATURE_ID_BIT: u64 = 1 << 32;
+const UNKNOWN_FIXED_FEATURE_ID: u64 = 1 << 33;
+const USER_DICTIONARY_ID_SHIFT: u32 = 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeKind {
@@ -170,7 +170,7 @@ impl<'t, 'x> LatticeView<'t, 'x> {
         }
     }
 
-    fn stored(&self) -> &'t [RawNode] {
+    fn nodes_after_bos(&self) -> &'t [RawNode] {
         &self.lattice.nodes()[1..]
     }
 
@@ -236,7 +236,7 @@ impl<'t, 'x> LatticeView<'t, 'x> {
 
     pub fn nodes(&self) -> impl Iterator<Item = Node<'t, 'x>> + use<'t, 'x> {
         let view = *self;
-        self.stored()
+        self.nodes_after_bos()
             .chunk_by(|a, b| a.begin() == b.begin())
             .flat_map(|group| group.iter().rev())
             .map(move |raw| view.node(raw))
@@ -246,11 +246,11 @@ impl<'t, 'x> LatticeView<'t, 'x> {
         &self,
         position: usize,
     ) -> impl DoubleEndedIterator<Item = Node<'t, 'x>> + ExactSizeIterator + use<'t, 'x> {
-        let stored = self.stored();
-        let start = stored.partition_point(|raw| raw.begin() < position);
-        let end = start + stored[start..].partition_point(|raw| raw.begin() == position);
+        let after_bos = self.nodes_after_bos();
+        let start = after_bos.partition_point(|raw| raw.begin() < position);
+        let end = start + after_bos[start..].partition_point(|raw| raw.begin() == position);
         let view = *self;
-        stored[start..end]
+        after_bos[start..end]
             .iter()
             .rev()
             .map(move |raw| view.node(raw))
@@ -368,10 +368,10 @@ impl<'t, 'x> Node<'t, 'x> {
         match self.raw.source {
             NodeSource::System | NodeSource::SystemExtended => Some(FeatureId(offset)),
             NodeSource::User(index) => Some(FeatureId(
-                ((u64::from(index) + 1) << USER_FEATURE_SHIFT) | offset,
+                ((u64::from(index) + 1) << USER_DICTIONARY_ID_SHIFT) | offset,
             )),
-            NodeSource::Unknown => Some(FeatureId(offset | UNKNOWN_FEATURE_FLAG)),
-            NodeSource::UnknownFixed => Some(FeatureId(FIXED_FEATURE_ID)),
+            NodeSource::Unknown => Some(FeatureId(offset | UNKNOWN_FEATURE_ID_BIT)),
+            NodeSource::UnknownFixed => Some(FeatureId(UNKNOWN_FIXED_FEATURE_ID)),
             NodeSource::Constrained | NodeSource::Bos | NodeSource::Eos => None,
         }
     }

@@ -1,4 +1,3 @@
-
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, Write};
@@ -11,11 +10,14 @@ use crate::build::text::{BUF_SIZE, Lines, atof, cstr, tokenize2};
 use crate::build::{Charset, write_file};
 use crate::error::Error;
 
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
 pub(super) struct Fnv(u64);
 
 impl Default for Fnv {
     fn default() -> Self {
-        Self(0xcbf2_9ce4_8422_2325)
+        Self(FNV_OFFSET_BASIS)
     }
 }
 
@@ -26,7 +28,7 @@ impl Hasher for Fnv {
 
     fn write(&mut self, bytes: &[u8]) {
         for &byte in bytes {
-            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
         }
     }
 }
@@ -100,11 +102,19 @@ impl Features {
     }
 }
 
+pub(super) const ID_LIST_END: i32 = -1;
+const DROPPED: i32 = -1;
+
+struct Cached {
+    start: u32,
+    times: usize,
+}
+
 pub(super) struct FeatureIndex {
     templates: Templates,
     feature_def: PathBuf,
     dic: Map<Vec<u8>, i32>,
-    cache: Map<Vec<u8>, (u32, usize)>,
+    cache: Map<Vec<u8>, Cached>,
     pool: Vec<i32>,
     maxid: usize,
     scratch: Vec<i32>,
@@ -177,8 +187,8 @@ impl FeatureIndex {
         build: impl FnOnce(&Templates, &Path, &mut dyn FnMut(&[u8])) -> Result<(), Error>,
     ) -> Result<u32, Error> {
         if let Some(entry) = self.cache.get_mut(&key) {
-            entry.1 += 1;
-            return Ok(entry.0);
+            entry.times += 1;
+            return Ok(entry.start);
         }
         let Self {
             templates,
@@ -195,8 +205,8 @@ impl FeatureIndex {
         })?;
         let start = u32::try_from(pool.len()).expect("fewer than 2^32 ids");
         pool.extend_from_slice(scratch);
-        pool.push(-1);
-        cache.insert(key, (start, 1));
+        pool.push(ID_LIST_END);
+        cache.insert(key, Cached { start, times: 1 });
         Ok(start)
     }
 
@@ -213,10 +223,10 @@ impl FeatureIndex {
 
     pub(super) fn shrink(&mut self, freq: usize, observed: &mut Vec<f64>) {
         let mut counts = vec![0usize; self.maxid];
-        for &(start, times) in self.cache.values() {
-            let mut at = start as usize;
-            while self.pool[at] != -1 {
-                counts[self.pool[at] as usize] += times;
+        for cached in self.cache.values() {
+            let mut at = cached.start as usize;
+            while self.pool[at] != ID_LIST_END {
+                counts[self.pool[at] as usize] += cached.times;
                 at += 1;
             }
         }
@@ -225,7 +235,7 @@ impl FeatureIndex {
         }
 
         self.maxid = 0;
-        let mut renumbered = vec![-1i32; counts.len()];
+        let mut renumbered = vec![DROPPED; counts.len()];
         for (old, &count) in counts.iter().enumerate() {
             if count >= freq {
                 renumbered[old] = i32::try_from(self.maxid).expect("fewer than 2^31 features");
@@ -239,10 +249,10 @@ impl FeatureIndex {
             new >= 0
         });
 
-        for &(start, _) in self.cache.values() {
-            let mut to = start as usize;
-            let mut at = start as usize;
-            while self.pool[at] != -1 {
+        for cached in self.cache.values() {
+            let mut to = cached.start as usize;
+            let mut at = cached.start as usize;
+            while self.pool[at] != ID_LIST_END {
                 let new = renumbered[self.pool[at] as usize];
                 if new >= 0 {
                     self.pool[to] = new;
@@ -250,7 +260,7 @@ impl FeatureIndex {
                 }
                 at += 1;
             }
-            self.pool[to] = -1;
+            self.pool[to] = ID_LIST_END;
         }
 
         let mut shrunk = vec![0.0; self.maxid];

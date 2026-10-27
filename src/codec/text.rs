@@ -1,10 +1,13 @@
-
 use super::coder::Coder;
 use super::ppm::{NOVEL, Ppm, mix};
 
 const END: u32 = 0x11_0000;
 const BLOCK_SHIFT: u32 = 7;
 const BLOCKS: u64 = (0x11_0000 >> BLOCK_SHIFT) as u64;
+const HIST_SLACK: usize = 4;
+const HIRAGANA_TO_KATAKANA: u32 = 0x60;
+const CONTEXT_SEED: u64 = 0x5151;
+const MAX_CONTEXT_LEVELS: usize = 8;
 
 #[derive(Default)]
 pub struct NovelChar {
@@ -41,11 +44,11 @@ impl CharModel {
 
     fn code_sym(&mut self, c: &mut Coder, tail: &[u32], sym: u32) -> u32 {
         let n = tail.len().min(self.order);
-        let mut ctxs = [0u64; 8];
+        let mut ctxs = [0u64; MAX_CONTEXT_LEVELS];
         let mut k = n;
         let mut level = 0;
         loop {
-            let mut h = 0x5151 + k as u64;
+            let mut h = CONTEXT_SEED + k as u64;
             for &x in &tail[tail.len() - k..] {
                 h = mix(h, x as u64);
             }
@@ -85,7 +88,7 @@ impl CharModel {
             }
             out.push(char::from_u32(got).unwrap_or('\u{FFFD}'));
             hist.push(got);
-            if hist.len() > self.order + 4 {
+            if hist.len() > self.order + HIST_SLACK {
                 hist.drain(..hist.len() - self.order);
             }
         }
@@ -109,7 +112,7 @@ impl CharModel {
             }
             out.push(got as u8);
             hist.push(got);
-            if hist.len() > self.order + 4 {
+            if hist.len() > self.order + HIST_SLACK {
                 hist.drain(..hist.len() - self.order);
             }
         }
@@ -122,7 +125,7 @@ pub fn is_kana(c: char) -> bool {
 
 pub fn kata(c: char) -> char {
     if ('\u{3041}'..='\u{3096}').contains(&c) {
-        char::from_u32(c as u32 + 0x60).unwrap_or(c)
+        char::from_u32(c as u32 + HIRAGANA_TO_KATAKANA).unwrap_or(c)
     } else {
         c
     }

@@ -11,7 +11,7 @@ use crate::packed::{PackedDictionary, PackedView};
 use crate::system_dictionary::PrefixHit;
 use crate::system_dictionary::SystemDictionary;
 
-fn later_first<I: DoubleEndedIterator>(candidates: I) -> std::iter::Rev<I> {
+fn newest_first<I: DoubleEndedIterator>(candidates: I) -> std::iter::Rev<I> {
     candidates.rev()
 }
 
@@ -117,7 +117,7 @@ struct BestNode {
     cost: i32,
 }
 
-struct Found {
+struct HitSite {
     begin: usize,
     surface: usize,
     partial: bool,
@@ -201,7 +201,19 @@ fn best_left<const SELECT: bool>(
     (best_cost, best)
 }
 
-const GROUP: usize = 4;
+const CONNECT_GROUP_SIZE: usize = 4;
+
+const END_SLOTS_PAST_TEXT: usize = 2;
+
+#[inline(always)]
+fn utf8_sequence_len(lead: u8) -> usize {
+    match lead {
+        ..0xc0 => 1,
+        0xc0..0xe0 => 2,
+        0xe0..0xf0 => 3,
+        _ => 4,
+    }
+}
 
 #[inline(always)]
 fn best_lefts<const N: usize>(lefts: &[LeftCandidate], columns: [&[i16]; N]) -> [(i32, NodeId); N] {
@@ -223,11 +235,11 @@ fn store_best(
     ends: &mut [Vec<LeftCandidate>],
     position: usize,
     index: usize,
-    left_cost: i32,
+    cost_without_word: i32,
     best: NodeId,
 ) {
     let node = &mut best_nodes[index];
-    let cost = left_cost + i32::from(node.candidate.word_cost);
+    let cost = cost_without_word + i32::from(node.candidate.word_cost);
     node.prev = Some(best);
     node.cost = cost;
     ends[node.candidate.end as usize - position - 1].push(LeftCandidate {
@@ -293,61 +305,62 @@ impl Lattice {
     fn forward_backward(&mut self, theta: f32) {
         let theta = f64::from(theta);
         let count = self.nodes.len();
-        let m = &mut self.marginals;
-        m.alpha.clear();
-        m.alpha.resize(count, 0.0);
-        m.beta.clear();
-        m.beta.resize(count, 0.0);
-        m.prob.clear();
-        m.prob.resize(count, 0.0);
-        m.seeded.clear();
-        m.seeded.resize(count, false);
+        let marginals = &mut self.marginals;
+        marginals.alpha.clear();
+        marginals.alpha.resize(count, 0.0);
+        marginals.beta.clear();
+        marginals.beta.resize(count, 0.0);
+        marginals.prob.clear();
+        marginals.prob.resize(count, 0.0);
+        marginals.seeded.clear();
+        marginals.seeded.resize(count, false);
         for index in 1..count {
             let mut alpha = 0.0f32;
             for (step, link_index) in self.nodes[index].links.range().rev().enumerate() {
                 let PathLink { left_node, cost } = self.links[link_index];
-                let value = -theta * f64::from(cost) + f64::from(m.alpha[left_node]);
+                let value = -theta * f64::from(cost) + f64::from(marginals.alpha[left_node]);
                 alpha = if step == 0 {
                     value as f32
                 } else {
                     logsumexp(f64::from(alpha), value) as f32
                 };
             }
-            m.alpha[index] = alpha;
+            marginals.alpha[index] = alpha;
         }
         let nodes = &self.nodes;
         let links = &self.links;
-        let relax = |m: &mut Marginals, index: usize| {
-            let right_beta = m.beta[index];
+        let propagate_beta = |marginals: &mut Marginals, index: usize| {
+            let right_beta = marginals.beta[index];
             for link_index in nodes[index].links.range().rev() {
                 let PathLink { left_node, cost } = links[link_index];
                 let value = -theta * f64::from(cost) + f64::from(right_beta);
                 let left = left_node.index();
-                m.beta[left] = if m.seeded[left] {
-                    logsumexp(f64::from(m.beta[left]), value) as f32
+                marginals.beta[left] = if marginals.seeded[left] {
+                    logsumexp(f64::from(marginals.beta[left]), value) as f32
                 } else {
-                    m.seeded[left] = true;
+                    marginals.seeded[left] = true;
                     value as f32
                 };
             }
         };
         let eos = count - 1;
-        relax(m, eos);
+        propagate_beta(marginals, eos);
         let mut end = eos;
         while end > 0 {
             let begin = nodes[end - 1].begin();
             let start = nodes[..end].partition_point(|raw| raw.begin() < begin);
             for index in start..end {
-                relax(m, index);
+                propagate_beta(marginals, index);
             }
             end = start;
         }
-        let z = f64::from(m.alpha[count - 1]);
-        m.z = z;
+        let z = f64::from(marginals.alpha[count - 1]);
+        marginals.z = z;
         for index in 1..count {
-            m.prob[index] = (f64::from(m.alpha[index] + m.beta[index]) - z).exp() as f32;
+            marginals.prob[index] =
+                (f64::from(marginals.alpha[index] + marginals.beta[index]) - z).exp() as f32;
         }
-        m.ready = true;
+        marginals.ready = true;
     }
 
     pub(crate) fn start_nbest(
@@ -388,10 +401,11 @@ impl Lattice {
         for ending in &mut self.ends[..self.ends_used] {
             ending.clear();
         }
-        if self.ends.len() < sentence_len + 2 {
-            self.ends.resize_with(sentence_len + 2, Vec::new);
+        let slots = sentence_len + END_SLOTS_PAST_TEXT;
+        if self.ends.len() < slots {
+            self.ends.resize_with(slots, Vec::new);
         }
-        self.ends_used = sentence_len + 2;
+        self.ends_used = slots;
     }
 
     fn build<const NBEST: bool>(
@@ -434,10 +448,10 @@ impl Lattice {
         }
         let eos_index = self.nodes.len();
         let eos = self.push_node(RawNode::boundary(NodeSource::Eos, sentence_len));
-        let last_end = (0..=sentence_len)
+        let last_filled_end = (0..=sentence_len)
             .rev()
             .find(|&at| !self.ends[at].is_empty());
-        if let Some(position) = last_end {
+        if let Some(position) = last_filled_end {
             self.connect::<NBEST>(dictionary, position, eos_index..eos_index + 1);
         }
         Ok(eos)
@@ -463,7 +477,7 @@ impl Lattice {
         let sentence_len = sentence.len();
         let view = system.view();
         self.sentence_chars.fill(&dictionary.chars, sentence);
-        let boundary = Candidate {
+        let bos_candidate = Candidate {
             surface: 0,
             end: 0,
             feature: 0,
@@ -475,7 +489,7 @@ impl Lattice {
             char_type: 0,
         };
         self.best_nodes.push(BestNode {
-            candidate: boundary,
+            candidate: bos_candidate,
             prev: None,
             cost: 0,
         });
@@ -494,14 +508,9 @@ impl Lattice {
                 debug_assert!(found.is_ok());
                 self.connect_best(dictionary, position, first);
             }
-            position += match lead {
-                ..0xc0 => 1,
-                0xc0..0xe0 => 2,
-                0xe0..0xf0 => 3,
-                _ => 4,
-            };
+            position += utf8_sequence_len(lead);
         }
-        let last_end = (0..=sentence_len)
+        let last_filled_end = (0..=sentence_len)
             .rev()
             .find(|&at| !self.ends[at].is_empty())
             .unwrap_or(0);
@@ -509,14 +518,14 @@ impl Lattice {
         self.best_nodes.push(BestNode {
             candidate: Candidate {
                 surface: sentence_len as u32,
-                end: last_end as u32 + 1,
+                end: last_filled_end as u32 + 1,
                 source: NodeSource::Eos,
-                ..boundary
+                ..bos_candidate
             },
             prev: None,
             cost: 0,
         });
-        self.connect_best(dictionary, last_end, eos);
+        self.connect_best(dictionary, last_filled_end, eos);
         self.collect_best_nodes();
     }
 
@@ -524,7 +533,7 @@ impl Lattice {
         let Self {
             best_nodes, ends, ..
         } = self;
-        let (head, tail) = ends.split_at_mut(position + 1);
+        let (head, later_ends) = ends.split_at_mut(position + 1);
         let lefts: &[LeftCandidate] = &head[position];
         match &dictionary.matrix {
             Matrix::PackedDense(dense) => {
@@ -534,7 +543,7 @@ impl Lattice {
                         debug_assert!(usize::from(id) < column.len());
                         unsafe { *column.get_unchecked(usize::from(id)) }
                     });
-                    store_best(best_nodes, tail, position, index, cost, best);
+                    store_best(best_nodes, later_ends, position, index, cost, best);
                 }
             }
             Matrix::PackedHot(hot) => {
@@ -553,8 +562,9 @@ impl Lattice {
                 }
                 let mut next = best_nodes.len();
                 while next > first {
-                    if lefts_are_hot && next - first >= GROUP {
-                        let indices: [usize; GROUP] = std::array::from_fn(|lane| next - 1 - lane);
+                    if lefts_are_hot && next - first >= CONNECT_GROUP_SIZE {
+                        let indices: [usize; CONNECT_GROUP_SIZE] =
+                            std::array::from_fn(|lane| next - 1 - lane);
                         let columns = indices.map(|index| {
                             hot.right_column(best_nodes[index].candidate.left_id)
                                 .cells()
@@ -562,9 +572,9 @@ impl Lattice {
                         if columns.iter().all(|cells| cells.len() == hot_left) {
                             let found = best_lefts(lefts, columns);
                             for (index, (cost, best)) in indices.into_iter().zip(found) {
-                                store_best(best_nodes, tail, position, index, cost, best);
+                                store_best(best_nodes, later_ends, position, index, cost, best);
                             }
-                            next -= GROUP;
+                            next -= CONNECT_GROUP_SIZE;
                             continue;
                         }
                     }
@@ -577,7 +587,7 @@ impl Lattice {
                     } else {
                         best_left::<true>(lefts, column.into_cost_fn())
                     };
-                    store_best(best_nodes, tail, position, next, cost, best);
+                    store_best(best_nodes, later_ends, position, next, cost, best);
                 }
             }
         }
@@ -627,9 +637,14 @@ impl Lattice {
     }
 
     pub(crate) fn marginal(&self, index: usize) -> Option<(f32, f32, f32)> {
-        let m = &self.marginals;
-        m.ready
-            .then(|| (m.alpha[index], m.beta[index], m.prob[index]))
+        let marginals = &self.marginals;
+        marginals.ready.then(|| {
+            (
+                marginals.alpha[index],
+                marginals.beta[index],
+                marginals.prob[index],
+            )
+        })
     }
 
     pub(crate) fn z(&self) -> Option<f64> {
@@ -714,7 +729,7 @@ impl Lattice {
     ) {
         match &dictionary.matrix {
             Matrix::PackedDense(dense) => {
-                for right_index in later_first(begun) {
+                for right_index in newest_first(begun) {
                     let right_id = NodeId::from_index(right_index);
                     let column = dense.right_column(self.nodes[right_id].left_id);
                     self.connect_right::<NBEST, false>(
@@ -734,7 +749,7 @@ impl Lattice {
                 let lefts_are_hot = lefts
                     .iter()
                     .all(|left| usize::from(left.right_id) < hot_left);
-                for right_index in later_first(begun) {
+                for right_index in newest_first(begun) {
                     let right_id = NodeId::from_index(right_index);
                     let column = hot.right_column(self.nodes[right_id].left_id);
                     let cells = column.cells();
@@ -769,16 +784,16 @@ impl Lattice {
         let (best_cost, best) = if NBEST {
             let mut best_cost = i32::MAX;
             let mut best = lefts[0].id;
-            for left in later_first(lefts.iter()) {
-                let local = i32::from(connection_cost(left.right_id)) + word_cost;
-                let cost = left.cost + local;
+            for left in newest_first(lefts.iter()) {
+                let link_cost = i32::from(connection_cost(left.right_id)) + word_cost;
+                let cost = left.cost + link_cost;
                 if cost < best_cost {
                     best_cost = cost;
                     best = left.id;
                 }
                 self.links.push(PathLink {
                     left_node: left.id,
-                    cost: local,
+                    cost: link_cost,
                 });
             }
             (best_cost, best)
@@ -832,7 +847,7 @@ impl Lattice {
         let char_info = scan.info;
         let key_end = if end == surface { sentence_len } else { end };
         let key = &sentence[surface..key_end];
-        let found = Found {
+        let found = HitSite {
             begin,
             surface,
             partial,
@@ -938,7 +953,7 @@ impl Lattice {
         view: &PackedView<'_>,
         source: NodeSource,
         sentence: &[u8],
-        found: &Found,
+        found: &HitSite,
     ) {
         for hit_index in 0..self.hits.len() {
             let hit = self.hits[hit_index];
@@ -984,7 +999,7 @@ impl Lattice {
         words: &SystemDictionary,
         source: NodeSource,
         sentence: &[u8],
-        found: &Found,
+        found: &HitSite,
     ) {
         for hit_index in 0..self.hits.len() {
             let hit = self.hits[hit_index];

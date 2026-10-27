@@ -1,4 +1,3 @@
-
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -106,7 +105,6 @@ fn matrix_shape(dict_dir: &Path) -> Result<(usize, usize), Error> {
     ))
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextStats {
     pub right: Vec<u64>,
@@ -199,7 +197,6 @@ pub fn collect_stats(dict_dir: &Path, corpora: &[PathBuf]) -> Result<ContextStat
     let _ = fs::remove_file(&runtime);
     result
 }
-
 
 fn order_by_frequency(counts: &[u64]) -> Vec<usize> {
     let mut order: Vec<usize> = (1..counts.len()).collect();
@@ -440,7 +437,6 @@ pub fn renumber(
         right_size: plan.right_size,
     })
 }
-
 
 fn split_fields(text: &[u8]) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();

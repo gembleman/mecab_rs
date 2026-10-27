@@ -1,4 +1,3 @@
-
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -13,6 +12,8 @@ struct Stream {
 
 type Sentence = Vec<Vec<Vec<u8>>>;
 
+const LEVEL_TOKEN_LIMIT: usize = 512;
+
 fn output_error(source: io::Error) -> Error {
     Error::Io {
         path: PathBuf::from("output"),
@@ -20,7 +21,7 @@ fn output_error(source: io::Error) -> Error {
     }
 }
 
-fn read(stream: &mut Stream, levels: &[i32]) -> Result<Option<Sentence>, Error> {
+fn read_sentence(stream: &mut Stream, levels: &[i32]) -> Result<Option<Sentence>, Error> {
     if stream.failed {
         return Ok(None);
     }
@@ -113,7 +114,7 @@ pub fn evaluate(
     }
     let mut buffer = levels.as_bytes().to_vec();
     buffer.push(0);
-    let levels: Vec<i32> = tokenize2(&mut buffer, b"\t ", 512)
+    let levels: Vec<i32> = tokenize2(&mut buffer, b"\t ", LEVEL_TOKEN_LIMIT)
         .into_iter()
         .map(|start| atoi(cstr(&buffer, start)))
         .collect();
@@ -124,8 +125,8 @@ pub fn evaluate(
     let mut precision = 0usize;
     let mut recall = 0usize;
 
-    while let Some(r1) = read(&mut first, &levels)? {
-        let Some(r2) = read(&mut second, &levels)? else {
+    while let Some(r1) = read_sentence(&mut first, &levels)? {
+        let Some(r2) = read_sentence(&mut second, &levels)? else {
             break;
         };
         let (mut i1, mut i2, mut p1, mut p2) = (0, 0, 0, 0);

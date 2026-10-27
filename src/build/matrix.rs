@@ -1,4 +1,3 @@
-
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -6,8 +5,18 @@ use super::text::{BUF_SIZE, Lines, atoi, cstr, failure, tokenize2};
 use crate::error::Error;
 
 const MATRIX_DEF_DEFAULT: &str = "1 1\n0 0 0\n";
+const FIELDS_PER_LINE: usize = 3;
+const HEADER_CELLS: usize = 2;
+const CELL_BYTES: usize = 2;
+const WRITE_CHUNK_CELLS: usize = 1 << 19;
 
-fn size_of_first_line(lines: &mut Lines) -> Result<Option<(usize, usize)>, Error> {
+#[derive(Clone, Copy)]
+pub(super) struct MatrixSize {
+    pub(super) left: usize,
+    pub(super) right: usize,
+}
+
+fn size_of_first_line(lines: &mut Lines) -> Result<Option<MatrixSize>, Error> {
     let Some(line) = lines.next_line()? else {
         return Ok(None);
     };
@@ -16,17 +25,17 @@ fn size_of_first_line(lines: &mut Lines) -> Result<Option<(usize, usize)>, Error
     if found.len() != 2 {
         return Err(failure(lines.path(), format!("format error: {shown}")));
     }
-    Ok(Some((
-        atoi(cstr(line, found[0])) as usize,
-        atoi(cstr(line, found[1])) as usize,
-    )))
+    Ok(Some(MatrixSize {
+        left: atoi(cstr(line, found[0])) as usize,
+        right: atoi(cstr(line, found[1])) as usize,
+    }))
 }
 
-pub(super) fn sizes(dic_dir: &Path) -> Result<(usize, usize), Error> {
+pub(super) fn sizes(dic_dir: &Path) -> Result<MatrixSize, Error> {
     let text = dic_dir.join("matrix.def");
     if text.is_file() {
         let mut lines = Lines::open(&text, Some(BUF_SIZE))?;
-        return Ok(size_of_first_line(&mut lines)?.unwrap_or((0, 0)));
+        return Ok(size_of_first_line(&mut lines)?.unwrap_or(MatrixSize { left: 0, right: 0 }));
     }
     let binary = dic_dir.join("matrix.bin");
     if let Ok(mut file) = std::fs::File::open(&binary)
@@ -36,23 +45,23 @@ pub(super) fn sizes(dic_dir: &Path) -> Result<(usize, usize), Error> {
         if io::Read::read_exact(&mut file, &mut header).is_ok() {
             let left = usize::from(u16::from_le_bytes([header[0], header[1]]));
             let right = usize::from(u16::from_le_bytes([header[2], header[3]]));
-            if (left * right + 2) as u64 * 2 == length {
-                return Ok((left, right));
+            if ((left * right + HEADER_CELLS) * CELL_BYTES) as u64 == length {
+                return Ok(MatrixSize { left, right });
             }
         }
     }
-    Ok((1, 1))
+    Ok(MatrixSize { left: 1, right: 1 })
 }
 
-fn token<'a>(line: &'a [u8], at: &mut usize) -> Option<&'a [u8]> {
-    while line[*at] == b' ' || line[*at] == b'\t' {
-        *at += 1;
+fn next_field<'a>(line: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+    while line[*cursor] == b' ' || line[*cursor] == b'\t' {
+        *cursor += 1;
     }
-    let start = *at;
-    while line[*at] != 0 && line[*at] != b' ' && line[*at] != b'\t' {
-        *at += 1;
+    let start = *cursor;
+    while line[*cursor] != 0 && line[*cursor] != b' ' && line[*cursor] != b'\t' {
+        *cursor += 1;
     }
-    (*at > start).then(|| &line[start..*at])
+    (*cursor > start).then(|| &line[start..*cursor])
 }
 
 pub(super) fn compile(
@@ -69,24 +78,24 @@ pub(super) fn compile(
         );
         Lines::builtin(MATRIX_DEF_DEFAULT, matrix_def, Some(BUF_SIZE))
     };
-    let (left_size, right_size) =
+    let declared =
         size_of_first_line(&mut lines)?.ok_or_else(|| failure(matrix_def, "format error: "))?;
-    let left_size = left_size as u16 as usize;
-    let right_size = right_size as u16 as usize;
+    let left_size = declared.left as u16 as usize;
+    let right_size = declared.right as u16 as usize;
     let mut matrix = vec![0i16; left_size * right_size];
 
     while let Some(line) = lines.next_line()? {
-        let mut at = 0;
-        let mut numbers = [0i32; 3];
+        let mut cursor = 0;
+        let mut numbers = [0i32; FIELDS_PER_LINE];
         let mut count = 0;
-        while count < 3 {
-            let Some(found) = token(line, &mut at) else {
+        while count < FIELDS_PER_LINE {
+            let Some(found) = next_field(line, &mut cursor) else {
                 break;
             };
             numbers[count] = atoi(found);
             count += 1;
         }
-        if count != 3 {
+        if count != FIELDS_PER_LINE {
             let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
             return Err(failure(matrix_def, format!("format error: {shown}")));
         }
@@ -100,8 +109,8 @@ pub(super) fn compile(
     let write = |output: &mut dyn Write| -> io::Result<()> {
         output.write_all(&(left_size as u16).to_le_bytes())?;
         output.write_all(&(right_size as u16).to_le_bytes())?;
-        let mut bytes = Vec::with_capacity(1 << 20);
-        for chunk in matrix.chunks(1 << 19) {
+        let mut bytes = Vec::with_capacity(WRITE_CHUNK_CELLS * CELL_BYTES);
+        for chunk in matrix.chunks(WRITE_CHUNK_CELLS) {
             bytes.clear();
             for cell in chunk {
                 bytes.extend_from_slice(&cell.to_le_bytes());

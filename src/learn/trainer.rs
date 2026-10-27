@@ -1,4 +1,3 @@
-
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -8,6 +7,10 @@ use super::lbfgs::Lbfgs;
 use super::tokenizer::Tokenizer;
 use super::{Config, failure, format_g, open_lines};
 use crate::error::Error;
+
+const MAX_THREADS: usize = 512;
+const PROGRESS_INTERVAL: usize = 100;
+const CONVERGED_ITERATIONS: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct TrainOptions {
@@ -151,7 +154,7 @@ pub fn train(
             format!("freq is out of range: {unk_eval_size}"),
         ));
     }
-    if threads == 0 || threads > 512 {
+    if threads == 0 || threads > MAX_THREADS {
         return Err(failure(dic_dir, format!("# thread is invalid: {threads}")));
     }
 
@@ -172,7 +175,7 @@ pub fn train(
             let sentence = Sentence::read(&mut reader, &mut lines, &mut observed, log)?;
             let done = sentence.is_none();
             sentences.extend(sentence);
-            if sentences.len().is_multiple_of(100) {
+            if sentences.len().is_multiple_of(PROGRESS_INTERVAL) {
                 let _ = write!(log, "{}... ", sentences.len());
             }
             if done {
@@ -214,7 +217,7 @@ pub fn train(
         })
         .collect();
 
-    let mut converge = 0;
+    let mut stable_iterations = 0;
     let mut previous = 0.0;
     let mut lbfgs = Lbfgs::default();
     let mut iterations = 0;
@@ -288,11 +291,11 @@ pub fn train(
         objective_value = objective;
 
         if diff < eta {
-            converge += 1;
+            stable_iterations += 1;
         } else {
-            converge = 0;
+            stable_iterations = 0;
         }
-        if converge == 3 {
+        if stable_iterations == CONVERGED_ITERATIONS {
             break;
         }
 

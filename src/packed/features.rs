@@ -1,4 +1,3 @@
-
 pub(super) mod check;
 pub(super) mod encode;
 
@@ -20,6 +19,11 @@ pub(super) const HEADER_BYTES: usize = 64;
 pub(super) const SYNC_EVERY: usize = 4096;
 pub(super) const RECORD_PADDING: usize = 16;
 pub(super) const SLACK: usize = 16;
+pub(super) const OP_COPY_MAX: u8 = OP_NUM - 1;
+pub(super) const OP_NUM_MAX: u8 = OP_NUM + MAX_NUMERIC as u8 - 1;
+pub(super) const OP_HIGH_MAX: u8 = OP_HIGH + MAX_NUMERIC as u8 - 1;
+const LENGTH_LIMIT: u64 = 1 << 40;
+const MAX_DIGITS: usize = 20;
 
 pub(super) fn bits_for(count: u64) -> u32 {
     if count <= 1 {
@@ -129,10 +133,10 @@ impl Layout {
             record_count: u32_at(48),
         };
         if counts.numerics as usize > MAX_NUMERIC
-            || counts.strings >= 1 << 40
-            || counts.template_bytes >= 1 << 40
-            || counts.shape_bytes >= 1 << 40
-            || counts.records >= 1 << 40
+            || counts.strings >= LENGTH_LIMIT
+            || counts.template_bytes >= LENGTH_LIMIT
+            || counts.shape_bytes >= LENGTH_LIMIT
+            || counts.records >= LENGTH_LIMIT
             || header[55..64].iter().any(|&byte| byte != 0)
         {
             return None;
@@ -565,7 +569,7 @@ impl FeatureView<'_> {
                 OP_EMPTY => {}
                 OP_STAR => sink.put("*")?,
                 OP_KEY => sink.put(key)?,
-                OP_COPY..=0x1F => {
+                OP_COPY..=OP_COPY_MAX => {
                     let (start, length) = slots[usize::from(op - OP_COPY)];
                     if start & IN_RECORD != 0 {
                         let start = start & !IN_RECORD;
@@ -574,7 +578,7 @@ impl FeatureView<'_> {
                         unsafe { sink.put_region(self.strings, start, length)? };
                     }
                 }
-                OP_NUM..=0x23 => {
+                OP_NUM..=OP_NUM_MAX => {
                     let number = usize::from(op - OP_NUM);
                     let spec = &self.specs[number];
                     let high = read_bits(record, bit, spec.hi_bits);
@@ -586,7 +590,7 @@ impl FeatureView<'_> {
                     highs[number] = high;
                     put_number(sink, high << spec.shift | low)?;
                 }
-                OP_HIGH..=0x33 => put_number(sink, highs[usize::from(op - OP_HIGH)])?,
+                OP_HIGH..=OP_HIGH_MAX => put_number(sink, highs[usize::from(op - OP_HIGH)])?,
                 _ => {}
             }
         }
@@ -631,8 +635,8 @@ pub(super) fn find_byte(bytes: &[u8], needle: u8) -> usize {
 const DIGIT_PAIRS: &[u8; 200] = b"00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
 
 fn put_number<S: Sink + ?Sized>(sink: &mut S, mut value: u64) -> fmt::Result {
-    let mut digits = [0u8; 20 + SLACK];
-    let mut at = 20;
+    let mut digits = [0u8; MAX_DIGITS + SLACK];
+    let mut at = MAX_DIGITS;
     while value >= 10_000 {
         let rest = (value % 10_000) as usize;
         value /= 10_000;
@@ -655,5 +659,5 @@ fn put_number<S: Sink + ?Sized>(sink: &mut S, mut value: u64) -> fmt::Result {
         at -= 1;
         digits[at] = b'0' + rest as u8;
     }
-    unsafe { sink.put_region(&digits, at, 20 - at) }
+    unsafe { sink.put_region(&digits, at, MAX_DIGITS - at) }
 }

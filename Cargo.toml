@@ -15,7 +15,6 @@ memmap2 = "0.9"
 lzma-rust2 = { version = "0.19", default-features = false, features = ["std", "encoder", "optimization", "xz"], optional = true }
 
 [features]
-# matrix.xz: an xz-compressed form of the connection templates (pure Rust)
 xz = ["dep:lzma-rust2"]
 
 [profile.release]

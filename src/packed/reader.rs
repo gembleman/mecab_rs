@@ -1,4 +1,3 @@
-
 use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
@@ -26,6 +25,11 @@ pub use crate::system_dictionary::TokenRecord;
 
 const CHUNK: usize = 1 << 20;
 const PARAM_BYTES: usize = 8;
+const MAGIC_BYTES: usize = 8;
+const SECTION_TABLE_AT: usize = 40;
+const SECTION_ENTRY_BYTES: usize = 16;
+const MATRIX_HEADER_BYTES: usize = 4;
+const HOT_MATRIX_HEADER_BYTES: usize = 8;
 
 pub type Hit = PrefixHit;
 
@@ -155,7 +159,7 @@ impl PackedDictionary {
             return Err(broken("the file is shorter than its header"));
         }
         read_at(&file, &mut header, 0).map_err(io_error)?;
-        if header[..8] != *MAGIC {
+        if header[..MAGIC_BYTES] != *MAGIC {
             return Err(broken("the magic number is not valid"));
         }
         if u32_at(&header, 8) != VERSION {
@@ -185,7 +189,7 @@ impl PackedDictionary {
         let mut sections: [Range<usize>; SECTIONS] = Default::default();
         let mut end = HEADER_BYTES as u64;
         for (number, section) in sections.iter_mut().enumerate() {
-            let at = 40 + 16 * number;
+            let at = SECTION_TABLE_AT + SECTION_ENTRY_BYTES * number;
             let (offset, length) = (u64_at(&header, at), u64_at(&header, at + 8));
             let stop = offset.checked_add(length);
             if offset % 8 != 0 || offset < end || stop.is_none_or(|stop| stop > file_length) {
@@ -220,8 +224,8 @@ impl PackedDictionary {
             return Err(broken("the size of a section does not match the header"));
         }
 
-        let mut matrix_header = [0u8; 4];
-        if length(MATRIX) < 4 {
+        let mut matrix_header = [0u8; MATRIX_HEADER_BYTES];
+        if length(MATRIX) < MATRIX_HEADER_BYTES {
             return Err(broken("the matrix is shorter than its header"));
         }
         source.read(MATRIX, 0, &mut matrix_header)?;
@@ -230,16 +234,16 @@ impl PackedDictionary {
         let hot = flags & FLAG_HOT_MATRIX != 0;
         let integer_templates = flags & FLAG_INT_TEMPLATES != 0;
         let (header_bytes, hot_cells) = if hot {
-            let mut hot_header = [0u8; 4];
-            source.read(MATRIX, 4, &mut hot_header)?;
+            let mut hot_header = [0u8; MATRIX_HEADER_BYTES];
+            source.read(MATRIX, MATRIX_HEADER_BYTES, &mut hot_header)?;
             let hot_left = usize::from(u16_at(&hot_header, 0));
             let hot_right = usize::from(u16_at(&hot_header, 2));
             if hot_left == 0 || hot_right == 0 || hot_left > left_size || hot_right > right_size {
                 return Err(broken("the hot block lies outside of the matrix"));
             }
-            (8, hot_left * hot_right)
+            (HOT_MATRIX_HEADER_BYTES, hot_left * hot_right)
         } else {
-            (4, left_size * right_size)
+            (MATRIX_HEADER_BYTES, left_size * right_size)
         };
         if left_size == 0 || right_size == 0 || length(MATRIX) != header_bytes + hot_cells * 2 {
             return Err(broken("the matrix size does not match its header"));
@@ -729,9 +733,7 @@ impl PackedView<'_> {
             "token range out of range"
         );
         let view = *self;
-        range.map(move |index| {
-            unsafe { view.token_unchecked(view.tokens, index) }
-        })
+        range.map(move |index| unsafe { view.token_unchecked(view.tokens, index) })
     }
 
     #[inline]

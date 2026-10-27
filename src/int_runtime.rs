@@ -1,4 +1,3 @@
-
 use std::mem::size_of;
 use std::path::Path;
 
@@ -20,6 +19,8 @@ const BLOCK_CELLS: usize = 64;
 const BLOCK_BYTES: usize = 12;
 const MIN_SPARSE_GAIN: usize = 1 << 18;
 const ABOVE: u16 = 1 << 15;
+const MAX_KEYS: usize = 0xFFFF;
+const CELL_SUM_BOUND: u128 = 1 << 62;
 
 struct Renumbered {
     new_of_old: Vec<u16>,
@@ -374,7 +375,7 @@ impl<S: SectionSource> RuntimeIntTemplates<S> {
         if left_size == 0
             || right_size == 0
             || left_size > usize::from(!ABOVE)
-            || right_size > 0xFFFF
+            || right_size > MAX_KEYS
         {
             return Err(reader.broken("the template matrix size is out of range"));
         }
@@ -442,7 +443,7 @@ impl<S: SectionSource> RuntimeIntTemplates<S> {
             }
             magnitude += u128::from(cluster_base.unsigned_abs()) + (1u128 << (8 * width));
         }
-        if magnitude * u128::from(cost_factor) >= 1 << 62 {
+        if magnitude * u128::from(cost_factor) >= CELL_SUM_BOUND {
             return Err(reader.broken("the integer templates are inconsistent"));
         }
         let row_starts: Section<u32> = reader.section(right_size + 1)?;
