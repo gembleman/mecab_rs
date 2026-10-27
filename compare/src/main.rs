@@ -180,6 +180,51 @@ impl Engine for Sudachi<'_> {
     }
 }
 
+
+#[derive(Clone, Copy, Default)]
+struct Mem {
+    ws: usize,
+    peak_ws: usize,
+    private: usize,
+    peak_private: usize,
+}
+
+#[cfg(windows)]
+fn memory() -> Mem {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Counters {
+        cb: u32,
+        page_faults: u32,
+        peak_ws: usize,
+        ws: usize,
+        quota: [usize; 4],
+        pagefile: usize,
+        peak_pagefile: usize,
+    }
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(process: isize, counters: *mut Counters, cb: u32) -> i32;
+    }
+    let mut c = Counters { cb: size_of::<Counters>() as u32, ..Default::default() };
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    assert!(ok != 0, "K32GetProcessMemoryInfo failed");
+    Mem { ws: c.ws, peak_ws: c.peak_ws, private: c.pagefile, peak_private: c.peak_pagefile }
+}
+
+#[cfg(not(windows))]
+fn memory() -> Mem {
+    Mem::default()
+}
+
+fn mem_json(base: Mem, loaded: Mem, end: Mem) -> String {
+    let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+    format!(
+        "{{\"base_ws_mb\":{:.2},\"base_private_mb\":{:.2},\"loaded_ws_mb\":{:.2},\"loaded_private_mb\":{:.2},\"peak_ws_mb\":{:.2},\"peak_private_mb\":{:.2}}}",
+        mb(base.ws), mb(base.private), mb(loaded.ws), mb(loaded.private), mb(end.peak_ws), mb(end.peak_private)
+    )
+}
+
 struct Opts {
     tool: String,
     dict: PathBuf,
@@ -188,6 +233,7 @@ struct Opts {
     passes: usize,
     limit: Option<usize>,
     dump: Option<PathBuf>,
+    max_grouping: usize,
 }
 
 fn parse_args() -> Opts {
@@ -195,6 +241,7 @@ fn parse_args() -> Opts {
     let mut dict = None;
     let mut corpus = None;
     let (mut warmup, mut passes, mut limit, mut dump) = (2, 7, None, None);
+    let mut max_grouping = 24;
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         let mut v = || it.next().unwrap_or_else(|| panic!("{k} needs a value"));
@@ -206,6 +253,7 @@ fn parse_args() -> Opts {
             "--passes" => passes = v().parse().unwrap(),
             "--limit" => limit = Some(v().parse().unwrap()),
             "--dump" => dump = Some(PathBuf::from(v())),
+            "--max-grouping" => max_grouping = v().parse().unwrap(),
             _ => panic!("unknown option {k}"),
         }
     }
@@ -217,6 +265,7 @@ fn parse_args() -> Opts {
         passes,
         limit,
         dump,
+        max_grouping,
     }
 }
 
@@ -262,8 +311,10 @@ fn stats_json(times: &[f64], acc: Acc, n_lines: usize, n_bytes: usize) -> String
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn report(
     o: &Opts,
+    base: Mem,
     version: &str,
     load_s: f64,
     lines: &[&str],
@@ -271,8 +322,10 @@ fn report(
     es: &mut dyn Engine,
     ef: &mut dyn Engine,
 ) {
+    let loaded = memory();
     let (ts, as_) = measure(es, lines, |e, l| e.surface(l), o.warmup, o.passes);
     let (tf, af) = measure(ef, lines, |e, l| e.feature(l), o.warmup, o.passes);
+    let end = memory();
     if let Some(p) = &o.dump {
         let mut out = String::new();
         for l in lines {
@@ -282,7 +335,7 @@ fn report(
         fs::write(p, out).expect("write dump");
     }
     println!(
-        "{{\"tool\":\"{}\",\"version\":\"{}\",\"load_s\":{load_s:.4},\"sentences\":{},\"corpus_bytes\":{n_bytes},\"warmup\":{},\"passes\":{},\"surface\":{},\"feature\":{}}}",
+        "{{\"tool\":\"{}\",\"version\":\"{}\",\"load_s\":{load_s:.4},\"sentences\":{},\"corpus_bytes\":{n_bytes},\"warmup\":{},\"passes\":{},\"surface\":{},\"feature\":{},\"mem\":{}}}",
         o.tool,
         version,
         lines.len(),
@@ -290,6 +343,7 @@ fn report(
         o.passes,
         stats_json(&ts, as_, lines.len(), n_bytes),
         stats_json(&tf, af, lines.len(), n_bytes),
+        mem_json(base, loaded, end),
     );
 }
 
@@ -301,15 +355,17 @@ fn main() {
         lines.truncate(n);
     }
     let n_bytes: usize = lines.iter().map(|l| l.len()).sum();
+    let base = memory();
 
     match o.tool.as_str() {
         "mecab_rs" => {
             let t = Instant::now();
-            let d = mecab_rs::Dictionary::open(&o.dict).expect("open mecab_rs dictionary");
+            let mut d = mecab_rs::Dictionary::open(&o.dict).expect("open mecab_rs dictionary");
+            d.set_max_grouping_size(o.max_grouping);
             let load_s = t.elapsed().as_secs_f64();
             let mut es = MecabRs { tagger: mecab_rs::Tagger::new(&d) };
             let mut ef = MecabRs { tagger: mecab_rs::Tagger::new(&d) };
-            report(&o, "mecab_rs 0.1.0", load_s, &lines, n_bytes, &mut es, &mut ef);
+            report(&o, base, "mecab_rs 0.1.0", load_s, &lines, n_bytes, &mut es, &mut ef);
         }
         "vibrato" => {
             let t = Instant::now();
@@ -318,22 +374,22 @@ fn main() {
             let tk = vibrato::Tokenizer::new(dict)
                 .ignore_space(true)
                 .expect("ignore_space")
-                .max_grouping_len(24);
+                .max_grouping_len(o.max_grouping);
             let load_s = t.elapsed().as_secs_f64();
             let mut es = Vibrato { worker: tk.new_worker() };
             let mut ef = Vibrato { worker: tk.new_worker() };
-            report(&o, "vibrato 0.5.2", load_s, &lines, n_bytes, &mut es, &mut ef);
+            report(&o, base, "vibrato 0.5.2", load_s, &lines, n_bytes, &mut es, &mut ef);
         }
         "lindera" => {
             let t = Instant::now();
             let dict = lindera::dictionary::load_dictionary(o.dict.to_str().unwrap())
                 .expect("load lindera dictionary");
             let seg = lindera::segmenter::Segmenter::new(lindera::mode::Mode::Normal, dict, None)
-                .max_grouping_len(Some(24));
+                .max_grouping_len(Some(o.max_grouping));
             let load_s = t.elapsed().as_secs_f64();
             let mut es = Lindera { worker: seg.new_worker() };
             let mut ef = Lindera { worker: seg.new_worker() };
-            report(&o, "lindera 7.0.0", load_s, &lines, n_bytes, &mut es, &mut ef);
+            report(&o, base, "lindera 7.0.0", load_s, &lines, n_bytes, &mut es, &mut ef);
         }
         "sudachi" => {
             use sudachi::analysis::stateful_tokenizer::StatefulTokenizer;
@@ -347,7 +403,7 @@ fn main() {
             let mut es = Sudachi { tokenizer: ts, morphemes: MorphemeList::empty(&d) };
             let tf = StatefulTokenizer::create(&d, false, sudachi::analysis::Mode::C);
             let mut ef = Sudachi { tokenizer: tf, morphemes: MorphemeList::empty(&d) };
-            report(&o, "sudachi.rs 0.7.1-a1 (mode C)", load_s, &lines, n_bytes, &mut es, &mut ef);
+            report(&o, base, "sudachi.rs 0.7.1-a1 (mode C)", load_s, &lines, n_bytes, &mut es, &mut ef);
         }
         other => panic!("unknown tool {other}"),
     }
