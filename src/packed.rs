@@ -19,6 +19,7 @@ pub(crate) const MAGIC: &[u8; 8] = b"MRDPACK1";
 pub(crate) const VERSION: u32 = 1;
 pub(crate) const FLAG_WIDE_PARAMS: u32 = 1;
 pub(crate) const FLAG_HOT_MATRIX: u32 = 2;
+pub(crate) const FLAG_INT_TEMPLATES: u32 = 4;
 pub(crate) const HEADER_BYTES: usize = 40 + 16 * SECTIONS;
 pub(crate) const SECTIONS: usize = 12;
 pub(crate) const BLOCK_CODES: usize = 256;

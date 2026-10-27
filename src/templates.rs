@@ -11,7 +11,8 @@ use memmap2::Mmap;
 use crate::clusters::{MappedClusters, plan_clusters, write_clusters};
 use crate::dictionary::map_file;
 use crate::error::Error;
-use crate::section::{Plain, Section};
+use crate::mapped_bytes::MappedBytes;
+use crate::section::{Plain, Section, SectionSource};
 
 const TEMPLATE_MAGIC: &[u8; 4] = b"MXTP";
 const TEMPLATE_VERSION: u32 = 1;
@@ -160,15 +161,15 @@ struct MappedPart {
 }
 
 impl MappedPart {
-    fn slices<'a>(&self, file: &'a [u8]) -> PartSlices<'a> {
+    fn slices<'a, S: SectionSource>(&self, file: &'a S) -> PartSlices<'a> {
         PartSlices {
             left_count: self.left_count,
             right_count: self.right_count,
-            left_projection: self.left_projection.view(file),
-            right_projection: self.right_projection.view(file),
-            indptr: self.indptr.view(file),
-            left_index: self.left_index.view(file),
-            weight: self.weight.view(file),
+            left_projection: self.left_projection.view_source(file),
+            right_projection: self.right_projection.view_source(file),
+            indptr: self.indptr.view_source(file),
+            left_index: self.left_index.view_source(file),
+            weight: self.weight.view_source(file),
         }
     }
 }
@@ -228,8 +229,8 @@ impl<'a> TemplateReader<'a> {
     }
 }
 
-pub struct MappedTemplates {
-    map: Mmap,
+pub struct MappedTemplates<S = Mmap> {
+    map: S,
     cost_factor: f64,
     left_size: usize,
     right_size: usize,
@@ -237,12 +238,25 @@ pub struct MappedTemplates {
     clusters: Option<MappedClusters>,
 }
 
-impl MappedTemplates {
+impl MappedTemplates<Mmap> {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
-        let map = map_file(path)?;
+        Self::from_source(map_file(path)?, path)
+    }
+}
+
+impl MappedTemplates<MappedBytes> {
+    pub(crate) fn from_mapped(map: MappedBytes, path: &Path) -> Result<Self, Error> {
+        Self::from_source(map, path)
+    }
+}
+
+#[allow(private_bounds)]
+impl<S: SectionSource> MappedTemplates<S> {
+    fn from_source(map: S, path: &Path) -> Result<Self, Error> {
+        let file = map.all_bytes();
         let mut reader = TemplateReader {
-            file: &map,
+            file,
             path,
             offset: 0,
         };
@@ -288,7 +302,7 @@ impl MappedTemplates {
                 right_size,
             )?),
         };
-        if reader.offset != map.len() {
+        if reader.offset != file.len() {
             return Err(reader.broken("the file has trailing bytes"));
         }
         Ok(Self {

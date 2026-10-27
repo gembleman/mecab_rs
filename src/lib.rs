@@ -11,6 +11,7 @@ mod ids;
 mod int_templates;
 mod lattice;
 pub mod learn;
+mod mapped_bytes;
 mod matrix;
 mod nbest;
 pub mod packed;

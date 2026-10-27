@@ -2,6 +2,38 @@ use std::marker::PhantomData;
 use std::mem::size_of;
 use std::ops::Range;
 
+use crate::mapped_bytes::MappedBytes;
+
+pub(crate) trait SectionSource {
+    fn bytes(&self, start: usize, end: usize) -> &[u8];
+    fn all_bytes(&self) -> &[u8];
+}
+
+impl SectionSource for memmap2::Mmap {
+    #[inline]
+    fn bytes(&self, start: usize, end: usize) -> &[u8] {
+        &self[start..end]
+    }
+
+    #[inline]
+    fn all_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+impl SectionSource for MappedBytes {
+    #[inline]
+    fn bytes(&self, start: usize, end: usize) -> &[u8] {
+        self.slice(start..end)
+            .expect("a section is viewed in the mapped range it was made from")
+    }
+
+    #[inline]
+    fn all_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
 #[expect(clippy::missing_safety_doc)]
 pub(crate) unsafe trait Plain: Copy {}
 
@@ -30,6 +62,11 @@ impl<T: Plain> Section<T> {
 
     pub(crate) fn view<'f>(&self, file: &'f [u8]) -> &'f [T] {
         cast(&file[self.start..self.end]).expect("a section is viewed in the file it was made from")
+    }
+
+    #[inline]
+    pub(crate) fn view_source<'f, S: SectionSource>(&self, file: &'f S) -> &'f [T] {
+        cast(file.bytes(self.start, self.end)).expect("a section is viewed in its source map")
     }
 }
 

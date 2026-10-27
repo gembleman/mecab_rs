@@ -1,7 +1,5 @@
 use std::path::Path;
 
-use memmap2::Mmap;
-
 use crate::char_table::{
     BMP_LEN, CODE_POINTS, DEFAULT_TYPE_SHIFT, EXTENDER_FLAG, GROUP_SHIFT, HEADER_BYTES,
     INVOKE_SHIFT, LENGTH_SHIFT, MAGIC, MAX_PALETTE, NAME_BYTES, PALETTE_ENTRY_BYTES, TYPE_BITS,
@@ -9,6 +7,7 @@ use crate::char_table::{
 };
 use crate::dictionary::map_file;
 use crate::error::Error;
+use crate::mapped_bytes::MappedBytes;
 
 const SPACE_CODE: u32 = 0x20;
 const FOUR_BYTE_LEAD: u8 = 0xf0;
@@ -75,20 +74,21 @@ pub(crate) struct SentenceChars {
 impl SentenceChars {
     pub(crate) fn fill(&mut self, chars: &CharProperty, text: &[u8]) {
         let length = text.len();
+        let table = chars.table();
         assert!(u32::try_from(length).is_ok());
         self.length = length;
         if self.entries.len() <= length {
             self.entries.resize(length + 1, Entry::default());
         }
         self.entries[length] = Entry {
-            info: chars.class_of_code(0).info,
+            info: chars.class_of_table_code(table, 0).info,
             single: 1,
             width: 1,
             ..Entry::default()
         };
         for position in (0..length).rev() {
             let (code, single) = decode_utf8(text, position, length - position);
-            let class = chars.class_of_code(code);
+            let class = chars.class_of_table_code(table, code);
             let following = self.entries[position + single];
             let width = single as u32
                 + if following.extender {
@@ -170,7 +170,7 @@ impl SentenceChars {
 }
 
 pub(crate) struct CharProperty {
-    map: Mmap,
+    map: MappedBytes,
     category_count: usize,
     palette: Vec<Class>,
     table_start: usize,
@@ -183,11 +183,11 @@ impl CharProperty {
                 path: path.to_path_buf(),
             });
         }
-        let map = map_file(path)?;
-        Self::from_map(map, path)
+        let map = MappedBytes::whole(map_file(path)?);
+        Self::from_mapped(map, path)
     }
 
-    fn from_map(map: Mmap, path: &Path) -> Result<Self, Error> {
+    pub(crate) fn from_mapped(map: MappedBytes, path: &Path) -> Result<Self, Error> {
         let broken = |reason| Error::Format {
             file: path.to_path_buf(),
             reason,
@@ -223,7 +223,9 @@ impl CharProperty {
                 extender: flags & EXTENDER_FLAG != 0,
             });
         }
-        let table = &map[table_start..];
+        let table = map
+            .slice(table_start..map.len())
+            .expect("the character table size was checked above");
         if table.iter().any(|&index| usize::from(index) >= palette_len) {
             return Err(broken("a character refers to a missing palette entry"));
         }
@@ -241,13 +243,20 @@ impl CharProperty {
         })
     }
 
+    pub(crate) fn open_bytes(path: &Path, map: MappedBytes) -> Result<Self, Error> {
+        Self::from_mapped(map, path)
+    }
+
     pub(crate) fn category_count(&self) -> usize {
         self.category_count
     }
 
     pub(crate) fn name(&self, index: usize) -> &[u8] {
         let start = HEADER_BYTES + NAME_BYTES * index;
-        let bytes = &self.map[start..start + NAME_BYTES];
+        let bytes = self
+            .map
+            .slice(start..start + NAME_BYTES)
+            .expect("the category name is inside the validated table");
         let length = bytes
             .iter()
             .position(|&byte| byte == 0)
@@ -256,7 +265,21 @@ impl CharProperty {
     }
 
     fn class_of_code(&self, code: u32) -> Class {
-        self.palette[usize::from(self.map[self.table_start + code as usize])]
+        let table = self.table();
+        self.class_of_table_code(table, code)
+    }
+
+    #[inline]
+    fn class_of_table_code(&self, table: &[u8], code: u32) -> Class {
+        let index = table[code as usize];
+        self.palette[usize::from(index)]
+    }
+
+    #[inline]
+    fn table(&self) -> &[u8] {
+        self.map
+            .slice(self.table_start..self.map.len())
+            .expect("the character table is inside the validated map")
     }
 
     pub(crate) fn space(&self) -> CharInfo {

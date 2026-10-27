@@ -8,6 +8,7 @@ use crate::Error;
 use crate::build::text::key_value;
 use crate::char_property::CharProperty;
 use crate::char_table::CHAR_TABLE_FILE;
+use crate::int_templates::MappedIntTemplates;
 use crate::system_dictionary::{
     DictionaryKind, HEADER_SIZE, SystemDictionary, TOKEN_SIZE, TokenRecord,
 };
@@ -168,8 +169,10 @@ pub(super) fn read_dictionary(directory: &Path) -> Result<Model, Error> {
     let unknown = SystemDictionary::open(&unknown_path, DictionaryKind::Unknown)?;
     let chars = CharProperty::open(&directory.join(CHAR_TABLE_FILE))?;
     let hot_path = directory.join("matrix.hot");
+    let int_templates_path = directory.join("matrix.itp");
     let templates_path = directory.join("matrix.tpl");
-    let hot = hot_path.exists() && templates_path.exists();
+    let integer_templates = hot_path.exists() && int_templates_path.exists();
+    let hot = integer_templates || (hot_path.exists() && templates_path.exists());
     let matrix_path = if hot {
         hot_path
     } else {
@@ -181,6 +184,11 @@ pub(super) fn read_dictionary(directory: &Path) -> Result<Model, Error> {
         ));
     }
     let matrix = fs::read(&matrix_path).map_err(io_error(&matrix_path))?;
+    let templates_path = if integer_templates {
+        int_templates_path
+    } else {
+        templates_path
+    };
     let templates = if hot {
         fs::read(&templates_path).map_err(io_error(&templates_path))?
     } else {
@@ -208,7 +216,15 @@ pub(super) fn read_dictionary(directory: &Path) -> Result<Model, Error> {
             "the file size does not match the header",
         ));
     }
-    if hot {
+    if hot && integer_templates {
+        let mapped = MappedIntTemplates::open(&templates_path)?;
+        if mapped.left_size() != left_size || mapped.right_size() != right_size {
+            return Err(broken(
+                &templates_path,
+                "the integer templates do not match the hot matrix",
+            ));
+        }
+    } else if hot {
         let sizes = templates.get(16..24).map(|bytes| {
             (
                 u32::from_le_bytes(bytes[..4].try_into().expect("four bytes")) as usize,
@@ -236,6 +252,7 @@ pub(super) fn read_dictionary(directory: &Path) -> Result<Model, Error> {
     let mut model = Model {
         matrix,
         templates,
+        integer_templates,
         char_table: fs::read(directory.join(CHAR_TABLE_FILE))
             .map_err(io_error(&directory.join(CHAR_TABLE_FILE)))?,
         bos_feature,

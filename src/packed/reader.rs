@@ -2,48 +2,33 @@
 use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 
 use memmap2::Mmap;
 
 use super::{
     BLOCK_CODES, BLOCK_COUNT, CELLS, CHAR_BLOCKS, CHAR_INDEX, CHAR_TABLE, COUNT_SHIFT, DICRC,
-    FEATURES, FLAG_HOT_MATRIX, FLAG_WIDE_PARAMS, HEADER_BYTES, INLINE_COUNT_MASK, INLINE_FLAG,
-    MAGIC, MATRIX, MAX_UNITS, PARAMS, PARENT_MASK, SECTION_NAMES, SECTIONS, TEMPLATES,
-    TERMINAL_FLAG, TOKENS, UNKNOWN_STARTS, UNKNOWN_TOKENS, UNUSED_CHECK, VERSION,
+    FEATURES, FLAG_HOT_MATRIX, FLAG_INT_TEMPLATES, FLAG_WIDE_PARAMS, HEADER_BYTES,
+    INLINE_COUNT_MASK, INLINE_FLAG, MAGIC, MATRIX, MAX_UNITS, PARAMS, PARENT_MASK, SECTION_NAMES,
+    SECTIONS, TEMPLATES, TERMINAL_FLAG, TOKENS, UNKNOWN_STARTS, UNKNOWN_TOKENS, UNUSED_CHECK,
+    VERSION,
 };
 use crate::char_table::{HEADER_BYTES as CHAR_TABLE_HEADER, MAGIC as CHAR_TABLE_MAGIC};
 use crate::dictionary::map_file;
 use crate::error::Error;
+use crate::int_templates::MappedIntTemplates;
+use crate::mapped_bytes::MappedBytes;
 use crate::section::Section;
+use crate::system_dictionary::PrefixHit;
+pub use crate::system_dictionary::TokenRecord;
 
 const CHUNK: usize = 1 << 20;
 const PARAM_BYTES: usize = 8;
 const PARALLEL_MIN_BYTES: usize = 1 << 22;
 const MAX_CHECK_THREADS: usize = 8;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Hit {
-    pub length: usize,
-    first_token: u32,
-    token_count: u32,
-}
-
-impl Hit {
-    pub fn tokens(self) -> Range<usize> {
-        self.first_token as usize..(self.first_token + self.token_count) as usize
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TokenRecord {
-    pub left_id: u16,
-    pub right_id: u16,
-    pub pos_id: u16,
-    pub word_cost: i16,
-    pub feature: u32,
-}
+pub type Hit = PrefixHit;
 
 #[cfg(unix)]
 fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
@@ -126,12 +111,8 @@ impl Source<'_> {
     }
 }
 
-fn bit(bits: &[u64], index: usize) -> bool {
-    bits[index / 64] >> (index % 64) & 1 != 0
-}
-
 pub struct PackedDictionary {
-    map: Mmap,
+    map: Arc<Mmap>,
     sections: [Range<usize>; SECTIONS],
     char_index: Section<u16>,
     char_blocks: Section<u16>,
@@ -142,6 +123,7 @@ pub struct PackedDictionary {
     right_size: usize,
     category_count: usize,
     hot: bool,
+    integer_templates: bool,
     ascii: [u16; 128],
     bos_feature: Range<usize>,
     unknown_feature: Option<Range<usize>>,
@@ -168,8 +150,11 @@ impl PackedDictionary {
             return Err(broken("the magic number or the version is not valid"));
         }
         let flags = u32_at(&header, 12);
-        if flags & !(FLAG_WIDE_PARAMS | FLAG_HOT_MATRIX) != 0 {
+        if flags & !(FLAG_WIDE_PARAMS | FLAG_HOT_MATRIX | FLAG_INT_TEMPLATES) != 0 {
             return Err(broken("the flags are not valid"));
+        }
+        if flags & FLAG_INT_TEMPLATES != 0 && flags & FLAG_HOT_MATRIX == 0 {
+            return Err(broken("integer templates require a hot matrix"));
         }
         let token_bytes = if flags & FLAG_WIDE_PARAMS != 0 { 8 } else { 6 };
         let code_count = u32_at(&header, 16) as usize;
@@ -225,6 +210,7 @@ impl PackedDictionary {
         let left_size = usize::from(u16_at(&matrix_header, 0));
         let right_size = usize::from(u16_at(&matrix_header, 2));
         let hot = flags & FLAG_HOT_MATRIX != 0;
+        let integer_templates = flags & FLAG_INT_TEMPLATES != 0;
         let (header_bytes, hot_cells) = if hot {
             let mut hot_header = [0u8; 4];
             source.read(MATRIX, 4, &mut hot_header)?;
@@ -240,7 +226,20 @@ impl PackedDictionary {
         if left_size == 0 || right_size == 0 || length(MATRIX) != header_bytes + hot_cells * 2 {
             return Err(broken("the matrix size does not match its header"));
         }
-        if hot {
+        if hot && integer_templates {
+            let mut templates_header = [0u8; 24];
+            if length(TEMPLATES) < templates_header.len() {
+                return Err(broken("the integer templates are empty"));
+            }
+            source.read(TEMPLATES, 0, &mut templates_header)?;
+            if templates_header[..4] != *b"MXIT"
+                || u32_at(&templates_header, 4) != 1
+                || u32_at(&templates_header, 16) as usize != left_size
+                || u32_at(&templates_header, 20) as usize != right_size
+            {
+                return Err(broken("the integer templates do not match the hot matrix"));
+            }
+        } else if hot {
             let mut templates_header = [0u8; 24];
             if length(TEMPLATES) < templates_header.len() {
                 return Err(broken("the templates are shorter than their header"));
@@ -312,12 +311,15 @@ impl PackedDictionary {
                 } else {
                     (usize::from(u16_at(token, 0)), u32_at(token, 2) as usize)
                 };
-                param < param_count && feature < features_length && bit(&starts, feature)
+                param < param_count
+                    && feature < features_length
+                    && starts.binary_search(&(feature as u32)).is_ok()
             })
         };
         let reason = "a token has a parameter set or a feature that does not exist";
         source.chunks(TOKENS, token_bytes, valid_tokens, reason)?;
         source.chunks(UNKNOWN_TOKENS, token_bytes, valid_tokens, reason)?;
+        drop(starts);
         let unknown_starts = source.read_all(UNKNOWN_STARTS)?;
         let unknown_starts: Vec<u32> = unknown_starts
             .as_chunks::<4>()
@@ -349,7 +351,7 @@ impl PackedDictionary {
             return Err(broken("bos-feature or unk-feature is not valid UTF-8"));
         }
 
-        let map = map_file(path)?;
+        let map = Arc::new(map_file(path)?);
         if map.len() as u64 != file_length {
             return Err(broken("the file changed while it was opened"));
         }
@@ -358,6 +360,11 @@ impl PackedDictionary {
         let char_blocks =
             Section::new(&map, sections[CHAR_BLOCKS].clone()).ok_or_else(view_error)?;
         let cells = Section::new(&map, sections[CELLS].clone()).ok_or_else(view_error)?;
+        if hot && integer_templates {
+            let template = MappedBytes::from_arc(Arc::clone(&map), sections[TEMPLATES].clone())
+                .expect("the template section is inside the mapping");
+            MappedIntTemplates::from_mapped(template, path)?;
+        }
         let dicrc_start = sections[DICRC].start + 8;
         let mut dictionary = Self {
             map,
@@ -370,6 +377,7 @@ impl PackedDictionary {
             right_size,
             category_count,
             hot: flags & FLAG_HOT_MATRIX != 0,
+            integer_templates,
             bos_feature: dicrc_start..dicrc_start + bos_length,
             unknown_feature: (unknown_length > 0)
                 .then(|| dicrc_start + bos_length..dicrc_start + bos_length + unknown_length),
@@ -414,6 +422,7 @@ impl PackedDictionary {
         self.walk_bytes(key, |hit| hits.push(hit));
     }
 
+    #[inline(always)]
     pub fn common_prefix_search_codes(&self, codes: &[u16], hits: &mut Vec<Hit>) {
         hits.clear();
         let mut cursor = Cursor::new(self.cells.view(&self.map));
@@ -423,8 +432,8 @@ impl PackedDictionary {
                 Step::Inner => {}
                 Step::Key(first_token, token_count) => hits.push(Hit {
                     length: at + 1,
-                    first_token,
-                    token_count,
+                    first_token: first_token as usize,
+                    token_count: token_count as usize,
                 }),
             }
         }
@@ -455,8 +464,8 @@ impl PackedDictionary {
                 Step::Inner => {}
                 Step::Key(first_token, token_count) => found(Hit {
                     length: at,
-                    first_token,
-                    token_count,
+                    first_token: first_token as usize,
+                    token_count: token_count as usize,
                 }),
             }
         }
@@ -508,17 +517,23 @@ impl PackedDictionary {
 
     pub fn feature(&self, offset: u32) -> &str {
         let area = &self.map[self.sections[FEATURES].clone()];
-        let rest = &area[offset as usize..];
-        assert!(rest[0] & 0xC0 != 0x80, "not the start of a feature");
+        let area = unsafe { str::from_utf8_unchecked(area) };
+        let rest = area
+            .get(offset as usize..)
+            .expect("feature offset is outside the feature area");
         let length = rest
-            .iter()
-            .position(|&byte| byte == 0)
+            .find('\0')
             .expect("open checked that the features end with a NUL byte");
-        unsafe { str::from_utf8_unchecked(&rest[..length]) }
+        &rest[..length]
     }
 
     pub fn matrix_bytes(&self) -> &[u8] {
         &self.map[self.sections[MATRIX].clone()]
+    }
+
+    pub(crate) fn matrix_mapped(&self) -> MappedBytes {
+        MappedBytes::from_arc(Arc::clone(&self.map), self.sections[MATRIX].clone())
+            .expect("the matrix section is inside the mapping")
     }
 
     pub fn template_bytes(&self) -> Option<&[u8]> {
@@ -526,8 +541,24 @@ impl PackedDictionary {
             .then(|| &self.map[self.sections[TEMPLATES].clone()])
     }
 
+    pub(crate) fn templates_mapped(&self) -> Option<MappedBytes> {
+        self.hot.then(|| {
+            MappedBytes::from_arc(Arc::clone(&self.map), self.sections[TEMPLATES].clone())
+                .expect("the template section is inside the mapping")
+        })
+    }
+
+    pub fn integer_templates(&self) -> bool {
+        self.integer_templates
+    }
+
     pub fn char_table_bytes(&self) -> &[u8] {
         &self.map[self.sections[CHAR_TABLE].clone()]
+    }
+
+    pub(crate) fn char_table_mapped(&self) -> MappedBytes {
+        MappedBytes::from_arc(Arc::clone(&self.map), self.sections[CHAR_TABLE].clone())
+            .expect("the character-table section is inside the mapping")
     }
 
     pub fn bos_feature(&self) -> &str {
@@ -615,11 +646,7 @@ fn decode(bytes: &[u8]) -> Option<(char, usize)> {
     char::from_u32(scalar).map(|char| (char, width))
 }
 
-fn check_features(source: &Source, length: usize) -> Result<Vec<u64>, Error> {
-    let starts: Vec<AtomicU64> = (0..length / 64 + 1).map(|_| AtomicU64::new(0)).collect();
-    if length > 0 {
-        starts[0].fetch_or(1, Ordering::Relaxed);
-    }
+fn check_features(source: &Source, length: usize) -> Result<Vec<u32>, Error> {
     let threads = if length < PARALLEL_MIN_BYTES {
         1
     } else {
@@ -630,14 +657,13 @@ fn check_features(source: &Source, length: usize) -> Result<Vec<u64>, Error> {
         bounds.push(next_boundary(source, length / threads * part, length)?);
     }
     bounds.push(length);
-    let results: Vec<Result<(), Error>> = thread::scope(|scope| {
+    let results: Vec<Result<Vec<u32>, Error>> = thread::scope(|scope| {
         let handles: Vec<_> = bounds
             .windows(2)
             .filter(|pair| pair[0] < pair[1])
             .map(|pair| {
                 let (begin, end) = (pair[0], pair[1]);
-                let starts = &starts;
-                scope.spawn(move || check_feature_range(source, begin..end, length, starts))
+                scope.spawn(move || check_feature_range(source, begin..end, length))
             })
             .collect();
         handles
@@ -645,8 +671,14 @@ fn check_features(source: &Source, length: usize) -> Result<Vec<u64>, Error> {
             .map(|handle| handle.join().expect("a check thread panicked"))
             .collect()
     });
-    results.into_iter().collect::<Result<(), Error>>()?;
-    Ok(starts.into_iter().map(AtomicU64::into_inner).collect())
+    let mut starts = Vec::new();
+    if length > 0 {
+        starts.push(0);
+    }
+    for result in results {
+        starts.extend(result?);
+    }
+    Ok(starts)
 }
 
 fn next_boundary(source: &Source, from: usize, length: usize) -> Result<usize, Error> {
@@ -667,9 +699,9 @@ fn check_feature_range(
     source: &Source,
     range: Range<usize>,
     length: usize,
-    starts: &[AtomicU64],
-) -> Result<(), Error> {
+) -> Result<Vec<u32>, Error> {
     let mut buffer = vec![0u8; CHUNK.min(range.len())];
+    let mut starts = Vec::new();
     let mut carry = 0;
     let mut done = range.start;
     while done < range.end {
@@ -685,8 +717,8 @@ fn check_feature_range(
             if byte == 0 {
                 cut = at + 1;
                 let start = base + cut;
-                if start < length {
-                    starts[start / 64].fetch_or(1 << (start % 64), Ordering::Relaxed);
+                if start < length && u32::try_from(start).is_ok() {
+                    starts.push(start as u32);
                 }
             }
         }
@@ -700,47 +732,77 @@ fn check_feature_range(
     if carry != 0 {
         return Err(source.broken("the features do not end with a NUL byte"));
     }
-    Ok(())
+    Ok(starts)
 }
 
 fn check_cells(source: &Source, token_count: usize) -> Result<(), Error> {
-    let bytes = source.read_all(CELLS)?;
-    let cells: Vec<[u32; 2]> = bytes
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|unit| [u32_at(unit, 0), u32_at(unit, 4)])
-        .collect();
+    let cell_count = source.sections[CELLS].len() / 8;
     let reason = "a double array unit points outside the token table";
     let valid_range =
         |first: u32, count: u32| count > 0 && first as usize + count as usize <= token_count;
-    let mut data = vec![false; cells.len()];
-    for (index, &[base, check]) in cells.iter().enumerate() {
-        if check == UNUSED_CHECK || check & TERMINAL_FLAG == 0 || check & INLINE_FLAG != 0 {
-            continue;
-        }
-        match cells.get(base as usize) {
-            Some(&[tokens, data_check])
-                if data_check == index as u32
-                    && base as usize != index
-                    && valid_range(tokens & PARENT_MASK, tokens >> COUNT_SHIFT) =>
-            {
-                data[base as usize] = true;
+    let mut data = vec![0u64; cell_count.div_ceil(64)];
+    let mut read_error = None;
+    let first_pass = source.chunks(
+        CELLS,
+        8,
+        |first, part| {
+            for (offset, unit) in part.as_chunks::<8>().0.iter().enumerate() {
+                let index = first + offset;
+                let base = u32_at(unit, 0);
+                let check = u32_at(unit, 4);
+                if check == UNUSED_CHECK || check & TERMINAL_FLAG == 0 || check & INLINE_FLAG != 0 {
+                    continue;
+                }
+                let base = base as usize;
+                if base >= cell_count || base == index {
+                    return false;
+                }
+                let mut target = [0u8; 8];
+                if let Err(error) = source.read(CELLS, base * 8, &mut target) {
+                    read_error = Some(error);
+                    return false;
+                }
+                let tokens = u32_at(&target, 0);
+                let data_check = u32_at(&target, 4);
+                if data_check != index as u32
+                    || !valid_range(tokens & PARENT_MASK, tokens >> COUNT_SHIFT)
+                {
+                    return false;
+                }
+                data[base / 64] |= 1 << (base % 64);
             }
-            _ => return Err(source.broken(reason)),
-        }
+            true
+        },
+        reason,
+    );
+    if let Some(error) = read_error {
+        return Err(error);
     }
-    for (index, &[base, check]) in cells.iter().enumerate() {
-        if check == UNUSED_CHECK || data[index] {
-            continue;
-        }
-        let inline = check & INLINE_FLAG != 0;
-        let terminal = check & TERMINAL_FLAG != 0;
-        if inline && !terminal
-            || inline && !valid_range(base, (check >> COUNT_SHIFT) & INLINE_COUNT_MASK)
-        {
-            return Err(source.broken(reason));
-        }
-    }
-    Ok(())
+    first_pass?;
+    source.chunks(
+        CELLS,
+        8,
+        |first, part| {
+            for (offset, unit) in part.as_chunks::<8>().0.iter().enumerate() {
+                let index = first + offset;
+                if data[index / 64] >> (index % 64) & 1 != 0 {
+                    continue;
+                }
+                let base = u32_at(unit, 0);
+                let check = u32_at(unit, 4);
+                if check == UNUSED_CHECK {
+                    continue;
+                }
+                let inline = check & INLINE_FLAG != 0;
+                let terminal = check & TERMINAL_FLAG != 0;
+                if inline && !terminal
+                    || inline && !valid_range(base, (check >> COUNT_SHIFT) & INLINE_COUNT_MASK)
+                {
+                    return false;
+                }
+            }
+            true
+        },
+        reason,
+    )
 }

@@ -12,7 +12,8 @@ use memmap2::Mmap;
 use crate::clusters::{ClusterPlan, plan_projection_clusters, representatives};
 use crate::dictionary::map_file;
 use crate::error::Error;
-use crate::section::Section;
+use crate::mapped_bytes::MappedBytes;
+use crate::section::{Section, SectionSource};
 use crate::templates::{TemplateReader, write_array};
 
 const MAGIC: &[u8; 4] = b"MXIT";
@@ -726,11 +727,12 @@ impl MappedIntClusters {
     }
 
     #[inline]
-    fn total(&self, file: &[u8], left_right_id: u16, right_left_id: u16) -> i64 {
+    fn total<S: SectionSource>(&self, file: &S, left_right_id: u16, right_left_id: u16) -> i64 {
         let count = self.shapes.len();
-        let left = &self.left_keys.view(file)[usize::from(left_right_id) * count..][..count];
-        let right = &self.right_keys.view(file)[usize::from(right_left_id) * count..][..count];
-        let tables = self.tables.view(file);
+        let left = &self.left_keys.view_source(file)[usize::from(left_right_id) * count..][..count];
+        let right =
+            &self.right_keys.view_source(file)[usize::from(right_left_id) * count..][..count];
+        let tables = self.tables.view_source(file);
         let mut total = 0i64;
         for ((shape, &left), &right) in self.shapes.iter().zip(left).zip(right) {
             total += i64::from(
@@ -753,21 +755,21 @@ struct MappedIntPart {
 }
 
 impl MappedIntPart {
-    fn slices<'a>(&self, file: &'a [u8]) -> IntSlices<'a> {
+    fn slices<'a, S: SectionSource>(&self, file: &'a S) -> IntSlices<'a> {
         IntSlices {
             left_count: self.left_count,
             right_count: self.right_count,
-            left_projection: self.left_projection.view(file),
-            right_projection: self.right_projection.view(file),
-            indptr: self.indptr.view(file),
-            left_index: self.left_index.view(file),
-            weight: self.weight.view(file),
+            left_projection: self.left_projection.view_source(file),
+            right_projection: self.right_projection.view_source(file),
+            indptr: self.indptr.view_source(file),
+            left_index: self.left_index.view_source(file),
+            weight: self.weight.view_source(file),
         }
     }
 }
 
-pub struct MappedIntTemplates {
-    map: Mmap,
+pub struct MappedIntTemplates<S = Mmap> {
+    map: S,
     cost_factor: u32,
     shift: u32,
     left_size: usize,
@@ -779,11 +781,23 @@ pub struct MappedIntTemplates {
     exception_rows: Vec<u32>,
 }
 
-impl MappedIntTemplates {
+impl MappedIntTemplates<Mmap> {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
-        let map = map_file(path)?;
-        let mut reader = TemplateReader::new(&map, path);
+        Self::from_source(map_file(path)?, path)
+    }
+}
+
+impl MappedIntTemplates<MappedBytes> {
+    pub(crate) fn from_mapped(map: MappedBytes, path: &Path) -> Result<Self, Error> {
+        Self::from_source(map, path)
+    }
+}
+
+#[allow(private_bounds)]
+impl<S: SectionSource> MappedIntTemplates<S> {
+    fn from_source(map: S, path: &Path) -> Result<Self, Error> {
+        let mut reader = TemplateReader::new(map.all_bytes(), path);
         if reader.bytes::<4>()? != *MAGIC || u32::from_le_bytes(reader.bytes()?) != VERSION {
             return Err(reader.broken("the file is not an integer template file of this version"));
         }
@@ -833,14 +847,14 @@ impl MappedIntTemplates {
             shift,
             left_size,
             right_size,
-            exception_cells.view(&map),
+            exception_cells.view_source(&map),
         )
         .map_err(|_| reader.broken("the integer templates are inconsistent"))?;
         let mut exception_rows = Vec::with_capacity(right_size + 1);
         let mut next = 0usize;
         for row in 0..=right_size {
             let first_of_row = row * left_size;
-            let cells = exception_cells.view(&map);
+            let cells = exception_cells.view_source(&map);
             while next < cells.len() && (cells[next] as usize) < first_of_row {
                 next += 1;
             }
@@ -873,7 +887,7 @@ impl MappedIntTemplates {
     }
 
     pub fn exception_count(&self) -> usize {
-        self.exception_cells.view(&self.map).len()
+        self.exception_cells.view_source(&self.map).len()
     }
 
     pub fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
@@ -883,9 +897,9 @@ impl MappedIntTemplates {
         let exception = if span.is_empty() {
             None
         } else {
-            let cells = &self.exception_cells.view(&self.map)[span.clone()];
+            let cells = &self.exception_cells.view_source(&self.map)[span.clone()];
             let found = cells.binary_search(&(cell as u32)).ok();
-            found.map(|at| self.exception_values.view(&self.map)[span.start + at])
+            found.map(|at| self.exception_values.view_source(&self.map)[span.start + at])
         };
         exception.unwrap_or_else(|| {
             let total = match &self.clusters {

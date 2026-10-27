@@ -7,6 +7,7 @@ use crate::packed::model::Model;
 
 const ENCODING_DENSE_DELTA: u32 = 1;
 const ENCODING_TEMPLATES_XZ: u32 = 2;
+const ENCODING_INTEGER_TEMPLATES: u32 = 3;
 
 fn row_delta(matrix: &[u8], encode: bool) -> Vec<u8> {
     let mut out = matrix.to_vec();
@@ -123,6 +124,17 @@ pub(in crate::packed) fn encode(dict_dir: &Path, model: &Model, out: &Path) -> R
             bytes: row_delta(&model.matrix, true),
         });
     }
+    if model.integer_templates {
+        let mut bytes = Vec::with_capacity(8 + model.matrix.len() + model.templates.len());
+        bytes.extend_from_slice(&(model.matrix.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&model.matrix);
+        bytes.extend_from_slice(&model.templates);
+        return Ok(Part {
+            name: "matrix",
+            encoding: ENCODING_INTEGER_TEMPLATES,
+            bytes,
+        });
+    }
     let hot = (
         usize::from(u16::from_le_bytes([model.matrix[4], model.matrix[5]])),
         usize::from(u16::from_le_bytes([model.matrix[6], model.matrix[7]])),
@@ -182,6 +194,27 @@ pub(in crate::packed) fn decode(
             let word = |word: &[u8]| u32::from_le_bytes(word.try_into().expect("four bytes"));
             let hot = (word(hot_left) as usize, word(hot_right) as usize);
             regenerate(&bytes[8..], hot, next_to)
+        }
+        (ENCODING_INTEGER_TEMPLATES, bytes) => {
+            let Some(length) = bytes.get(..8) else {
+                return Err(corrupt("the integer matrix part is too short"));
+            };
+            let matrix_length =
+                usize::try_from(u64::from_le_bytes(length.try_into().expect("eight bytes")))
+                    .map_err(|_| corrupt("the integer matrix part is too long"))?;
+            let matrix_end = 8usize
+                .checked_add(matrix_length)
+                .ok_or_else(|| corrupt("the integer matrix part is too long"))?;
+            let matrix = bytes
+                .get(8..matrix_end)
+                .ok_or_else(|| corrupt("the integer matrix part ends early"))?;
+            let templates = bytes
+                .get(matrix_end..)
+                .ok_or_else(|| corrupt("the integer templates are missing"))?;
+            if matrix.len() < 8 || templates.len() < 24 || &templates[..4] != b"MXIT" {
+                return Err(corrupt("the integer matrix part is not valid"));
+            }
+            Ok((matrix.to_vec(), templates.to_vec()))
         }
         _ => Err(Error::Unsupported("a matrix with an unknown encoding")),
     }

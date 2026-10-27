@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::thread;
 
 use crate::error::Error;
-use crate::section::Section;
+use crate::section::{Section, SectionSource};
 use crate::templates::{PartSlices, TemplateReader, to_cost, write_array};
 
 const MAX_TABLE_THREADS: usize = 8;
@@ -292,17 +292,18 @@ impl MappedClusters {
         }
     }
 
-    pub(crate) fn cost(
+    pub(crate) fn cost<S: SectionSource>(
         &self,
-        file: &[u8],
+        file: &S,
         cost_factor: f64,
         left_right_id: u16,
         right_left_id: u16,
     ) -> Option<i16> {
         let count = self.shapes.len();
-        let left = &self.left_keys.view(file)[usize::from(left_right_id) * count..][..count];
-        let right = &self.right_keys.view(file)[usize::from(right_left_id) * count..][..count];
-        let tables = self.tables.view(file);
+        let left = &self.left_keys.view_source(file)[usize::from(left_right_id) * count..][..count];
+        let right =
+            &self.right_keys.view_source(file)[usize::from(right_left_id) * count..][..count];
+        let tables = self.tables.view_source(file);
         let mut sum = 0.0;
         for ((shape, &left), &right) in self.shapes.iter().zip(left).zip(right) {
             sum += tables

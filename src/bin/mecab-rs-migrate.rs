@@ -13,6 +13,10 @@ the built-in defaults; the other files of the directory are not touched.";
 
 const REBUILD_USAGE: &str = "
 dictionary rebuilding:
+  mecab-rs-migrate pack <dict-dir> <out.mrd>
+  mecab-rs-migrate pack-transport <dict-dir> <out.mrd.xz>  (feature xz)
+  mecab-rs-migrate expand <in.mrd.xz> <out.mrd>           (feature xz)
+      Writes a packed runtime dictionary, or packs and expands its transport form.
   mecab-rs-migrate stats <dict-dir> <out-dir> <corpus>...
       Analyzes every line of the corpora and writes right.tsv and left.tsv (id<TAB>count) to
       <out-dir>. Needs char.uni in <dict-dir>.
@@ -589,6 +593,9 @@ fn run() -> Result<(), String> {
         let start = Instant::now();
         let args = &all[1..];
         let result = match command {
+            "pack" => packed_command(command, args),
+            #[cfg(feature = "xz")]
+            "pack-transport" | "expand" => packed_command(command, args),
             "stats" => stats(args),
             "renumber" => renumber(args),
             "slim" => slim(args),
@@ -611,7 +618,7 @@ fn run() -> Result<(), String> {
                 "{command}: this build has no xz support; build with --features xz"
             )),
             #[cfg(not(feature = "xz"))]
-            "pack-matrix" | "unpack-matrix" => Err(format!(
+            "pack-matrix" | "unpack-matrix" | "pack-transport" | "expand" => Err(format!(
                 "{command}: this build has no xz support; build with --features xz"
             )),
             _ => return migrate_char_table(all),
@@ -621,6 +628,24 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     migrate_char_table(all)
+}
+
+fn packed_command(command: &str, args: &Args) -> Result<(), String> {
+    if args.len() != 2 {
+        return Err(format!("{command}: expected two paths"));
+    }
+    let input = Path::new(&args[0]);
+    let output = Path::new(&args[1]);
+    match command {
+        "pack" => mecab_rs::packed::write_runtime(input, output).map_err(shown),
+        #[cfg(feature = "xz")]
+        "pack-transport" => mecab_rs::packed::write_transport(input, output)
+            .map(|_| ())
+            .map_err(shown),
+        #[cfg(feature = "xz")]
+        "expand" => mecab_rs::packed::expand(input, output).map_err(shown),
+        _ => unreachable!(),
+    }
 }
 
 fn migrate_char_table(all: Vec<std::ffi::OsString>) -> Result<(), String> {

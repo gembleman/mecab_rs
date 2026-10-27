@@ -55,11 +55,11 @@ fn is_utf8_charset(name: &[u8]) -> bool {
         .any(|utf8| name.eq_ignore_ascii_case(utf8))
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct PrefixHit {
-    first_token: usize,
-    token_count: usize,
-    pub(crate) length: usize,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefixHit {
+    pub(crate) first_token: usize,
+    pub(crate) token_count: usize,
+    pub length: usize,
 }
 
 impl PrefixHit {
@@ -71,18 +71,22 @@ impl PrefixHit {
         }
     }
 
-    pub(crate) fn tokens(self) -> Range<usize> {
+    pub fn tokens(self) -> Range<usize> {
         self.first_token..self.first_token + self.token_count
+    }
+
+    pub fn length(self) -> usize {
+        self.length
     }
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct TokenRecord {
-    pub(crate) left_id: u16,
-    pub(crate) right_id: u16,
-    pub(crate) pos_id: u16,
-    pub(crate) word_cost: i16,
-    pub(crate) feature: u32,
+pub struct TokenRecord {
+    pub left_id: u16,
+    pub right_id: u16,
+    pub pos_id: u16,
+    pub word_cost: i16,
+    pub feature: u32,
 }
 
 #[derive(Clone, Copy)]

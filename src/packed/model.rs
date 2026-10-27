@@ -6,8 +6,8 @@ use std::io::{self, Write};
 use super::trie::{self, Entry};
 use super::{
     BLOCK_CODES, BLOCK_COUNT, CELLS, CHAR_BLOCKS, CHAR_INDEX, CHAR_TABLE, DICRC, FEATURES,
-    FLAG_HOT_MATRIX, FLAG_WIDE_PARAMS, HEADER_BYTES, MAGIC, MATRIX, PARAMS, SECTIONS, TEMPLATES,
-    TOKENS, UNKNOWN_STARTS, UNKNOWN_TOKENS, VERSION,
+    FLAG_HOT_MATRIX, FLAG_INT_TEMPLATES, FLAG_WIDE_PARAMS, HEADER_BYTES, MAGIC, MATRIX, PARAMS,
+    SECTIONS, TEMPLATES, TOKENS, UNKNOWN_STARTS, UNKNOWN_TOKENS, VERSION,
 };
 use crate::Error;
 
@@ -32,6 +32,7 @@ pub(super) struct Model {
     pub(super) unknown_features: Vec<u32>,
     pub(super) matrix: Vec<u8>,
     pub(super) templates: Vec<u8>,
+    pub(super) integer_templates: bool,
     pub(super) char_table: Vec<u8>,
     pub(super) bos_feature: String,
     pub(super) unknown_feature: Option<String>,
@@ -162,7 +163,8 @@ impl Model {
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
         let flags = (u32::from(wide) * FLAG_WIDE_PARAMS)
-            | (u32::from(!self.templates.is_empty()) * FLAG_HOT_MATRIX);
+            | (u32::from(!self.templates.is_empty()) * FLAG_HOT_MATRIX)
+            | (u32::from(self.integer_templates) * FLAG_INT_TEMPLATES);
         out.extend_from_slice(&flags.to_le_bytes());
         for count in [
             code_count,

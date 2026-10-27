@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::Path;
+use std::sync::Arc;
 
 use memmap2::Mmap;
 
@@ -9,7 +10,8 @@ use crate::char_property::CharProperty;
 use crate::char_table::CHAR_TABLE_FILE;
 use crate::error::Error;
 use crate::matrix::Matrix;
-use crate::system_dictionary::{DictionaryKind, SystemDictionary, TokenRecord};
+use crate::packed::PackedDictionary;
+use crate::system_dictionary::{DictionaryKind, PrefixHit, SystemDictionary, TokenRecord};
 
 const DENSE_MATRIX_FILE: &str = "matrix.bin";
 const HOT_MATRIX_FILE: &str = "matrix.hot";
@@ -50,15 +52,96 @@ fn dicrc_values(bytes: &[u8], path: &Path) -> Result<HashMap<Vec<u8>, Vec<u8>>, 
 }
 
 pub struct Dictionary {
-    pub(crate) system: SystemDictionary,
+    pub(crate) system: Lexicon,
     pub(crate) users: Vec<SystemDictionary>,
-    pub(crate) unknown: SystemDictionary,
+    pub(crate) unknown: Lexicon,
     pub(crate) matrix: Matrix,
     pub(crate) chars: CharProperty,
     pub(crate) unknown_tokens: Vec<Box<[TokenRecord]>>,
     pub(crate) bos_feature: String,
     pub(crate) unknown_feature: Option<String>,
     pub(crate) max_grouping_size: usize,
+}
+
+pub(crate) enum Lexicon {
+    System(SystemDictionary),
+    Packed(Arc<PackedDictionary>),
+}
+
+impl Lexicon {
+    #[inline(always)]
+    pub(crate) fn exact_match(&self, key: &[u8]) -> Option<std::ops::Range<usize>> {
+        match self {
+            Self::System(dictionary) => dictionary.exact_match(key),
+            Self::Packed(dictionary) => dictionary.exact_match(key),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn token(&self, index: usize) -> TokenRecord {
+        match self {
+            Self::System(dictionary) => dictionary.token(index),
+            Self::Packed(dictionary) => dictionary.token(index),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn feature(&self, offset: u32) -> &str {
+        match self {
+            Self::System(dictionary) => dictionary.feature(offset),
+            Self::Packed(dictionary) => dictionary.feature(offset),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn left_size(&self) -> usize {
+        match self {
+            Self::System(dictionary) => dictionary.left_size(),
+            Self::Packed(dictionary) => dictionary.left_size(),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn right_size(&self) -> usize {
+        match self {
+            Self::System(dictionary) => dictionary.right_size(),
+            Self::Packed(dictionary) => dictionary.right_size(),
+        }
+    }
+}
+
+pub(crate) trait LexiconOps {
+    fn common_prefix_search(&self, key: &[u8], hits: &mut Vec<PrefixHit>);
+    fn token(&self, index: usize) -> TokenRecord;
+    fn feature(&self, offset: u32) -> &str;
+}
+
+impl LexiconOps for PackedDictionary {
+    fn common_prefix_search(&self, key: &[u8], hits: &mut Vec<PrefixHit>) {
+        self.common_prefix_search(key, hits)
+    }
+
+    fn token(&self, index: usize) -> TokenRecord {
+        self.token(index)
+    }
+
+    fn feature(&self, offset: u32) -> &str {
+        self.feature(offset)
+    }
+}
+
+impl LexiconOps for SystemDictionary {
+    fn common_prefix_search(&self, key: &[u8], hits: &mut Vec<PrefixHit>) {
+        self.common_prefix_search(key, hits)
+    }
+
+    fn token(&self, index: usize) -> TokenRecord {
+        self.token(index)
+    }
+
+    fn feature(&self, offset: u32) -> &str {
+        self.feature(offset)
+    }
 }
 
 impl Dictionary {
@@ -79,10 +162,13 @@ impl Dictionary {
         user_dictionaries: &[P],
     ) -> Result<Self, Error> {
         let directory = directory.as_ref();
-        let users: Vec<&Path> = user_dictionaries.iter().map(AsRef::as_ref).collect();
-        if users.len() > MAX_USER_DICTIONARIES {
+        if user_dictionaries.len() > MAX_USER_DICTIONARIES {
             return Err(Error::Unsupported("more than 255 user dictionaries"));
         }
+        if directory.is_file() {
+            return Self::open_packed(directory, user_dictionaries);
+        }
+        let users: Vec<&Path> = user_dictionaries.iter().map(AsRef::as_ref).collect();
         let hot_path = directory.join(HOT_MATRIX_FILE);
         let int_templates_path = directory.join(INT_TEMPLATES_FILE);
         let templates_path = directory.join(TEMPLATES_FILE);
@@ -128,23 +214,31 @@ impl Dictionary {
                 reason: "bos-feature is missing",
             })?;
         let bos_feature = String::from_utf8(bos_feature.clone()).map_err(not_utf8)?;
-        let system = SystemDictionary::open(&directory.join("sys.dic"), DictionaryKind::System)?;
+        let system = Lexicon::System(SystemDictionary::open(
+            &directory.join("sys.dic"),
+            DictionaryKind::System,
+        )?);
         let users = user_paths
             .iter()
             .map(|path| SystemDictionary::open(path, DictionaryKind::User))
             .collect::<Result<Vec<_>, _>>()?;
         let unknown_path = directory.join("unk.dic");
-        let unknown = SystemDictionary::open(&unknown_path, DictionaryKind::Unknown)?;
+        let unknown = Lexicon::System(SystemDictionary::open(
+            &unknown_path,
+            DictionaryKind::Unknown,
+        )?);
         let matrix_path = directory.join(matrix_file);
         let matrix = open_matrix(&matrix_path)?;
         let chars = CharProperty::open(&directory.join(CHAR_TABLE_FILE))?;
-        let matches_matrix = |dictionary: &SystemDictionary| {
+        let matches_matrix = |dictionary: &Lexicon| {
             dictionary.left_size() == matrix.left_size()
                 && dictionary.right_size() == matrix.right_size()
         };
         if !matches_matrix(&system)
             || !matches_matrix(&unknown)
-            || !users.iter().all(matches_matrix)
+            || !users.iter().all(|user| {
+                user.left_size() == matrix.left_size() && user.right_size() == matrix.right_size()
+            })
         {
             return Err(Error::Format {
                 file: matrix_path,
@@ -165,6 +259,72 @@ impl Dictionary {
         }
         Ok(Self {
             system,
+            users,
+            unknown,
+            matrix,
+            chars,
+            unknown_tokens,
+            bos_feature,
+            unknown_feature,
+            max_grouping_size: DEFAULT_MAX_GROUPING_SIZE,
+        })
+    }
+
+    fn open_packed<P: AsRef<Path>>(path: &Path, user_dictionaries: &[P]) -> Result<Self, Error> {
+        let packed = Arc::new(PackedDictionary::open(path)?);
+        let matrix = if packed.template_bytes().is_some() {
+            if packed.integer_templates() {
+                Matrix::open_hot_int_bytes(
+                    path,
+                    packed.matrix_mapped(),
+                    packed.templates_mapped().unwrap(),
+                )?
+            } else {
+                Matrix::open_hot_bytes(
+                    path,
+                    packed.matrix_mapped(),
+                    packed.templates_mapped().unwrap(),
+                )?
+            }
+        } else {
+            Matrix::open_dense_bytes(path, packed.matrix_mapped())?
+        };
+        let chars = CharProperty::open_bytes(path, packed.char_table_mapped())?;
+        let unknown = Lexicon::Packed(Arc::clone(&packed));
+        let users = user_dictionaries
+            .iter()
+            .map(|user| SystemDictionary::open(user.as_ref(), DictionaryKind::User))
+            .collect::<Result<Vec<_>, _>>()?;
+        let matches_matrix = |dictionary: &Lexicon| {
+            dictionary.left_size() == matrix.left_size()
+                && dictionary.right_size() == matrix.right_size()
+        };
+        if !matches_matrix(&unknown)
+            || !users.iter().all(|user| {
+                user.left_size() == matrix.left_size() && user.right_size() == matrix.right_size()
+            })
+        {
+            return Err(Error::Format {
+                file: path.to_path_buf(),
+                reason: "the matrix size does not match the packed dictionary or a user dictionary",
+            });
+        }
+        let packed_ref = match &unknown {
+            Lexicon::Packed(dictionary) => dictionary,
+            Lexicon::System(_) => unreachable!(),
+        };
+        let unknown_tokens = (0..packed_ref.category_count())
+            .map(|category| {
+                packed_ref
+                    .unknown_tokens(category)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            })
+            .collect();
+        let bos_feature = packed_ref.bos_feature().to_owned();
+        let unknown_feature = packed_ref.unknown_feature().map(str::to_owned);
+        Ok(Self {
+            system: Lexicon::Packed(packed),
             users,
             unknown,
             matrix,

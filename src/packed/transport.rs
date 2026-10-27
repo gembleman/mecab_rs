@@ -164,6 +164,7 @@ fn model_from_parts(parts: &Parts, next_to: &Path) -> Result<Model, Error> {
     let mut model = Model::default();
     lexicon::decode(parts, &mut model)?;
     (model.matrix, model.templates) = matrix::decode(parts, next_to)?;
+    model.integer_templates = model.templates.starts_with(b"MXIT");
     model.char_table = parts.plain("char table", 0)?.to_vec();
     let dicrc = parts.plain("dicrc", 0)?;
     let corrupt = |reason| parts.corrupt(reason);
