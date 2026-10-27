@@ -58,7 +58,8 @@ impl<D: Deref<Target = Dictionary>> Tagger<D> {
         constraints: &[Constraint<'_>],
     ) -> Result<Path<'t, 'x>, Error> {
         check_text(text)?;
-        self.lattice.parse(&self.dictionary, text, constraints)?;
+        self.lattice
+            .parse_best(&self.dictionary, text, constraints)?;
         Ok(Path {
             frame: Frame {
                 dictionary: &self.dictionary,

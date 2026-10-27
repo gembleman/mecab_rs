@@ -74,6 +74,46 @@ pub(crate) struct LeftCandidate {
     pub(crate) id: NodeId,
 }
 
+#[derive(Clone, Copy)]
+struct Candidate {
+    surface: u32,
+    end: u32,
+    feature: u32,
+    left_id: u16,
+    right_id: u16,
+    pos_id: u16,
+    word_cost: i16,
+    source: NodeSource,
+    char_type: u8,
+}
+
+impl Candidate {
+    fn raw(self, begin: usize) -> RawNode {
+        RawNode {
+            surface_start: self.surface,
+            length: self.end - self.surface,
+            length_with_space: self.end - begin as u32,
+            left_id: self.left_id,
+            right_id: self.right_id,
+            word_cost: self.word_cost,
+            pos_id: self.pos_id,
+            source: self.source,
+            char_type: self.char_type,
+            feature: self.feature,
+            cost: 0,
+            prev: None,
+            links: LinkSpan::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BestNode {
+    candidate: Candidate,
+    prev: Option<NodeId>,
+    cost: i32,
+}
+
 struct Found {
     begin: usize,
     surface: usize,
@@ -91,6 +131,7 @@ struct Span {
 #[derive(Default)]
 pub(crate) struct Lattice {
     nodes: Vec<RawNode>,
+    best_nodes: Vec<BestNode>,
     ends: Vec<Vec<LeftCandidate>>,
     ends_used: usize,
     sentence_chars: SentenceChars,
@@ -124,6 +165,75 @@ fn logsumexp(x: f64, y: f64) -> f64 {
     }
 }
 
+#[inline(always)]
+fn prefetch<T>(address: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(address.cast())
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = address;
+}
+
+#[inline(always)]
+fn best_left<const SELECT: bool>(
+    lefts: &[LeftCandidate],
+    mut connection_cost: impl FnMut(u16) -> i16,
+) -> (i32, NodeId) {
+    let mut best_cost = i32::MAX;
+    let mut best = lefts[0].id;
+    for left in lefts {
+        let cost = left.cost + i32::from(connection_cost(left.right_id));
+        if SELECT {
+            (best_cost, best) = std::hint::select_unpredictable(
+                cost <= best_cost,
+                (cost, left.id),
+                (best_cost, best),
+            );
+        } else if cost <= best_cost {
+            best_cost = cost;
+            best = left.id;
+        }
+    }
+    (best_cost, best)
+}
+
+const GROUP: usize = 4;
+
+#[inline(always)]
+fn best_lefts<const N: usize>(lefts: &[LeftCandidate], columns: [&[i16]; N]) -> [(i32, NodeId); N] {
+    let mut best = [(i32::MAX, lefts[0].id); N];
+    for left in lefts {
+        let right_id = usize::from(left.right_id);
+        for (best, cells) in best.iter_mut().zip(columns) {
+            debug_assert!(right_id < cells.len());
+            let cost = left.cost + i32::from(unsafe { *cells.get_unchecked(right_id) });
+            *best = std::hint::select_unpredictable(cost <= best.0, (cost, left.id), *best);
+        }
+    }
+    best
+}
+
+#[inline(always)]
+fn store_best(
+    best_nodes: &mut [BestNode],
+    ends: &mut [Vec<LeftCandidate>],
+    position: usize,
+    index: usize,
+    left_cost: i32,
+    best: NodeId,
+) {
+    let node = &mut best_nodes[index];
+    let cost = left_cost + i32::from(node.candidate.word_cost);
+    node.prev = Some(best);
+    node.cost = cost;
+    ends[node.candidate.end as usize - position - 1].push(LeftCandidate {
+        right_id: node.candidate.right_id,
+        cost,
+        id: NodeId::from_index(index),
+    });
+}
+
 impl Lattice {
     pub(crate) fn parse(
         &mut self,
@@ -134,6 +244,22 @@ impl Lattice {
         self.reset(text, constraints);
         let eos = self.build::<false>(dictionary, text.as_bytes())?;
         self.collect_best(eos);
+        Ok(())
+    }
+
+    pub(crate) fn parse_best(
+        &mut self,
+        dictionary: &Dictionary,
+        text: &str,
+        constraints: &[Constraint<'_>],
+    ) -> Result<(), Error> {
+        self.reset(text, constraints);
+        if self.constraints.is_active() {
+            let eos = self.build::<false>(dictionary, text.as_bytes())?;
+            self.collect_best(eos);
+        } else {
+            self.build_best(dictionary, text.as_bytes());
+        }
         Ok(())
     }
 
@@ -251,6 +377,7 @@ impl Lattice {
     fn reset(&mut self, text: &str, constraints: &[Constraint<'_>]) {
         let sentence_len = text.len();
         self.nodes.clear();
+        self.best_nodes.clear();
         self.path.clear();
         self.links.clear();
         self.marginals.ready = false;
@@ -258,10 +385,10 @@ impl Lattice {
         for ending in &mut self.ends[..self.ends_used] {
             ending.clear();
         }
-        if self.ends.len() <= sentence_len {
-            self.ends.resize_with(sentence_len + 1, Vec::new);
+        if self.ends.len() < sentence_len + 2 {
+            self.ends.resize_with(sentence_len + 2, Vec::new);
         }
-        self.ends_used = sentence_len + 1;
+        self.ends_used = sentence_len + 2;
     }
 
     fn build<const NBEST: bool>(
@@ -281,7 +408,7 @@ impl Lattice {
             if self.ends[position].is_empty() {
                 continue;
             }
-            let begun = self.lookup(dictionary, sentence, position)?;
+            let begun = self.lookup::<false>(dictionary, sentence, position)?;
             self.connect::<NBEST>(dictionary, position, begun);
         }
         let eos_index = self.nodes.len();
@@ -293,6 +420,162 @@ impl Lattice {
             self.connect::<NBEST>(dictionary, position, eos_index..eos_index + 1);
         }
         Ok(eos)
+    }
+
+    fn build_best(&mut self, dictionary: &Dictionary, sentence: &[u8]) {
+        let sentence_len = sentence.len();
+        self.sentence_chars.fill(&dictionary.chars, sentence);
+        let boundary = Candidate {
+            surface: 0,
+            end: 0,
+            feature: 0,
+            left_id: 0,
+            right_id: 0,
+            pos_id: 0,
+            word_cost: 0,
+            source: NodeSource::Bos,
+            char_type: 0,
+        };
+        self.best_nodes.push(BestNode {
+            candidate: boundary,
+            prev: None,
+            cost: 0,
+        });
+        self.ends[0].push(LeftCandidate {
+            right_id: 0,
+            cost: 0,
+            id: NodeId::from_index(0),
+        });
+        let mut position = 0;
+        while position < sentence_len {
+            let lead = sentence[position];
+            if !self.ends[position].is_empty() {
+                let first = self.best_nodes.len();
+                let found = self.lookup::<true>(dictionary, sentence, position);
+                debug_assert!(found.is_ok());
+                self.connect_best(dictionary, position, first);
+            }
+            position += match lead {
+                ..0xc0 => 1,
+                0xc0..0xe0 => 2,
+                0xe0..0xf0 => 3,
+                _ => 4,
+            };
+        }
+        let last_end = (0..=sentence_len)
+            .rev()
+            .find(|&at| !self.ends[at].is_empty())
+            .unwrap_or(0);
+        let eos = self.best_nodes.len();
+        self.best_nodes.push(BestNode {
+            candidate: Candidate {
+                surface: sentence_len as u32,
+                end: last_end as u32 + 1,
+                source: NodeSource::Eos,
+                ..boundary
+            },
+            prev: None,
+            cost: 0,
+        });
+        self.connect_best(dictionary, last_end, eos);
+        self.collect_best_nodes();
+    }
+
+    fn connect_best(&mut self, dictionary: &Dictionary, position: usize, first: usize) {
+        let Self {
+            best_nodes, ends, ..
+        } = self;
+        let (head, tail) = ends.split_at_mut(position + 1);
+        let lefts: &[LeftCandidate] = &head[position];
+        match &dictionary.matrix {
+            Matrix::Dense(dense) => {
+                for index in (first..best_nodes.len()).rev() {
+                    let column = dense.right_column(best_nodes[index].candidate.left_id);
+                    let (cost, best) = best_left::<false>(lefts, |id| {
+                        debug_assert!(usize::from(id) < column.len());
+                        unsafe { *column.get_unchecked(usize::from(id)) }
+                    });
+                    store_best(best_nodes, tail, position, index, cost, best);
+                }
+            }
+            Matrix::Hot(hot) => {
+                let hot_left = hot.hot_left();
+                let lefts_are_hot = lefts
+                    .iter()
+                    .all(|left| usize::from(left.right_id) < hot_left);
+                if lefts_are_hot {
+                    for node in &best_nodes[first..] {
+                        let cells = hot.right_column(node.candidate.left_id).cells();
+                        for left in lefts {
+                            prefetch(cells.as_ptr().wrapping_add(usize::from(left.right_id)));
+                        }
+                    }
+                }
+                let mut next = best_nodes.len();
+                while next > first {
+                    if lefts_are_hot && next - first >= GROUP {
+                        let indices: [usize; GROUP] = std::array::from_fn(|lane| next - 1 - lane);
+                        let columns = indices.map(|index| {
+                            hot.right_column(best_nodes[index].candidate.left_id)
+                                .cells()
+                        });
+                        if columns.iter().all(|cells| cells.len() == hot_left) {
+                            let found = best_lefts(lefts, columns);
+                            for (index, (cost, best)) in indices.into_iter().zip(found) {
+                                store_best(best_nodes, tail, position, index, cost, best);
+                            }
+                            next -= GROUP;
+                            continue;
+                        }
+                    }
+                    next -= 1;
+                    let column = hot.right_column(best_nodes[next].candidate.left_id);
+                    let cells = column.cells();
+                    let (cost, best) = if lefts_are_hot && cells.len() == hot_left {
+                        let cost = |id: u16| unsafe { *cells.get_unchecked(usize::from(id)) };
+                        best_left::<true>(lefts, cost)
+                    } else {
+                        best_left::<true>(lefts, column.into_cost_fn())
+                    };
+                    store_best(best_nodes, tail, position, next, cost, best);
+                }
+            }
+        }
+    }
+
+    fn collect_best_nodes(&mut self) {
+        let eos = self.best_nodes.len() - 1;
+        self.path_cost = i64::from(self.best_nodes[eos].cost);
+        let mut count = 0;
+        let mut cursor = Some(NodeId::from_index(eos));
+        while let Some(id) = cursor {
+            count += 1;
+            cursor = self.best_nodes[id].prev;
+        }
+        self.nodes
+            .resize(count, RawNode::boundary(NodeSource::Bos, 0));
+        self.path.extend((0..count).map(NodeId::from_index));
+        let mut cursor = Some(NodeId::from_index(eos));
+        while let Some(id) = cursor {
+            count -= 1;
+            let best = self.best_nodes[id];
+            let candidate = best.candidate;
+            let mut node = match candidate.source {
+                NodeSource::Bos | NodeSource::Eos => {
+                    RawNode::boundary(candidate.source, candidate.surface as usize)
+                }
+                _ => {
+                    let begin = self.best_nodes[best.prev.expect("a word has a left node")]
+                        .candidate
+                        .end;
+                    candidate.raw(begin as usize)
+                }
+            };
+            node.cost = best.cost;
+            node.prev = count.checked_sub(1).map(NodeId::from_index);
+            self.nodes[count] = node;
+            cursor = best.prev;
+        }
     }
 
     pub(crate) fn nodes(&self) -> &[RawNode] {
@@ -344,6 +627,27 @@ impl Lattice {
     fn push_node(&mut self, node: RawNode) -> NodeId {
         self.nodes.push(node);
         NodeId::from_index(self.nodes.len() - 1)
+    }
+
+    fn node_count<const BEST: bool>(&self) -> usize {
+        if BEST {
+            self.best_nodes.len()
+        } else {
+            self.nodes.len()
+        }
+    }
+
+    #[inline(always)]
+    fn push_candidate<const BEST: bool>(&mut self, begin: usize, candidate: Candidate) {
+        if BEST {
+            self.best_nodes.push(BestNode {
+                candidate,
+                prev: None,
+                cost: 0,
+            });
+        } else {
+            self.push_node(candidate.raw(begin));
+        }
     }
 
     fn connect<const NBEST: bool>(
@@ -438,21 +742,7 @@ impl Lattice {
             }
             (best_cost, best)
         } else {
-            let mut best_cost = i32::MAX;
-            let mut best = lefts[0].id;
-            for left in lefts {
-                let cost = left.cost + i32::from(connection_cost(left.right_id));
-                if SELECT {
-                    (best_cost, best) = std::hint::select_unpredictable(
-                        cost <= best_cost,
-                        (cost, left.id),
-                        (best_cost, best),
-                    );
-                } else if cost <= best_cost {
-                    best_cost = cost;
-                    best = left.id;
-                }
-            }
+            let (best_cost, best) = best_left::<SELECT>(lefts, connection_cost);
             (best_cost + word_cost, best)
         };
         let target = right_node.length_with_space as usize + position;
@@ -468,7 +758,7 @@ impl Lattice {
         self.ends[target].push(ending);
     }
 
-    fn lookup(
+    fn lookup<const BEST: bool>(
         &mut self,
         dictionary: &Dictionary,
         sentence: &[u8],
@@ -476,9 +766,9 @@ impl Lattice {
     ) -> Result<Range<usize>, Error> {
         let chars = &dictionary.chars;
         let sentence_len = sentence.len();
-        let first = self.nodes.len();
+        let first = self.node_count::<BEST>();
         let mut end = sentence_len;
-        let partial = self.constraints.is_active();
+        let partial = !BEST && self.constraints.is_active();
         if partial
             && let Some(boundary) = (begin + 1..sentence_len)
                 .find(|&position| self.constraints.is_token_boundary(position))
@@ -505,7 +795,7 @@ impl Lattice {
             limit: end,
         };
         dictionary.system.common_prefix_search(key, &mut self.hits);
-        self.push_hits(
+        self.push_hits::<BEST>(
             dictionary,
             &dictionary.system,
             NodeSource::System,
@@ -514,7 +804,7 @@ impl Lattice {
         );
         for (index, user) in dictionary.users.iter().enumerate() {
             user.common_prefix_search(key, &mut self.hits);
-            self.push_hits(
+            self.push_hits::<BEST>(
                 dictionary,
                 user,
                 NodeSource::User(index as u8),
@@ -522,8 +812,8 @@ impl Lattice {
                 &found,
             );
         }
-        if self.nodes.len() > first && !char_info.invoke() {
-            return Ok(first..self.nodes.len());
+        if self.node_count::<BEST>() > first && !char_info.invoke() {
+            return Ok(first..self.node_count::<BEST>());
         }
         let mut after_char = surface + scan.width;
         let mut group_end: Option<usize> = None;
@@ -533,9 +823,9 @@ impl Lattice {
                 surface,
                 end: after_char,
             };
-            self.add_unknown(dictionary, char_info, &span);
-            if self.nodes.len() > first {
-                return Ok(first..self.nodes.len());
+            self.add_unknown::<BEST>(dictionary, char_info, &span);
+            if self.node_count::<BEST>() > first {
+                return Ok(first..self.node_count::<BEST>());
             }
         }
         if char_info.group() {
@@ -552,7 +842,7 @@ impl Lattice {
                     surface,
                     end: after_char,
                 };
-                self.add_unknown(dictionary, char_info, &span);
+                self.add_unknown::<BEST>(dictionary, char_info, &span);
             }
             group_end = Some(after_char);
             after_char = saved;
@@ -569,7 +859,7 @@ impl Lattice {
                 surface,
                 end: after_char,
             };
-            self.add_unknown(dictionary, char_info, &span);
+            self.add_unknown::<BEST>(dictionary, char_info, &span);
             let (next_info, width) = if whole {
                 self.sentence_chars.char_info(after_char)
             } else {
@@ -580,22 +870,22 @@ impl Lattice {
             }
             after_char += width;
         }
-        if self.nodes.len() == first {
+        if self.node_count::<BEST>() == first {
             let span = Span {
                 begin,
                 surface,
                 end: after_char,
             };
-            self.add_unknown(dictionary, char_info, &span);
+            self.add_unknown::<BEST>(dictionary, char_info, &span);
         }
-        if partial && self.nodes.len() == first {
+        if partial && self.node_count::<BEST>() == first {
             self.add_constrained_unknown(dictionary, sentence, begin, surface, end)?;
         }
-        Ok(first..self.nodes.len())
+        Ok(first..self.node_count::<BEST>())
     }
 
     #[inline]
-    fn push_hits(
+    fn push_hits<const BEST: bool>(
         &mut self,
         dictionary: &Dictionary,
         words: &SystemDictionary,
@@ -609,32 +899,28 @@ impl Lattice {
                 dictionary
                     .chars
                     .extended_end(sentence, found.surface + hit.length, found.limit);
-            let length = end - found.surface;
             for token_index in hit.tokens() {
                 let token = words.token(token_index);
-                if found.partial
+                if !BEST
+                    && found.partial
                     && !self
                         .constraints
                         .admits(found.begin, end, || words.feature(token.feature))
                 {
                     continue;
                 }
-                let node = RawNode {
-                    surface_start: found.surface as u32,
-                    length: length as u32,
-                    length_with_space: (end - found.begin) as u32,
+                let candidate = Candidate {
+                    surface: found.surface as u32,
+                    end: end as u32,
+                    feature: token.feature,
                     left_id: token.left_id,
                     right_id: token.right_id,
-                    word_cost: token.word_cost,
                     pos_id: token.pos_id,
+                    word_cost: token.word_cost,
                     source,
                     char_type: found.char_type,
-                    feature: token.feature,
-                    cost: 0,
-                    prev: None,
-                    links: LinkSpan::default(),
                 };
-                self.push_node(node);
+                self.push_candidate::<BEST>(found.begin, candidate);
             }
         }
     }
@@ -661,7 +947,7 @@ impl Lattice {
             surface,
             end: cursor,
         };
-        self.add_unknown(dictionary, char_info, &span);
+        self.add_unknown::<false>(dictionary, char_info, &span);
         if self.nodes.len() > first {
             return Ok(());
         }
@@ -686,7 +972,12 @@ impl Lattice {
         Ok(())
     }
 
-    fn add_unknown(&mut self, dictionary: &Dictionary, char_info: CharInfo, span: &Span) {
+    fn add_unknown<const BEST: bool>(
+        &mut self,
+        dictionary: &Dictionary,
+        char_info: CharInfo,
+        span: &Span,
+    ) {
         let tokens = &dictionary.unknown_tokens[char_info.default_type()];
         let source = if dictionary.unknown_feature.is_some() {
             NodeSource::UnknownFixed
@@ -694,7 +985,8 @@ impl Lattice {
             NodeSource::Unknown
         };
         for &token in tokens {
-            if self.constraints.is_active()
+            if !BEST
+                && self.constraints.is_active()
                 && !self.constraints.admits(span.begin, span.end, || {
                     match &dictionary.unknown_feature {
                         Some(feature) => feature,
@@ -704,22 +996,18 @@ impl Lattice {
             {
                 continue;
             }
-            let node = RawNode {
-                surface_start: span.surface as u32,
-                length: (span.end - span.surface) as u32,
-                length_with_space: (span.end - span.begin) as u32,
+            let candidate = Candidate {
+                surface: span.surface as u32,
+                end: span.end as u32,
+                feature: token.feature,
                 left_id: token.left_id,
                 right_id: token.right_id,
-                word_cost: token.word_cost,
                 pos_id: token.pos_id,
+                word_cost: token.word_cost,
                 source,
                 char_type: char_info.default_type() as u8,
-                feature: token.feature,
-                cost: 0,
-                prev: None,
-                links: LinkSpan::default(),
             };
-            self.push_node(node);
+            self.push_candidate::<BEST>(span.begin, candidate);
         }
     }
 }

@@ -59,23 +59,27 @@ struct Class {
 struct Entry {
     info: CharInfo,
     extender: bool,
-    single: usize,
-    width: usize,
-    chain_end: usize,
-    chain_count: usize,
-    chain_last: usize,
+    single: u8,
+    width: u32,
+    chain_end: u32,
+    chain_count: u32,
+    chain_last: u32,
 }
 
 #[derive(Default)]
 pub(crate) struct SentenceChars {
     entries: Vec<Entry>,
+    length: usize,
 }
 
 impl SentenceChars {
     pub(crate) fn fill(&mut self, chars: &CharProperty, text: &[u8]) {
         let length = text.len();
-        self.entries.clear();
-        self.entries.resize(length + 1, Entry::default());
+        assert!(u32::try_from(length).is_ok());
+        self.length = length;
+        if self.entries.len() <= length {
+            self.entries.resize(length + 1, Entry::default());
+        }
         self.entries[length] = Entry {
             info: chars.class_of_code(0).info,
             single: 1,
@@ -86,24 +90,24 @@ impl SentenceChars {
             let (code, single) = decode_utf8(text, position, length - position);
             let class = chars.class_of_code(code);
             let following = self.entries[position + single];
-            let width = single
+            let width = single as u32
                 + if following.extender {
                     following.width
                 } else {
                     0
                 };
-            let next = position + width;
+            let next = position + width as usize;
             let after = self.entries[next];
             let (chain_end, chain_count, chain_last) =
                 if next < length && class.info.is_kind_of(after.info) {
                     (after.chain_end, after.chain_count + 1, after.chain_last)
                 } else {
-                    (next, 1, position)
+                    (next as u32, 1, position as u32)
                 };
             self.entries[position] = Entry {
                 info: class.info,
                 extender: class.extender,
-                single,
+                single: single as u8,
                 width,
                 chain_end,
                 chain_count,
@@ -114,11 +118,11 @@ impl SentenceChars {
 
     pub(crate) fn char_info(&self, position: usize) -> (CharInfo, usize) {
         let entry = &self.entries[position];
-        (entry.info, entry.width)
+        (entry.info, entry.width as usize)
     }
 
     pub(crate) fn seek_other_type(&self, begin: usize, start: CharInfo) -> (usize, Scan) {
-        let length = self.entries.len() - 1;
+        let length = self.length;
         if begin >= length {
             return (begin, Scan::default());
         }
@@ -126,37 +130,38 @@ impl SentenceChars {
         if !start.is_kind_of(entry.info) {
             let scan = Scan {
                 info: entry.info,
-                width: entry.width,
+                width: entry.width as usize,
                 count: 0,
             };
             return (begin, scan);
         }
-        let described = &self.entries[if entry.chain_end < length {
-            entry.chain_end
+        let chain_end = entry.chain_end as usize;
+        let described = &self.entries[if chain_end < length {
+            chain_end
         } else {
-            entry.chain_last
+            entry.chain_last as usize
         }];
         let scan = Scan {
             info: described.info,
-            width: described.width,
-            count: entry.chain_count,
+            width: described.width as usize,
+            count: entry.chain_count as usize,
         };
-        (entry.chain_end, scan)
+        (chain_end, scan)
     }
 
     pub(crate) fn skip_space(&self, begin: usize, space: CharInfo) -> (usize, Scan) {
-        let length = self.entries.len() - 1;
+        let length = self.length;
         let mut position = begin;
         let mut current = space;
         let mut scan = Scan::default();
         while position < length {
             let entry = &self.entries[position];
             scan.info = entry.info;
-            scan.width = entry.width;
+            scan.width = entry.width as usize;
             if !current.is_kind_of(entry.info) {
                 break;
             }
-            position += entry.single;
+            position += usize::from(entry.single);
             scan.count += 1;
             current = entry.info;
         }
