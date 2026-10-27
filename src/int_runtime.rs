@@ -293,16 +293,33 @@ fn pad(out: &mut Vec<u8>) {
     out.resize(out.len().next_multiple_of(8), 0);
 }
 
-struct Shape {
+struct Layout {
+    cluster: usize,
     table_start: usize,
-    values_start: usize,
-    sparse: bool,
-    base: i64,
     left_mixed: usize,
     left_gap: usize,
     right_mixed: usize,
     stride: usize,
     mask: u32,
+}
+
+impl Layout {
+    #[inline]
+    fn index(&self, left: u16, right: u16) -> usize {
+        let (left, right) = (usize::from(left), usize::from(right));
+        right * self.left_mixed + left + right.min(self.right_mixed) * self.left_gap
+    }
+
+    #[inline]
+    fn word_at(&self, start: usize, position: usize) -> usize {
+        start + position * self.stride
+    }
+}
+
+struct SparseShape {
+    layout: Layout,
+    values_start: usize,
+    base: i64,
 }
 
 type Limits = (usize, usize, usize, usize);
@@ -331,7 +348,9 @@ pub struct RuntimeIntTemplates<S = Mmap> {
     right_size: usize,
     hot_left: usize,
     hot_right: usize,
-    shapes: Vec<Shape>,
+    cluster_count: usize,
+    dense: Vec<Layout>,
+    sparse: Vec<SparseShape>,
     base: i64,
     row_starts: Section<u32>,
     columns: Section<u16>,
@@ -385,7 +404,7 @@ impl<S: SectionSource> RuntimeIntTemplates<S> {
         if shift > MAX_SHIFT || cost_factor > MAX_COST_FACTOR || cluster_count > MAX_SHAPES {
             return Err(reader.broken("the integer templates are inconsistent"));
         }
-        let mut shapes = Vec::with_capacity(cluster_count);
+        let (mut dense, mut sparse_shapes) = (Vec::new(), Vec::new());
         let mut limits: Vec<Limits> = Vec::with_capacity(cluster_count);
         let mut table_bytes = 0usize;
         let mut base = 0i64;
@@ -423,17 +442,24 @@ impl<S: SectionSource> RuntimeIntTemplates<S> {
             if sparse == 1 {
                 sparse_tables.push((table_bytes, cells.unwrap_or(0), nonzero));
             }
-            shapes.push(Shape {
+            let layout = Layout {
+                cluster: limits.len(),
                 table_start: table_bytes,
-                values_start: table_bytes + blocks_bytes,
-                sparse: sparse == 1,
-                base: if sparse == 1 { cluster_base } else { 0 },
                 left_mixed,
                 left_gap: left_keys - left_mixed,
                 right_mixed,
                 stride: width,
                 mask: u32::MAX >> (32 - 8 * width),
-            });
+            };
+            if sparse == 1 {
+                sparse_shapes.push(SparseShape {
+                    layout,
+                    values_start: table_bytes + blocks_bytes,
+                    base: cluster_base,
+                });
+            } else {
+                dense.push(layout);
+            }
             limits.push((left_keys, left_mixed, right_keys, right_mixed));
             table_bytes = table_bytes
                 .checked_add(bytes)
@@ -513,7 +539,9 @@ impl<S: SectionSource> RuntimeIntTemplates<S> {
             right_size,
             hot_left,
             hot_right,
-            shapes,
+            cluster_count,
+            dense,
+            sparse: sparse_shapes,
             base,
             row_starts,
             columns,
@@ -549,13 +577,24 @@ impl<S: SectionSource> RuntimeIntTemplates<S> {
             column >= self.hot_left || row >= self.hot_right,
             "the cell lies inside of the hot block"
         );
-        let starts = self.row_starts.view_source(&self.map);
-        let span = starts[row] as usize..starts[row + 1] as usize;
-        let computed = int_cost(self.total(column, row), self.cost_factor, self.shift);
+        assert!(
+            column < self.left_size && row < self.right_size,
+            "the cell lies outside of the matrix"
+        );
+        let file = self.map.all_bytes();
+        let computed = int_cost(
+            self.total(file, left_node_rc, right_node_lc),
+            self.cost_factor,
+            self.shift,
+        );
+        let starts = unsafe { self.row_starts.view_in(file) };
+        debug_assert!(row + 1 < starts.len());
+        let span =
+            unsafe { *starts.get_unchecked(row) as usize..*starts.get_unchecked(row + 1) as usize };
         if span.is_empty() {
             return computed;
         }
-        let listed = &self.columns.view_source(&self.map)[span];
+        let listed = unsafe { self.columns.view_in(file).get_unchecked(span) };
         match listed.binary_search_by(|exception| (exception & !ABOVE).cmp(&left_node_rc)) {
             Ok(at) if listed[at] & ABOVE != 0 => computed + 1,
             Ok(_) => computed - 1,
@@ -564,34 +603,55 @@ impl<S: SectionSource> RuntimeIntTemplates<S> {
     }
 
     #[inline]
-    fn total(&self, column: usize, row: usize) -> i64 {
-        let count = self.shapes.len();
-        let lefts = &self.left_keys.view_source(&self.map)[column * count..][..count];
-        let rights = &self.right_keys.view_source(&self.map)[row * count..][..count];
-        let tables = self.tables.view_source(&self.map);
+    fn total(&self, file: &[u8], column: u16, row: u16) -> i64 {
+        let count = self.cluster_count;
+        let (column, row) = (usize::from(column), usize::from(row));
+        let (lefts, rights, tables) = unsafe {
+            (
+                self.left_keys.view_in(file),
+                self.right_keys.view_in(file),
+                self.tables.view_in(file),
+            )
+        };
+        debug_assert!((column + 1) * count <= lefts.len() && (row + 1) * count <= rights.len());
+        let lefts = unsafe { lefts.as_ptr().add(column * count) };
+        let rights = unsafe { rights.as_ptr().add(row * count) };
         let mut total = self.base;
-        for ((shape, &left), &right) in self.shapes.iter().zip(lefts).zip(rights) {
-            let (left, right) = (usize::from(left), usize::from(right));
-            let index =
-                right * shape.left_mixed + left + right.min(shape.right_mixed) * shape.left_gap;
-            let word_at = |at: usize| {
-                let word = tables[at..at + size_of::<u32>()].as_chunks::<4>().0[0];
-                i64::from(u32::from_le_bytes(word) & shape.mask)
-            };
-            if !shape.sparse {
-                total += word_at(shape.table_start + index * shape.stride);
-                continue;
-            }
-            let block =
-                &tables[shape.table_start + index / BLOCK_CELLS * BLOCK_BYTES..][..BLOCK_BYTES];
-            let before = u32::from_le_bytes(block[..4].try_into().expect("four bytes"));
-            let bits = u64::from_le_bytes(block[4..].try_into().expect("eight bytes"));
+        let index_of = |layout: &Layout| unsafe {
+            layout.index(*lefts.add(layout.cluster), *rights.add(layout.cluster))
+        };
+        for layout in &self.dense {
+            let at = layout.word_at(layout.table_start, index_of(layout));
+            total += i64::from(unsafe { read_word(tables, at) } & layout.mask);
+        }
+        for shape in &self.sparse {
+            let layout = &shape.layout;
+            let index = index_of(layout);
+            let block_at = layout.table_start + index / BLOCK_CELLS * BLOCK_BYTES;
+            let (before, bits) = unsafe { read_block(tables, block_at) };
             let bit = index % BLOCK_CELLS;
             if bits >> bit & 1 != 0 {
                 let rank = before as usize + (bits & ((1 << bit) - 1)).count_ones() as usize;
-                total += shape.base + word_at(shape.values_start + rank * shape.stride);
+                let value = unsafe { read_word(tables, layout.word_at(shape.values_start, rank)) };
+                total += shape.base + i64::from(value & layout.mask);
             }
         }
         total
     }
+}
+
+#[inline]
+unsafe fn read_word(tables: &[u8], at: usize) -> u32 {
+    debug_assert!(at + size_of::<u32>() <= tables.len());
+    u32::from_le(unsafe { tables.as_ptr().add(at).cast::<u32>().read_unaligned() })
+}
+
+#[inline]
+unsafe fn read_block(tables: &[u8], at: usize) -> (u32, u64) {
+    debug_assert!(at + BLOCK_BYTES <= tables.len());
+    let block = unsafe { tables.as_ptr().add(at) };
+    (
+        u32::from_le(unsafe { block.cast::<u32>().read_unaligned() }),
+        u64::from_le(unsafe { block.add(size_of::<u32>()).cast::<u64>().read_unaligned() }),
+    )
 }

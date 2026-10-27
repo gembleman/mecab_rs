@@ -45,7 +45,7 @@ dictionary rebuilding:
   mecab-rs-migrate unpack-int <file.xz> <id-defs-dir> <dict-dir> [--hot L R] [--threads N]
                                                                                 (feature xz)
   mecab-rs-migrate check-int <file.xz> <id-defs-dir> <matrix.bin> [--threads N]  (feature xz)
-  mecab-rs-migrate bench-cold <templates> <templates> [--hot L R] [--samples N]
+  mecab-rs-migrate bench-cold <templates> <templates> [--hot L R] [--samples N] [--pairs <file>]
       Integer matrix: rounds the template weights to the grid 2^-shift (the shifts given, default
       16-26), lists the cells where the integer sum differs from the real matrix (taken from
       --reference or else from the exact templates) and writes the smallest xz file; unpack-int
@@ -177,6 +177,7 @@ struct MatrixArgs {
     shifts: Option<Vec<u32>>,
     reference: Option<PathBuf>,
     samples: Option<usize>,
+    pairs: Option<PathBuf>,
 }
 
 fn parse_shifts(text: &str) -> Result<Vec<u32>, String> {
@@ -232,6 +233,7 @@ fn parse_matrix_args(command: &str, args: &[std::ffi::OsString]) -> Result<Matri
                 parsed.shifts = Some(parse_shifts(&value.to_string_lossy())?);
             }
             Some("--reference") => parsed.reference = Some(text(iterator.next(), "--reference")?),
+            Some("--pairs") => parsed.pairs = Some(text(iterator.next(), "--pairs")?),
             Some("--samples") => parsed.samples = Some(number(iterator.next(), "--samples")?),
             Some("--xz") => parsed.xz = true,
             Some("--int") => parsed.int = true,
@@ -602,15 +604,23 @@ impl ColdFile {
     }
 }
 
-fn bench_cold(args: &Args) -> Result<(), String> {
-    let parsed = parse_matrix_args("bench-cold", args)?;
-    let [first_path, second_path] = positional("bench-cold", &parsed, "<templates> <templates>")?;
+const PAIR_BYTES: usize = 4;
+
+fn recorded_cells(path: &Path) -> Result<Vec<(u16, u16)>, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(bytes
+        .as_chunks::<PAIR_BYTES>()
+        .0
+        .iter()
+        .map(|&[a, b, c, d]| (u16::from_le_bytes([a, b]), u16::from_le_bytes([c, d])))
+        .collect())
+}
+
+fn random_cells(parsed: &MatrixArgs, (left_size, right_size): (usize, usize)) -> Vec<(u16, u16)> {
     let samples = parsed.samples.unwrap_or(2_000_000);
-    let (first, second) = (ColdFile::open(first_path)?, ColdFile::open(second_path)?);
     let (hot_left, hot_right) = parsed
         .hot
         .unwrap_or((rebuild::DEFAULT_HOT_LEFT, rebuild::DEFAULT_HOT_RIGHT));
-    let (left_size, right_size) = first.sizes();
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
     let mut next = move || {
         state ^= state << 13;
@@ -626,6 +636,18 @@ fn bench_cold(args: &Args) -> Result<(), String> {
             cells.push((column, row));
         }
     }
+    cells
+}
+
+fn bench_cold(args: &Args) -> Result<(), String> {
+    let parsed = parse_matrix_args("bench-cold", args)?;
+    let [first_path, second_path] = positional("bench-cold", &parsed, "<templates> <templates>")?;
+    let (first, second) = (ColdFile::open(first_path)?, ColdFile::open(second_path)?);
+    let cells = match &parsed.pairs {
+        Some(pairs) => recorded_cells(pairs)?,
+        None => random_cells(&parsed, first.sizes()),
+    };
+    let samples = cells.len();
     let time = |file: &ColdFile| {
         let started = Instant::now();
         let sum: i64 = cells

@@ -66,6 +66,14 @@ impl<T: Plain> Section<T> {
     }
 
     #[inline]
+    pub(crate) unsafe fn view_in<'f>(&self, file: &'f [u8]) -> &'f [T] {
+        debug_assert!(self.end <= file.len());
+        let pointer = unsafe { file.as_ptr().add(self.start) }.cast::<T>();
+        debug_assert!(pointer.is_aligned());
+        unsafe { std::slice::from_raw_parts(pointer, (self.end - self.start) / size_of::<T>()) }
+    }
+
+    #[inline]
     pub(crate) fn view_source<'f, S: SectionSource>(&self, file: &'f S) -> &'f [T] {
         cast(file.bytes(self.start, self.end)).expect("a section is viewed in its source map")
     }
