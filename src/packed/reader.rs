@@ -242,7 +242,7 @@ impl PackedDictionary {
             }
             source.read(TEMPLATES, 0, &mut templates_header)?;
             if templates_header[..4] != *b"MXIT"
-                || u32_at(&templates_header, 4) != 1
+                || !matches!(u32_at(&templates_header, 4), 1 | 2)
                 || u32_at(&templates_header, 16) as usize != left_size
                 || u32_at(&templates_header, 20) as usize != right_size
             {

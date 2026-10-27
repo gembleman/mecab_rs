@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::error::Error;
+use crate::int_runtime::{RuntimeIntTemplates, is_runtime_form};
 use crate::int_templates::MappedIntTemplates;
 use crate::mapped_bytes::MappedBytes;
 use crate::section::{Section, SectionSource};
@@ -63,6 +64,7 @@ impl<S: SectionSource> DenseMatrix<S> {
 pub(crate) enum ColdPath<S = MappedBytes> {
     Float(MappedTemplates<S>),
     Int(Box<MappedIntTemplates<S>>),
+    Runtime(Box<RuntimeIntTemplates<S>>),
 }
 
 impl<S: SectionSource> ColdPath<S> {
@@ -70,6 +72,7 @@ impl<S: SectionSource> ColdPath<S> {
         match self {
             Self::Float(templates) => templates.left_size(),
             Self::Int(templates) => templates.left_size(),
+            Self::Runtime(templates) => templates.left_size(),
         }
     }
 
@@ -77,6 +80,7 @@ impl<S: SectionSource> ColdPath<S> {
         match self {
             Self::Float(templates) => templates.right_size(),
             Self::Int(templates) => templates.right_size(),
+            Self::Runtime(templates) => templates.right_size(),
         }
     }
 }
@@ -105,6 +109,7 @@ fn cold_cost<S: SectionSource>(
     match templates {
         ColdPath::Float(templates) => templates.cost(left_right_id, right_left_id),
         ColdPath::Int(templates) => templates.cost(left_right_id, right_left_id),
+        ColdPath::Runtime(templates) => templates.cost(left_right_id, right_left_id),
     }
 }
 
@@ -138,6 +143,14 @@ impl<S: SectionSource> HotMatrix<S> {
         }
         if hot_left == 0 || hot_right == 0 || hot_left > left_size || hot_right > right_size {
             return Err(broken(path, "the hot block lies outside of the matrix"));
+        }
+        if let ColdPath::Runtime(runtime) = &templates
+            && (runtime.hot_left(), runtime.hot_right()) != (hot_left, hot_right)
+        {
+            return Err(broken(
+                path,
+                "the integer templates were made for another hot block",
+            ));
         }
         if HOT_HEADER_BYTES + hot_left * hot_right * COST_BYTES != map.all_bytes().len() {
             return Err(broken(path, "the file size does not match the header"));
@@ -212,7 +225,9 @@ impl Matrix {
         integer: bool,
         path: &Path,
     ) -> Result<Self, Error> {
-        let templates = if integer {
+        let templates = if integer && is_runtime_form(&templates) {
+            ColdPath::Runtime(Box::new(RuntimeIntTemplates::from_mapped(templates, path)?))
+        } else if integer {
             ColdPath::Int(Box::new(MappedIntTemplates::from_mapped(templates, path)?))
         } else {
             ColdPath::Float(MappedTemplates::from_mapped(templates, path)?)

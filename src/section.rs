@@ -39,6 +39,7 @@ pub(crate) unsafe trait Plain: Copy {}
 
 unsafe impl Plain for i16 {}
 unsafe impl Plain for i32 {}
+unsafe impl Plain for u8 {}
 unsafe impl Plain for u16 {}
 unsafe impl Plain for f64 {}
 unsafe impl Plain for u32 {}

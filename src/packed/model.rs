@@ -11,6 +11,7 @@ use super::{
     SECTIONS, TEMPLATES, TOKENS, UNKNOWN_STARTS, UNKNOWN_TOKENS, VERSION,
 };
 use crate::Error;
+use crate::int_runtime::{is_runtime_form, runtime_form_of};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(super) struct Param {
@@ -146,7 +147,17 @@ impl Model {
         sections[UNKNOWN_STARTS] = le_bytes(&self.unknown_starts, u32::to_le_bytes).into();
         sections[UNKNOWN_TOKENS] = encode_tokens(&self.unknown_params, unknown_starts, wide).into();
         sections[MATRIX] = Cow::Borrowed(&self.matrix);
-        sections[TEMPLATES] = Cow::Borrowed(&self.templates);
+        sections[TEMPLATES] = if self.integer_templates && !is_runtime_form(&self.templates) {
+            let hot =
+                |at: usize| usize::from(u16::from_le_bytes([self.matrix[at], self.matrix[at + 1]]));
+            match runtime_form_of(&self.templates, hot(4), hot(6)) {
+                Ok(bytes) => bytes.into(),
+                Err(Error::Unsupported(_)) => Cow::Borrowed(&self.templates),
+                Err(error) => return Err(error),
+            }
+        } else {
+            Cow::Borrowed(&self.templates)
+        };
         sections[CHAR_TABLE] = Cow::Borrowed(&self.char_table);
         let unknown = self.unknown_feature.as_deref().unwrap_or_default();
         let mut dicrc = Vec::new();

@@ -46,12 +46,18 @@ dictionary rebuilding:
   mecab-rs-migrate unpack-int <file.xz> <id-defs-dir> <dict-dir> [--hot L R] [--threads N]
                                                                                 (feature xz)
   mecab-rs-migrate check-int <file.xz> <id-defs-dir> <matrix.bin> [--threads N]  (feature xz)
-  mecab-rs-migrate bench-cold <matrix.tpl> <matrix.itp> [--hot L R] [--samples N]
+  mecab-rs-migrate bench-cold <templates> <templates> [--hot L R] [--samples N]
       Integer matrix: rounds the template weights to the grid 2^-shift (the shifts given, default
       16-26), lists the cells where the integer sum differs from the real matrix (taken from
       --reference or else from the exact templates) and writes the smallest xz file; unpack-int
       writes matrix.itp and matrix.hot from it; check-int compares every cell of the decoded
-      integer matrix with matrix.bin; bench-cold times the cold lookups of both template files.
+      integer matrix with matrix.bin; bench-cold times the cold lookups of two template files
+      (matrix.tpl, matrix.itp or the runtime form).
+  mecab-rs-migrate runtime-int <matrix.itp> <matrix.hot> <out>
+  mecab-rs-migrate check-runtime-int <matrix.itp> <runtime> [<matrix.bin>] [--threads N]
+      Writes the runtime form of matrix.itp (what pack puts into the .mrd file) for the hot block
+      of matrix.hot, and compares every cell outside of the hot block with matrix.itp and, if
+      given, with the dense matrix.bin.
   mecab-rs-migrate rebuild <unidic-full-dir> <out-dir> (--stats <dir> | --corpus <file>...)
                          [--keep <fields>] [--hot L R] [--threads N] [--int [--shift N]]
                          [--xz] [--matrix-bin]
@@ -474,16 +480,138 @@ fn check_int(args: &Args, start: Instant) -> Result<(), String> {
     }
 }
 
+fn runtime_int(args: &Args) -> Result<(), String> {
+    let parsed = parse_matrix_args("runtime-int", args)?;
+    let [itp, hot, out] = positional("runtime-int", &parsed, "<matrix.itp> <matrix.hot> <out>")?;
+    let ints = mecab_rs::MappedIntTemplates::open(itp).map_err(shown)?;
+    let header = std::fs::read(hot).map_err(|error| format!("{}: {error}", hot.display()))?;
+    let size = |at: usize| {
+        header
+            .get(at..at + 2)
+            .map(|pair| usize::from(u16::from_le_bytes([pair[0], pair[1]])))
+            .ok_or_else(|| format!("{}: shorter than its header", hot.display()))
+    };
+    let bytes = ints.runtime_form(size(4)?, size(6)?).map_err(shown)?;
+    std::fs::write(out, &bytes).map_err(|error| format!("{}: {error}", out.display()))?;
+    println!("wrote {} bytes", bytes.len());
+    Ok(())
+}
+
+fn check_runtime_int(args: &Args) -> Result<(), String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let parsed = parse_matrix_args("check-runtime-int", args)?;
+    let usage = "<matrix.itp> <runtime.itp> [<matrix.bin>]";
+    let (full, runtime, dense) = match parsed.positional.as_slice() {
+        [full, runtime] => (full, runtime, None),
+        [full, runtime, dense] => (full, runtime, Some(dense)),
+        _ => return Err(format!("check-runtime-int: expected {usage}")),
+    };
+    let dense = dense
+        .map(|path| std::fs::read(path).map_err(|error| format!("{}: {error}", path.display())))
+        .transpose()?;
+    let full = mecab_rs::MappedIntTemplates::open(full).map_err(shown)?;
+    let runtime = mecab_rs::RuntimeIntTemplates::open(runtime).map_err(shown)?;
+    let (left_size, right_size) = (full.left_size(), full.right_size());
+    if (left_size, right_size) != (runtime.left_size(), runtime.right_size()) {
+        return Err("the two files have different sizes".into());
+    }
+    let (hot_left, hot_right) = (runtime.hot_left(), runtime.hot_right());
+    if let Some(dense) = &dense
+        && dense.len() != 4 + 2 * left_size * right_size
+    {
+        return Err("the dense matrix does not have the size of the templates".into());
+    }
+    let next_row = AtomicUsize::new(0);
+    let checked = AtomicUsize::new(0);
+    let mismatches = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads_of(&parsed).max(1) {
+            scope.spawn(|| {
+                loop {
+                    let row = next_row.fetch_add(1, Ordering::Relaxed);
+                    if row >= right_size {
+                        break;
+                    }
+                    for column in 0..left_size {
+                        if row < hot_right && column < hot_left {
+                            continue;
+                        }
+                        let (column, row) = (column as u16, row as u16);
+                        let expected = full.cost(column, row);
+                        let found = runtime.cost(column, row);
+                        let by_templates = (usize::from(row) * 31 + usize::from(column)) % 61 == 0;
+                        let real = dense.as_ref().is_none_or(|dense| {
+                            let at = 4 + 2 * (usize::from(row) * left_size + usize::from(column));
+                            i16::from_le_bytes([dense[at], dense[at + 1]]) == found
+                        });
+                        if !real
+                            || found != expected
+                            || (by_templates && full.cost_from_templates(column, row) != found)
+                        {
+                            mismatches.fetch_add(1, Ordering::Relaxed);
+                        }
+                        checked.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    let (checked, mismatches) = (checked.into_inner(), mismatches.into_inner());
+    println!(
+        "compared {checked} cells outside of the {hot_left} x {hot_right} hot block, {mismatches} mismatches"
+    );
+    if mismatches > 0 {
+        return Err("the runtime form differs".into());
+    }
+    Ok(())
+}
+
+enum ColdFile {
+    Float(mecab_rs::MappedTemplates),
+    Full(mecab_rs::MappedIntTemplates),
+    Runtime(mecab_rs::RuntimeIntTemplates),
+}
+
+impl ColdFile {
+    fn open(path: &Path) -> Result<Self, String> {
+        if let Ok(runtime) = mecab_rs::RuntimeIntTemplates::open(path) {
+            return Ok(Self::Runtime(runtime));
+        }
+        if let Ok(full) = mecab_rs::MappedIntTemplates::open(path) {
+            return Ok(Self::Full(full));
+        }
+        mecab_rs::MappedTemplates::open(path)
+            .map(Self::Float)
+            .map_err(shown)
+    }
+
+    fn sizes(&self) -> (usize, usize) {
+        match self {
+            Self::Float(file) => (file.left_size(), file.right_size()),
+            Self::Full(file) => (file.left_size(), file.right_size()),
+            Self::Runtime(file) => (file.left_size(), file.right_size()),
+        }
+    }
+
+    fn cost(&self, column: u16, row: u16) -> i16 {
+        match self {
+            Self::Float(file) => file.cost(column, row),
+            Self::Full(file) => file.cost(column, row),
+            Self::Runtime(file) => file.cost(column, row),
+        }
+    }
+}
+
 fn bench_cold(args: &Args) -> Result<(), String> {
     let parsed = parse_matrix_args("bench-cold", args)?;
-    let [float_path, int_path] = positional("bench-cold", &parsed, "<matrix.tpl> <matrix.itp>")?;
+    let [first_path, second_path] = positional("bench-cold", &parsed, "<templates> <templates>")?;
     let samples = parsed.samples.unwrap_or(2_000_000);
-    let floats = mecab_rs::MappedTemplates::open(float_path).map_err(shown)?;
-    let ints = mecab_rs::MappedIntTemplates::open(int_path).map_err(shown)?;
+    let (first, second) = (ColdFile::open(first_path)?, ColdFile::open(second_path)?);
     let (hot_left, hot_right) = parsed
         .hot
         .unwrap_or((rebuild::DEFAULT_HOT_LEFT, rebuild::DEFAULT_HOT_RIGHT));
-    let (left_size, right_size) = (floats.left_size(), floats.right_size());
+    let (left_size, right_size) = first.sizes();
     let mut state = 0x9E37_79B9_7F4A_7C15u64;
     let mut next = move || {
         state ^= state << 13;
@@ -499,21 +627,21 @@ fn bench_cold(args: &Args) -> Result<(), String> {
             cells.push((column, row));
         }
     }
-    let time = |lookup: &dyn Fn(u16, u16) -> i16| {
+    let time = |file: &ColdFile| {
         let started = Instant::now();
         let sum: i64 = cells
             .iter()
-            .map(|&(column, row)| i64::from(lookup(column, row)))
+            .map(|&(column, row)| i64::from(file.cost(column, row)))
             .sum();
         (started.elapsed().as_secs_f64() * 1e9 / samples as f64, sum)
     };
-    for round in 0..2 {
-        let (float_ns, float_sum) = time(&|column, row| floats.cost(column, row));
-        let (int_ns, int_sum) = time(&|column, row| ints.cost(column, row));
+    for round in 0..3 {
+        let (first_ns, first_sum) = time(&first);
+        let (second_ns, second_sum) = time(&second);
         println!(
-            "round {round}: matrix.tpl {float_ns:.0} ns/cell, matrix.itp {int_ns:.0} ns/cell (checksums {float_sum} {int_sum})"
+            "round {round}: first {first_ns:.0} ns/cell, second {second_ns:.0} ns/cell (checksums {first_sum} {second_sum})"
         );
-        if float_sum != int_sum {
+        if first_sum != second_sum {
             return Err("the two template files disagree".into());
         }
     }
@@ -613,6 +741,8 @@ fn run() -> Result<(), String> {
             #[cfg(feature = "xz")]
             "check-int" => check_int(args, start),
             "bench-cold" => bench_cold(args),
+            "runtime-int" => runtime_int(args),
+            "check-runtime-int" => check_runtime_int(args),
             #[cfg(not(feature = "xz"))]
             "pack-int" | "unpack-int" | "check-int" => Err(format!(
                 "{command}: this build has no xz support; build with --features xz"

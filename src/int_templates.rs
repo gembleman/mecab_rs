@@ -16,7 +16,7 @@ use crate::mapped_bytes::MappedBytes;
 use crate::section::{Section, SectionSource};
 use crate::templates::{TemplateReader, write_array};
 
-const MAGIC: &[u8; 4] = b"MXIT";
+pub(crate) const MAGIC: &[u8; 4] = b"MXIT";
 const VERSION: u32 = 1;
 const MAX_PARTS: usize = 256;
 const MAX_SHAPES: usize = 256;
@@ -649,13 +649,11 @@ fn write_clusters(
     let total: usize = plans.iter().map(ClusterPlan::cells).sum();
     output.write_all(&(total as u32).to_le_bytes())?;
     output.write_all(&[0; 4])?;
+    let mut cells = Vec::with_capacity(total);
     for plan in plans {
-        write_array(
-            output,
-            &fill_int_table(plan, parts, threads)?,
-            i32::to_le_bytes,
-        )?;
+        cells.extend(fill_int_table(plan, parts, threads)?);
     }
+    write_array(output, &cells, i32::to_le_bytes)?;
     Ok(())
 }
 
@@ -667,9 +665,10 @@ fn keys_fit(keys: &[u16], limits: &[usize]) -> bool {
     })
 }
 
-struct ClusterShape {
+pub(crate) struct ClusterShape {
     table_start: usize,
-    left_keys: usize,
+    pub(crate) left_keys: usize,
+    pub(crate) right_keys: usize,
 }
 
 struct MappedIntClusters {
@@ -696,6 +695,7 @@ impl MappedIntClusters {
             shapes.push(ClusterShape {
                 table_start: table_cells,
                 left_keys,
+                right_keys,
             });
             left_limits.push(left_keys);
             right_limits.push(right_keys);
@@ -768,6 +768,19 @@ impl MappedIntPart {
     }
 }
 
+pub(crate) struct RuntimeInputs<'a> {
+    pub(crate) cost_factor: u32,
+    pub(crate) shift: u32,
+    pub(crate) left_size: usize,
+    pub(crate) right_size: usize,
+    pub(crate) shapes: &'a [ClusterShape],
+    pub(crate) left_keys: &'a [u16],
+    pub(crate) right_keys: &'a [u16],
+    pub(crate) tables: &'a [i32],
+    pub(crate) exception_cells: &'a [u32],
+    pub(crate) exception_values: &'a [i16],
+}
+
 pub struct MappedIntTemplates<S = Mmap> {
     map: S,
     cost_factor: u32,
@@ -796,7 +809,7 @@ impl MappedIntTemplates<MappedBytes> {
 
 #[allow(private_bounds)]
 impl<S: SectionSource> MappedIntTemplates<S> {
-    fn from_source(map: S, path: &Path) -> Result<Self, Error> {
+    pub(crate) fn from_source(map: S, path: &Path) -> Result<Self, Error> {
         let mut reader = TemplateReader::new(map.all_bytes(), path);
         if reader.bytes::<4>()? != *MAGIC || u32::from_le_bytes(reader.bytes()?) != VERSION {
             return Err(reader.broken("the file is not an integer template file of this version"));
@@ -890,7 +903,31 @@ impl<S: SectionSource> MappedIntTemplates<S> {
         self.exception_cells.view_source(&self.map).len()
     }
 
+    pub(crate) fn runtime_inputs(&self) -> Option<RuntimeInputs<'_>> {
+        let clusters = self.clusters.as_ref()?;
+        Some(RuntimeInputs {
+            cost_factor: self.cost_factor,
+            shift: self.shift,
+            left_size: self.left_size,
+            right_size: self.right_size,
+            shapes: &clusters.shapes,
+            left_keys: clusters.left_keys.view_source(&self.map),
+            right_keys: clusters.right_keys.view_source(&self.map),
+            tables: clusters.tables.view_source(&self.map),
+            exception_cells: self.exception_cells.view_source(&self.map),
+            exception_values: self.exception_values.view_source(&self.map),
+        })
+    }
+
     pub fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
+        self.cost_with(left_node_rc, right_node_lc, true)
+    }
+
+    pub fn cost_from_templates(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
+        self.cost_with(left_node_rc, right_node_lc, false)
+    }
+
+    fn cost_with(&self, left_node_rc: u16, right_node_lc: u16, use_clusters: bool) -> i16 {
         let row = usize::from(right_node_lc);
         let cell = row * self.left_size + usize::from(left_node_rc);
         let span = self.exception_rows[row] as usize..self.exception_rows[row + 1] as usize;
@@ -903,8 +940,10 @@ impl<S: SectionSource> MappedIntTemplates<S> {
         };
         exception.unwrap_or_else(|| {
             let total = match &self.clusters {
-                Some(clusters) => clusters.total(&self.map, left_node_rc, right_node_lc),
-                None => total_of(
+                Some(clusters) if use_clusters => {
+                    clusters.total(&self.map, left_node_rc, right_node_lc)
+                }
+                _ => total_of(
                     self.parts.iter().map(|part| part.slices(&self.map)),
                     left_node_rc,
                     right_node_lc,
