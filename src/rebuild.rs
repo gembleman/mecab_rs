@@ -10,6 +10,7 @@ use crate::build::{write_file, write_file_with};
 use crate::system_dictionary::{HEADER_SIZE, MAGIC_ID, TOKEN_SIZE};
 use crate::{Dictionary, Error, Tagger};
 
+pub mod int_matrix;
 mod runtime;
 mod templates;
 #[cfg(feature = "xz")]

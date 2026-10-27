@@ -179,7 +179,19 @@ pub(crate) struct TemplateReader<'a> {
     offset: usize,
 }
 
-impl TemplateReader<'_> {
+impl<'a> TemplateReader<'a> {
+    pub(crate) fn new(file: &'a [u8], path: &'a Path) -> Self {
+        Self {
+            file,
+            path,
+            offset: 0,
+        }
+    }
+
+    pub(crate) fn at_end(&self) -> bool {
+        self.offset == self.file.len()
+    }
+
     pub(crate) fn broken(&self, reason: &'static str) -> Error {
         Error::Format {
             file: self.path.to_path_buf(),
@@ -522,6 +534,29 @@ impl ConnectionTemplates {
                 Err(io::Error::other("a template worker stopped early"))
             }
         })
+    }
+}
+
+pub(crate) struct ExactRows<'a> {
+    templates: &'a ConnectionTemplates,
+    scratch: RowScratch,
+}
+
+impl<'a> ExactRows<'a> {
+    pub(crate) fn new(templates: &'a ConnectionTemplates) -> Self {
+        Self {
+            templates,
+            scratch: RowScratch::new(templates),
+        }
+    }
+
+    pub(crate) fn render(&mut self, right_left_id: usize, out: &mut [i16]) {
+        let left_size = self.templates.left_size;
+        self.templates
+            .fill_row_sums(right_left_id, left_size, &mut self.scratch);
+        for (cost, sum) in out.iter_mut().zip(&self.scratch.row) {
+            *cost = to_cost(*sum, self.templates.cost_factor);
+        }
     }
 }
 

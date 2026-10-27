@@ -4,6 +4,7 @@ use memmap2::Mmap;
 
 use crate::dictionary::map_file;
 use crate::error::Error;
+use crate::int_templates::MappedIntTemplates;
 use crate::section::Section;
 use crate::templates::MappedTemplates;
 
@@ -62,24 +63,48 @@ impl DenseMatrix {
     }
 }
 
+pub(crate) enum ColdPath {
+    Float(MappedTemplates),
+    Int(Box<MappedIntTemplates>),
+}
+
+impl ColdPath {
+    fn left_size(&self) -> usize {
+        match self {
+            Self::Float(templates) => templates.left_size(),
+            Self::Int(templates) => templates.left_size(),
+        }
+    }
+
+    fn right_size(&self) -> usize {
+        match self {
+            Self::Float(templates) => templates.right_size(),
+            Self::Int(templates) => templates.right_size(),
+        }
+    }
+}
+
 pub(crate) struct HotMatrix {
     map: Mmap,
     costs: Section<i16>,
-    templates: MappedTemplates,
+    templates: ColdPath,
     hot_left: usize,
     hot_right: usize,
 }
 
 pub(crate) struct HotColumn<'m> {
     cells: &'m [i16],
-    templates: &'m MappedTemplates,
+    templates: &'m ColdPath,
     right_left_id: u16,
 }
 
 #[cold]
 #[inline(never)]
-fn cold_cost(templates: &MappedTemplates, left_right_id: u16, right_left_id: u16) -> i16 {
-    templates.cost(left_right_id, right_left_id)
+fn cold_cost(templates: &ColdPath, left_right_id: u16, right_left_id: u16) -> i16 {
+    match templates {
+        ColdPath::Float(templates) => templates.cost(left_right_id, right_left_id),
+        ColdPath::Int(templates) => templates.cost(left_right_id, right_left_id),
+    }
 }
 
 impl<'m> HotColumn<'m> {
@@ -101,7 +126,7 @@ impl<'m> HotColumn<'m> {
 }
 
 impl HotMatrix {
-    fn open(path: &Path, templates: MappedTemplates) -> Result<Self, Error> {
+    fn open(path: &Path, templates: ColdPath) -> Result<Self, Error> {
         let map = map_file(path)?;
         let [left_size, right_size, hot_left, hot_right] =
             header_sizes(&map, path, HOT_HEADER_BYTES / 2)?;
@@ -158,7 +183,13 @@ impl Matrix {
     }
 
     pub(crate) fn open_hot(path: &Path, templates_path: &Path) -> Result<Self, Error> {
-        let templates = MappedTemplates::open(templates_path)?;
+        let templates = ColdPath::Float(MappedTemplates::open(templates_path)?);
+        HotMatrix::open(path, templates).map(Self::Hot)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn open_hot_int(path: &Path, int_templates_path: &Path) -> Result<Self, Error> {
+        let templates = ColdPath::Int(Box::new(MappedIntTemplates::open(int_templates_path)?));
         HotMatrix::open(path, templates).map(Self::Hot)
     }
 

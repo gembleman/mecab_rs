@@ -27,7 +27,7 @@ impl Layout {
     pub const ALL: [Layout; 2] = [Layout::PerTemplate, Layout::ByField];
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
+pub(super) fn fnv1a64(bytes: &[u8]) -> u64 {
     bytes.iter().fold(FNV_OFFSET, |state, &byte| {
         (state ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
     })
@@ -139,7 +139,7 @@ fn payload(templates: &ConnectionTemplates, layout: Layout) -> Vec<u8> {
     out
 }
 
-fn compress(payload: &[u8], path: &Path) -> Result<Vec<u8>, Error> {
+pub(super) fn compress(payload: &[u8], path: &Path) -> Result<Vec<u8>, Error> {
     let mut options = XzOptions::with_preset(9);
     options.lzma_options.nice_len = NICE_LEN;
     options.lzma_options.depth_limit = DEPTH_LIMIT;
@@ -177,7 +177,7 @@ pub fn pack(templates: &ConnectionTemplates, path: &Path) -> Result<u64, Error> 
     Ok(std::fs::metadata(path).map_err(io_error(path))?.len())
 }
 
-fn decompress(path: &Path) -> Result<Vec<u8>, Error> {
+pub(super) fn decompress(path: &Path) -> Result<Vec<u8>, Error> {
     let file = std::fs::File::open(path).map_err(io_error(path))?;
     let mut payload = Vec::new();
     XzReader::new(std::io::BufReader::new(file), false)

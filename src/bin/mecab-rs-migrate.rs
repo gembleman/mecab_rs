@@ -37,6 +37,17 @@ dictionary rebuilding:
   mecab-rs-migrate unpack-matrix <file.xz> <dict-dir> [--hot L R] [--threads N]   (feature xz)
       Packs the compiled templates into one xz file, or writes matrix.tpl and matrix.hot
       from such a file.
+  mecab-rs-migrate pack-int <source-dir> <out.xz> [--id-defs <dir>] [--shift N | --shift A-B]
+                            [--reference <matrix.bin>] [--threads N]           (feature xz)
+  mecab-rs-migrate unpack-int <file.xz> <id-defs-dir> <dict-dir> [--hot L R] [--threads N]
+                                                                                (feature xz)
+  mecab-rs-migrate check-int <file.xz> <id-defs-dir> <matrix.bin> [--threads N]  (feature xz)
+  mecab-rs-migrate bench-cold <matrix.tpl> <matrix.itp> [--hot L R] [--samples N]
+      Integer matrix: rounds the template weights to the grid 2^-shift (the shifts given, default
+      16-26), lists the cells where the integer sum differs from the real matrix (taken from
+      --reference or else from the exact templates) and writes the smallest xz file; unpack-int
+      writes matrix.itp and matrix.hot from it; check-int compares every cell of the decoded
+      integer matrix with matrix.bin; bench-cold times the cold lookups of both template files.
   mecab-rs-migrate rebuild <unidic-full-dir> <out-dir> (--stats <dir> | --corpus <file>...)
                          [--keep <fields>] [--hot L R] [--threads N] [--xz] [--matrix-bin]
       One-shot build of the runtime files only (dicrc, char.bin, char.uni, license/, sys.dic,
@@ -150,6 +161,20 @@ struct MatrixArgs {
     threads: Option<usize>,
     xz: bool,
     matrix_bin: bool,
+    shifts: Option<Vec<u32>>,
+    reference: Option<PathBuf>,
+    samples: Option<usize>,
+}
+
+fn parse_shifts(text: &str) -> Result<Vec<u32>, String> {
+    let bad = || format!("`{text}` is not a shift or a range like 16-26");
+    let (first, last) = text.split_once('-').unwrap_or((text, text));
+    let first: u32 = first.parse().map_err(|_| bad())?;
+    let last: u32 = last.parse().map_err(|_| bad())?;
+    if first > last || last > rebuild::int_matrix::MAX_SHIFT {
+        return Err(bad());
+    }
+    Ok((first..=last).collect())
 }
 
 fn parse_matrix_args(command: &str, args: &[std::ffi::OsString]) -> Result<MatrixArgs, String> {
@@ -189,6 +214,12 @@ fn parse_matrix_args(command: &str, args: &[std::ffi::OsString]) -> Result<Matri
                 parsed.hot = Some((left, number(iterator.next(), "--hot")?));
             }
             Some("--threads") => parsed.threads = Some(number(iterator.next(), "--threads")?),
+            Some("--shift") => {
+                let value = text(iterator.next(), "--shift")?;
+                parsed.shifts = Some(parse_shifts(&value.to_string_lossy())?);
+            }
+            Some("--reference") => parsed.reference = Some(text(iterator.next(), "--reference")?),
+            Some("--samples") => parsed.samples = Some(number(iterator.next(), "--samples")?),
             Some("--xz") => parsed.xz = true,
             Some("--matrix-bin") => parsed.matrix_bin = true,
             Some(flag) if flag.starts_with("--") => {
@@ -299,6 +330,187 @@ fn check_templates_command(args: &Args, start: Instant) -> Result<(), String> {
     check_templates(&templates, matrix, threads_of(&parsed))
 }
 
+#[cfg(feature = "xz")]
+fn pack_int(args: &Args, start: Instant) -> Result<(), String> {
+    let parsed = parse_matrix_args("pack-int", args)?;
+    let [source, out] = positional("pack-int", &parsed, "<source-dir> <out.xz>")?;
+    let shifts = parsed
+        .shifts
+        .clone()
+        .unwrap_or_else(|| rebuild::int_matrix::DEFAULT_SHIFTS.collect());
+    let (left, right) = read_id_defs(source, parsed.id_defs.as_deref())?;
+    let templates = compile(source, parsed.id_defs.as_deref())?;
+    println!("compiled in {:.2} s", start.elapsed().as_secs_f64());
+    let (reports, chosen) = rebuild::int_matrix::pack_int(
+        &templates,
+        source,
+        &left,
+        &right,
+        &shifts,
+        parsed.reference.as_deref(),
+        threads_of(&parsed),
+        out,
+        &mut |line| println!("{line}"),
+    )
+    .map_err(shown)?;
+    for report in &reports {
+        let sizes = &report.sizes;
+        println!(
+            "shift {:2}: exceptions {:>9}  xz header {} pattern {} weights {} exceptions {} total {}  |  ideal pattern {:.0} weights {:.0} exceptions {:.0} total {:.0}",
+            report.shift,
+            report.exceptions,
+            sizes.header.1,
+            sizes.pattern.1,
+            sizes.weights.1,
+            sizes.exceptions.1,
+            sizes.total.1,
+            report.ideal.pattern,
+            report.ideal.weights,
+            report.ideal.exceptions,
+            report.ideal.total(),
+        );
+    }
+    println!(
+        "chosen shift {}: {} bytes in {}",
+        reports[chosen].shift,
+        reports[chosen].sizes.total.1,
+        out.display()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "xz")]
+fn unpack_int(args: &Args) -> Result<(), String> {
+    let parsed = parse_matrix_args("unpack-int", args)?;
+    let [pack, id_defs, dictionary] =
+        positional("unpack-int", &parsed, "<file.xz> <id-defs-dir> <dict-dir>")?;
+    std::fs::create_dir_all(dictionary).map_err(|error| error.to_string())?;
+    rebuild::int_matrix::unpack_int(pack, id_defs, dictionary, parsed.hot, threads_of(&parsed))
+        .map_err(shown)
+}
+
+#[cfg(feature = "xz")]
+fn check_int(args: &Args, start: Instant) -> Result<(), String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let parsed = parse_matrix_args("check-int", args)?;
+    let [pack, id_defs, matrix] =
+        positional("check-int", &parsed, "<file.xz> <id-defs-dir> <matrix.bin>")?;
+    let (left, right) = read_id_defs(id_defs, None)?;
+    let templates = rebuild::int_matrix::read_int_pack(pack, &left, &right).map_err(shown)?;
+    println!(
+        "decoded in {:.2} s: shift {}, {} exceptions",
+        start.elapsed().as_secs_f64(),
+        templates.shift(),
+        templates.exception_count()
+    );
+    let bytes = std::fs::read(matrix).map_err(|error| format!("{}: {error}", matrix.display()))?;
+    let (left_size, right_size) = (templates.left_size(), templates.right_size());
+    if bytes.len() != 4 + 2 * left_size * right_size {
+        return Err("the matrix does not have the size of the templates".into());
+    }
+    const ROWS: usize = 64;
+    let next_chunk = AtomicUsize::new(0);
+    let mismatches = AtomicUsize::new(0);
+    let first = std::sync::Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..threads_of(&parsed).max(1) {
+            scope.spawn(|| {
+                loop {
+                    let chunk = next_chunk.fetch_add(1, Ordering::Relaxed);
+                    if chunk * ROWS >= right_size {
+                        break;
+                    }
+                    templates.visit_rows(chunk * ROWS, (chunk + 1) * ROWS, |row, costs| {
+                        let cells = &bytes[4 + 2 * row * left_size..][..2 * left_size];
+                        for (column, (cell, &found)) in
+                            cells.as_chunks::<2>().0.iter().zip(costs).enumerate()
+                        {
+                            let expected = i16::from_le_bytes(*cell);
+                            if expected != found {
+                                mismatches.fetch_add(1, Ordering::Relaxed);
+                                first
+                                    .lock()
+                                    .unwrap()
+                                    .get_or_insert((column, row, expected, found));
+                            }
+                        }
+                    });
+                }
+            });
+        }
+    });
+    let cells = left_size * right_size;
+    let exception_cells: Vec<usize> = templates
+        .exceptions()
+        .map(|(cell, _)| cell as usize)
+        .collect();
+    let mut single = 0usize;
+    for cell in (0..cells).step_by(997).chain(exception_cells) {
+        let (column, row) = (cell % left_size, cell / left_size);
+        let expected = i16::from_le_bytes([bytes[4 + 2 * cell], bytes[5 + 2 * cell]]);
+        if templates.cost(column as u16, row as u16) != expected {
+            mismatches.fetch_add(1, Ordering::Relaxed);
+        }
+        single += 1;
+    }
+    let mismatches = mismatches.into_inner();
+    println!("compared {cells} cells by rows and {single} by cell, {mismatches} mismatches");
+    match first.into_inner().unwrap() {
+        Some((column, row, expected, found)) => Err(format!(
+            "first mismatch at rc {column} lc {row}: matrix {expected}, integer templates {found}"
+        )),
+        None if mismatches > 0 => Err("the single-cell path differs".into()),
+        None => Ok(()),
+    }
+}
+
+fn bench_cold(args: &Args) -> Result<(), String> {
+    let parsed = parse_matrix_args("bench-cold", args)?;
+    let [float_path, int_path] = positional("bench-cold", &parsed, "<matrix.tpl> <matrix.itp>")?;
+    let samples = parsed.samples.unwrap_or(2_000_000);
+    let floats = mecab_rs::MappedTemplates::open(float_path).map_err(shown)?;
+    let ints = mecab_rs::MappedIntTemplates::open(int_path).map_err(shown)?;
+    let (hot_left, hot_right) = parsed
+        .hot
+        .unwrap_or((rebuild::DEFAULT_HOT_LEFT, rebuild::DEFAULT_HOT_RIGHT));
+    let (left_size, right_size) = (floats.left_size(), floats.right_size());
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut cells = Vec::with_capacity(samples);
+    while cells.len() < samples {
+        let column = (next() % left_size as u64) as u16;
+        let row = (next() % right_size as u64) as u16;
+        if usize::from(column) >= hot_left || usize::from(row) >= hot_right {
+            cells.push((column, row));
+        }
+    }
+    let time = |lookup: &dyn Fn(u16, u16) -> i16| {
+        let started = Instant::now();
+        let sum: i64 = cells
+            .iter()
+            .map(|&(column, row)| i64::from(lookup(column, row)))
+            .sum();
+        (started.elapsed().as_secs_f64() * 1e9 / samples as f64, sum)
+    };
+    for round in 0..2 {
+        let (float_ns, float_sum) = time(&|column, row| floats.cost(column, row));
+        let (int_ns, int_sum) = time(&|column, row| ints.cost(column, row));
+        println!(
+            "round {round}: matrix.tpl {float_ns:.0} ns/cell, matrix.itp {int_ns:.0} ns/cell (checksums {float_sum} {int_sum})"
+        );
+        if float_sum != int_sum {
+            return Err("the two template files disagree".into());
+        }
+    }
+    Ok(())
+}
+
 fn rebuild_command(args: &Args) -> Result<(), String> {
     let parsed = parse_matrix_args("rebuild", args)?;
     let [source, out] = positional("rebuild", &parsed, "<unidic-full-dir> <out-dir>")?;
@@ -376,6 +588,17 @@ fn run() -> Result<(), String> {
             "pack-matrix" => pack_matrix(args, start),
             #[cfg(feature = "xz")]
             "unpack-matrix" => unpack_matrix(args),
+            #[cfg(feature = "xz")]
+            "pack-int" => pack_int(args, start),
+            #[cfg(feature = "xz")]
+            "unpack-int" => unpack_int(args),
+            #[cfg(feature = "xz")]
+            "check-int" => check_int(args, start),
+            "bench-cold" => bench_cold(args),
+            #[cfg(not(feature = "xz"))]
+            "pack-int" | "unpack-int" | "check-int" => Err(format!(
+                "{command}: this build has no xz support; build with --features xz"
+            )),
             #[cfg(not(feature = "xz"))]
             "pack-matrix" | "unpack-matrix" => Err(format!(
                 "{command}: this build has no xz support; build with --features xz"

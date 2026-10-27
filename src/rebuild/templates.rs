@@ -176,7 +176,7 @@ struct Source {
     weights: HashMap<(Box<str>, u32), f64>,
 }
 
-fn read_bigrams(feature_def: &Path) -> Result<Vec<(String, String)>, Error> {
+pub(super) fn read_bigrams(feature_def: &Path) -> Result<Vec<(String, String)>, Error> {
     let text =
         String::from_utf8(read_file(feature_def)?).map_err(|_| bad(feature_def, "not UTF-8"))?;
     let mut bigrams = Vec::new();
@@ -388,6 +388,44 @@ pub fn compile_templates(
         right_rows.len(),
         parts,
     )
+}
+
+pub(super) struct UniverseSide {
+    pub(super) projection: Vec<u16>,
+    pub(super) count: usize,
+}
+
+pub(super) fn universe_projections(
+    bigrams: &[(String, String)],
+    left_id_def: &str,
+    right_id_def: &str,
+    source: &Path,
+) -> Result<Vec<(UniverseSide, UniverseSide)>, Error> {
+    let left_rows = id_rows(right_id_def, &source.join("right-id.def"))?;
+    let right_rows = id_rows(left_id_def, &source.join("left-id.def"))?;
+    let side = |keys: Vec<Option<String>>| -> Result<UniverseSide, Error> {
+        let distinct: BTreeSet<&str> = keys.iter().flatten().map(String::as_str).collect();
+        if distinct.len() > NO_FIRE_LIMIT {
+            return Err(bad(source, "a template has more than 65535 distinct keys"));
+        }
+        let distinct: Vec<&str> = distinct.into_iter().collect();
+        Ok(UniverseSide {
+            projection: project(&keys, &distinct),
+            count: distinct.len(),
+        })
+    };
+    bigrams
+        .iter()
+        .map(|(name, body)| {
+            let (left_body, right_body) = body
+                .split_once('/')
+                .ok_or_else(|| bad(source, format!("template {name} has no `/`")))?;
+            Ok((
+                side(side_keys(&parse_side(left_body, true), &left_rows))?,
+                side(side_keys(&parse_side(right_body, false), &right_rows))?,
+            ))
+        })
+        .collect()
 }
 
 pub fn write_matrix_files(

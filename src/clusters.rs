@@ -14,11 +14,11 @@ const MAX_SHAPES: usize = 256;
 
 pub(crate) struct ClusterPlan {
     id: usize,
-    parts: Vec<usize>,
-    left_ids: Vec<u16>,
-    right_ids: Vec<u16>,
-    left_keys: usize,
-    right_keys: usize,
+    pub(crate) parts: Vec<usize>,
+    pub(crate) left_ids: Vec<u16>,
+    pub(crate) right_ids: Vec<u16>,
+    pub(crate) left_keys: usize,
+    pub(crate) right_keys: usize,
 }
 
 fn dense_ids(keys: impl Iterator<Item = u32>) -> (Vec<u16>, usize) {
@@ -41,7 +41,7 @@ fn joined_ids(first: &[u16], second: &[u16]) -> (Vec<u16>, usize) {
     )
 }
 
-fn representatives(ids: &[u16], keys: usize) -> Vec<u16> {
+pub(crate) fn representatives(ids: &[u16], keys: usize) -> Vec<u16> {
     let mut first = vec![0; keys];
     for (index, &id) in ids.iter().enumerate().rev() {
         first[usize::from(id)] = index as u16;
@@ -50,11 +50,9 @@ fn representatives(ids: &[u16], keys: usize) -> Vec<u16> {
 }
 
 impl ClusterPlan {
-    fn of_part(id: usize, part: &PartSlices) -> Self {
-        let (left_ids, left_keys) =
-            dense_ids(part.left_projection.iter().map(|&key| u32::from(key)));
-        let (right_ids, right_keys) =
-            dense_ids(part.right_projection.iter().map(|&key| u32::from(key)));
+    fn of_projections(id: usize, left_projection: &[u16], right_projection: &[u16]) -> Self {
+        let (left_ids, left_keys) = dense_ids(left_projection.iter().map(|&key| u32::from(key)));
+        let (right_ids, right_keys) = dense_ids(right_projection.iter().map(|&key| u32::from(key)));
         Self {
             id,
             parts: vec![id],
@@ -65,7 +63,7 @@ impl ClusterPlan {
         }
     }
 
-    fn cells(&self) -> usize {
+    pub(crate) fn cells(&self) -> usize {
         self.left_keys * self.right_keys
     }
 
@@ -96,10 +94,21 @@ fn growth_of_merge(plans: &[ClusterPlan], first: usize, second: usize) -> i64 {
 }
 
 pub(crate) fn plan_clusters(parts: &[PartSlices], target: usize) -> Vec<ClusterPlan> {
-    let mut plans: Vec<ClusterPlan> = parts
+    let projections: Vec<(&[u16], &[u16])> = parts
+        .iter()
+        .map(|part| (part.left_projection, part.right_projection))
+        .collect();
+    plan_projection_clusters(&projections, target)
+}
+
+pub(crate) fn plan_projection_clusters(
+    projections: &[(&[u16], &[u16])],
+    target: usize,
+) -> Vec<ClusterPlan> {
+    let mut plans: Vec<ClusterPlan> = projections
         .iter()
         .enumerate()
-        .map(|(index, part)| ClusterPlan::of_part(index, part))
+        .map(|(index, &(left, right))| ClusterPlan::of_projections(index, left, right))
         .collect();
     let mut next_id = plans.len();
     let mut growth: HashMap<(usize, usize), i64> = HashMap::new();
