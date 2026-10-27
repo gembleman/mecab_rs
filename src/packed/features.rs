@@ -1,3 +1,4 @@
+pub(super) mod chars;
 pub(super) mod check;
 pub(super) mod encode;
 
@@ -43,6 +44,7 @@ pub(super) struct Counts {
     pub(super) shapes: u32,
     pub(super) numerics: u32,
     pub(super) lo_total: u32,
+    pub(super) chars: u32,
     pub(super) template_bytes: u64,
     pub(super) shape_bytes: u64,
     pub(super) strings: u64,
@@ -62,6 +64,7 @@ pub(super) struct Layout {
     pub(super) shapes: Range<usize>,
     pub(super) specs: Range<usize>,
     pub(super) lo: Range<usize>,
+    pub(super) chars: Range<usize>,
     pub(super) sync: Range<usize>,
     pub(super) strings: Range<usize>,
     pub(super) records: Range<usize>,
@@ -88,6 +91,7 @@ impl Layout {
             shapes: take(counts.shape_bytes)?,
             specs: take(SPEC_BYTES as u64 * u64::from(counts.numerics))?,
             lo: take(8 * u64::from(counts.lo_total))?,
+            chars: take(chars::ENTRY_BYTES as u64 * u64::from(counts.chars))?,
             sync: take(4 * sync_count)?,
             strings: take(counts.strings.checked_add(SLACK as u64)?)?,
             records: take(counts.records.checked_add(RECORD_PADDING as u64)?)?,
@@ -111,6 +115,7 @@ impl Layout {
         header[32..40].copy_from_slice(&counts.strings.to_le_bytes());
         header[40..48].copy_from_slice(&counts.records.to_le_bytes());
         header[48..52].copy_from_slice(&counts.record_count.to_le_bytes());
+        header[56..60].copy_from_slice(&counts.chars.to_le_bytes());
         header[52] = self.template_bits as u8;
         header[53] = self.shape_bits as u8;
         header[54] = self.ref_bits as u8;
@@ -126,6 +131,7 @@ impl Layout {
             shapes: u32_at(4),
             numerics: u32_at(8),
             lo_total: u32_at(12),
+            chars: u32_at(56),
             template_bytes: u64_at(16),
             shape_bytes: u64_at(24),
             strings: u64_at(32),
@@ -137,7 +143,9 @@ impl Layout {
             || counts.template_bytes >= LENGTH_LIMIT
             || counts.shape_bytes >= LENGTH_LIMIT
             || counts.records >= LENGTH_LIMIT
-            || header[55..64].iter().any(|&byte| byte != 0)
+            || counts.chars as usize > chars::MAX_CHARS
+            || header[55] != 0
+            || header[60..64].iter().any(|&byte| byte != 0)
         {
             return None;
         }
@@ -159,6 +167,7 @@ impl Layout {
             shapes: shift(&self.shapes),
             specs: shift(&self.specs),
             lo: shift(&self.lo),
+            chars: shift(&self.chars),
             sync: shift(&self.sync),
             strings: shift(&self.strings),
             records: shift(&self.records),
@@ -275,9 +284,16 @@ pub(crate) trait Sink {
     fn put(&mut self, text: &str) -> fmt::Result;
 
     unsafe fn put_region(&mut self, region: &[u8], start: usize, length: usize) -> fmt::Result;
+
+    unsafe fn put_coded(&mut self, table: &[u8], codes: &[u8]) -> fmt::Result;
 }
 
 impl Sink for String {
+    #[inline(always)]
+    unsafe fn put_coded(&mut self, table: &[u8], codes: &[u8]) -> fmt::Result {
+        chars::for_each_char(table, codes, |text| self.put(text))
+    }
+
     #[inline(always)]
     fn put(&mut self, text: &str) -> fmt::Result {
         self.push_str(text);
@@ -349,6 +365,13 @@ impl<'a> Cursor<'a> {
 
 impl Sink for Cursor<'_> {
     #[inline(always)]
+    unsafe fn put_coded(&mut self, table: &[u8], codes: &[u8]) -> fmt::Result {
+        self.reserve(codes.len() * chars::MAX_EXPANSION + chars::ENTRY_BYTES);
+        self.len += unsafe { chars::decode_unchecked(table, codes, self.ptr.add(self.len)) };
+        Ok(())
+    }
+
+    #[inline(always)]
     fn put(&mut self, text: &str) -> fmt::Result {
         self.reserve(text.len());
         unsafe {
@@ -387,6 +410,10 @@ impl Sink for Cursor<'_> {
 }
 
 impl Sink for fmt::Formatter<'_> {
+    unsafe fn put_coded(&mut self, table: &[u8], codes: &[u8]) -> fmt::Result {
+        chars::for_each_char(table, codes, |text| self.write_str(text))
+    }
+
     fn put(&mut self, text: &str) -> fmt::Result {
         self.write_str(text)
     }
@@ -472,6 +499,7 @@ pub(crate) struct FeatureView<'a> {
     pub(super) shape_offsets: &'a [u8],
     pub(super) shapes: &'a [u8],
     pub(super) lo: &'a [u8],
+    pub(super) chars: &'a [u8],
     pub(super) strings: &'a [u8],
     pub(super) records: &'a [u8],
     pub(super) specs: &'a [NumSpec],
@@ -491,9 +519,6 @@ impl FeatureView<'_> {
     #[inline(always)]
     fn string<const TRUSTED: bool>(&self, at: usize) -> (usize, usize) {
         let tail = access::from::<TRUSTED>(self.strings, at);
-        if tail.first().is_some_and(|&byte| byte.cast_signed() < -64) {
-            return (at, 0);
-        }
         (at, find_byte(tail, 0))
     }
 
@@ -554,7 +579,8 @@ impl FeatureView<'_> {
                         slots[slot_count] = (start, length);
                         slot_count += 1;
                     }
-                    unsafe { sink.put_region(self.strings, start, length)? };
+                    let codes = access::range::<TRUSTED>(self.strings, start..start + length);
+                    unsafe { sink.put_coded(self.chars, codes)? };
                 }
                 OP_INLINE => {
                     let start = bit.div_ceil(8);
@@ -564,19 +590,21 @@ impl FeatureView<'_> {
                         slots[slot_count] = (start | IN_RECORD, length);
                         slot_count += 1;
                     }
-                    sink.put(inline_text::<TRUSTED>(record, start, length))?;
+                    let codes = access::range::<TRUSTED>(record, start..start + length);
+                    unsafe { sink.put_coded(self.chars, codes)? };
                 }
                 OP_EMPTY => {}
                 OP_STAR => sink.put("*")?,
                 OP_KEY => sink.put(key)?,
                 OP_COPY..=OP_COPY_MAX => {
                     let (start, length) = slots[usize::from(op - OP_COPY)];
-                    if start & IN_RECORD != 0 {
-                        let start = start & !IN_RECORD;
-                        sink.put(inline_text::<TRUSTED>(record, start, length))?;
+                    let (region, start) = if start & IN_RECORD != 0 {
+                        (record, start & !IN_RECORD)
                     } else {
-                        unsafe { sink.put_region(self.strings, start, length)? };
-                    }
+                        (self.strings, start)
+                    };
+                    let codes = access::range::<TRUSTED>(region, start..start + length);
+                    unsafe { sink.put_coded(self.chars, codes)? };
                 }
                 OP_NUM..=OP_NUM_MAX => {
                     let number = usize::from(op - OP_NUM);
@@ -599,16 +627,6 @@ impl FeatureView<'_> {
             unsafe { sink.put_region(self.templates, start, length)? };
         }
         Ok(())
-    }
-}
-
-#[inline(always)]
-fn inline_text<const TRUSTED: bool>(record: &[u8], start: usize, length: usize) -> &str {
-    let bytes = access::range::<TRUSTED>(record, start..start + length);
-    if TRUSTED {
-        unsafe { text_of(bytes) }
-    } else {
-        str::from_utf8(bytes).unwrap_or("")
     }
 }
 

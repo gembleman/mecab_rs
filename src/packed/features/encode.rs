@@ -3,7 +3,8 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 use super::{
     BitWriter, Counts, Layout, MAX_NUMERIC, MAX_SLOTS, NumSpec, OP_COPY, OP_EMPTY, OP_HIGH,
-    OP_INLINE, OP_KEY, OP_NUM, OP_NUM_MAX, OP_REF, OP_STAR, SYNC_EVERY, bits_for, push_piece,
+    OP_INLINE, OP_KEY, OP_NUM, OP_NUM_MAX, OP_REF, OP_STAR, SYNC_EVERY, bits_for, chars,
+    push_piece,
 };
 use crate::Error;
 
@@ -286,6 +287,86 @@ struct Stored {
     low_table: Vec<u64>,
 }
 
+struct Recoded {
+    table: Vec<u64>,
+    area: Vec<u8>,
+    references: Vec<u32>,
+    inline: Vec<Vec<u8>>,
+}
+
+fn text_of(bytes: &[u8]) -> Result<&str, Error> {
+    std::str::from_utf8(bytes).map_err(|_| Error::Unsupported("feature text that is not UTF-8"))
+}
+
+fn char_ranks(area: &[u8], inline: &[&[u8]]) -> Result<Vec<char>, Error> {
+    let mut counts: HashMap<char, u64> = HashMap::new();
+    for bytes in area.split(|&byte| byte == 0).chain(inline.iter().copied()) {
+        for ch in text_of(bytes)?.chars() {
+            *counts.entry(ch).or_insert(0) += 1;
+        }
+    }
+    let mut ranked: Vec<(char, u64)> = counts.into_iter().collect();
+    ranked.sort_by_key(|&(ch, count)| (std::cmp::Reverse(count), ch));
+    if ranked.len() > chars::MAX_CHARS {
+        return Err(Error::Unsupported(
+            "more distinct feature characters than codes",
+        ));
+    }
+    Ok(ranked.into_iter().map(|(ch, _)| ch).collect())
+}
+
+fn code_text(text: &[u8], rank_of: &HashMap<char, usize>, out: &mut Vec<u8>) -> Result<(), Error> {
+    for ch in text_of(text)?.chars() {
+        chars::push_code(rank_of[&ch], out);
+    }
+    Ok(())
+}
+
+fn recode(area: &[u8], references: &[u32], inline: &[&[u8]]) -> Result<Recoded, Error> {
+    let ranked = char_ranks(area, inline)?;
+    let rank_of: HashMap<char, usize> = ranked
+        .iter()
+        .enumerate()
+        .map(|(rank, &ch)| (ch, rank))
+        .collect();
+    let mut coded_area: Vec<u8> = Vec::new();
+    let mut old_starts: Vec<u32> = Vec::new();
+    let mut new_starts: Vec<u32> = Vec::new();
+    let mut at = 0usize;
+    while at < area.len() {
+        let length = area[at..]
+            .iter()
+            .position(|&byte| byte == 0)
+            .expect("every string of the area ends with NUL");
+        old_starts.push(at as u32);
+        new_starts.push(coded_area.len() as u32);
+        code_text(&area[at..at + length], &rank_of, &mut coded_area)?;
+        coded_area.push(0);
+        at += length + 1;
+    }
+    let references = references
+        .iter()
+        .map(|offset| {
+            let number = old_starts
+                .binary_search(offset)
+                .expect("a reference names the start of a string");
+            new_starts[number]
+        })
+        .collect();
+    let mut coded_inline = Vec::with_capacity(inline.len());
+    for text in inline {
+        let mut codes = Vec::new();
+        code_text(text, &rank_of, &mut codes)?;
+        coded_inline.push(codes);
+    }
+    Ok(Recoded {
+        table: ranked.into_iter().map(chars::entry_of).collect(),
+        area: coded_area,
+        references,
+        inline: coded_inline,
+    })
+}
+
 pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Result<Encoded, Error> {
     let mut entries: Vec<&[u8]> = features.split(|&byte| byte == 0).collect();
     entries.pop();
@@ -529,6 +610,11 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
     drop(values);
     drop(known_strings);
     drop(string_uses);
+    let recoded = recode(&area, &references, &inline)?;
+    let (area, references, inline) = (recoded.area, recoded.references, recoded.inline);
+    if area.len() > u32::MAX as usize {
+        return Err(Error::Unsupported("feature strings of more than 4 GiB"));
+    }
 
     let template_bits = bits_for(template_list.len() as u64);
     let shape_bits = bits_for(shape_list.len() as u64);
@@ -551,7 +637,7 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
                     next_reference += 1;
                 }
                 OP_INLINE => {
-                    writer.put_bytes(inline[next_inline]);
+                    writer.put_bytes(&inline[next_inline]);
                     next_inline += 1;
                 }
                 OP_NUM..=OP_NUM_MAX => {
@@ -570,6 +656,15 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         }
     }
     let records = writer.bytes;
+    if let Ok(path) = std::env::var("CHARCODE_DUMP") {
+        let _ = std::fs::write(format!("{path}.area"), &area);
+        let mut joined = Vec::new();
+        for text in &inline {
+            joined.extend_from_slice(text);
+            joined.push(0);
+        }
+        let _ = std::fs::write(format!("{path}.inline"), &joined);
+    }
 
     let too_big = || Error::Unsupported("a feature table that does not fit the section");
     let mut template_offsets: Vec<u32> = vec![0];
@@ -593,6 +688,7 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         shapes: shape_list.len() as u32,
         numerics: stored.len() as u32,
         lo_total: u32::try_from(low_values.len()).map_err(|_| too_big())?,
+        chars: recoded.table.len() as u32,
         template_bytes: template_bytes.len() as u64,
         shape_bytes: shape_bytes.len() as u64,
         strings: area.len() as u64,
@@ -624,6 +720,12 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
     put(&mut bytes, &layout.lo, &low_bytes);
     let sync: Vec<u32> = starts.iter().step_by(SYNC_EVERY).copied().collect();
     put(&mut bytes, &layout.sync, &words(&sync));
+    let table_bytes: Vec<u8> = recoded
+        .table
+        .iter()
+        .flat_map(|entry| entry.to_le_bytes())
+        .collect();
+    put(&mut bytes, &layout.chars, &table_bytes);
     put(&mut bytes, &layout.strings, &area);
     put(&mut bytes, &layout.records, &records);
     let starts = starts_of

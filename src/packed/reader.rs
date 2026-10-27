@@ -511,6 +511,7 @@ impl PackedDictionary {
             shape_offsets: part(&layout.shape_offsets),
             shapes: part(&layout.shapes),
             lo: part(&layout.lo),
+            chars: part(&layout.chars),
             strings: part(&layout.strings),
             records: part(&layout.records),
             specs: &self.numbers,
