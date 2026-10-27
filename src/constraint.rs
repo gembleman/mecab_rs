@@ -33,6 +33,7 @@ pub(crate) struct ConstraintSet {
     feature_at: Vec<Option<u32>>,
     spans: Vec<(usize, usize)>,
     bytes: String,
+    scratch: String,
 }
 
 impl ConstraintSet {
@@ -91,11 +92,11 @@ impl ConstraintSet {
         &self.bytes[start..end]
     }
 
-    pub(crate) fn admits<'f>(
-        &self,
+    pub(crate) fn admits(
+        &mut self,
         begin: usize,
         end: usize,
-        feature: impl FnOnce() -> &'f str,
+        feature: impl FnOnce(&mut String),
     ) -> bool {
         if self.is_inside_token(end) {
             return false;
@@ -103,9 +104,12 @@ impl ConstraintSet {
         let Some(index) = self.feature_at(begin) else {
             return true;
         };
-        self.is_token_boundary(begin)
-            && self.is_token_boundary(end)
-            && partial_match(self.feature_str(index).as_bytes(), feature().as_bytes())
+        if !self.is_token_boundary(begin) || !self.is_token_boundary(end) {
+            return false;
+        }
+        self.scratch.clear();
+        feature(&mut self.scratch);
+        partial_match(self.feature_str(index).as_bytes(), self.scratch.as_bytes())
     }
 
     fn boundary_at(&self, position: usize) -> Boundary {

@@ -949,9 +949,9 @@ impl Lattice {
                 let token = view.token(token_index);
                 if !BEST
                     && found.partial
-                    && !self
-                        .constraints
-                        .admits(found.begin, end, || words.feature(token.feature))
+                    && !self.constraints.admits(found.begin, end, |out| {
+                        words.write_feature(token.feature, out);
+                    })
                 {
                     continue;
                 }
@@ -990,9 +990,9 @@ impl Lattice {
                 let token = words.token(token_index);
                 if !BEST
                     && found.partial
-                    && !self
-                        .constraints
-                        .admits(found.begin, end, || words.feature(token.feature))
+                    && !self.constraints.admits(found.begin, end, |out| {
+                        out.push_str(words.feature(token.feature))
+                    })
                 {
                     continue;
                 }
@@ -1077,10 +1077,10 @@ impl Lattice {
         for &token in tokens {
             if !BEST
                 && self.constraints.is_active()
-                && !self.constraints.admits(span.begin, span.end, || {
+                && !self.constraints.admits(span.begin, span.end, |out| {
                     match &dictionary.unknown_feature {
-                        Some(feature) => feature,
-                        None => unknown.feature(token.feature),
+                        Some(feature) => out.push_str(feature),
+                        None => unknown.write_feature(token.feature, out),
                     }
                 })
             {

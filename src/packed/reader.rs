@@ -3,10 +3,10 @@ use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
-use std::thread;
 
 use memmap2::Mmap;
 
+use super::features::{FeatureView, Layout as FeatureLayout, NumSpec, check as feature_check};
 use super::{
     BLOCK_CODES, BLOCK_COUNT, CELLS, CHAR_BLOCKS, CHAR_INDEX, CHAR_TABLE, COUNT_SHIFT, DICRC,
     FEATURES, FLAG_HOT_MATRIX, FLAG_INT_TEMPLATES, FLAG_WIDE_PARAMS, HEADER_BYTES,
@@ -23,10 +23,7 @@ use crate::system_dictionary::PrefixHit;
 pub use crate::system_dictionary::TokenRecord;
 
 const CHUNK: usize = 1 << 20;
-const FEATURE_CHUNK: usize = 1 << 16;
 const PARAM_BYTES: usize = 8;
-const PARALLEL_MIN_BYTES: usize = 1 << 22;
-const MAX_CHECK_THREADS: usize = 8;
 
 pub type Hit = PrefixHit;
 
@@ -60,21 +57,28 @@ fn u64_at(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(*bytes[at..].first_chunk().expect("in range"))
 }
 
-struct Source<'a> {
+pub(super) struct Source<'a> {
     file: &'a File,
     path: &'a Path,
     sections: [Range<usize>; SECTIONS],
 }
 
+impl<'a> Source<'a> {
+}
+
 impl Source<'_> {
-    fn broken(&self, reason: &'static str) -> Error {
+    pub(super) fn broken(&self, reason: &'static str) -> Error {
         Error::Format {
             file: self.path.to_path_buf(),
             reason,
         }
     }
 
-    fn read(&self, section: usize, from: usize, buffer: &mut [u8]) -> Result<(), Error> {
+    pub(super) fn section_length(&self, section: usize) -> usize {
+        self.sections[section].len()
+    }
+
+    pub(super) fn read(&self, section: usize, from: usize, buffer: &mut [u8]) -> Result<(), Error> {
         let start = self.sections[section].start + from;
         read_at(self.file, buffer, start as u64).map_err(|source| Error::Io {
             path: self.path.to_path_buf(),
@@ -127,6 +131,8 @@ pub struct PackedDictionary {
     ascii: [u16; 128],
     bos_feature: Range<usize>,
     unknown_feature: Option<Range<usize>>,
+    features: FeatureLayout,
+    numbers: Box<[NumSpec]>,
 }
 
 impl PackedDictionary {
@@ -199,7 +205,6 @@ impl PackedDictionary {
             || code_count == 0
             || code_count > 1 << 16
             || token_count > MAX_UNITS
-            || length(FEATURES) > u32::MAX as usize
             || (token_bytes == 6 && param_count > 1 << 16)
         {
             return Err(broken("the size of a section does not match the header"));
@@ -293,8 +298,7 @@ impl PackedDictionary {
             "a character code is out of range",
         )?;
 
-        let features_length = length(FEATURES);
-        let starts = check_features(&source, features_length)?;
+        let checked = feature_check::check(&source, FEATURES)?;
 
         source.chunks(
             PARAMS,
@@ -308,28 +312,19 @@ impl PackedDictionary {
             "a parameter set has a context id outside the matrix",
         )?;
 
-        let mut next_start = 0;
-        let mut valid_tokens = |_: usize, part: &[u8]| {
+        let valid_tokens = |_: usize, part: &[u8]| {
             part.chunks_exact(token_bytes).all(|token| {
                 let (param, feature) = if token_bytes == 8 {
                     (u32_at(token, 0) as usize, u32_at(token, 4) as usize)
                 } else {
                     (usize::from(u16_at(token, 0)), u32_at(token, 2) as usize)
                 };
-                if param >= param_count || feature >= features_length {
-                    return false;
-                }
-                if starts.get(next_start) == Some(&(feature as u32)) {
-                    next_start += 1;
-                    return true;
-                }
-                starts.binary_search(&(feature as u32)).is_ok()
+                param < param_count && checked.is_record(feature)
             })
         };
         let reason = "a token has a parameter set or a feature that does not exist";
-        source.chunks(TOKENS, token_bytes, &mut valid_tokens, reason)?;
-        source.chunks(UNKNOWN_TOKENS, token_bytes, &mut valid_tokens, reason)?;
-        drop(starts);
+        source.chunks(TOKENS, token_bytes, valid_tokens, reason)?;
+        source.chunks(UNKNOWN_TOKENS, token_bytes, valid_tokens, reason)?;
         let unknown_starts = source.read_all(UNKNOWN_STARTS)?;
         let unknown_starts: Vec<u32> = unknown_starts
             .as_chunks::<4>()
@@ -383,6 +378,8 @@ impl PackedDictionary {
             unknown_feature: (unknown_length > 0)
                 .then(|| dicrc_start + bos_length..dicrc_start + bos_length + unknown_length),
             ascii: [0; 128],
+            features: checked.layout.moved(sections[FEATURES].start),
+            numbers: checked.specs.into(),
             sections,
         };
         dictionary.ascii = std::array::from_fn(|byte| dictionary.code_of(char::from(byte as u8)));
@@ -478,16 +475,36 @@ impl PackedDictionary {
         range.map(move |index| view.token_at(bytes, index))
     }
 
-    pub fn feature(&self, offset: u32) -> &str {
-        let area = &self.map[self.sections[FEATURES].clone()];
-        let area = unsafe { str::from_utf8_unchecked(area) };
-        let rest = area
-            .get(offset as usize..)
-            .expect("feature offset is outside the feature area");
-        let length = rest
-            .find('\0')
-            .expect("open checked that the features end with a NUL byte");
-        &rest[..length]
+    #[inline]
+    pub(crate) fn feature_view(&self) -> FeatureView<'_> {
+        let layout = &self.features;
+        let map = &self.map[..];
+        FeatureView {
+            template_offsets: &map[layout.template_offsets.clone()],
+            templates: &map[layout.templates.clone()],
+            shape_offsets: &map[layout.shape_offsets.clone()],
+            shapes: &map[layout.shapes.clone()],
+            lo: &map[layout.lo.clone()],
+            strings: &map[layout.strings.clone()],
+            records: &map[layout.records.clone()],
+            specs: &self.numbers,
+            template_bits: layout.template_bits,
+            shape_bits: layout.shape_bits,
+            ref_bits: layout.ref_bits,
+        }
+    }
+
+    #[inline]
+    pub fn write_feature(&self, offset: u32, out: &mut String) {
+        self.feature_view()
+            .emit(offset, out)
+            .expect("writing to a string does not fail");
+    }
+
+    pub fn feature_string(&self, offset: u32) -> String {
+        let mut out = String::new();
+        self.write_feature(offset, &mut out);
+        out
     }
 
     pub fn matrix_bytes(&self) -> &[u8] {
@@ -683,97 +700,6 @@ impl PackedView<'_> {
             feature,
         }
     }
-}
-
-fn check_features(source: &Source, length: usize) -> Result<Vec<u32>, Error> {
-    let threads = if length < PARALLEL_MIN_BYTES {
-        1
-    } else {
-        thread::available_parallelism().map_or(1, |count| count.get().min(MAX_CHECK_THREADS))
-    };
-    let mut bounds = vec![0];
-    for part in 1..threads {
-        bounds.push(next_boundary(source, length / threads * part, length)?);
-    }
-    bounds.push(length);
-    let results: Vec<Result<Vec<u32>, Error>> = thread::scope(|scope| {
-        let handles: Vec<_> = bounds
-            .windows(2)
-            .filter(|pair| pair[0] < pair[1])
-            .map(|pair| {
-                let (begin, end) = (pair[0], pair[1]);
-                scope.spawn(move || check_feature_range(source, begin..end, length))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().expect("a check thread panicked"))
-            .collect()
-    });
-    let parts = results.into_iter().collect::<Result<Vec<_>, _>>()?;
-    let mut starts =
-        Vec::with_capacity(usize::from(length > 0) + parts.iter().map(Vec::len).sum::<usize>());
-    if length > 0 {
-        starts.push(0);
-    }
-    for part in parts {
-        starts.extend(part);
-    }
-    Ok(starts)
-}
-
-fn next_boundary(source: &Source, from: usize, length: usize) -> Result<usize, Error> {
-    let mut buffer = vec![0u8; 4096];
-    let mut at = from.saturating_sub(1);
-    while at < length {
-        let part = buffer.len().min(length - at);
-        source.read(FEATURES, at, &mut buffer[..part])?;
-        if let Some(found) = buffer[..part].iter().position(|&byte| byte == 0) {
-            return Ok(at + found + 1);
-        }
-        at += part;
-    }
-    Ok(length)
-}
-
-fn check_feature_range(
-    source: &Source,
-    range: Range<usize>,
-    length: usize,
-) -> Result<Vec<u32>, Error> {
-    let mut buffer = vec![0u8; FEATURE_CHUNK.min(range.len())];
-    let mut starts = Vec::new();
-    let mut carry = 0;
-    let mut done = range.start;
-    while done < range.end {
-        let part = FEATURE_CHUNK.min(range.end - done);
-        if buffer.len() < carry + part {
-            buffer.resize(carry + part, 0);
-        }
-        source.read(FEATURES, done, &mut buffer[carry..carry + part])?;
-        let filled = carry + part;
-        let base = done - carry;
-        let mut cut = 0;
-        for (at, &byte) in buffer[..filled].iter().enumerate() {
-            if byte == 0 {
-                cut = at + 1;
-                let start = base + cut;
-                if start < length && u32::try_from(start).is_ok() {
-                    starts.push(start as u32);
-                }
-            }
-        }
-        if str::from_utf8(&buffer[..cut]).is_err() {
-            return Err(source.broken("the features are not valid UTF-8"));
-        }
-        buffer.copy_within(cut..filled, 0);
-        carry = filled - cut;
-        done += part;
-    }
-    if carry != 0 {
-        return Err(source.broken("the features do not end with a NUL byte"));
-    }
-    Ok(starts)
 }
 
 fn check_cells(source: &Source, bytes: &[u8], token_count: usize) -> Result<(), Error> {

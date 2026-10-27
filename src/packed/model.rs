@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, Write};
 
+use super::features;
 use super::trie::{self, Entry};
 use super::{
     BLOCK_CODES, BLOCK_COUNT, CELLS, CHAR_BLOCKS, CHAR_INDEX, CHAR_TABLE, DICRC, FEATURES,
@@ -53,18 +54,6 @@ impl Runtime<'_> {
         }
         Ok(())
     }
-}
-
-pub(super) fn feature_starts(features: &[u8]) -> Vec<u32> {
-    let mut starts = Vec::new();
-    let mut start = 0;
-    for (at, &byte) in features.iter().enumerate() {
-        if byte == 0 {
-            starts.push(start as u32);
-            start = at + 1;
-        }
-    }
-    starts
 }
 
 fn le_bytes<T: Copy, const N: usize>(values: &[T], bytes: fn(T) -> [u8; N]) -> Vec<u8> {
@@ -120,7 +109,7 @@ impl Model {
         let cells = trie::build(&entries)?;
 
         let wide = self.params.len() > 1 << 16;
-        let starts = feature_starts(&self.features);
+        let encoded = features::encode::encode(&self.features)?;
         let mut sections: [Cow<[u8]>; SECTIONS] = Default::default();
         let (index, blocks) = char_map(&table);
         sections[CHAR_INDEX] = le_bytes(&index, u16::to_le_bytes).into();
@@ -130,8 +119,13 @@ impl Model {
             .flat_map(|unit| unit.iter().flat_map(|value| value.to_le_bytes()))
             .collect::<Vec<u8>>()
             .into();
-        sections[TOKENS] =
-            encode_tokens(&self.token_params, &self.token_features, &starts, wide).into();
+        sections[TOKENS] = encode_tokens(
+            &self.token_params,
+            &self.token_features,
+            &encoded.starts,
+            wide,
+        )
+        .into();
         sections[PARAMS] = self
             .params
             .iter()
@@ -144,10 +138,15 @@ impl Model {
             })
             .collect::<Vec<u8>>()
             .into();
-        sections[FEATURES] = Cow::Borrowed(&self.features);
+        sections[FEATURES] = encoded.bytes.into();
         sections[UNKNOWN_STARTS] = le_bytes(&self.unknown_starts, u32::to_le_bytes).into();
-        sections[UNKNOWN_TOKENS] =
-            encode_tokens(&self.unknown_params, &self.unknown_features, &starts, wide).into();
+        sections[UNKNOWN_TOKENS] = encode_tokens(
+            &self.unknown_params,
+            &self.unknown_features,
+            &encoded.starts,
+            wide,
+        )
+        .into();
         sections[MATRIX] = Cow::Borrowed(&self.matrix);
         sections[TEMPLATES] = Cow::Borrowed(&self.templates);
         sections[CHAR_TABLE] = Cow::Borrowed(&self.char_table);

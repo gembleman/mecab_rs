@@ -27,6 +27,7 @@ trait Engine {
 
 struct MecabRs<'d> {
     tagger: mecab_rs::Tagger<&'d mecab_rs::Dictionary>,
+    feature_buffer: String,
 }
 
 fn is_word(k: mecab_rs::NodeKind) -> bool {
@@ -50,7 +51,9 @@ impl Engine for MecabRs<'_> {
             if is_word(n.kind()) {
                 a.tokens += 1;
                 a.surface_bytes += n.surface().len() as u64;
-                a.feature_bytes += n.feature().len() as u64;
+                self.feature_buffer.clear();
+                n.feature().write_to(&mut self.feature_buffer);
+                a.feature_bytes += self.feature_buffer.len() as u64;
             }
         }
         a
@@ -363,8 +366,8 @@ fn main() {
             let mut d = mecab_rs::Dictionary::open(&o.dict).expect("open mecab_rs dictionary");
             d.set_max_grouping_size(o.max_grouping);
             let load_s = t.elapsed().as_secs_f64();
-            let mut es = MecabRs { tagger: mecab_rs::Tagger::new(&d) };
-            let mut ef = MecabRs { tagger: mecab_rs::Tagger::new(&d) };
+            let mut es = MecabRs { tagger: mecab_rs::Tagger::new(&d), feature_buffer: String::new() };
+            let mut ef = MecabRs { tagger: mecab_rs::Tagger::new(&d), feature_buffer: String::new() };
             report(&o, base, "mecab_rs 0.1.0", load_s, &lines, n_bytes, &mut es, &mut ef);
         }
         "vibrato" => {

@@ -1,4 +1,5 @@
 
+mod features;
 mod model;
 mod reader;
 mod source;
@@ -16,7 +17,7 @@ pub use reader::{Hit, PackedDictionary, PackedView, TokenRecord};
 pub use transport::{expand, write_transport};
 
 pub(crate) const MAGIC: &[u8; 8] = b"MRDPACK1";
-pub(crate) const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 2;
 pub(crate) const FLAG_WIDE_PARAMS: u32 = 1;
 pub(crate) const FLAG_HOT_MATRIX: u32 = 2;
 pub(crate) const FLAG_INT_TEMPLATES: u32 = 4;

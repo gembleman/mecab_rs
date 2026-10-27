@@ -5,6 +5,7 @@ use std::slice;
 use crate::constraint::{Constraint, ConstraintSet};
 use crate::dictionary::Dictionary;
 use crate::error::Error;
+use crate::feature_text::FeatureText;
 use crate::ids::NodeId;
 use crate::lattice::{Lattice, NodeSource, RawNode};
 
@@ -335,17 +336,21 @@ impl<'t, 'x> Node<'t, 'x> {
         self.raw.length_with_space as usize
     }
 
-    pub fn feature(&self) -> &'t str {
+    pub fn feature(&self) -> FeatureText<'t> {
         let dictionary = self.frame.dictionary;
         match self.raw.source {
-            NodeSource::System => dictionary.system.feature(self.raw.feature),
+            NodeSource::System => FeatureText::packed(&dictionary.system, self.raw.feature),
             NodeSource::User(index) => {
-                dictionary.users[usize::from(index)].feature(self.raw.feature)
+                FeatureText::text(dictionary.users[usize::from(index)].feature(self.raw.feature))
             }
-            NodeSource::Unknown => dictionary.unknown.feature(self.raw.feature),
-            NodeSource::UnknownFixed => dictionary.unknown_feature.as_deref().unwrap_or_default(),
-            NodeSource::Constrained => self.frame.constraints.feature_str(self.raw.feature),
-            NodeSource::Bos | NodeSource::Eos => &dictionary.bos_feature,
+            NodeSource::Unknown => FeatureText::packed(&dictionary.unknown, self.raw.feature),
+            NodeSource::UnknownFixed => {
+                FeatureText::text(dictionary.unknown_feature.as_deref().unwrap_or_default())
+            }
+            NodeSource::Constrained => {
+                FeatureText::text(self.frame.constraints.feature_str(self.raw.feature))
+            }
+            NodeSource::Bos | NodeSource::Eos => FeatureText::text(&dictionary.bos_feature),
         }
     }
 
