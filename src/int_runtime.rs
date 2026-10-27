@@ -5,6 +5,7 @@ use memmap2::{Mmap, MmapOptions};
 
 use crate::dictionary::map_file;
 use crate::error::Error;
+use crate::hot_shape::HotShape;
 use crate::int_templates::{
     MAGIC, MAX_COST_FACTOR, MAX_SHIFT, MappedIntTemplates, RuntimeInputs, int_cost,
 };
@@ -50,19 +51,15 @@ fn renumber(keys: impl Iterator<Item = u16>, count: usize, hot: usize) -> Renumb
 }
 
 impl MappedIntTemplates<Mmap> {
-    pub fn runtime_form(&self, hot_left: usize, hot_right: usize) -> Result<Vec<u8>, Error> {
+    pub fn runtime_form(&self, shape: &HotShape) -> Result<Vec<u8>, Error> {
         let inputs = self.runtime_inputs().ok_or(Error::Unsupported(
             "integer templates without clusters have no runtime form",
         ))?;
-        write_runtime(&inputs, hot_left, hot_right, MIN_SPARSE_GAIN)
+        write_runtime(&inputs, shape, MIN_SPARSE_GAIN)
     }
 }
 
-pub(crate) fn runtime_form_of(
-    bytes: &[u8],
-    hot_left: usize,
-    hot_right: usize,
-) -> Result<Vec<u8>, Error> {
+pub(crate) fn runtime_form_of(bytes: &[u8], shape: &HotShape) -> Result<Vec<u8>, Error> {
     let path = Path::new("matrix.itp");
     let io_error = |source| Error::Io {
         path: path.to_path_buf(),
@@ -74,19 +71,19 @@ pub(crate) fn runtime_form_of(
         .map_err(io_error)?;
     map[..bytes.len()].copy_from_slice(bytes);
     let map = map.make_read_only().map_err(io_error)?;
-    MappedIntTemplates::from_source(map, path)?.runtime_form(hot_left, hot_right)
+    MappedIntTemplates::from_source(map, path)?.runtime_form(shape)
 }
 
 fn write_runtime(
     inputs: &RuntimeInputs,
-    hot_left: usize,
-    hot_right: usize,
+    shape: &HotShape,
     min_sparse_gain: usize,
 ) -> Result<Vec<u8>, Error> {
     let (left_size, right_size) = (inputs.left_size, inputs.right_size);
-    if hot_left == 0 || hot_right == 0 || hot_left > left_size || hot_right > right_size {
+    if !shape.fits(left_size, right_size) {
         return Err(Error::Corrupt("the hot block lies outside of the matrix"));
     }
+    let (hot_left, hot_right) = shape.inscribed_rectangle();
     if left_size > usize::from(!ABOVE) {
         return Err(Error::Unsupported(
             "too many left ids for the exceptions of a runtime form",
@@ -106,7 +103,7 @@ fn write_runtime(
     let mut columns = Vec::new();
     for (&cell, &value) in inputs.exception_cells.iter().zip(inputs.exception_values) {
         let (row, column) = (cell as usize / left_size, cell as usize % left_size);
-        if row >= hot_right || column >= hot_left {
+        if !shape.contains(row, column) {
             let total: i64 = inputs
                 .shapes
                 .iter()

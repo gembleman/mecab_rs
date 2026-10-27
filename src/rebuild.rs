@@ -17,8 +17,8 @@ pub mod xz;
 
 pub use runtime::{RuntimeOptions, RuntimeReport, StatsSource, build_runtime};
 pub use templates::{
-    DEFAULT_HOT_LEFT, DEFAULT_HOT_RIGHT, MAX_HOT_THREADS, compile_templates, default_threads,
-    write_matrix_files,
+    DEFAULT_HOT_CELLS, DEFAULT_HOT_LEFT, DEFAULT_HOT_RIGHT, MAX_HOT_THREADS, compile_templates,
+    default_threads, write_matrix_files,
 };
 
 const CONTEXT_FILES: [&str; 2] = ["sys.dic", "unk.dic"];

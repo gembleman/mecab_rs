@@ -7,6 +7,7 @@ use crate::Error;
 use crate::build::text::key_value;
 use crate::char_property::CharProperty;
 use crate::char_table::CHAR_TABLE_FILE;
+use crate::hot_shape::HotShape;
 use crate::int_templates::MappedIntTemplates;
 use crate::system_dictionary::{
     DictionaryKind, HEADER_SIZE, SystemDictionary, TOKEN_SIZE, TokenRecord,
@@ -193,28 +194,27 @@ pub(super) fn read_dictionary(directory: &Path) -> Result<Model, Error> {
     } else {
         Vec::new()
     };
-    let size = |at: usize| {
-        matrix
-            .get(at..at + 2)
-            .map(|pair| usize::from(u16::from_le_bytes([pair[0], pair[1]])))
-    };
-    let (Some(left_size), Some(right_size)) = (size(0), size(2)) else {
-        return Err(broken(&matrix_path, "the file is shorter than its header"));
-    };
-    let expected_length = if hot {
-        let (Some(hot_left), Some(hot_right)) = (size(4), size(6)) else {
+    let (left_size, right_size) = if hot {
+        let (left_size, right_size, _) =
+            HotShape::parse(&matrix).map_err(|reason| broken(&matrix_path, reason))?;
+        (left_size, right_size)
+    } else {
+        let size = |at: usize| {
+            matrix
+                .get(at..at + 2)
+                .map(|pair| usize::from(u16::from_le_bytes([pair[0], pair[1]])))
+        };
+        let (Some(left_size), Some(right_size)) = (size(0), size(2)) else {
             return Err(broken(&matrix_path, "the file is shorter than its header"));
         };
-        8 + hot_left * hot_right * 2
-    } else {
-        4 + left_size * right_size * 2
+        if left_size == 0 || right_size == 0 || 4 + left_size * right_size * 2 != matrix.len() {
+            return Err(broken(
+                &matrix_path,
+                "the file size does not match the header",
+            ));
+        }
+        (left_size, right_size)
     };
-    if left_size == 0 || right_size == 0 || expected_length != matrix.len() {
-        return Err(broken(
-            &matrix_path,
-            "the file size does not match the header",
-        ));
-    }
     if hot && integer_templates {
         let mapped = MappedIntTemplates::open(&templates_path)?;
         if mapped.left_size() != left_size || mapped.right_size() != right_size {

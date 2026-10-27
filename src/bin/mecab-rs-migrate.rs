@@ -32,7 +32,7 @@ dictionary rebuilding:
   mecab-rs-migrate templates <source-dir> <dict-dir> [--id-defs <dir>] [--hot L R] [--threads N]
       Compiles the connection templates of <source-dir> (feature.def, model.def, dicrc) for
       the id definitions in <id-defs-dir> (default: <source-dir>) and writes matrix.tpl and
-      matrix.hot into <dict-dir>. The hot block defaults to 7104 x 4992 (clamped).
+      matrix.hot into <dict-dir>. The hot block defaults to 4480 x 3136 (clamped).
   mecab-rs-migrate check-templates <source-dir> <matrix.bin> [--id-defs <dir>] [--threads N]
       Compiles the templates like `templates` and compares the cost of every cell with the
       dense matrix.bin; exits with an error at the first mismatch.
@@ -57,8 +57,15 @@ dictionary rebuilding:
       Writes the runtime form of matrix.itp (what pack puts into the .mrd file) for the hot block
       of matrix.hot, and compares every cell outside of the hot block with matrix.itp and, if
       given, with the dense matrix.bin.
+  mecab-rs-migrate pair-stats <mrd> <corpus>... -o <file>                  (feature pair-stats)
+      Parses every line of the corpora with max grouping size 10 and writes how often the lattice
+      asked for each (right node left id, left node right id) pair of the hot matrix as records
+      of row u16, column u16, count u32 (little endian), for rebuild --pairs.
+  mecab-rs-migrate pair-cover <matrix.hot> <pairs>
+      Prints how many of the lookups counted in <pairs> fall inside the hot part of <matrix.hot>.
   mecab-rs-migrate rebuild <unidic-full-dir> <out-dir> (--stats <dir> | --corpus <file>...)
-                         [--keep <fields>] [--hot L R] [--threads N] [--int [--shift N]]
+                         [--keep <fields>] [--threads N] [--int [--shift N]]
+                         [--hot L R | --pairs <file> [--hot-cells N]]
                          [--xz] [--matrix-bin]
       One-shot build of the runtime files only (dicrc, char.bin, char.uni, license/, sys.dic,
       unk.dic, left-id.def, right-id.def, right.tsv, left.tsv, matrix.tpl, matrix.hot): renumbers
@@ -66,7 +73,8 @@ dictionary rebuilding:
       templates instead of writing matrix.bin. --int writes the integer templates matrix.itp
       (grid 2^-20 unless --shift, every cell exact, about half of matrix.tpl) in place of
       matrix.tpl. --xz also writes matrix.xz (feature xz), --matrix-bin the permuted dense
-      matrix.bin.";
+      matrix.bin. --hot L R makes the hot part a rectangle; --pairs with --hot-cells N makes it a
+      staircase of at most N cells (default 14,000,000) whose row lengths follow the pair counts.";
 
 type Args = [std::ffi::OsString];
 
@@ -170,6 +178,7 @@ struct MatrixArgs {
     corpora: Vec<PathBuf>,
     keep: Option<rebuild::Keep>,
     hot: Option<(usize, usize)>,
+    hot_cells: Option<usize>,
     threads: Option<usize>,
     xz: bool,
     int: bool,
@@ -226,6 +235,9 @@ fn parse_matrix_args(command: &str, args: &[std::ffi::OsString]) -> Result<Matri
             Some("--hot") => {
                 let left = number(iterator.next(), "--hot")?;
                 parsed.hot = Some((left, number(iterator.next(), "--hot")?));
+            }
+            Some("--hot-cells") => {
+                parsed.hot_cells = Some(number(iterator.next(), "--hot-cells")?);
             }
             Some("--threads") => parsed.threads = Some(number(iterator.next(), "--threads")?),
             Some("--shift") => {
@@ -324,6 +336,44 @@ fn positional<'a, const COUNT: usize>(
         .map_err(|_| format!("{command}: expected {usage}"))
 }
 
+fn rectangle_of(parsed: &MatrixArgs) -> Option<mecab_rs::HotShape> {
+    parsed
+        .hot
+        .map(|(left, right)| mecab_rs::HotShape::rectangle(left, right))
+}
+
+fn read_pair_counts(path: &Path) -> Result<Vec<mecab_rs::PairCount>, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let (chunks, rest) = bytes.as_chunks::<{ mecab_rs::PAIR_COUNT_BYTES }>();
+    if !rest.is_empty() {
+        return Err(format!("{}: not a list of pair counts", path.display()));
+    }
+    Ok(chunks
+        .iter()
+        .map(|&chunk| mecab_rs::PairCount::from_bytes(chunk))
+        .collect())
+}
+
+fn hot_shape_of(parsed: &MatrixArgs) -> Result<Option<mecab_rs::HotShape>, String> {
+    match (&parsed.pairs, parsed.hot_cells, parsed.hot) {
+        (Some(pairs), cells, None) => {
+            let cells = cells.unwrap_or(rebuild::DEFAULT_HOT_CELLS);
+            let shape = mecab_rs::HotShape::from_pair_counts(&read_pair_counts(pairs)?, cells);
+            println!(
+                "hot shape from pair counts: {} cells in {} rows, inscribed rectangle {:?}",
+                shape.cells(),
+                shape.rows(),
+                shape.inscribed_rectangle()
+            );
+            Ok(Some(shape))
+        }
+        (None, None, hot) => {
+            Ok(hot.map(|(left, right)| mecab_rs::HotShape::rectangle(left, right)))
+        }
+        _ => Err("rebuild: give --pairs <file> with --hot-cells <N>, or --hot L R".into()),
+    }
+}
+
 fn threads_of(parsed: &MatrixArgs) -> usize {
     parsed.threads.unwrap_or_else(rebuild::default_threads)
 }
@@ -334,8 +384,13 @@ fn templates(args: &Args, start: Instant) -> Result<(), String> {
     let templates = compile(source, parsed.id_defs.as_deref())?;
     println!("compiled in {:.2} s", start.elapsed().as_secs_f64());
     std::fs::create_dir_all(dictionary).map_err(|error| error.to_string())?;
-    rebuild::write_matrix_files(&templates, dictionary, parsed.hot, threads_of(&parsed))
-        .map_err(shown)
+    rebuild::write_matrix_files(
+        &templates,
+        dictionary,
+        rectangle_of(&parsed),
+        threads_of(&parsed),
+    )
+    .map_err(shown)
 }
 
 fn check_templates_command(args: &Args, start: Instant) -> Result<(), String> {
@@ -401,8 +456,14 @@ fn unpack_int(args: &Args) -> Result<(), String> {
     let [pack, id_defs, dictionary] =
         positional("unpack-int", &parsed, "<file.xz> <id-defs-dir> <dict-dir>")?;
     std::fs::create_dir_all(dictionary).map_err(|error| error.to_string())?;
-    rebuild::int_matrix::unpack_int(pack, id_defs, dictionary, parsed.hot, threads_of(&parsed))
-        .map_err(shown)
+    rebuild::int_matrix::unpack_int(
+        pack,
+        id_defs,
+        dictionary,
+        rectangle_of(&parsed),
+        threads_of(&parsed),
+    )
+    .map_err(shown)
 }
 
 #[cfg(feature = "xz")]
@@ -485,14 +546,10 @@ fn runtime_int(args: &Args) -> Result<(), String> {
     let parsed = parse_matrix_args("runtime-int", args)?;
     let [itp, hot, out] = positional("runtime-int", &parsed, "<matrix.itp> <matrix.hot> <out>")?;
     let ints = mecab_rs::MappedIntTemplates::open(itp).map_err(shown)?;
-    let header = std::fs::read(hot).map_err(|error| format!("{}: {error}", hot.display()))?;
-    let size = |at: usize| {
-        header
-            .get(at..at + 2)
-            .map(|pair| usize::from(u16::from_le_bytes([pair[0], pair[1]])))
-            .ok_or_else(|| format!("{}: shorter than its header", hot.display()))
-    };
-    let bytes = ints.runtime_form(size(4)?, size(6)?).map_err(shown)?;
+    let matrix = std::fs::read(hot).map_err(|error| format!("{}: {error}", hot.display()))?;
+    let (_, _, shape) = mecab_rs::HotShape::parse(&matrix)
+        .map_err(|reason| format!("{}: {reason}", hot.display()))?;
+    let bytes = ints.runtime_form(&shape).map_err(shown)?;
     std::fs::write(out, &bytes).map_err(|error| format!("{}: {error}", out.display()))?;
     println!("wrote {} bytes", bytes.len());
     Ok(())
@@ -669,6 +726,81 @@ fn bench_cold(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "pair-stats")]
+fn pair_stats(args: &Args) -> Result<(), String> {
+    const STATS_MAX_GROUPING: usize = 10;
+    let mut output = None;
+    let mut inputs: Vec<PathBuf> = Vec::new();
+    let mut iterator = args.iter();
+    while let Some(argument) = iterator.next() {
+        if argument == "-o" {
+            output = Some(PathBuf::from(
+                iterator.next().ok_or("pair-stats: -o needs a file")?,
+            ));
+        } else {
+            inputs.push(argument.into());
+        }
+    }
+    let output = output.ok_or("pair-stats: give the output file with -o")?;
+    let Some((runtime, corpora)) = inputs.split_first().filter(|(_, rest)| !rest.is_empty()) else {
+        return Err("pair-stats: expected <mrd> <corpus>... -o <file>".into());
+    };
+    let mut dictionary = mecab_rs::Dictionary::open(runtime).map_err(shown)?;
+    dictionary.set_max_grouping_size(STATS_MAX_GROUPING);
+    let mut tagger = mecab_rs::Tagger::new(&dictionary);
+    let mut sentences = 0usize;
+    for corpus in corpora {
+        let bytes =
+            std::fs::read(corpus).map_err(|error| format!("{}: {error}", corpus.display()))?;
+        let text =
+            std::str::from_utf8(&bytes).map_err(|_| format!("{}: not UTF-8", corpus.display()))?;
+        for line in text.split_terminator('\n') {
+            let sentence = line.strip_suffix('\r').unwrap_or(line);
+            tagger.parse(sentence).map_err(shown)?;
+            sentences += 1;
+        }
+    }
+    let pairs = mecab_rs::pair_stats::take();
+    let mut bytes = Vec::with_capacity(pairs.len() * mecab_rs::PAIR_COUNT_BYTES);
+    for pair in &pairs {
+        bytes.extend_from_slice(&pair.to_bytes());
+    }
+    std::fs::write(&output, &bytes).map_err(|error| format!("{}: {error}", output.display()))?;
+    println!(
+        "{sentences} sentences, {} distinct pairs, {} lookups -> {}",
+        pairs.len(),
+        pairs.iter().map(|pair| u64::from(pair.count)).sum::<u64>(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn pair_cover(args: &Args) -> Result<(), String> {
+    let [hot, pairs] = match args {
+        [hot, pairs] => [Path::new(hot), Path::new(pairs)],
+        _ => return Err("pair-cover: expected <matrix.hot> <pairs>".into()),
+    };
+    let matrix = std::fs::read(hot).map_err(|error| format!("{}: {error}", hot.display()))?;
+    let (_, _, shape) = mecab_rs::HotShape::parse(&matrix)
+        .map_err(|reason| format!("{}: {reason}", hot.display()))?;
+    let (mut inside, mut outside) = (0u64, 0u64);
+    for pair in read_pair_counts(pairs)? {
+        let count = u64::from(pair.count);
+        if shape.contains(usize::from(pair.row), usize::from(pair.column)) {
+            inside += count;
+        } else {
+            outside += count;
+        }
+    }
+    println!(
+        "{} cells in {} rows: {inside} lookups inside, {outside} outside ({:.2}%)",
+        shape.cells(),
+        shape.rows(),
+        outside as f64 * 100.0 / (inside + outside).max(1) as f64
+    );
+    Ok(())
+}
+
 fn rebuild_command(args: &Args) -> Result<(), String> {
     let parsed = parse_matrix_args("rebuild", args)?;
     let [source, out] = positional("rebuild", &parsed, "<unidic-full-dir> <out-dir>")?;
@@ -682,7 +814,7 @@ fn rebuild_command(args: &Args) -> Result<(), String> {
         out,
         stats,
         keep: parsed.keep.clone(),
-        hot: parsed.hot,
+        hot: hot_shape_of(&parsed)?,
         threads: threads_of(&parsed),
         int_shift: match parsed.shifts.as_deref() {
             _ if !parsed.int => None,
@@ -733,7 +865,7 @@ fn unpack_matrix(args: &Args) -> Result<(), String> {
     let parsed = parse_matrix_args("unpack-matrix", args)?;
     let [pack, dictionary] = positional("unpack-matrix", &parsed, "<file.xz> <dict-dir>")?;
     std::fs::create_dir_all(dictionary).map_err(|error| error.to_string())?;
-    rebuild::xz::unpack(pack, dictionary, parsed.hot, threads_of(&parsed)).map_err(shown)
+    rebuild::xz::unpack(pack, dictionary, rectangle_of(&parsed), threads_of(&parsed)).map_err(shown)
 }
 
 fn run() -> Result<(), String> {
@@ -762,6 +894,13 @@ fn run() -> Result<(), String> {
             #[cfg(feature = "xz")]
             "check-int" => check_int(args, start),
             "bench-cold" => bench_cold(args),
+            "pair-cover" => pair_cover(args),
+            #[cfg(feature = "pair-stats")]
+            "pair-stats" => pair_stats(args),
+            #[cfg(not(feature = "pair-stats"))]
+            "pair-stats" => Err(format!(
+                "{command}: this build has no pair counting; build with --features pair-stats"
+            )),
             "runtime-int" => runtime_int(args),
             "check-runtime-int" => check_runtime_int(args),
             #[cfg(not(feature = "xz"))]

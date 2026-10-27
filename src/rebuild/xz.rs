@@ -5,7 +5,7 @@ use lzma_rust2::{XzOptions, XzReader, XzWriter};
 
 use super::{bad, io_error, write_matrix_files};
 use crate::build::write_file;
-use crate::{ConnectionTemplates, Error, TemplatePart};
+use crate::{ConnectionTemplates, Error, HotShape, TemplatePart};
 
 const MAGIC: &[u8; 4] = b"MRCT";
 const VERSION: u32 = 2;
@@ -379,7 +379,7 @@ fn read_pack(path: &Path) -> Result<ConnectionTemplates, Error> {
 pub fn unpack(
     pack: &Path,
     dict_dir: &Path,
-    hot: Option<(usize, usize)>,
+    hot: Option<HotShape>,
     threads: usize,
 ) -> Result<(), Error> {
     let templates = read_pack(pack)?;

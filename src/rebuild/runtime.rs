@@ -5,7 +5,7 @@ use super::templates::{compile_templates, write_matrix_files};
 use super::{
     ContextStats, Keep, Renumbering, SlimReport, collect_stats, copy_entries, prepare_output,
 };
-use crate::{CharTable, Error};
+use crate::{CharTable, Error, HotShape};
 
 pub enum StatsSource<'a> {
     Directory(&'a Path),
@@ -17,7 +17,7 @@ pub struct RuntimeOptions<'a> {
     pub out: &'a Path,
     pub stats: StatsSource<'a>,
     pub keep: Option<Keep>,
-    pub hot: Option<(usize, usize)>,
+    pub hot: Option<HotShape>,
     pub threads: usize,
     pub int_shift: Option<u32>,
     pub xz: bool,
@@ -76,10 +76,10 @@ pub fn build_runtime(
     progress("compile templates");
     if let Some(shift) = options.int_shift {
         let int = exact_int_templates(&templates, shift, options.threads, out)?;
-        write_int_files(&int, out, options.hot, options.threads)?;
+        write_int_files(&int, out, options.hot.clone(), options.threads)?;
         progress("matrix.itp, matrix.hot");
     } else {
-        write_matrix_files(&templates, out, options.hot, options.threads)?;
+        write_matrix_files(&templates, out, options.hot.clone(), options.threads)?;
         progress("matrix.tpl, matrix.hot");
     }
 

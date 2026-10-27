@@ -11,6 +11,7 @@ use memmap2::Mmap;
 use crate::clusters::{ClusterPlan, plan_projection_clusters, representatives};
 use crate::dictionary::map_file;
 use crate::error::Error;
+use crate::hot_shape::HotShape;
 use crate::section::{Section, SectionSource};
 use crate::templates::{TemplateReader, write_array};
 
@@ -323,21 +324,12 @@ impl IntView<'_> {
 
     pub(crate) fn write_hot_matrix(
         &self,
-        hot_left: usize,
-        hot_right: usize,
+        shape: &HotShape,
         threads: usize,
         output: &mut impl Write,
     ) -> io::Result<()> {
-        if hot_left > self.left_size || hot_right > self.right_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the hot block exceeds the matrix",
-            ));
-        }
-        for size in [self.left_size, self.right_size, hot_left, hot_right] {
-            output.write_all(&(size as u16).to_le_bytes())?;
-        }
-        let blocks = hot_right.div_ceil(ROWS_PER_BLOCK);
+        shape.write_header(self.left_size, self.right_size, output)?;
+        let blocks = shape.rows().div_ceil(ROWS_PER_BLOCK);
         let next_block = AtomicUsize::new(0);
         let (sender, receiver) = mpsc::sync_channel::<(usize, Vec<u8>)>(threads.max(1) * 2);
         thread::scope(|scope| {
@@ -353,11 +345,15 @@ impl IntView<'_> {
                             break;
                         }
                         let first = block * ROWS_PER_BLOCK;
-                        let last = (first + ROWS_PER_BLOCK).min(hot_right);
-                        let mut bytes = Vec::with_capacity((last - first) * hot_left * 2);
+                        let last = (first + ROWS_PER_BLOCK).min(shape.rows());
+                        let mut bytes = Vec::new();
                         for row in first..last {
+                            let length = shape.row_length(row);
+                            if length == 0 {
+                                continue;
+                            }
                             self.render_row(row, &mut scratch, &mut row_costs);
-                            for cost in &row_costs[..hot_left] {
+                            for cost in &row_costs[..length] {
                                 bytes.extend_from_slice(&cost.to_le_bytes());
                             }
                         }
@@ -500,13 +496,11 @@ impl IntTemplates {
 
     pub fn write_hot_matrix(
         &self,
-        hot_left: usize,
-        hot_right: usize,
+        shape: &HotShape,
         threads: usize,
         output: &mut impl Write,
     ) -> io::Result<()> {
-        self.view()
-            .write_hot_matrix(hot_left, hot_right, threads, output)
+        self.view().write_hot_matrix(shape, threads, output)
     }
 
     pub fn visit_rows(&self, first: usize, end: usize, mut visit: impl FnMut(usize, &[i16])) {

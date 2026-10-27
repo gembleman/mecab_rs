@@ -10,7 +10,7 @@ use super::io_error;
 use super::templates::{UniverseSide, read_bigrams, universe_projections};
 use crate::dictionary::map_file;
 use crate::templates::ExactRows;
-use crate::{ConnectionTemplates, Error, IntPart, IntTemplates};
+use crate::{ConnectionTemplates, Error, HotShape, IntPart, IntTemplates};
 
 const MAGIC: &[u8; 4] = b"MRIT";
 const VERSION: u32 = 1;
@@ -764,21 +764,18 @@ pub fn exact_int_templates(
 pub fn write_int_files(
     templates: &IntTemplates,
     dict_dir: &Path,
-    hot: Option<(usize, usize)>,
+    hot: Option<HotShape>,
     threads: usize,
 ) -> Result<(), Error> {
     use crate::build::write_file;
-    let (hot_left, hot_right) = hot.unwrap_or((super::DEFAULT_HOT_LEFT, super::DEFAULT_HOT_RIGHT));
-    let (hot_left, hot_right) = (
-        hot_left.min(templates.left_size()),
-        hot_right.min(templates.right_size()),
-    );
+    let shape =
+        super::templates::hot_shape_or_default(hot, templates.left_size(), templates.right_size());
     super::templates::remove_stale(dict_dir, "matrix.tpl")?;
     write_file(&dict_dir.join("matrix.itp"), |writer| {
         templates.write_templates(writer)
     })?;
     write_file(&dict_dir.join("matrix.hot"), |writer| {
-        templates.write_hot_matrix(hot_left, hot_right, threads, writer)
+        templates.write_hot_matrix(&shape, threads, writer)
     })
 }
 
@@ -787,7 +784,7 @@ pub fn unpack_int(
     pack: &Path,
     id_defs: &Path,
     dict_dir: &Path,
-    hot: Option<(usize, usize)>,
+    hot: Option<HotShape>,
     threads: usize,
 ) -> Result<(), Error> {
     let read = |name: &str| {

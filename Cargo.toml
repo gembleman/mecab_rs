@@ -16,6 +16,7 @@ lzma-rust2 = { version = "0.19", default-features = false, features = ["std", "e
 
 [features]
 xz = ["dep:lzma-rust2"]
+pair-stats = []
 
 [profile.release]
 incremental = true

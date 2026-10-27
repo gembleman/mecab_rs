@@ -6,10 +6,11 @@ use std::thread;
 
 use super::{bad, io_error, read_file};
 use crate::build::write_file;
-use crate::{ConnectionTemplates, Error, TemplatePart};
+use crate::{ConnectionTemplates, Error, HotShape, TemplatePart};
 
-pub const DEFAULT_HOT_LEFT: usize = 7104;
-pub const DEFAULT_HOT_RIGHT: usize = 4992;
+pub const DEFAULT_HOT_LEFT: usize = 4480;
+pub const DEFAULT_HOT_RIGHT: usize = 3136;
+pub const DEFAULT_HOT_CELLS: usize = 14_000_000;
 pub const MAX_HOT_THREADS: usize = 8;
 
 const MODEL_HEADER_LINES: usize = 7;
@@ -437,22 +438,27 @@ pub(super) fn universe_projections(
         .collect()
 }
 
+pub(super) fn hot_shape_or_default(
+    hot: Option<HotShape>,
+    left_size: usize,
+    right_size: usize,
+) -> HotShape {
+    hot.unwrap_or_else(|| HotShape::rectangle(DEFAULT_HOT_LEFT, DEFAULT_HOT_RIGHT))
+        .clamped(left_size, right_size)
+}
+
 pub fn write_matrix_files(
     templates: &ConnectionTemplates,
     dict_dir: &Path,
-    hot: Option<(usize, usize)>,
+    hot: Option<HotShape>,
     threads: usize,
 ) -> Result<(), Error> {
-    let (hot_left, hot_right) = hot.unwrap_or((DEFAULT_HOT_LEFT, DEFAULT_HOT_RIGHT));
-    let (hot_left, hot_right) = (
-        hot_left.min(templates.left_size()),
-        hot_right.min(templates.right_size()),
-    );
+    let shape = hot_shape_or_default(hot, templates.left_size(), templates.right_size());
     remove_stale(dict_dir, INT_TEMPLATE_FILE)?;
     write_file(&dict_dir.join(TEMPLATE_FILE), |writer| {
         templates.write_templates(writer)
     })?;
     write_file(&dict_dir.join(HOT_FILE), |writer| {
-        templates.write_hot_matrix(hot_left, hot_right, threads, writer)
+        templates.write_hot_matrix(&shape, threads, writer)
     })
 }

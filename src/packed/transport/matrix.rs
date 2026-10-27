@@ -2,6 +2,7 @@ use std::path::Path;
 
 use super::{Part, Parts, bad, io_error, work_directory};
 use crate::Error;
+use crate::hot_shape::HotShape;
 use crate::packed::model::Model;
 
 const ENCODING_DENSE_DELTA: u32 = 1;
@@ -30,7 +31,7 @@ fn row_delta(matrix: &[u8], encode: bool) -> Vec<u8> {
     out
 }
 
-fn regenerate(xz: &[u8], hot: (usize, usize), next_to: &Path) -> Result<(Vec<u8>, Vec<u8>), Error> {
+fn regenerate(xz: &[u8], hot: &HotShape, next_to: &Path) -> Result<(Vec<u8>, Vec<u8>), Error> {
     let directory = work_directory(next_to);
     std::fs::create_dir_all(&directory).map_err(io_error(&directory))?;
     let run = || {
@@ -39,7 +40,7 @@ fn regenerate(xz: &[u8], hot: (usize, usize), next_to: &Path) -> Result<(Vec<u8>
         crate::rebuild::xz::unpack(
             &pack,
             &directory,
-            Some(hot),
+            Some(hot.clone()),
             crate::rebuild::default_threads(),
         )?;
         let hot_path = directory.join("matrix.hot");
@@ -134,10 +135,8 @@ pub(in crate::packed) fn encode(dict_dir: &Path, model: &Model, out: &Path) -> R
             bytes,
         });
     }
-    let hot = (
-        usize::from(u16::from_le_bytes([model.matrix[4], model.matrix[5]])),
-        usize::from(u16::from_le_bytes([model.matrix[6], model.matrix[7]])),
-    );
+    let (_, _, hot) = HotShape::parse(&model.matrix)
+        .map_err(|reason| bad(&dict_dir.join("matrix.hot"), reason))?;
     let existing = dict_dir.join("matrix.xz");
     let xz = if existing.is_file() {
         std::fs::read(&existing).map_err(io_error(&existing))?
@@ -149,15 +148,17 @@ pub(in crate::packed) fn encode(dict_dir: &Path, model: &Model, out: &Path) -> R
         let _ = std::fs::remove_file(&pack);
         bytes?
     };
-    let (regenerated_hot, regenerated_templates) = regenerate(&xz, hot, out)?;
+    let (regenerated_hot, regenerated_templates) = regenerate(&xz, &hot, out)?;
     if regenerated_hot != model.matrix || regenerated_templates != model.templates {
         return Err(Error::Unsupported(
             "matrix.hot and matrix.tpl that matrix.xz does not regenerate",
         ));
     }
-    let mut bytes = Vec::with_capacity(xz.len() + 8);
-    bytes.extend_from_slice(&(hot.0 as u32).to_le_bytes());
-    bytes.extend_from_slice(&(hot.1 as u32).to_le_bytes());
+    let mut bytes = Vec::with_capacity(xz.len() + 4 + hot.rows() * 2);
+    bytes.extend_from_slice(&(hot.rows() as u32).to_le_bytes());
+    for &length in hot.lengths() {
+        bytes.extend_from_slice(&(length as u16).to_le_bytes());
+    }
     bytes.extend_from_slice(&xz);
     Ok(Part {
         name: "matrix",
@@ -187,12 +188,26 @@ pub(in crate::packed) fn decode(
             Ok((row_delta(bytes, false), Vec::new()))
         }
         (ENCODING_TEMPLATES_XZ, bytes) => {
-            let (Some(hot_left), Some(hot_right)) = (bytes.get(..4), bytes.get(4..8)) else {
+            let Some(rows) = bytes.get(..4) else {
                 return Err(corrupt("the matrix is too short"));
             };
-            let word = |word: &[u8]| u32::from_le_bytes(word.try_into().expect("four bytes"));
-            let hot = (word(hot_left) as usize, word(hot_right) as usize);
-            regenerate(&bytes[8..], hot, next_to)
+            let rows = u32::from_le_bytes(rows.try_into().expect("four bytes")) as usize;
+            let lengths_end = rows
+                .checked_mul(2)
+                .and_then(|length| length.checked_add(4))
+                .ok_or_else(|| corrupt("the hot rows are too many"))?;
+            let lengths = bytes
+                .get(4..lengths_end)
+                .ok_or_else(|| corrupt("the matrix is too short"))?;
+            let hot = HotShape::from_lengths(
+                lengths
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&length| u32::from(u16::from_le_bytes(length)))
+                    .collect(),
+            );
+            regenerate(&bytes[lengths_end..], &hot, next_to)
         }
         (ENCODING_INTEGER_TEMPLATES, bytes) => {
             let Some(length) = bytes.get(..8) else {

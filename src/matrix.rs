@@ -1,13 +1,13 @@
 use std::path::Path;
 
 use crate::error::Error;
+use crate::hot_shape::{HOT_HEADER_BYTES, HotShape};
 use crate::int_runtime::{RuntimeIntTemplates, is_runtime_form};
 use crate::mapped_bytes::MappedBytes;
 use crate::section::{Section, SectionSource};
 use crate::templates::MappedTemplates;
 
 const HEADER_BYTES: usize = 4;
-const HOT_HEADER_BYTES: usize = 8;
 const COST_BYTES: usize = 2;
 
 fn broken(path: &Path, reason: &'static str) -> Error {
@@ -83,10 +83,9 @@ impl<S: SectionSource> ColdPath<S> {
 
 pub(crate) struct HotMatrix<S = MappedBytes> {
     map: S,
+    row_starts: Section<u32>,
     costs: Section<i16>,
     templates: ColdPath<S>,
-    hot_left: usize,
-    hot_right: usize,
 }
 
 pub(crate) struct HotColumn<'m, S = MappedBytes> {
@@ -128,71 +127,65 @@ impl<'m, S: SectionSource> HotColumn<'m, S> {
 
 impl<S: SectionSource> HotMatrix<S> {
     fn from_source(map: S, templates: ColdPath<S>, path: &Path) -> Result<Self, Error> {
-        let [left_size, right_size, hot_left, hot_right] =
-            header_sizes(map.all_bytes(), path, HOT_HEADER_BYTES / 2)?;
+        let (left_size, right_size, shape) =
+            HotShape::parse(map.all_bytes()).map_err(|reason| broken(path, reason))?;
         if left_size != templates.left_size() || right_size != templates.right_size() {
             return Err(broken(
                 path,
                 "the hot matrix size does not match the templates",
             ));
         }
-        if hot_left == 0 || hot_right == 0 || hot_left > left_size || hot_right > right_size {
-            return Err(broken(path, "the hot block lies outside of the matrix"));
-        }
         if let ColdPath::Runtime(runtime) = &templates
-            && (runtime.hot_left(), runtime.hot_right()) != (hot_left, hot_right)
+            && !shape.contains_rectangle(runtime.hot_left(), runtime.hot_right())
         {
             return Err(broken(
                 path,
                 "the integer templates were made for another hot block",
             ));
         }
-        if HOT_HEADER_BYTES + hot_left * hot_right * COST_BYTES != map.all_bytes().len() {
-            return Err(broken(path, "the file size does not match the header"));
-        }
-        let costs = Section::new(map.all_bytes(), HOT_HEADER_BYTES..map.all_bytes().len())
+        let table_end = HotShape::header_bytes(shape.rows());
+        let row_starts = Section::new(map.all_bytes(), HOT_HEADER_BYTES..table_end)
+            .ok_or_else(|| broken(path, "the row starts are misaligned"))?;
+        let costs = Section::new(map.all_bytes(), table_end..map.all_bytes().len())
             .ok_or_else(|| broken(path, "the cost table is misaligned"))?;
         Ok(Self {
             map,
+            row_starts,
             costs,
             templates,
-            hot_left,
-            hot_right,
         })
-    }
-
-    pub(crate) fn hot_left(&self) -> usize {
-        self.hot_left
     }
 
     #[inline]
     pub(crate) fn view(&self) -> HotView<'_, S> {
+        let file = self.map.all_bytes();
         HotView {
-            costs: self.costs.view_source(&self.map),
+            row_starts: unsafe { self.row_starts.view_in(file) },
+            costs: unsafe { self.costs.view_in(file) },
             templates: &self.templates,
-            hot_left: self.hot_left,
-            hot_right: self.hot_right,
         }
     }
 }
 
 pub(crate) struct HotView<'m, S = MappedBytes> {
+    row_starts: &'m [u32],
     costs: &'m [i16],
     templates: &'m ColdPath<S>,
-    hot_left: usize,
-    hot_right: usize,
 }
 
 impl<'m, S: SectionSource> HotView<'m, S> {
     #[inline]
     pub(crate) fn right_column(&self, right_left_id: u16) -> HotColumn<'m, S> {
         let row = usize::from(right_left_id);
-        let cells = if row < self.hot_right {
-            debug_assert!((row + 1) * self.hot_left <= self.costs.len());
-            unsafe {
-                self.costs
-                    .get_unchecked(row * self.hot_left..(row + 1) * self.hot_left)
-            }
+        let cells = if row + 1 < self.row_starts.len() {
+            let (start, end) = unsafe {
+                (
+                    *self.row_starts.get_unchecked(row) as usize,
+                    *self.row_starts.get_unchecked(row + 1) as usize,
+                )
+            };
+            debug_assert!(start <= end && end <= self.costs.len());
+            unsafe { self.costs.get_unchecked(start..end) }
         } else {
             &[]
         };

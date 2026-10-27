@@ -17,6 +17,7 @@ use super::{
 use crate::char_table::{HEADER_BYTES as CHAR_TABLE_HEADER, MAGIC as CHAR_TABLE_MAGIC};
 use crate::dictionary::map_file;
 use crate::error::Error;
+use crate::hot_shape::HotShape;
 use crate::int_runtime::is_runtime_form;
 use crate::mapped_bytes::MappedBytes;
 use crate::section::Section;
@@ -29,7 +30,8 @@ const MAGIC_BYTES: usize = 8;
 const SECTION_TABLE_AT: usize = 40;
 const SECTION_ENTRY_BYTES: usize = 16;
 const MATRIX_HEADER_BYTES: usize = 4;
-const HOT_MATRIX_HEADER_BYTES: usize = 8;
+const HOT_ROWS_BYTES: usize = 4;
+const ROW_START_BYTES: usize = 4;
 
 pub type Hit = PrefixHit;
 
@@ -233,19 +235,25 @@ impl PackedDictionary {
         let right_size = usize::from(u16_at(&matrix_header, 2));
         let hot = flags & FLAG_HOT_MATRIX != 0;
         let integer_templates = flags & FLAG_INT_TEMPLATES != 0;
-        let (header_bytes, hot_cells) = if hot {
-            let mut hot_header = [0u8; MATRIX_HEADER_BYTES];
+        let expected_length = if hot {
+            let mut hot_header = [0u8; HOT_ROWS_BYTES];
             source.read(MATRIX, MATRIX_HEADER_BYTES, &mut hot_header)?;
-            let hot_left = usize::from(u16_at(&hot_header, 0));
-            let hot_right = usize::from(u16_at(&hot_header, 2));
-            if hot_left == 0 || hot_right == 0 || hot_left > left_size || hot_right > right_size {
+            let rows = u32_at(&hot_header, 0) as usize;
+            if rows == 0 || rows > right_size {
                 return Err(broken("the hot block lies outside of the matrix"));
             }
-            (HOT_MATRIX_HEADER_BYTES, hot_left * hot_right)
+            let mut last_start = [0u8; ROW_START_BYTES];
+            source.read(
+                MATRIX,
+                HotShape::header_bytes(rows) - ROW_START_BYTES,
+                &mut last_start,
+            )?;
+            let cells = u32::from_le_bytes(last_start) as usize;
+            HotShape::header_bytes(rows) + cells * 2
         } else {
-            (MATRIX_HEADER_BYTES, left_size * right_size)
+            MATRIX_HEADER_BYTES + left_size * right_size * 2
         };
-        if left_size == 0 || right_size == 0 || length(MATRIX) != header_bytes + hot_cells * 2 {
+        if left_size == 0 || right_size == 0 || length(MATRIX) != expected_length {
             return Err(broken("the matrix size does not match its header"));
         }
         if hot && integer_templates {

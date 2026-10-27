@@ -11,6 +11,7 @@ use memmap2::Mmap;
 use crate::clusters::{MappedClusters, plan_clusters, write_clusters};
 use crate::dictionary::map_file;
 use crate::error::Error;
+use crate::hot_shape::HotShape;
 use crate::mapped_bytes::MappedBytes;
 use crate::section::{Plain, Section, SectionSource};
 
@@ -476,19 +477,14 @@ impl ConnectionTemplates {
         write_clusters(&slices, &plans, self.left_size, self.right_size, output)
     }
 
-    fn render_block(
-        &self,
-        block: usize,
-        hot_left: usize,
-        hot_right: usize,
-        scratch: &mut RowScratch,
-    ) -> Vec<u8> {
+    fn render_block(&self, block: usize, shape: &HotShape, scratch: &mut RowScratch) -> Vec<u8> {
         let first = block * ROWS_PER_BLOCK;
-        let last = (first + ROWS_PER_BLOCK).min(hot_right);
-        let mut bytes = Vec::with_capacity((last - first) * hot_left * 2);
+        let last = (first + ROWS_PER_BLOCK).min(shape.rows());
+        let mut bytes = Vec::new();
         for right_left_id in first..last {
-            self.fill_row_sums(right_left_id, hot_left, scratch);
-            for sum in &scratch.row[..hot_left] {
+            let length = shape.row_length(right_left_id);
+            self.fill_row_sums(right_left_id, length, scratch);
+            for sum in &scratch.row[..length] {
                 bytes.extend_from_slice(&to_cost(*sum, self.cost_factor).to_le_bytes());
             }
         }
@@ -497,21 +493,12 @@ impl ConnectionTemplates {
 
     pub fn write_hot_matrix(
         &self,
-        hot_left: usize,
-        hot_right: usize,
+        shape: &HotShape,
         threads: usize,
         output: &mut impl Write,
     ) -> io::Result<()> {
-        if hot_left > self.left_size || hot_right > self.right_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the hot block exceeds the matrix",
-            ));
-        }
-        for size in [self.left_size, self.right_size, hot_left, hot_right] {
-            output.write_all(&(size as u16).to_le_bytes())?;
-        }
-        let blocks = hot_right.div_ceil(ROWS_PER_BLOCK);
+        shape.write_header(self.left_size, self.right_size, output)?;
+        let blocks = shape.rows().div_ceil(ROWS_PER_BLOCK);
         let next_block = AtomicUsize::new(0);
         let (sender, receiver) = mpsc::sync_channel::<(usize, Vec<u8>)>(threads.max(1) * 2);
         thread::scope(|scope| {
@@ -525,7 +512,7 @@ impl ConnectionTemplates {
                         if block >= blocks {
                             break;
                         }
-                        let bytes = self.render_block(block, hot_left, hot_right, &mut scratch);
+                        let bytes = self.render_block(block, shape, &mut scratch);
                         if sender.send((block, bytes)).is_err() {
                             break;
                         }

@@ -11,6 +11,7 @@ use super::{
     TEMPLATES, TOKENS, UNIT_BYTES, UNKNOWN_STARTS, UNKNOWN_TOKENS, VERSION,
 };
 use crate::Error;
+use crate::hot_shape::HotShape;
 use crate::int_runtime::{is_runtime_form, runtime_form_of};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -167,9 +168,11 @@ impl Model {
         .into();
         sections[MATRIX] = Cow::Borrowed(&self.matrix);
         sections[TEMPLATES] = if self.integer_templates && !is_runtime_form(&self.templates) {
-            let hot =
-                |at: usize| usize::from(u16::from_le_bytes([self.matrix[at], self.matrix[at + 1]]));
-            match runtime_form_of(&self.templates, hot(4), hot(6)) {
+            let (_, _, shape) = HotShape::parse(&self.matrix).map_err(|reason| Error::Format {
+                file: "matrix.hot".into(),
+                reason,
+            })?;
+            match runtime_form_of(&self.templates, &shape) {
                 Ok(bytes) => bytes.into(),
                 Err(Error::Unsupported(_)) => {
                     return Err(Error::Unsupported(

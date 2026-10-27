@@ -547,14 +547,20 @@ impl Lattice {
                 }
             }
             Matrix::PackedHot(hot) => {
-                let hot_left = hot.hot_left();
+                #[cfg(feature = "pair-stats")]
+                for node in &best_nodes[first..] {
+                    for left in lefts {
+                        crate::pair_stats::record(node.candidate.left_id, left.right_id);
+                    }
+                }
                 let hot = hot.view();
-                let lefts_are_hot = lefts
+                let widest = lefts
                     .iter()
-                    .all(|left| usize::from(left.right_id) < hot_left);
-                if lefts_are_hot {
-                    for node in &best_nodes[first..] {
-                        let cells = hot.right_column(node.candidate.left_id).cells();
+                    .fold(0, |widest, left| widest.max(left.right_id));
+                let reaches = |cells: &[i16]| cells.len() > usize::from(widest);
+                for node in &best_nodes[first..] {
+                    let cells = hot.right_column(node.candidate.left_id).cells();
+                    if reaches(cells) {
                         for left in lefts {
                             prefetch(cells.as_ptr().wrapping_add(usize::from(left.right_id)));
                         }
@@ -562,14 +568,14 @@ impl Lattice {
                 }
                 let mut next = best_nodes.len();
                 while next > first {
-                    if lefts_are_hot && next - first >= CONNECT_GROUP_SIZE {
+                    if next - first >= CONNECT_GROUP_SIZE {
                         let indices: [usize; CONNECT_GROUP_SIZE] =
                             std::array::from_fn(|lane| next - 1 - lane);
                         let columns = indices.map(|index| {
                             hot.right_column(best_nodes[index].candidate.left_id)
                                 .cells()
                         });
-                        if columns.iter().all(|cells| cells.len() == hot_left) {
+                        if columns.iter().all(|cells| reaches(cells)) {
                             let found = best_lefts(lefts, columns);
                             for (index, (cost, best)) in indices.into_iter().zip(found) {
                                 store_best(best_nodes, later_ends, position, index, cost, best);
@@ -581,7 +587,7 @@ impl Lattice {
                     next -= 1;
                     let column = hot.right_column(best_nodes[next].candidate.left_id);
                     let cells = column.cells();
-                    let (cost, best) = if lefts_are_hot && cells.len() == hot_left {
+                    let (cost, best) = if reaches(cells) {
                         let cost = |id: u16| unsafe { *cells.get_unchecked(usize::from(id)) };
                         best_left::<true>(lefts, cost)
                     } else {
@@ -744,16 +750,15 @@ impl Lattice {
                 }
             }
             Matrix::PackedHot(hot) => {
-                let hot_left = hot.hot_left();
                 let hot = hot.view();
-                let lefts_are_hot = lefts
+                let widest = lefts
                     .iter()
-                    .all(|left| usize::from(left.right_id) < hot_left);
+                    .fold(0, |widest, left| widest.max(left.right_id));
                 for right_index in newest_first(begun) {
                     let right_id = NodeId::from_index(right_index);
                     let column = hot.right_column(self.nodes[right_id].left_id);
                     let cells = column.cells();
-                    if lefts_are_hot && cells.len() == hot_left {
+                    if cells.len() > usize::from(widest) {
                         let cost = |left_right_id: u16| unsafe {
                             *cells.get_unchecked(usize::from(left_right_id))
                         };
