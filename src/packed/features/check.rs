@@ -4,7 +4,7 @@ use std::thread;
 
 use super::{
     HEADER_BYTES, Layout, MAX_NUMERIC, MAX_SLOTS, NumSpec, OP_COPY, OP_EMPTY, OP_HIGH, OP_INLINE,
-    OP_NUM, OP_REF, OP_STAR, RECORD_PADDING, SPEC_BYTES, SYNC_EVERY, find_byte, read_bits,
+    OP_KEY, OP_NUM, OP_REF, OP_STAR, RECORD_PADDING, SPEC_BYTES, SYNC_EVERY, find_byte, read_bits,
 };
 use crate::Error;
 use crate::packed::reader::Source;
@@ -142,7 +142,7 @@ pub(in crate::packed) fn check(source: &Source, section: usize) -> Result<Checke
         for &op in ops {
             match op {
                 OP_REF | OP_INLINE => slots = (slots + 1).min(MAX_SLOTS),
-                OP_EMPTY | OP_STAR => {}
+                OP_EMPTY | OP_STAR | OP_KEY => {}
                 OP_COPY..=0x1F if usize::from(op - OP_COPY) < slots => {}
                 OP_NUM..=0x23 if usize::from(op - OP_NUM) < specs.len() => {
                     numbers |= 1 << (op - OP_NUM);

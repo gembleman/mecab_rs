@@ -495,16 +495,28 @@ impl PackedDictionary {
     }
 
     #[inline]
-    pub fn write_feature(&self, offset: u32, out: &mut String) {
+    pub fn write_feature(&self, offset: u32, key: &str, out: &mut String) {
         self.feature_view()
-            .emit(offset, out)
+            .emit(offset, key, out)
             .expect("writing to a string does not fail");
     }
 
-    pub fn feature_string(&self, offset: u32) -> String {
+    pub fn feature_string(&self, offset: u32, key: &str) -> String {
         let mut out = String::new();
-        self.write_feature(offset, &mut out);
+        self.write_feature(offset, key, &mut out);
         out
+    }
+
+    pub fn key_of<'t>(&self, text: &'t str, offset: u32) -> &'t str {
+        let mut hits = Vec::new();
+        self.common_prefix_search(text.as_bytes(), &mut hits);
+        let view = self.view();
+        hits.iter()
+            .find(|hit| {
+                hit.tokens()
+                    .any(|index| view.token(index).feature == offset)
+            })
+            .map_or("", |hit| &text[..hit.length()])
     }
 
     pub fn matrix_bytes(&self) -> &[u8] {

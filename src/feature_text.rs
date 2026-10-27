@@ -8,7 +8,7 @@ pub struct FeatureText<'a>(Source<'a>);
 #[derive(Clone, Copy)]
 enum Source<'a> {
     Text(&'a str),
-    Packed(&'a PackedDictionary, u32),
+    Packed(&'a PackedDictionary, u32, &'a str),
 }
 
 impl<'a> FeatureText<'a> {
@@ -16,15 +16,15 @@ impl<'a> FeatureText<'a> {
         Self(Source::Text(text))
     }
 
-    pub(crate) fn packed(dictionary: &'a PackedDictionary, offset: u32) -> Self {
-        Self(Source::Packed(dictionary, offset))
+    pub(crate) fn packed(dictionary: &'a PackedDictionary, offset: u32, key: &'a str) -> Self {
+        Self(Source::Packed(dictionary, offset, key))
     }
 
     #[inline]
     pub fn write_to(&self, out: &mut String) {
         match self.0 {
             Source::Text(text) => out.push_str(text),
-            Source::Packed(dictionary, offset) => dictionary.write_feature(offset, out),
+            Source::Packed(dictionary, offset, key) => dictionary.write_feature(offset, key, out),
         }
     }
 }
@@ -33,7 +33,9 @@ impl fmt::Display for FeatureText<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             Source::Text(text) => formatter.write_str(text),
-            Source::Packed(dictionary, offset) => dictionary.feature_view().emit(offset, formatter),
+            Source::Packed(dictionary, offset, key) => {
+                dictionary.feature_view().emit(offset, key, formatter)
+            }
         }
     }
 }

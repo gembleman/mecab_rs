@@ -109,7 +109,17 @@ impl Model {
         let cells = trie::build(&entries)?;
 
         let wide = self.params.len() > 1 << 16;
-        let encoded = features::encode::encode(&self.features)?;
+        let mut tokens: Vec<(u32, &str)> =
+            Vec::with_capacity(self.token_features.len() + self.unknown_features.len());
+        let mut next = self.token_features.iter();
+        for (key, &count) in self.keys.iter().zip(&self.counts) {
+            for &feature in next.by_ref().take(usize::from(count)) {
+                tokens.push((feature, key));
+            }
+        }
+        tokens.extend(self.unknown_features.iter().map(|&feature| (feature, "")));
+        let encoded = features::encode::encode(&self.features, &tokens)?;
+        let (system_starts, unknown_starts) = encoded.starts.split_at(self.token_features.len());
         let mut sections: [Cow<[u8]>; SECTIONS] = Default::default();
         let (index, blocks) = char_map(&table);
         sections[CHAR_INDEX] = le_bytes(&index, u16::to_le_bytes).into();
@@ -119,13 +129,7 @@ impl Model {
             .flat_map(|unit| unit.iter().flat_map(|value| value.to_le_bytes()))
             .collect::<Vec<u8>>()
             .into();
-        sections[TOKENS] = encode_tokens(
-            &self.token_params,
-            &self.token_features,
-            &encoded.starts,
-            wide,
-        )
-        .into();
+        sections[TOKENS] = encode_tokens(&self.token_params, system_starts, wide).into();
         sections[PARAMS] = self
             .params
             .iter()
@@ -140,13 +144,7 @@ impl Model {
             .into();
         sections[FEATURES] = encoded.bytes.into();
         sections[UNKNOWN_STARTS] = le_bytes(&self.unknown_starts, u32::to_le_bytes).into();
-        sections[UNKNOWN_TOKENS] = encode_tokens(
-            &self.unknown_params,
-            &self.unknown_features,
-            &encoded.starts,
-            wide,
-        )
-        .into();
+        sections[UNKNOWN_TOKENS] = encode_tokens(&self.unknown_params, unknown_starts, wide).into();
         sections[MATRIX] = Cow::Borrowed(&self.matrix);
         sections[TEMPLATES] = Cow::Borrowed(&self.templates);
         sections[CHAR_TABLE] = Cow::Borrowed(&self.char_table);
@@ -189,15 +187,15 @@ impl Model {
     }
 }
 
-fn encode_tokens(params: &[u32], features: &[u32], starts: &[u32], wide: bool) -> Vec<u8> {
+fn encode_tokens(params: &[u32], starts: &[u32], wide: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(params.len() * if wide { 8 } else { 6 });
-    for (&param, &feature) in params.iter().zip(features) {
+    for (&param, &start) in params.iter().zip(starts) {
         if wide {
             out.extend_from_slice(&param.to_le_bytes());
         } else {
             out.extend_from_slice(&(param as u16).to_le_bytes());
         }
-        out.extend_from_slice(&starts[feature as usize].to_le_bytes());
+        out.extend_from_slice(&start.to_le_bytes());
     }
     out
 }

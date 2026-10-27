@@ -18,6 +18,7 @@ fn later_first<I: DoubleEndedIterator>(candidates: I) -> std::iter::Rev<I> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NodeSource {
     System,
+    SystemExtended,
     User(u8),
     Unknown,
     UnknownFixed,
@@ -945,12 +946,18 @@ impl Lattice {
                 dictionary
                     .chars
                     .extended_end(sentence, found.surface + hit.length(), found.limit);
+            let source = if end == found.surface + hit.length() {
+                source
+            } else {
+                NodeSource::SystemExtended
+            };
             for token_index in hit.tokens() {
                 let token = view.token(token_index);
                 if !BEST
                     && found.partial
                     && !self.constraints.admits(found.begin, end, |out| {
-                        words.write_feature(token.feature, out);
+                        let key = &sentence[found.surface..found.surface + hit.length()];
+                        words.write_feature(token.feature, str::from_utf8(key).unwrap_or(""), out);
                     })
                 {
                     continue;
@@ -1080,7 +1087,7 @@ impl Lattice {
                 && !self.constraints.admits(span.begin, span.end, |out| {
                     match &dictionary.unknown_feature {
                         Some(feature) => out.push_str(feature),
-                        None => unknown.write_feature(token.feature, out),
+                        None => unknown.write_feature(token.feature, "", out),
                     }
                 })
             {

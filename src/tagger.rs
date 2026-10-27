@@ -310,7 +310,9 @@ pub struct Node<'t, 'x> {
 impl<'t, 'x> Node<'t, 'x> {
     pub fn kind(&self) -> NodeKind {
         match self.raw.source {
-            NodeSource::System | NodeSource::User(_) => NodeKind::Normal,
+            NodeSource::System | NodeSource::SystemExtended | NodeSource::User(_) => {
+                NodeKind::Normal
+            }
             NodeSource::Unknown | NodeSource::UnknownFixed | NodeSource::Constrained => {
                 NodeKind::Unknown
             }
@@ -336,14 +338,21 @@ impl<'t, 'x> Node<'t, 'x> {
         self.raw.length_with_space as usize
     }
 
-    pub fn feature(&self) -> FeatureText<'t> {
+    pub fn feature(&self) -> FeatureText<'_> {
         let dictionary = self.frame.dictionary;
         match self.raw.source {
-            NodeSource::System => FeatureText::packed(&dictionary.system, self.raw.feature),
+            NodeSource::System => {
+                FeatureText::packed(&dictionary.system, self.raw.feature, self.surface())
+            }
+            NodeSource::SystemExtended => FeatureText::packed(
+                &dictionary.system,
+                self.raw.feature,
+                dictionary.system.key_of(self.surface(), self.raw.feature),
+            ),
             NodeSource::User(index) => {
                 FeatureText::text(dictionary.users[usize::from(index)].feature(self.raw.feature))
             }
-            NodeSource::Unknown => FeatureText::packed(&dictionary.unknown, self.raw.feature),
+            NodeSource::Unknown => FeatureText::packed(&dictionary.unknown, self.raw.feature, ""),
             NodeSource::UnknownFixed => {
                 FeatureText::text(dictionary.unknown_feature.as_deref().unwrap_or_default())
             }
@@ -357,7 +366,7 @@ impl<'t, 'x> Node<'t, 'x> {
     pub fn feature_id(&self) -> Option<FeatureId> {
         let offset = u64::from(self.raw.feature);
         match self.raw.source {
-            NodeSource::System => Some(FeatureId(offset)),
+            NodeSource::System | NodeSource::SystemExtended => Some(FeatureId(offset)),
             NodeSource::User(index) => Some(FeatureId(
                 ((u64::from(index) + 1) << USER_FEATURE_SHIFT) | offset,
             )),

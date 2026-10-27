@@ -4,7 +4,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 use super::{
     BitWriter, Counts, Layout, MAX_NUMERIC, MAX_SLOTS, NumSpec, OP_COPY, OP_EMPTY, OP_HIGH,
-    OP_INLINE, OP_NUM, OP_REF, OP_STAR, SYNC_EVERY, bits_for, push_piece,
+    OP_INLINE, OP_KEY, OP_NUM, OP_REF, OP_STAR, SYNC_EVERY, bits_for, push_piece,
 };
 use crate::Error;
 
@@ -17,6 +17,10 @@ const ABSENT: u16 = u16::MAX;
 pub(in crate::packed) struct Encoded {
     pub(in crate::packed) bytes: Vec<u8>,
     pub(in crate::packed) starts: Vec<u32>,
+}
+
+fn is_key(value: &[u8], key: &[u8]) -> bool {
+    !key.is_empty() && value == key && value != b"*"
 }
 
 #[derive(Default)]
@@ -281,7 +285,7 @@ struct Stored {
     low_table: Vec<u64>,
 }
 
-pub(in crate::packed) fn encode(features: &[u8]) -> Result<Encoded, Error> {
+pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Result<Encoded, Error> {
     let mut entries: Vec<&[u8]> = features.split(|&byte| byte == 0).collect();
     entries.pop();
     let count = entries.len();
@@ -403,14 +407,41 @@ pub(in crate::packed) fn encode(features: &[u8]) -> Result<Encoded, Error> {
         stored_values.push(slot);
     }
 
+    let mut variants: Vec<(usize, &[u8])> = Vec::new();
+    let mut variant_of: FastMap<(u32, &[u8]), u32> = FastMap::default();
+    let mut starts_of: Vec<u32> = Vec::with_capacity(tokens.len());
+    for &(feature, key) in tokens {
+        let entry = feature as usize;
+        let text = *entries.get(entry).ok_or(Error::Unsupported(
+            "a token with a feature that is not there",
+        ))?;
+        let key = key.as_bytes();
+        split_fields(text, &mut fields);
+        let keyed = fields.iter().enumerate().any(|(field, &(begin, end))| {
+            classes[field] == Class::Text && is_key(&text[begin..end], key)
+        });
+        let key: &[u8] = if keyed { key } else { b"" };
+        let next = variants.len() as u32;
+        let number = *variant_of.entry((feature, key)).or_insert(next);
+        if number == next {
+            variants.push((entry, key));
+        }
+        starts_of.push(number);
+    }
+    drop(variant_of);
+
     let mut uses: FastMap<&[u8], u32> = FastMap::default();
     let mut slots: Vec<&[u8]> = Vec::new();
-    for &text in &entries {
+    for &(entry, key) in &variants {
+        let text = entries[entry];
         split_fields(text, &mut fields);
         slots.clear();
         for (field, &(begin, end)) in fields.iter().enumerate() {
             if classes[field] == Class::Text {
                 let value = &text[begin..end];
+                if is_key(value, key) {
+                    continue;
+                }
                 if let TextOp::New = text_op(value, &mut slots) {
                     *uses.entry(value).or_insert(0) += 1;
                 }
@@ -424,15 +455,16 @@ pub(in crate::packed) fn encode(features: &[u8]) -> Result<Encoded, Error> {
     let mut shape_list: Vec<Vec<u8>> = Vec::new();
     let mut known_strings: FastMap<&[u8], u32> = FastMap::default();
     let mut area: Vec<u8> = Vec::new();
-    let mut entry_template: Vec<u32> = Vec::with_capacity(count);
-    let mut entry_shape: Vec<u32> = Vec::with_capacity(count);
+    let mut entry_template: Vec<u32> = Vec::with_capacity(variants.len());
+    let mut entry_shape: Vec<u32> = Vec::with_capacity(variants.len());
     let mut references: Vec<u32> = Vec::new();
     let mut inline: Vec<&[u8]> = Vec::new();
     let mut numbers: Vec<(u64, u32)> = Vec::new();
     let mut program: Vec<u8> = Vec::new();
     let mut piece: Vec<u8> = Vec::new();
     let mut ops: Vec<u8> = Vec::new();
-    for (entry, &text) in entries.iter().enumerate() {
+    for &(entry, key) in &variants {
+        let text = entries[entry];
         split_fields(text, &mut fields);
         program.clear();
         piece.clear();
@@ -451,6 +483,7 @@ pub(in crate::packed) fn encode(features: &[u8]) -> Result<Encoded, Error> {
             piece.clear();
             match classes[field] {
                 Class::Folded => {}
+                Class::Text if is_key(value, key) => ops.push(OP_KEY),
                 Class::Text => match text_op(value, &mut slots) {
                     TextOp::Star => ops.push(OP_STAR),
                     TextOp::Empty => ops.push(OP_EMPTY),
@@ -499,9 +532,9 @@ pub(in crate::packed) fn encode(features: &[u8]) -> Result<Encoded, Error> {
     let shape_bits = bits_for(shape_list.len() as u64);
     let ref_bits = bits_for(area.len() as u64);
     let mut writer = BitWriter::default();
-    let mut starts: Vec<u32> = Vec::with_capacity(count);
+    let mut starts: Vec<u32> = Vec::with_capacity(variants.len());
     let (mut next_reference, mut next_inline, mut next_number) = (0, 0, 0);
-    for entry in 0..count {
+    for entry in 0..variants.len() {
         let start = writer.bytes.len();
         starts.push(
             u32::try_from(start)
@@ -562,7 +595,7 @@ pub(in crate::packed) fn encode(features: &[u8]) -> Result<Encoded, Error> {
         shape_bytes: shape_bytes.len() as u64,
         strings: area.len() as u64,
         records: records.len() as u64,
-        record_count: count as u32,
+        record_count: variants.len() as u32,
     };
     let layout = Layout::new(counts).ok_or_else(too_big)?;
     let mut bytes = vec![0u8; layout.length()];
@@ -591,5 +624,9 @@ pub(in crate::packed) fn encode(features: &[u8]) -> Result<Encoded, Error> {
     put(&mut bytes, &layout.sync, &words(&sync));
     put(&mut bytes, &layout.strings, &area);
     put(&mut bytes, &layout.records, &records);
+    let starts = starts_of
+        .iter()
+        .map(|&variant| starts[variant as usize])
+        .collect();
     Ok(Encoded { bytes, starts })
 }

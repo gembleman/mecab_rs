@@ -9,6 +9,7 @@ pub(super) const OP_REF: u8 = 0x00;
 pub(super) const OP_EMPTY: u8 = 0x01;
 pub(super) const OP_STAR: u8 = 0x02;
 pub(super) const OP_INLINE: u8 = 0x03;
+pub(super) const OP_KEY: u8 = 0x04;
 pub(super) const OP_COPY: u8 = 0x10;
 pub(super) const OP_NUM: u8 = 0x20;
 pub(super) const OP_HIGH: u8 = 0x30;
@@ -362,7 +363,12 @@ impl FeatureView<'_> {
     }
 
     #[inline]
-    pub(crate) fn emit<S: Sink + ?Sized>(&self, offset: u32, sink: &mut S) -> fmt::Result {
+    pub(crate) fn emit<S: Sink + ?Sized>(
+        &self,
+        offset: u32,
+        key: &str,
+        sink: &mut S,
+    ) -> fmt::Result {
         let record = &self.records[offset as usize..];
         let mut bit = 0usize;
         let template = read_bits(record, bit, self.template_bits) as usize;
@@ -412,6 +418,7 @@ impl FeatureView<'_> {
                 }
                 OP_EMPTY => {}
                 OP_STAR => sink.put("*")?,
+                OP_KEY => sink.put(key)?,
                 OP_COPY..=0x1F => {
                     let (start, length) = slots[usize::from(op - OP_COPY)];
                     if start & IN_RECORD != 0 {
