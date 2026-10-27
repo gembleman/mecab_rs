@@ -135,7 +135,7 @@ struct Span {
 pub(crate) struct Lattice {
     nodes: Vec<RawNode>,
     best_nodes: Vec<BestNode>,
-    ends: Vec<Vec<LeftCandidate>>,
+    ends: Vec<EndSlot>,
     ends_used: usize,
     sentence_chars: SentenceChars,
     hits: Vec<PrefixHit>,
@@ -145,6 +145,31 @@ pub(crate) struct Lattice {
     links: Vec<PathLink>,
     agenda: Agenda,
     marginals: Marginals,
+}
+
+#[derive(Default)]
+struct EndSlot {
+    lefts: Vec<LeftCandidate>,
+    widest: u16,
+}
+
+impl EndSlot {
+    #[inline(always)]
+    fn push(&mut self, left: LeftCandidate) {
+        self.widest = self.widest.max(left.right_id);
+        self.lefts.push(left);
+    }
+
+    fn clear(&mut self) {
+        self.lefts.clear();
+        self.widest = 0;
+    }
+
+    fn absorb(&mut self, added: &mut EndSlot) {
+        self.lefts.append(&mut added.lefts);
+        self.widest = self.widest.max(added.widest);
+        added.widest = 0;
+    }
 }
 
 #[derive(Default)]
@@ -232,7 +257,7 @@ fn best_lefts<const N: usize>(lefts: &[LeftCandidate], columns: [&[i16]; N]) -> 
 #[inline(always)]
 fn store_best(
     best_nodes: &mut [BestNode],
-    ends: &mut [Vec<LeftCandidate>],
+    ends: &mut [EndSlot],
     position: usize,
     index: usize,
     cost_without_word: i32,
@@ -403,7 +428,7 @@ impl Lattice {
         }
         let slots = sentence_len + END_SLOTS_PAST_TEXT;
         if self.ends.len() < slots {
-            self.ends.resize_with(slots, Vec::new);
+            self.ends.resize_with(slots, EndSlot::default);
         }
         self.ends_used = slots;
     }
@@ -439,7 +464,7 @@ impl Lattice {
             id: bos,
         });
         for position in 0..sentence_len {
-            if self.ends[position].is_empty() {
+            if self.ends[position].lefts.is_empty() {
                 continue;
             }
             let begun =
@@ -450,7 +475,7 @@ impl Lattice {
         let eos = self.push_node(RawNode::boundary(NodeSource::Eos, sentence_len));
         let last_filled_end = (0..=sentence_len)
             .rev()
-            .find(|&at| !self.ends[at].is_empty());
+            .find(|&at| !self.ends[at].lefts.is_empty());
         if let Some(position) = last_filled_end {
             self.connect::<NBEST>(dictionary, position, eos_index..eos_index + 1);
         }
@@ -501,7 +526,7 @@ impl Lattice {
         let mut position = 0;
         while position < sentence_len {
             let lead = sentence[position];
-            if !self.ends[position].is_empty() {
+            if !self.ends[position].lefts.is_empty() {
                 let first = self.best_nodes.len();
                 let found =
                     self.lookup::<true>(dictionary, system, &view, unknown, sentence, position);
@@ -512,7 +537,7 @@ impl Lattice {
         }
         let last_filled_end = (0..=sentence_len)
             .rev()
-            .find(|&at| !self.ends[at].is_empty())
+            .find(|&at| !self.ends[at].lefts.is_empty())
             .unwrap_or(0);
         let eos = self.best_nodes.len();
         self.best_nodes.push(BestNode {
@@ -534,7 +559,8 @@ impl Lattice {
             best_nodes, ends, ..
         } = self;
         let (head, later_ends) = ends.split_at_mut(position + 1);
-        let lefts: &[LeftCandidate] = &head[position];
+        let lefts: &[LeftCandidate] = &head[position].lefts;
+        let widest = head[position].widest;
         match &dictionary.matrix {
             Matrix::PackedDense(dense) => {
                 for index in (first..best_nodes.len()).rev() {
@@ -554,9 +580,6 @@ impl Lattice {
                     }
                 }
                 let hot = hot.view();
-                let widest = lefts
-                    .iter()
-                    .fold(0, |widest, left| widest.max(left.right_id));
                 let reaches = |cells: &[i16]| cells.len() > usize::from(widest);
                 for node in &best_nodes[first..] {
                     let cells = hot.right_column(node.candidate.left_id).cells();
@@ -639,7 +662,9 @@ impl Lattice {
     }
 
     pub(crate) fn ending_at(&self, position: usize) -> &[LeftCandidate] {
-        self.ends.get(position).map_or(&[], Vec::as_slice)
+        self.ends
+            .get(position)
+            .map_or(&[], |slot| slot.lefts.as_slice())
     }
 
     pub(crate) fn marginal(&self, index: usize) -> Option<(f32, f32, f32)> {
@@ -718,10 +743,10 @@ impl Lattice {
         begun: Range<usize>,
     ) {
         let mut lefts = std::mem::take(&mut self.ends[position]);
-        self.connect_rights::<NBEST>(dictionary, position, begun, &lefts);
+        self.connect_rights::<NBEST>(dictionary, position, begun, &lefts.lefts, lefts.widest);
         let added = &mut self.ends[position];
-        if !added.is_empty() {
-            lefts.append(added);
+        if !added.lefts.is_empty() {
+            lefts.absorb(added);
         }
         std::mem::swap(added, &mut lefts);
     }
@@ -732,6 +757,7 @@ impl Lattice {
         position: usize,
         begun: Range<usize>,
         lefts: &[LeftCandidate],
+        widest: u16,
     ) {
         match &dictionary.matrix {
             Matrix::PackedDense(dense) => {
@@ -751,9 +777,6 @@ impl Lattice {
             }
             Matrix::PackedHot(hot) => {
                 let hot = hot.view();
-                let widest = lefts
-                    .iter()
-                    .fold(0, |widest, left| widest.max(left.right_id));
                 for right_index in newest_first(begun) {
                     let right_id = NodeId::from_index(right_index);
                     let column = hot.right_column(self.nodes[right_id].left_id);
