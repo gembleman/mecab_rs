@@ -6,6 +6,7 @@ pub mod codec;
 mod constraint;
 mod dictionary;
 mod error;
+mod expand_cache;
 mod feature_match;
 mod feature_text;
 mod ids;

@@ -6,6 +6,7 @@ use memmap2::Mmap;
 
 use crate::char_property::CharProperty;
 use crate::error::Error;
+use crate::expand_cache;
 use crate::matrix::Matrix;
 use crate::packed::PackedDictionary;
 use crate::system_dictionary::{DictionaryKind, SystemDictionary, TokenRecord};
@@ -62,11 +63,26 @@ impl Dictionary {
                 "dictionary directories are not accepted; convert with `mecab-rs-migrate pack <dir> <out.mrd>`",
             ));
         }
-        Self::open_packed(path, user_dictionaries)
+        if !expand_cache::is_xz(path) {
+            return Self::open_packed(path, PackedDictionary::open(path)?, user_dictionaries);
+        }
+        let (cache, expanded) = expand_cache::ensure(path, false)?;
+        match PackedDictionary::open(&cache) {
+            Ok(packed) => Self::open_packed(&cache, packed, user_dictionaries),
+            Err(_) if !expanded => {
+                let (cache, _) = expand_cache::ensure(path, true)?;
+                Self::open_packed(&cache, PackedDictionary::open(&cache)?, user_dictionaries)
+            }
+            Err(error) => Err(error),
+        }
     }
 
-    fn open_packed<P: AsRef<Path>>(path: &Path, user_dictionaries: &[P]) -> Result<Self, Error> {
-        let packed = Arc::new(PackedDictionary::open(path)?);
+    fn open_packed<P: AsRef<Path>>(
+        path: &Path,
+        packed: PackedDictionary,
+        user_dictionaries: &[P],
+    ) -> Result<Self, Error> {
+        let packed = Arc::new(packed);
         let matrix = if packed.template_bytes().is_some() {
             if packed.integer_templates() {
                 Matrix::open_hot_int_bytes(
