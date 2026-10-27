@@ -180,7 +180,11 @@ impl<'m, S: SectionSource> HotView<'m, S> {
     pub(crate) fn right_column(&self, right_left_id: u16) -> HotColumn<'m, S> {
         let row = usize::from(right_left_id);
         let cells = if row < self.hot_right {
-            &self.costs[row * self.hot_left..(row + 1) * self.hot_left]
+            debug_assert!((row + 1) * self.hot_left <= self.costs.len());
+            unsafe {
+                self.costs
+                    .get_unchecked(row * self.hot_left..(row + 1) * self.hot_left)
+            }
         } else {
             &[]
         };

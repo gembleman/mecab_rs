@@ -212,6 +212,13 @@ pub(super) fn read_bits(bytes: &[u8], bit: usize, width: u32) -> u64 {
 }
 
 #[inline(always)]
+fn read_small<const TRUSTED: bool>(bytes: &[u8], bit: usize, width: u32) -> u64 {
+    debug_assert!(width <= 56);
+    let word = access::word::<TRUSTED>(bytes, bit >> 3);
+    (word >> (bit & 7)) & ((1u64 << width) - 1)
+}
+
+#[inline(always)]
 fn read_narrow(bytes: &[u8], bit: usize, width: u32) -> u64 {
     let word = u64::from_le_bytes(
         bytes[bit >> 3..(bit >> 3) + 8]
@@ -296,6 +303,85 @@ impl Sink for String {
     }
 }
 
+struct Cursor<'a> {
+    vector: &'a mut Vec<u8>,
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+}
+
+#[cold]
+#[inline(never)]
+fn grow(vector: &mut Vec<u8>, len: usize, extra: usize) -> (*mut u8, usize) {
+    unsafe { vector.set_len(len) };
+    vector.reserve(extra);
+    (vector.as_mut_ptr(), vector.capacity())
+}
+
+impl<'a> Cursor<'a> {
+    #[inline(always)]
+    fn new(string: &'a mut String) -> Self {
+        let vector = unsafe { string.as_mut_vec() };
+        Self {
+            ptr: vector.as_mut_ptr(),
+            len: vector.len(),
+            cap: vector.capacity(),
+            vector,
+        }
+    }
+
+    #[inline(always)]
+    fn reserve(&mut self, extra: usize) {
+        if self.cap - self.len < extra {
+            (self.ptr, self.cap) = grow(self.vector, self.len, extra);
+        }
+    }
+
+    #[inline(always)]
+    fn finish(self) {
+        unsafe { self.vector.set_len(self.len) };
+    }
+}
+
+impl Sink for Cursor<'_> {
+    #[inline(always)]
+    fn put(&mut self, text: &str) -> fmt::Result {
+        self.reserve(text.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(text.as_ptr(), self.ptr.add(self.len), text.len());
+        }
+        self.len += text.len();
+        Ok(())
+    }
+
+    #[inline(always)]
+    unsafe fn put_region(&mut self, region: &[u8], start: usize, length: usize) -> fmt::Result {
+        debug_assert!(start + length + SLACK <= region.len());
+        if length == 1 {
+            self.reserve(1);
+            unsafe { *self.ptr.add(self.len) = *region.get_unchecked(start) };
+            self.len += 1;
+            return Ok(());
+        }
+        let window = unsafe { region.get_unchecked(start..start + length + SLACK) };
+        self.reserve(length + SLACK);
+        unsafe {
+            let target = self.ptr.add(self.len);
+            let source = window.as_ptr();
+            let mut done = 0;
+            loop {
+                std::ptr::copy_nonoverlapping(source.add(done), target.add(done), 16);
+                done += 16;
+                if done >= length {
+                    break;
+                }
+            }
+        }
+        self.len += length;
+        Ok(())
+    }
+}
+
 impl Sink for fmt::Formatter<'_> {
     fn put(&mut self, text: &str) -> fmt::Result {
         self.write_str(text)
@@ -306,17 +392,62 @@ impl Sink for fmt::Formatter<'_> {
     }
 }
 
-fn u32_at(bytes: &[u8], at: usize) -> usize {
-    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes")) as usize
+mod access {
+    use std::ops::Range;
+
+    #[inline(always)]
+    pub(super) fn byte<const TRUSTED: bool>(bytes: &[u8], at: usize) -> u8 {
+        if TRUSTED {
+            unsafe { *bytes.get_unchecked(at) }
+        } else {
+            bytes[at]
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn range<const TRUSTED: bool>(bytes: &[u8], range: Range<usize>) -> &[u8] {
+        if TRUSTED {
+            unsafe { bytes.get_unchecked(range) }
+        } else {
+            &bytes[range]
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn from<const TRUSTED: bool>(bytes: &[u8], start: usize) -> &[u8] {
+        if TRUSTED {
+            unsafe { bytes.get_unchecked(start..) }
+        } else {
+            &bytes[start..]
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn word<const TRUSTED: bool>(bytes: &[u8], at: usize) -> u64 {
+        if TRUSTED {
+            u64::from_le(unsafe { bytes.as_ptr().add(at).cast::<u64>().read_unaligned() })
+        } else {
+            u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"))
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn u32_at<const TRUSTED: bool>(bytes: &[u8], at: usize) -> usize {
+        if TRUSTED {
+            u32::from_le(unsafe { bytes.as_ptr().add(at).cast::<u32>().read_unaligned() }) as usize
+        } else {
+            u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes")) as usize
+        }
+    }
 }
 
 #[inline(always)]
-pub(super) fn piece_at(program: &[u8], at: usize) -> (usize, usize) {
-    let first = program[at];
+fn piece_in<const TRUSTED: bool>(program: &[u8], at: usize) -> (usize, usize) {
+    let first = access::byte::<TRUSTED>(program, at);
     if first < 255 {
         (at + 1, usize::from(first))
     } else {
-        (at + 5, u32_at(program, at + 1))
+        (at + 5, access::u32_at::<TRUSTED>(program, at + 1))
     }
 }
 
@@ -354,12 +485,22 @@ const IN_RECORD: usize = 1 << 62;
 
 impl FeatureView<'_> {
     #[inline(always)]
-    fn string(&self, at: usize) -> (usize, usize) {
-        let tail = &self.strings[at..];
+    fn string<const TRUSTED: bool>(&self, at: usize) -> (usize, usize) {
+        let tail = access::from::<TRUSTED>(self.strings, at);
         if tail.first().is_some_and(|&byte| byte.cast_signed() < -64) {
             return (at, 0);
         }
         (at, find_byte(tail, 0))
+    }
+
+    #[inline]
+    pub(crate) unsafe fn emit_into(&self, offset: u32, key: &str, out: &mut String) {
+        let mut cursor = Cursor::new(out);
+        match self.emit_with::<true, _>(offset, key, &mut cursor) {
+            Ok(()) => {}
+            Err(_) => unreachable!("writing to a string does not fail"),
+        }
+        cursor.finish();
     }
 
     #[inline]
@@ -369,37 +510,42 @@ impl FeatureView<'_> {
         key: &str,
         sink: &mut S,
     ) -> fmt::Result {
-        let record = &self.records[offset as usize..];
+        self.emit_with::<false, S>(offset, key, sink)
+    }
+
+    #[inline(always)]
+    fn emit_with<const TRUSTED: bool, S: Sink + ?Sized>(
+        &self,
+        offset: u32,
+        key: &str,
+        sink: &mut S,
+    ) -> fmt::Result {
+        let record = access::from::<TRUSTED>(self.records, offset as usize);
         let mut bit = 0usize;
-        let template = read_bits(record, bit, self.template_bits) as usize;
+        let template = read_small::<TRUSTED>(record, bit, self.template_bits) as usize;
         bit += self.template_bits as usize;
-        let shape = read_bits(record, bit, self.shape_bits) as usize;
+        let shape = read_small::<TRUSTED>(record, bit, self.shape_bits) as usize;
         bit += self.shape_bits as usize;
-        let begin = u32_at(self.template_offsets, 4 * template);
-        let end = u32_at(self.template_offsets, 4 * template + 4);
-        let ops = &self.shapes
-            [u32_at(self.shape_offsets, 4 * shape)..u32_at(self.shape_offsets, 4 * shape + 4)];
+        let begin = access::u32_at::<TRUSTED>(self.template_offsets, 4 * template);
+        let end = access::u32_at::<TRUSTED>(self.template_offsets, 4 * template + 4);
+        let ops = access::range::<TRUSTED>(
+            self.shapes,
+            access::u32_at::<TRUSTED>(self.shape_offsets, 4 * shape)
+                ..access::u32_at::<TRUSTED>(self.shape_offsets, 4 * shape + 4),
+        );
         let mut slots = [(0usize, 0usize); MAX_SLOTS];
         let mut slot_count = 0;
         let mut highs = [0u64; MAX_NUMERIC];
         let mut at = begin;
-        let mut next_op = 0;
-        loop {
-            let (start, length) = piece_at(self.templates, at);
+        for &op in ops {
+            let (start, length) = piece_in::<TRUSTED>(self.templates, at);
             unsafe { sink.put_region(self.templates, start, length)? };
             at = start + length;
-            let Some(&op) = ops.get(next_op) else {
-                return Ok(());
-            };
-            if at >= end {
-                return Ok(());
-            }
-            next_op += 1;
             match op {
                 OP_REF => {
-                    let target = read_bits(record, bit, self.ref_bits) as usize;
+                    let target = read_small::<TRUSTED>(record, bit, self.ref_bits) as usize;
                     bit += self.ref_bits as usize;
-                    let (start, length) = self.string(target);
+                    let (start, length) = self.string::<TRUSTED>(target);
                     if slot_count < MAX_SLOTS {
                         slots[slot_count] = (start, length);
                         slot_count += 1;
@@ -408,13 +554,13 @@ impl FeatureView<'_> {
                 }
                 OP_INLINE => {
                     let start = bit.div_ceil(8);
-                    let length = find_byte(&record[start..], 0);
+                    let length = find_byte(access::from::<TRUSTED>(record, start), 0);
                     bit = (start + length + 1) * 8;
                     if slot_count < MAX_SLOTS {
                         slots[slot_count] = (start | IN_RECORD, length);
                         slot_count += 1;
                     }
-                    sink.put(str::from_utf8(&record[start..start + length]).unwrap_or(""))?;
+                    sink.put(inline_text::<TRUSTED>(record, start, length))?;
                 }
                 OP_EMPTY => {}
                 OP_STAR => sink.put("*")?,
@@ -423,7 +569,7 @@ impl FeatureView<'_> {
                     let (start, length) = slots[usize::from(op - OP_COPY)];
                     if start & IN_RECORD != 0 {
                         let start = start & !IN_RECORD;
-                        sink.put(str::from_utf8(&record[start..start + length]).unwrap_or(""))?;
+                        sink.put(inline_text::<TRUSTED>(record, start, length))?;
                     } else {
                         unsafe { sink.put_region(self.strings, start, length)? };
                     }
@@ -433,12 +579,10 @@ impl FeatureView<'_> {
                     let spec = &self.specs[number];
                     let high = read_bits(record, bit, spec.hi_bits);
                     bit += spec.hi_bits as usize;
-                    let index = read_bits(record, bit, spec.lo_bits) as usize;
+                    let index = read_small::<TRUSTED>(record, bit, spec.lo_bits) as usize;
                     bit += spec.lo_bits as usize;
                     let low_at = 8 * (spec.lo_start as usize + index);
-                    let low = u64::from_le_bytes(
-                        self.lo[low_at..low_at + 8].try_into().expect("eight bytes"),
-                    );
+                    let low = access::word::<TRUSTED>(self.lo, low_at);
                     highs[number] = high;
                     put_number(sink, high << spec.shift | low)?;
                 }
@@ -446,6 +590,21 @@ impl FeatureView<'_> {
                 _ => {}
             }
         }
+        if at < end {
+            let (start, length) = piece_in::<TRUSTED>(self.templates, at);
+            unsafe { sink.put_region(self.templates, start, length)? };
+        }
+        Ok(())
+    }
+}
+
+#[inline(always)]
+fn inline_text<const TRUSTED: bool>(record: &[u8], start: usize, length: usize) -> &str {
+    let bytes = access::range::<TRUSTED>(record, start..start + length);
+    if TRUSTED {
+        unsafe { text_of(bytes) }
+    } else {
+        str::from_utf8(bytes).unwrap_or("")
     }
 }
 

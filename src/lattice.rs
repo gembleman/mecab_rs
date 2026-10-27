@@ -951,8 +951,7 @@ impl Lattice {
             } else {
                 NodeSource::SystemExtended
             };
-            for token_index in hit.tokens() {
-                let token = view.token(token_index);
+            for token in view.tokens(hit.tokens()) {
                 if !BEST
                     && found.partial
                     && !self.constraints.admits(found.begin, end, |out| {

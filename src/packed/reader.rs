@@ -479,14 +479,15 @@ impl PackedDictionary {
     pub(crate) fn feature_view(&self) -> FeatureView<'_> {
         let layout = &self.features;
         let map = &self.map[..];
+        let part = |range: &Range<usize>| unsafe { map.get_unchecked(range.start..range.end) };
         FeatureView {
-            template_offsets: &map[layout.template_offsets.clone()],
-            templates: &map[layout.templates.clone()],
-            shape_offsets: &map[layout.shape_offsets.clone()],
-            shapes: &map[layout.shapes.clone()],
-            lo: &map[layout.lo.clone()],
-            strings: &map[layout.strings.clone()],
-            records: &map[layout.records.clone()],
+            template_offsets: part(&layout.template_offsets),
+            templates: part(&layout.templates),
+            shape_offsets: part(&layout.shape_offsets),
+            shapes: part(&layout.shapes),
+            lo: part(&layout.lo),
+            strings: part(&layout.strings),
+            records: part(&layout.records),
             specs: &self.numbers,
             template_bits: layout.template_bits,
             shape_bits: layout.shape_bits,
@@ -695,21 +696,51 @@ impl PackedView<'_> {
     }
 
     #[inline]
+    pub fn tokens(&self, range: Range<usize>) -> impl Iterator<Item = TokenRecord> {
+        assert!(
+            range.start <= range.end && range.end <= self.tokens.len() / self.token_bytes,
+            "token range out of range"
+        );
+        let view = *self;
+        range.map(move |index| {
+            unsafe { view.token_unchecked(view.tokens, index) }
+        })
+    }
+
+    #[inline]
     fn token_at(&self, bytes: &[u8], index: usize) -> TokenRecord {
+        assert!(
+            index < bytes.len() / self.token_bytes,
+            "token index out of range"
+        );
+        unsafe { self.token_unchecked(bytes, index) }
+    }
+
+    #[inline(always)]
+    unsafe fn token_unchecked(&self, bytes: &[u8], index: usize) -> TokenRecord {
         let width = self.token_bytes;
-        let token = &bytes[index * width..(index + 1) * width];
-        let (param, feature) = if width == 8 {
-            (u32_at(token, 0) as usize, u32_at(token, 4))
-        } else {
-            (usize::from(u16_at(token, 0)), u32_at(token, 2))
-        };
-        let param = &self.params[param * PARAM_BYTES..(param + 1) * PARAM_BYTES];
-        TokenRecord {
-            left_id: u16_at(param, 0),
-            right_id: u16_at(param, 2),
-            pos_id: u16_at(param, 4),
-            word_cost: u16_at(param, 6).cast_signed(),
-            feature,
+        unsafe {
+            let token = bytes.as_ptr().add(index * width);
+            let (param, feature) = if width == 8 {
+                (
+                    u32::from_le(token.cast::<u32>().read_unaligned()) as usize,
+                    u32::from_le(token.add(4).cast::<u32>().read_unaligned()),
+                )
+            } else {
+                (
+                    usize::from(u16::from_le(token.cast::<u16>().read_unaligned())),
+                    u32::from_le(token.add(2).cast::<u32>().read_unaligned()),
+                )
+            };
+            let record = self.params.as_ptr().add(param * PARAM_BYTES);
+            let word = |at: usize| u16::from_le(record.add(at).cast::<u16>().read_unaligned());
+            TokenRecord {
+                left_id: word(0),
+                right_id: word(2),
+                pos_id: word(4),
+                word_cost: word(6).cast_signed(),
+                feature,
+            }
         }
     }
 }

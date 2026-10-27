@@ -24,7 +24,9 @@ impl<'a> FeatureText<'a> {
     pub fn write_to(&self, out: &mut String) {
         match self.0 {
             Source::Text(text) => out.push_str(text),
-            Source::Packed(dictionary, offset, key) => dictionary.write_feature(offset, key, out),
+            Source::Packed(dictionary, offset, key) => {
+                unsafe { dictionary.feature_view().emit_into(offset, key, out) }
+            }
         }
     }
 }
