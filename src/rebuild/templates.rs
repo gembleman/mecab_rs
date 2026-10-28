@@ -4,8 +4,9 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::thread;
 
-use super::{bad, io_error, read_file};
+use super::{bad, read_file};
 use crate::build::write_file;
+use crate::error::io_error;
 use crate::{ConnectionTemplates, Error, HotShape, TemplatePart};
 
 pub const DEFAULT_HOT_LEFT: usize = 4480;

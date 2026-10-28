@@ -13,7 +13,7 @@ use std::path::Path;
 use crate::Error;
 use crate::build::write_file;
 
-pub use reader::{Hit, PackedDictionary, PackedView, TokenRecord};
+pub(crate) use reader::{PackedDictionary, PackedView};
 #[cfg(feature = "xz")]
 pub use transport::{expand, write_transport};
 

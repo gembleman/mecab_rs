@@ -1,4 +1,5 @@
 use super::coder::Coder;
+use crate::wire::FNV_PRIME;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
@@ -92,7 +93,6 @@ const MAX_LEVELS: usize = 8;
 const BIG_AT: u32 = 24;
 const BIG: u32 = u32::MAX;
 const HIT_INC: u32 = 2;
-const FNV_PRIME: u64 = 0x100_0000_01b3;
 const EXCLUSION_CAP: usize = 48;
 const EXCLUSION_SCAN_MAX: usize = 24;
 const BIG_INITIAL_CAP: usize = 64;

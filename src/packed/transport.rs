@@ -2,42 +2,27 @@ mod lexicon;
 mod matrix;
 
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use lzma_rust2::{XzOptions, XzReader, XzWriter};
+use lzma_rust2::XzReader;
 
 use super::model::{LexiconSections, Model};
 use super::source::read_dictionary;
 use crate::Error;
 use crate::build::write_file;
+use crate::error::io_error;
+use crate::wire::{compress_xz, fnv1a64};
 
 const MAGIC: &[u8; 4] = b"MRDT";
 const VERSION: u32 = 3;
-const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
-const NICE_LEN: u32 = 273;
-const DEPTH_LIMIT: i32 = 512;
 const MAX_DICT_SIZE: u32 = 512 << 20;
 
 pub(super) use matrix::encode as matrix_part;
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(FNV_OFFSET, |state, &byte| {
-        (state ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
-    })
-}
 
 fn bad(path: &Path, reason: &'static str) -> Error {
     Error::Format {
         file: path.to_path_buf(),
         reason,
-    }
-}
-
-fn io_error(path: &Path) -> impl Fn(std::io::Error) -> Error + '_ {
-    |source| Error::Io {
-        path: path.to_path_buf(),
-        source,
     }
 }
 
@@ -191,7 +176,7 @@ fn lexicon_model(parts: &Parts) -> Result<Model, Error> {
 fn attach_matrix(model: &mut Model, (matrix, templates): (Vec<u8>, Vec<u8>)) {
     model.matrix = matrix;
     model.templates = templates;
-    model.integer_templates = model.templates.starts_with(b"MXIT");
+    model.integer_templates = model.templates.starts_with(crate::int_templates::MAGIC);
 }
 
 fn runtime_model(parts: &Parts, next_to: &Path) -> Result<(Model, LexiconSections), Error> {
@@ -209,31 +194,12 @@ fn runtime_model(parts: &Parts, next_to: &Path) -> Result<(Model, LexiconSection
 }
 
 pub(super) fn compress(payload: &[u8], path: &Path) -> Result<Vec<u8>, Error> {
-    let mut options = XzOptions::with_preset(9);
-    options.lzma_options.nice_len = NICE_LEN;
-    options.lzma_options.depth_limit = DEPTH_LIMIT;
-    options.lzma_options.dict_size = options
-        .lzma_options
-        .dict_size
-        .max(u32::try_from(payload.len()).unwrap_or(u32::MAX))
-        .min(MAX_DICT_SIZE);
-    let failed = |error: std::io::Error| Error::Rebuild {
-        path: path.to_path_buf(),
-        reason: format!("xz: {error}"),
-    };
-    let mut writer = XzWriter::new(Vec::new(), options).map_err(failed)?;
-    writer.write_all(payload).map_err(failed)?;
-    writer.finish().map_err(failed)
-}
-
-fn work_directory(path: &Path) -> PathBuf {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    path.with_file_name(format!(".{name}.matrix"))
+    compress_xz(payload, path, MAX_DICT_SIZE)
 }
 
 pub fn write_transport(dict_dir: &Path, out_xz: &Path) -> Result<u64, Error> {
     let model = read_dictionary(dict_dir)?;
-    let matrix = matrix_part(dict_dir, &model, out_xz)?;
+    let matrix = matrix_part(dict_dir, &model)?;
     let payload = container(&encode_parts(&model, matrix)?);
     drop(model);
     let compressed = compress(&payload, out_xz)?;

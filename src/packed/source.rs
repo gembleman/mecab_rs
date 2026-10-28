@@ -7,22 +7,17 @@ use crate::Error;
 use crate::build::text::key_value;
 use crate::char_property::CharProperty;
 use crate::char_table::CHAR_TABLE_FILE;
+use crate::error::io_error;
 use crate::hot_shape::HotShape;
 use crate::int_templates::MappedIntTemplates;
 use crate::system_dictionary::{
     DictionaryKind, HEADER_SIZE, SystemDictionary, TOKEN_SIZE, TokenRecord,
 };
+use crate::templates::float_header_sizes;
 
 const ARRAY_BYTES_AT: usize = 24;
 const TOKEN_BYTES_AT: usize = 28;
 const MAX_ROOT_FANOUT: u32 = 256;
-
-fn io_error(path: &Path) -> impl Fn(std::io::Error) -> Error + '_ {
-    |source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    }
-}
 
 fn broken(path: &Path, reason: &'static str) -> Error {
     Error::Format {
@@ -223,19 +218,11 @@ pub(super) fn read_dictionary(directory: &Path) -> Result<Model, Error> {
                 "the integer templates do not match the hot matrix",
             ));
         }
-    } else if hot {
-        let sizes = templates.get(16..24).map(|bytes| {
-            (
-                u32::from_le_bytes(bytes[..4].try_into().expect("four bytes")) as usize,
-                u32::from_le_bytes(bytes[4..].try_into().expect("four bytes")) as usize,
-            )
-        });
-        if templates.get(..4) != Some(b"MXTP") || sizes != Some((left_size, right_size)) {
-            return Err(broken(
-                &templates_path,
-                "the templates are not valid or do not match the hot matrix",
-            ));
-        }
+    } else if hot && float_header_sizes(&templates) != Some((left_size, right_size)) {
+        return Err(broken(
+            &templates_path,
+            "the templates are not valid or do not match the hot matrix",
+        ));
     }
     let matches_matrix = |dictionary: &SystemDictionary| {
         dictionary.left_size() == left_size && dictionary.right_size() == right_size

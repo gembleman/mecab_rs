@@ -1,5 +1,8 @@
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use mecab_rs::{CharTable, rebuild};
@@ -45,13 +48,12 @@ dictionary rebuilding:
   mecab-rs-migrate unpack-int <file.xz> <id-defs-dir> <dict-dir> [--hot L R] [--threads N]
                                                                                 (feature xz)
   mecab-rs-migrate check-int <file.xz> <id-defs-dir> <matrix.bin> [--threads N]  (feature xz)
-  mecab-rs-migrate bench-cold <templates> <templates> [--hot L R] [--samples N] [--pairs <file>]
       Integer matrix: rounds the template weights to the grid 2^-shift (the shifts given, default
       16-26), lists the cells where the integer sum differs from the real matrix (taken from
       --reference or else from the exact templates) and writes the smallest xz file; unpack-int
       writes matrix.itp and matrix.hot from it; check-int compares every cell of the decoded
-      integer matrix with matrix.bin; bench-cold times the cold lookups of two template files
-      (matrix.tpl, matrix.itp or the runtime form).
+      integer matrix with matrix.bin. The cold lookups of two template files (matrix.tpl,
+      matrix.itp or the runtime form) are timed by `cargo run --release --example bench_cold`.
   mecab-rs-migrate runtime-int <matrix.itp> <matrix.hot> <out>
   mecab-rs-migrate check-runtime-int <matrix.itp> <runtime> [<matrix.bin>] [--threads N]
       Writes the runtime form of matrix.itp (what pack puts into the .mrd file) for the hot block
@@ -185,7 +187,6 @@ struct MatrixArgs {
     matrix_bin: bool,
     shifts: Option<Vec<u32>>,
     reference: Option<PathBuf>,
-    samples: Option<usize>,
     pairs: Option<PathBuf>,
 }
 
@@ -246,7 +247,6 @@ fn parse_matrix_args(command: &str, args: &[std::ffi::OsString]) -> Result<Matri
             }
             Some("--reference") => parsed.reference = Some(text(iterator.next(), "--reference")?),
             Some("--pairs") => parsed.pairs = Some(text(iterator.next(), "--pairs")?),
-            Some("--samples") => parsed.samples = Some(number(iterator.next(), "--samples")?),
             Some("--xz") => parsed.xz = true,
             Some("--int") => parsed.int = true,
             Some("--matrix-bin") => parsed.matrix_bin = true,
@@ -272,52 +272,118 @@ fn compile(source: &Path, id_defs: Option<&Path>) -> Result<mecab_rs::Connection
     rebuild::compile_templates(source, &left, &right).map_err(|error| error.to_string())
 }
 
+const ROWS_PER_CHUNK: usize = 64;
+const DENSE_HEADER_BYTES: usize = 4;
+const DENSE_CELL_BYTES: usize = 2;
+#[cfg(feature = "xz")]
+const SINGLE_CELL_STRIDE: usize = 997;
+
+type FirstMismatch = (usize, usize, i16, i16);
+
+#[derive(Default)]
+struct Comparison {
+    compared: AtomicUsize,
+    mismatches: AtomicUsize,
+    first: Mutex<Option<FirstMismatch>>,
+}
+
+impl Comparison {
+    fn compared_cell(&self) {
+        self.compared.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mismatch(&self, column: usize, row: usize, expected: i16, found: i16) {
+        self.mismatches.fetch_add(1, Ordering::Relaxed);
+        self.first
+            .lock()
+            .unwrap()
+            .get_or_insert((column, row, expected, found));
+    }
+
+    fn check(&self, column: usize, row: usize, expected: i16, found: i16) {
+        self.compared_cell();
+        if expected != found {
+            self.mismatch(column, row, expected, found);
+        }
+    }
+
+    fn mismatch_count(&self) -> usize {
+        self.mismatches.load(Ordering::Relaxed)
+    }
+
+    fn first_mismatch(&self) -> Option<FirstMismatch> {
+        *self.first.lock().unwrap()
+    }
+}
+
+fn compare_row_chunks(
+    right_size: usize,
+    threads: usize,
+    compare_rows: impl Fn(Range<usize>) + Sync,
+) {
+    let next_chunk = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads.max(1) {
+            scope.spawn(|| {
+                loop {
+                    let first = next_chunk.fetch_add(1, Ordering::Relaxed) * ROWS_PER_CHUNK;
+                    if first >= right_size {
+                        break;
+                    }
+                    compare_rows(first..(first + ROWS_PER_CHUNK).min(right_size));
+                }
+            });
+        }
+    });
+}
+
+fn dense_cell(dense: &[u8], left_size: usize, column: usize, row: usize) -> i16 {
+    let at = DENSE_HEADER_BYTES + DENSE_CELL_BYTES * (row * left_size + column);
+    i16::from_le_bytes([dense[at], dense[at + 1]])
+}
+
+fn dense_has_size(dense: &[u8], left_size: usize, right_size: usize) -> bool {
+    dense.len() == DENSE_HEADER_BYTES + DENSE_CELL_BYTES * left_size * right_size
+}
+
+fn read_dense(path: &Path) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
 fn check_templates(
     templates: &mecab_rs::ConnectionTemplates,
     matrix: &Path,
     threads: usize,
 ) -> Result<(), String> {
-    let bytes = std::fs::read(matrix).map_err(|error| format!("{}: {error}", matrix.display()))?;
+    let bytes = read_dense(matrix)?;
     let (left_size, right_size) = (templates.left_size(), templates.right_size());
-    if bytes.len() != 4 + 2 * left_size * right_size
-        || usize::from(u16::from_le_bytes([bytes[0], bytes[1]])) != left_size
-        || usize::from(u16::from_le_bytes([bytes[2], bytes[3]])) != right_size
+    let header_size = |at: usize| usize::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
+    if !dense_has_size(&bytes, left_size, right_size)
+        || header_size(0) != left_size
+        || header_size(2) != right_size
     {
         return Err("the matrix does not have the size of the templates".into());
     }
-    let next_row = std::sync::atomic::AtomicUsize::new(0);
-    let mismatches = std::sync::atomic::AtomicUsize::new(0);
-    let first = std::sync::Mutex::new(None);
-    std::thread::scope(|scope| {
-        for _ in 0..threads.max(1) {
-            scope.spawn(|| {
-                loop {
-                    let row = next_row.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if row >= right_size {
-                        break;
-                    }
-                    let cells = &bytes[4 + 2 * row * left_size..][..2 * left_size];
-                    for (rc, cell) in cells.as_chunks::<2>().0.iter().enumerate() {
-                        let expected = i16::from_le_bytes(*cell);
-                        let found = templates.cost(rc as u16, row as u16);
-                        if expected != found {
-                            mismatches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            first
-                                .lock()
-                                .unwrap()
-                                .get_or_insert((rc, row, expected, found));
-                        }
-                    }
-                }
-            });
+    let comparison = Comparison::default();
+    compare_row_chunks(right_size, threads, |rows| {
+        for row in rows {
+            for column in 0..left_size {
+                let found = templates.cost(column as u16, row as u16);
+                comparison.check(
+                    column,
+                    row,
+                    dense_cell(&bytes, left_size, column, row),
+                    found,
+                );
+            }
         }
     });
-    let mismatches = mismatches.into_inner();
     println!(
-        "compared {} cells, {mismatches} mismatches",
-        left_size * right_size
+        "compared {} cells, {} mismatches",
+        left_size * right_size,
+        comparison.mismatch_count()
     );
-    match first.into_inner().unwrap() {
+    match comparison.first_mismatch() {
         Some((rc, lc, expected, found)) => Err(format!(
             "first mismatch at rc {rc} lc {lc}: matrix {expected}, templates {found}"
         )),
@@ -468,8 +534,6 @@ fn unpack_int(args: &Args) -> Result<(), String> {
 
 #[cfg(feature = "xz")]
 fn check_int(args: &Args, start: Instant) -> Result<(), String> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     let parsed = parse_matrix_args("check-int", args)?;
     let [pack, id_defs, matrix] =
         positional("check-int", &parsed, "<file.xz> <id-defs-dir> <matrix.bin>")?;
@@ -481,41 +545,19 @@ fn check_int(args: &Args, start: Instant) -> Result<(), String> {
         templates.shift(),
         templates.exception_count()
     );
-    let bytes = std::fs::read(matrix).map_err(|error| format!("{}: {error}", matrix.display()))?;
+    let bytes = read_dense(matrix)?;
     let (left_size, right_size) = (templates.left_size(), templates.right_size());
-    if bytes.len() != 4 + 2 * left_size * right_size {
+    if !dense_has_size(&bytes, left_size, right_size) {
         return Err("the matrix does not have the size of the templates".into());
     }
-    const ROWS: usize = 64;
-    let next_chunk = AtomicUsize::new(0);
-    let mismatches = AtomicUsize::new(0);
-    let first = std::sync::Mutex::new(None);
-    std::thread::scope(|scope| {
-        for _ in 0..threads_of(&parsed).max(1) {
-            scope.spawn(|| {
-                loop {
-                    let chunk = next_chunk.fetch_add(1, Ordering::Relaxed);
-                    if chunk * ROWS >= right_size {
-                        break;
-                    }
-                    templates.visit_rows(chunk * ROWS, (chunk + 1) * ROWS, |row, costs| {
-                        let cells = &bytes[4 + 2 * row * left_size..][..2 * left_size];
-                        for (column, (cell, &found)) in
-                            cells.as_chunks::<2>().0.iter().zip(costs).enumerate()
-                        {
-                            let expected = i16::from_le_bytes(*cell);
-                            if expected != found {
-                                mismatches.fetch_add(1, Ordering::Relaxed);
-                                first
-                                    .lock()
-                                    .unwrap()
-                                    .get_or_insert((column, row, expected, found));
-                            }
-                        }
-                    });
-                }
-            });
-        }
+    let comparison = Comparison::default();
+    compare_row_chunks(right_size, threads_of(&parsed), |rows| {
+        templates.visit_rows(rows.start, rows.end, |row, costs| {
+            for (column, &found) in costs.iter().enumerate() {
+                let expected = dense_cell(&bytes, left_size, column, row);
+                comparison.check(column, row, expected, found);
+            }
+        });
     });
     let cells = left_size * right_size;
     let exception_cells: Vec<usize> = templates
@@ -523,17 +565,21 @@ fn check_int(args: &Args, start: Instant) -> Result<(), String> {
         .map(|(cell, _)| cell as usize)
         .collect();
     let mut single = 0usize;
-    for cell in (0..cells).step_by(997).chain(exception_cells) {
+    let mut single_mismatches = 0usize;
+    for cell in (0..cells)
+        .step_by(SINGLE_CELL_STRIDE)
+        .chain(exception_cells)
+    {
         let (column, row) = (cell % left_size, cell / left_size);
-        let expected = i16::from_le_bytes([bytes[4 + 2 * cell], bytes[5 + 2 * cell]]);
+        let expected = dense_cell(&bytes, left_size, column, row);
         if templates.cost(column as u16, row as u16) != expected {
-            mismatches.fetch_add(1, Ordering::Relaxed);
+            single_mismatches += 1;
         }
         single += 1;
     }
-    let mismatches = mismatches.into_inner();
+    let mismatches = comparison.mismatch_count() + single_mismatches;
     println!("compared {cells} cells by rows and {single} by cell, {mismatches} mismatches");
-    match first.into_inner().unwrap() {
+    match comparison.first_mismatch() {
         Some((column, row, expected, found)) => Err(format!(
             "first mismatch at rc {column} lc {row}: matrix {expected}, integer templates {found}"
         )),
@@ -556,8 +602,6 @@ fn runtime_int(args: &Args) -> Result<(), String> {
 }
 
 fn check_runtime_int(args: &Args) -> Result<(), String> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     let parsed = parse_matrix_args("check-runtime-int", args)?;
     let usage = "<matrix.itp> <runtime.itp> [<matrix.bin>]";
     let (full, runtime, dense) = match parsed.positional.as_slice() {
@@ -565,9 +609,7 @@ fn check_runtime_int(args: &Args) -> Result<(), String> {
         [full, runtime, dense] => (full, runtime, Some(dense)),
         _ => return Err(format!("check-runtime-int: expected {usage}")),
     };
-    let dense = dense
-        .map(|path| std::fs::read(path).map_err(|error| format!("{}: {error}", path.display())))
-        .transpose()?;
+    let dense = dense.map(|path| read_dense(path)).transpose()?;
     let full = mecab_rs::MappedIntTemplates::open(full).map_err(shown)?;
     let runtime = mecab_rs::RuntimeIntTemplates::open(runtime).map_err(shown)?;
     let (left_size, right_size) = (full.left_size(), full.right_size());
@@ -576,152 +618,41 @@ fn check_runtime_int(args: &Args) -> Result<(), String> {
     }
     let (hot_left, hot_right) = (runtime.hot_left(), runtime.hot_right());
     if let Some(dense) = &dense
-        && dense.len() != 4 + 2 * left_size * right_size
+        && !dense_has_size(dense, left_size, right_size)
     {
         return Err("the dense matrix does not have the size of the templates".into());
     }
-    let next_row = AtomicUsize::new(0);
-    let checked = AtomicUsize::new(0);
-    let mismatches = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..threads_of(&parsed).max(1) {
-            scope.spawn(|| {
-                loop {
-                    let row = next_row.fetch_add(1, Ordering::Relaxed);
-                    if row >= right_size {
-                        break;
-                    }
-                    for column in 0..left_size {
-                        if row < hot_right && column < hot_left {
-                            continue;
-                        }
-                        let (column, row) = (column as u16, row as u16);
-                        let expected = full.cost(column, row);
-                        let found = runtime.cost(column, row);
-                        let by_templates = (usize::from(row) * 31 + usize::from(column)) % 61 == 0;
-                        let real = dense.as_ref().is_none_or(|dense| {
-                            let at = 4 + 2 * (usize::from(row) * left_size + usize::from(column));
-                            i16::from_le_bytes([dense[at], dense[at + 1]]) == found
-                        });
-                        if !real
-                            || found != expected
-                            || (by_templates && full.cost_from_templates(column, row) != found)
-                        {
-                            mismatches.fetch_add(1, Ordering::Relaxed);
-                        }
-                        checked.fetch_add(1, Ordering::Relaxed);
-                    }
+    let comparison = Comparison::default();
+    compare_row_chunks(right_size, threads_of(&parsed), |rows| {
+        for row in rows {
+            for column in 0..left_size {
+                if row < hot_right && column < hot_left {
+                    continue;
                 }
-            });
+                let (column_id, row_id) = (column as u16, row as u16);
+                let expected = full.cost(column_id, row_id);
+                let found = runtime.cost(column_id, row_id);
+                let by_templates = (row * 31 + column) % 61 == 0;
+                let real = dense
+                    .as_ref()
+                    .is_none_or(|dense| dense_cell(dense, left_size, column, row) == found);
+                comparison.compared_cell();
+                if !real
+                    || found != expected
+                    || (by_templates && full.cost_from_templates(column_id, row_id) != found)
+                {
+                    comparison.mismatch(column, row, expected, found);
+                }
+            }
         }
     });
-    let (checked, mismatches) = (checked.into_inner(), mismatches.into_inner());
+    let compared = comparison.compared.load(Ordering::Relaxed);
+    let mismatches = comparison.mismatch_count();
     println!(
-        "compared {checked} cells outside of the {hot_left} x {hot_right} hot block, {mismatches} mismatches"
+        "compared {compared} cells outside of the {hot_left} x {hot_right} hot block, {mismatches} mismatches"
     );
     if mismatches > 0 {
         return Err("the runtime form differs".into());
-    }
-    Ok(())
-}
-
-enum ColdFile {
-    Float(mecab_rs::MappedTemplates),
-    Full(mecab_rs::MappedIntTemplates),
-    Runtime(mecab_rs::RuntimeIntTemplates),
-}
-
-impl ColdFile {
-    fn open(path: &Path) -> Result<Self, String> {
-        if let Ok(runtime) = mecab_rs::RuntimeIntTemplates::open(path) {
-            return Ok(Self::Runtime(runtime));
-        }
-        if let Ok(full) = mecab_rs::MappedIntTemplates::open(path) {
-            return Ok(Self::Full(full));
-        }
-        mecab_rs::MappedTemplates::open(path)
-            .map(Self::Float)
-            .map_err(shown)
-    }
-
-    fn sizes(&self) -> (usize, usize) {
-        match self {
-            Self::Float(file) => (file.left_size(), file.right_size()),
-            Self::Full(file) => (file.left_size(), file.right_size()),
-            Self::Runtime(file) => (file.left_size(), file.right_size()),
-        }
-    }
-
-    fn cost(&self, column: u16, row: u16) -> i16 {
-        match self {
-            Self::Float(file) => file.cost(column, row),
-            Self::Full(file) => file.cost(column, row),
-            Self::Runtime(file) => file.cost(column, row),
-        }
-    }
-}
-
-const PAIR_BYTES: usize = 4;
-
-fn recorded_cells(path: &Path) -> Result<Vec<(u16, u16)>, String> {
-    let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    Ok(bytes
-        .as_chunks::<PAIR_BYTES>()
-        .0
-        .iter()
-        .map(|&[a, b, c, d]| (u16::from_le_bytes([a, b]), u16::from_le_bytes([c, d])))
-        .collect())
-}
-
-fn random_cells(parsed: &MatrixArgs, (left_size, right_size): (usize, usize)) -> Vec<(u16, u16)> {
-    let samples = parsed.samples.unwrap_or(2_000_000);
-    let (hot_left, hot_right) = parsed
-        .hot
-        .unwrap_or((rebuild::DEFAULT_HOT_LEFT, rebuild::DEFAULT_HOT_RIGHT));
-    let mut state = 0x9E37_79B9_7F4A_7C15u64;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state
-    };
-    let mut cells = Vec::with_capacity(samples);
-    while cells.len() < samples {
-        let column = (next() % left_size as u64) as u16;
-        let row = (next() % right_size as u64) as u16;
-        if usize::from(column) >= hot_left || usize::from(row) >= hot_right {
-            cells.push((column, row));
-        }
-    }
-    cells
-}
-
-fn bench_cold(args: &Args) -> Result<(), String> {
-    let parsed = parse_matrix_args("bench-cold", args)?;
-    let [first_path, second_path] = positional("bench-cold", &parsed, "<templates> <templates>")?;
-    let (first, second) = (ColdFile::open(first_path)?, ColdFile::open(second_path)?);
-    let cells = match &parsed.pairs {
-        Some(pairs) => recorded_cells(pairs)?,
-        None => random_cells(&parsed, first.sizes()),
-    };
-    let samples = cells.len();
-    let time = |file: &ColdFile| {
-        let started = Instant::now();
-        let sum: i64 = cells
-            .iter()
-            .map(|&(column, row)| i64::from(file.cost(column, row)))
-            .sum();
-        (started.elapsed().as_secs_f64() * 1e9 / samples as f64, sum)
-    };
-    for round in 0..3 {
-        let (first_ns, first_sum) = time(&first);
-        let (second_ns, second_sum) = time(&second);
-        println!(
-            "round {round}: first {first_ns:.0} ns/cell, second {second_ns:.0} ns/cell (checksums {first_sum} {second_sum})"
-        );
-        if first_sum != second_sum {
-            return Err("the two template files disagree".into());
-        }
     }
     Ok(())
 }
@@ -893,7 +824,6 @@ fn run() -> Result<(), String> {
             "unpack-int" => unpack_int(args),
             #[cfg(feature = "xz")]
             "check-int" => check_int(args, start),
-            "bench-cold" => bench_cold(args),
             "pair-cover" => pair_cover(args),
             #[cfg(feature = "pair-stats")]
             "pair-stats" => pair_stats(args),

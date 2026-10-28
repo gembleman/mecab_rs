@@ -9,6 +9,7 @@ use memmap2::Mmap;
 use crate::dictionary::map_open_file;
 use crate::error::Error;
 use crate::section::{Plain, Section};
+use crate::wire::u32_at;
 
 pub(crate) const MAGIC_ID: u32 = 0xEF71_8F77;
 pub(crate) const DIC_VERSION: u32 = 102;
@@ -32,14 +33,6 @@ pub(crate) enum DictionaryKind {
     System = 0,
     User = 1,
     Unknown = 2,
-}
-
-fn read_u32(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(
-        *bytes[at..]
-            .first_chunk()
-            .expect("the header is long enough"),
-    )
 }
 
 fn charset_name(header: &[u8]) -> &[u8] {
@@ -145,25 +138,25 @@ impl SystemDictionary {
         };
         let bytes = &map[..];
         if bytes.len() < HEADER_SIZE
-            || (read_u32(bytes, 0) ^ MAGIC_ID) as usize != bytes.len()
-            || read_u32(bytes, VERSION_AT) != DIC_VERSION
+            || (u32_at(bytes, 0) ^ MAGIC_ID) as usize != bytes.len()
+            || u32_at(bytes, VERSION_AT) != DIC_VERSION
         {
             return Err(broken("the header, magic number or version is not valid"));
         }
-        if read_u32(bytes, KIND_AT) != kind as u32 {
+        if u32_at(bytes, KIND_AT) != kind as u32 {
             return Err(broken("the dictionary type is not the expected one"));
         }
         if !is_utf8_charset(charset_name(bytes)) {
             return Err(Error::Unsupported("a dictionary charset other than UTF-8"));
         }
-        let array_end = HEADER_SIZE + read_u32(bytes, ARRAY_BYTES_AT) as usize;
-        let tokens_end = array_end + read_u32(bytes, TOKEN_BYTES_AT) as usize;
-        let features_end = tokens_end + read_u32(bytes, FEATURE_BYTES_AT) as usize;
+        let array_end = HEADER_SIZE + u32_at(bytes, ARRAY_BYTES_AT) as usize;
+        let tokens_end = array_end + u32_at(bytes, TOKEN_BYTES_AT) as usize;
+        let features_end = tokens_end + u32_at(bytes, FEATURE_BYTES_AT) as usize;
         if features_end != bytes.len() {
             return Err(broken("the section sizes do not add up to the file size"));
         }
-        let left_size = read_u32(bytes, LEFT_SIZE_AT) as usize;
-        let right_size = read_u32(bytes, RIGHT_SIZE_AT) as usize;
+        let left_size = u32_at(bytes, LEFT_SIZE_AT) as usize;
+        let right_size = u32_at(bytes, RIGHT_SIZE_AT) as usize;
         let cells = Section::new(bytes, HEADER_SIZE..array_end)
             .ok_or_else(|| broken("the double array is misaligned"))?;
         let tokens = Section::new(bytes, array_end..tokens_end)
@@ -368,9 +361,9 @@ impl Checked<'_> {
         let valid = self.each_block(self.tokens.start, TOKEN_SIZE, range, |_, bytes| {
             bytes.as_chunks::<TOKEN_SIZE>().0.iter().all(|raw| {
                 let token = RawToken {
-                    word: read_u32(raw, 0),
-                    costs: read_u32(raw, 4),
-                    feature: read_u32(raw, 8),
+                    word: u32_at(raw, 0),
+                    costs: u32_at(raw, 4),
+                    feature: u32_at(raw, 8),
                     reserved: 0,
                 }
                 .record();
@@ -392,8 +385,8 @@ impl Checked<'_> {
                 .iter()
                 .enumerate()
                 .all(|(offset, cell)| {
-                    let value = read_u32(cell, 0).cast_signed();
-                    let check = read_u32(cell, 4) as usize;
+                    let value = u32_at(cell, 0).cast_signed();
+                    let check = u32_at(cell, 4) as usize;
                     let is_terminal = value < 0 && check == first + offset;
                     let hit_value = !value;
                     !is_terminal || PrefixHit::new(hit_value, 0).tokens().end <= token_count

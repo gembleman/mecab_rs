@@ -1,9 +1,7 @@
-use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use memmap2::Mmap;
@@ -11,7 +9,7 @@ use memmap2::Mmap;
 use crate::clusters::{ClusterPlan, plan_projection_clusters, representatives};
 use crate::dictionary::map_file;
 use crate::error::Error;
-use crate::hot_shape::HotShape;
+use crate::hot_shape::{CELL_SUM_BOUND, HotShape, MAX_KEYS};
 #[cfg(feature = "xz")]
 use crate::int_runtime::runtime_form_from;
 use crate::section::{Section, SectionSource};
@@ -23,10 +21,7 @@ const MAX_PARTS: usize = 256;
 const MAX_SHAPES: usize = 256;
 const ROWS_PER_CHUNK: usize = 16;
 pub const DEFAULT_CLUSTER_COUNT: usize = 12;
-const ROWS_PER_BLOCK: usize = 64;
 const MAX_COST: i64 = 32767;
-const MAX_KEYS: usize = 0xFFFF;
-const CELL_SUM_BOUND: u128 = 1 << 62;
 pub const MAX_SHIFT: u32 = 40;
 pub const MAX_COST_FACTOR: u32 = 1 << 24;
 
@@ -330,57 +325,27 @@ impl IntView<'_> {
         threads: usize,
         output: &mut impl Write,
     ) -> io::Result<()> {
-        shape.write_header(self.left_size, self.right_size, output)?;
-        let blocks = shape.rows().div_ceil(ROWS_PER_BLOCK);
-        let next_block = AtomicUsize::new(0);
-        let (sender, receiver) = mpsc::sync_channel::<(usize, Vec<u8>)>(threads.max(1) * 2);
-        thread::scope(|scope| {
-            for _ in 0..threads.max(1) {
-                let sender = sender.clone();
-                let next_block = &next_block;
-                scope.spawn(move || {
-                    let mut scratch = self.scratch();
-                    let mut row_costs = vec![0i16; self.left_size];
-                    loop {
-                        let block = next_block.fetch_add(1, Ordering::Relaxed);
-                        if block >= blocks {
-                            break;
-                        }
-                        let first = block * ROWS_PER_BLOCK;
-                        let last = (first + ROWS_PER_BLOCK).min(shape.rows());
-                        let mut bytes = Vec::new();
-                        for row in first..last {
-                            let length = shape.row_length(row);
-                            if length == 0 {
-                                continue;
-                            }
-                            self.render_row(row, &mut scratch, &mut row_costs);
-                            for cost in &row_costs[..length] {
-                                bytes.extend_from_slice(&cost.to_le_bytes());
-                            }
-                        }
-                        if sender.send((block, bytes)).is_err() {
-                            break;
-                        }
+        shape.write_matrix_in_order(
+            self.left_size,
+            self.right_size,
+            threads,
+            output,
+            || (self.scratch(), vec![0i16; self.left_size]),
+            |(scratch, row_costs), rows| {
+                let mut bytes = Vec::new();
+                for row in rows {
+                    let length = shape.row_length(row);
+                    if length == 0 {
+                        continue;
                     }
-                });
-            }
-            drop(sender);
-            let mut pending = BTreeMap::new();
-            let mut next_to_write = 0;
-            for (block, bytes) in receiver.iter() {
-                pending.insert(block, bytes);
-                while let Some(bytes) = pending.remove(&next_to_write) {
-                    output.write_all(&bytes)?;
-                    next_to_write += 1;
+                    self.render_row(row, scratch, row_costs);
+                    for cost in &row_costs[..length] {
+                        bytes.extend_from_slice(&cost.to_le_bytes());
+                    }
                 }
-            }
-            if next_to_write == blocks {
-                Ok(())
-            } else {
-                Err(io::Error::other("a template worker stopped early"))
-            }
-        })
+                bytes
+            },
+        )
     }
 }
 

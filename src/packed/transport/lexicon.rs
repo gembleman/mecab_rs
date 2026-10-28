@@ -5,6 +5,7 @@ use super::{Part, Parts};
 use crate::Error;
 use crate::codec::{decode_lexicon, encode_lexicon};
 use crate::packed::model::{Model, Param};
+use crate::wire::{get_varint, put_varint};
 
 const ENCODING_PLAIN: u32 = 0;
 const ENCODING_CODEC: u32 = 2;
@@ -18,14 +19,6 @@ const LINE_END: u8 = b'\n';
 const UNKNOWN_PARAM_BYTES: usize = 6;
 const NUMBER_FIELDS: usize = 3;
 
-fn put_varint(out: &mut Vec<u8>, mut value: u64) {
-    while value >= 0x80 {
-        out.push((value & 0x7F) as u8 | 0x80);
-        value >>= 7;
-    }
-    out.push(value as u8);
-}
-
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -33,19 +26,9 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn varint(&mut self) -> Result<u64, Error> {
-        let mut value = 0u64;
-        for shift in (0..64).step_by(7) {
-            let byte = *self
-                .bytes
-                .get(self.at)
-                .ok_or(Error::Corrupt("the unknown tokens end early"))?;
-            self.at += 1;
-            value |= u64::from(byte & 0x7F) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(value);
-            }
-        }
-        Err(Error::Corrupt("a varint of the unknown tokens is too long"))
+        get_varint(self.bytes, &mut self.at).ok_or(Error::Corrupt(
+            "a varint of the unknown tokens is too long or the data ends early",
+        ))
     }
 
     fn count(&mut self) -> Result<usize, Error> {

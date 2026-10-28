@@ -5,27 +5,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use super::bad;
-#[cfg(feature = "xz")]
-use super::io_error;
 use super::templates::{UniverseSide, read_bigrams, universe_projections};
 use crate::dictionary::map_file;
+#[cfg(feature = "xz")]
+use crate::error::io_error;
 use crate::templates::ExactRows;
+use crate::wire::{fnv1a64, get_varint, put_varint, u32_at, unzigzag, zigzag};
 use crate::{ConnectionTemplates, Error, HotShape, IntPart, IntTemplates};
 
 const MAGIC: &[u8; 4] = b"MRIT";
 const VERSION: u32 = 1;
 const DIGEST_LEN: usize = 8;
-const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
 pub use crate::int_templates::MAX_SHIFT;
 pub const DEFAULT_SHIFTS: std::ops::RangeInclusive<u32> = 16..=26;
 pub const RUNTIME_SHIFT: u32 = 20;
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(FNV_OFFSET, |state, &byte| {
-        (state ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
-    })
-}
 
 fn integer_cost_factor(templates: &ConnectionTemplates, path: &Path) -> Result<u32, Error> {
     let factor = templates.cost_factor();
@@ -158,22 +151,6 @@ pub fn find_exceptions(
     Ok(found)
 }
 
-fn put_varint(out: &mut Vec<u8>, mut value: u64) {
-    while value >= 0x80 {
-        out.push(value as u8 | 0x80);
-        value >>= 7;
-    }
-    out.push(value as u8);
-}
-
-fn zigzag(value: i64) -> u64 {
-    ((value << 1) ^ (value >> 63)) as u64
-}
-
-fn unzigzag(value: u64) -> i64 {
-    (value >> 1) as i64 ^ -((value & 1) as i64)
-}
-
 struct Cursor<'a> {
     bytes: &'a [u8],
     position: usize,
@@ -193,19 +170,12 @@ impl<'a> Cursor<'a> {
     }
 
     fn word(&mut self) -> Result<u32, Error> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32_at(self.take(4)?, 0))
     }
 
     fn varint(&mut self) -> Result<u64, Error> {
-        let mut value = 0u64;
-        for shift in (0..64).step_by(7) {
-            let byte = self.take(1)?[0];
-            value |= u64::from(byte & 0x7F) << shift;
-            if byte < 0x80 {
-                return Ok(value);
-            }
-        }
-        Err(bad(self.path, "a varint is too long"))
+        get_varint(self.bytes, &mut self.position)
+            .ok_or_else(|| bad(self.path, "a varint is too long or the data ends early"))
     }
 }
 

@@ -1,11 +1,12 @@
 use std::path::Path;
 
-use super::{Part, Parts, bad, io_error, work_directory};
+use super::{Part, Parts, bad, io_error};
 use crate::int_runtime::{is_runtime_form, runtime_form_of};
 use crate::int_templates::DEFAULT_CLUSTER_COUNT;
 use crate::packed::model::Model;
 use crate::rebuild::default_threads;
 use crate::rebuild::int_matrix::{IntContext, decode_payload, encode_payload};
+use crate::templates::TEMPLATE_MAGIC;
 use crate::{Error, HotShape, IntTemplates};
 
 const ENCODING_DENSE_DELTA: u32 = 1;
@@ -39,28 +40,16 @@ fn row_delta(matrix: &[u8], encode: bool) -> Vec<u8> {
     out
 }
 
-fn regenerate(xz: &[u8], hot: &HotShape, next_to: &Path) -> Result<(Vec<u8>, Vec<u8>), Error> {
-    let directory = work_directory(next_to);
-    std::fs::create_dir_all(&directory).map_err(io_error(&directory))?;
-    let run = || {
-        let pack = directory.join("matrix.xz");
-        std::fs::write(&pack, xz).map_err(io_error(&pack))?;
-        crate::rebuild::xz::unpack(
-            &pack,
-            &directory,
-            Some(hot.clone()),
-            crate::rebuild::default_threads(),
-        )?;
-        let hot_path = directory.join("matrix.hot");
-        let templates_path = directory.join("matrix.tpl");
-        Ok((
-            std::fs::read(&hot_path).map_err(io_error(&hot_path))?,
-            std::fs::read(&templates_path).map_err(io_error(&templates_path))?,
-        ))
-    };
-    let result = run();
-    let _ = std::fs::remove_dir_all(&directory);
-    result
+fn regenerate(xz: &[u8], hot: &HotShape, path: &Path) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let templates = crate::rebuild::xz::unpack_bytes(xz, path)?;
+    let (mut matrix, mut tpl) = (Vec::new(), Vec::new());
+    templates
+        .write_hot_matrix(hot, default_threads(), &mut matrix)
+        .map_err(io_error(path))?;
+    templates
+        .write_templates(&mut tpl)
+        .map_err(io_error(path))?;
+    Ok((matrix, tpl))
 }
 
 fn read_templates(bytes: &[u8], path: &Path) -> Result<crate::ConnectionTemplates, Error> {
@@ -72,7 +61,7 @@ fn read_templates(bytes: &[u8], path: &Path) -> Result<crate::ConnectionTemplate
         Ok(slice)
     };
     let word = |slice: &[u8]| u32::from_le_bytes(slice.try_into().expect("four bytes")) as usize;
-    if take(8)?[..4] != *b"MXTP" {
+    if !take(8)?.starts_with(TEMPLATE_MAGIC) {
         return Err(broken());
     }
     let cost_factor = f64::from_le_bytes(take(8)?.try_into().expect("eight bytes"));
@@ -277,7 +266,7 @@ fn integer_part(dict_dir: &Path, model: &Model) -> Result<Part, Error> {
     })
 }
 
-pub(in crate::packed) fn encode(dict_dir: &Path, model: &Model, out: &Path) -> Result<Part, Error> {
+pub(in crate::packed) fn encode(dict_dir: &Path, model: &Model) -> Result<Part, Error> {
     if model.templates.is_empty() {
         return Ok(Part {
             name: "matrix",
@@ -295,13 +284,9 @@ pub(in crate::packed) fn encode(dict_dir: &Path, model: &Model, out: &Path) -> R
         std::fs::read(&existing).map_err(io_error(&existing))?
     } else {
         let templates = read_templates(&model.templates, &dict_dir.join("matrix.tpl"))?;
-        let pack = work_directory(out).with_extension("pack");
-        crate::rebuild::xz::pack(&templates, &pack)?;
-        let bytes = std::fs::read(&pack).map_err(io_error(&pack));
-        let _ = std::fs::remove_file(&pack);
-        bytes?
+        crate::rebuild::xz::pack_bytes(&templates, &existing)?
     };
-    let (regenerated_hot, regenerated_templates) = regenerate(&xz, &hot, out)?;
+    let (regenerated_hot, regenerated_templates) = regenerate(&xz, &hot, &existing)?;
     if regenerated_hot != model.matrix || regenerated_templates != model.templates {
         return Err(Error::Unsupported(
             "matrix.hot and matrix.tpl that matrix.xz does not regenerate",

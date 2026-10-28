@@ -5,8 +5,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::error::Error;
+use crate::error::{Error, io_error};
 use crate::packed::VERSION as MRD_VERSION;
+use crate::wire::{FNV_OFFSET, fnv1a};
 
 const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0];
 const IDENTITY_HEAD_BYTES: u64 = 4096;
@@ -17,13 +18,6 @@ const MARKER_SUFFIX: &str = ".src";
 
 static EXPAND_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_TEMPORARY_NUMBER: AtomicUsize = AtomicUsize::new(0);
-
-fn io_error(path: &Path) -> impl Fn(std::io::Error) -> Error + '_ {
-    |source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    }
-}
 
 pub(crate) fn is_xz(path: &Path) -> bool {
     let mut magic = [0u8; 6];
@@ -59,8 +53,6 @@ fn temporary_path(cache: &Path, suffix: &str) -> PathBuf {
     ))
 }
 
-const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
 const MARKER_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy)]
@@ -69,16 +61,10 @@ struct TransportIdentity {
     head_tail_digest: u64,
 }
 
-fn fnv1a(state: u64, bytes: &[u8]) -> u64 {
-    bytes.iter().fold(state, |state, &byte| {
-        (state ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
-    })
-}
-
 fn identify(xz: &Path) -> Result<TransportIdentity, Error> {
     let mut file = File::open(xz).map_err(io_error(xz))?;
     let length = file.metadata().map_err(io_error(xz))?.len();
-    let mut digest = FNV_OFFSET_BASIS;
+    let mut digest = FNV_OFFSET;
     let mut buffer = Vec::new();
     let head = IDENTITY_HEAD_BYTES.min(length);
     let tail_from = length.saturating_sub(IDENTITY_TAIL_BYTES).max(head);

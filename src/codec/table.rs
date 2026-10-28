@@ -1,12 +1,4 @@
-pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-pub fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
-    for &b in bytes {
-        h = (h ^ b as u64).wrapping_mul(FNV_PRIME);
-    }
-    h
-}
+use crate::wire::{FNV_OFFSET, fnv1a};
 
 pub fn parse_line(line: &str, buf: &mut Vec<u8>, ends: &mut Vec<u32>) -> bool {
     let b = line.as_bytes();

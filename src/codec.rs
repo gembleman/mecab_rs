@@ -6,19 +6,19 @@ mod table;
 mod text;
 
 use crate::Error;
+use crate::wire::{FNV_OFFSET, fnv1a, get_varint, put_varint};
 use coder::{Coder, UintModel};
-use model::{Model, get_varint, put_varint};
+use model::Model;
 use ppm::{NOVEL, Ppm, mix};
 use std::time::Instant;
-use table::{FNV_OFFSET, Parsed, fnv1a, parse_text};
+use table::{Parsed, parse_text};
 use text::CharModel;
 
-pub use model::{Kind, LidSpec, Plan, Step};
+pub use model::Plan;
 pub use table::Lexicon;
 
 const MAGIC: &[u8; 4] = b"MLX1";
 const FLAG_NO_FINAL_NEWLINE: u8 = 1;
-const FLAG_GROUPED: u8 = 2;
 const FLAG_STORED: u8 = 4;
 const FLAGS_KNOWN: u8 = 7;
 const MAX_KEY_COUNT: usize = 1 << 31;
@@ -33,9 +33,6 @@ pub struct EncodeOptions {
 
 #[derive(Default, Clone)]
 pub struct Report {
-    pub plan: Plan,
-    pub n_rows: usize,
-    pub n_keys: usize,
     pub keys_bits: f64,
     pub pos_bits: f64,
     pub counts_bits: f64,
@@ -201,9 +198,6 @@ pub fn encode_with(csv: &[u8], opts: &EncodeOptions) -> (Vec<u8>, Report) {
     let mut c = Coder::encoder(opts.report);
     let mut km = KeyModel::new();
     let mut report = Report {
-        plan: plan.clone(),
-        n_rows: lex.rows(),
-        n_keys: groups.len(),
         ..Default::default()
     };
     let mut buf = String::new();
@@ -276,7 +270,6 @@ fn corrupt<T>(why: &'static str) -> Result<T, Error> {
 struct Header {
     stored: bool,
     no_final_newline: bool,
-    grouped: bool,
     text_len: u64,
     digest: u64,
     n_keys: usize,
@@ -307,7 +300,6 @@ fn read_header(data: &[u8]) -> Result<Header, Error> {
     if flags & FLAG_STORED != 0 {
         return Ok(Header {
             no_final_newline: flags & FLAG_NO_FINAL_NEWLINE != 0,
-            grouped: flags & FLAG_GROUPED != 0,
             stored: true,
             text_len,
             digest,
@@ -331,7 +323,6 @@ fn read_header(data: &[u8]) -> Result<Header, Error> {
     Ok(Header {
         stored: false,
         no_final_newline: flags & FLAG_NO_FINAL_NEWLINE != 0,
-        grouped: flags & FLAG_GROUPED != 0,
         text_len,
         digest,
         n_keys: n_keys as usize,
@@ -339,19 +330,6 @@ fn read_header(data: &[u8]) -> Result<Header, Error> {
         plan,
         payload: pos,
     })
-}
-
-pub fn is_grouped(data: &[u8]) -> Result<bool, Error> {
-    Ok(read_header(data)?.grouped)
-}
-
-pub fn decode_rows(data: &[u8]) -> Result<Lexicon, Error> {
-    let (lex, h) = decode_unchecked(data)?;
-    let (digest, len) = lex.digest(None);
-    if digest != h.digest || len != h.text_len {
-        return corrupt("digest mismatch");
-    }
-    Ok(lex)
 }
 
 fn decode_unchecked(data: &[u8]) -> Result<(Lexicon, Header), Error> {
@@ -428,17 +406,4 @@ pub fn decode_lexicon(data: &[u8]) -> Result<Vec<u8>, Error> {
         return corrupt("digest mismatch");
     }
     Ok(text)
-}
-
-pub fn regroup(csv: &[u8]) -> Vec<u8> {
-    let parsed = parse_text(csv);
-    let mut out = Vec::with_capacity(csv.len());
-    parsed
-        .lex
-        .write_text(Some(&parsed.order), |p| out.extend_from_slice(p));
-    out
-}
-
-pub fn digest(bytes: &[u8]) -> u64 {
-    fnv1a(FNV_OFFSET, bytes)
 }

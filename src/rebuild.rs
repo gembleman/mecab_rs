@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 
 use crate::build::{write_file, write_file_with};
+use crate::error::io_error;
 use crate::system_dictionary::{HEADER_SIZE, MAGIC_ID, TOKEN_SIZE};
+use crate::wire::u32_at;
 use crate::{Dictionary, Error, Tagger};
 
 pub mod int_matrix;
@@ -38,13 +40,6 @@ const MATRIX_FILES: [&str; 6] = [
     LEFT_STATS,
 ];
 
-fn io_error(path: &Path) -> impl FnOnce(io::Error) -> Error + '_ {
-    move |source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    }
-}
-
 fn bad(path: &Path, reason: impl Into<String>) -> Error {
     Error::Rebuild {
         path: path.to_path_buf(),
@@ -52,9 +47,10 @@ fn bad(path: &Path, reason: impl Into<String>) -> Error {
     }
 }
 
+const WORD_BYTES: usize = 4;
+
 fn word(bytes: &[u8], index: usize) -> u32 {
-    let at = index * 4;
-    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    u32_at(bytes, index * WORD_BYTES)
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>, Error> {

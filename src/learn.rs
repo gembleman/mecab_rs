@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use crate::build::text::{BUF_SIZE, Lines, key_value};
-use crate::error::Error;
+use crate::error::{Error, io_error};
 
 mod dict_gen;
 mod eval;
@@ -166,11 +166,4 @@ pub(crate) fn open_lines(path: &Path) -> Result<Lines, Error> {
         ),
         other => other,
     })
-}
-
-pub(crate) fn io_error(path: &Path) -> impl Fn(io::Error) -> Error + '_ {
-    move |source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    }
 }

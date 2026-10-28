@@ -40,6 +40,13 @@ pub enum Error {
     Corrupt(&'static str),
 }
 
+pub(crate) fn io_error(path: &std::path::Path) -> impl Fn(io::Error) -> Error + '_ {
+    |source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

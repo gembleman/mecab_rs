@@ -1,20 +1,18 @@
 use std::io::{Read, Write};
 use std::path::Path;
 
-use lzma_rust2::{XzOptions, XzReader, XzWriter};
+use lzma_rust2::XzReader;
 
-use super::{bad, io_error, write_matrix_files};
+use super::{bad, write_matrix_files};
 use crate::build::write_file;
+use crate::error::io_error;
+use crate::wire::{compress_xz, fnv1a64};
 use crate::{ConnectionTemplates, Error, HotShape, TemplatePart};
 
 const MAGIC: &[u8; 4] = b"MRCT";
 const VERSION: u32 = 2;
-const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
 const DIGEST_LEN: usize = 8;
 const WEIGHT_SCALE: f64 = 1e16;
-const NICE_LEN: u32 = 273;
-const DEPTH_LIMIT: i32 = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Layout {
@@ -24,12 +22,6 @@ enum Layout {
 
 impl Layout {
     pub const ALL: [Layout; 2] = [Layout::PerTemplate, Layout::ByField];
-}
-
-pub(super) fn fnv1a64(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(FNV_OFFSET, |state, &byte| {
-        (state ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
-    })
 }
 
 fn fixed_point(weight: f64) -> i64 {
@@ -139,23 +131,16 @@ fn payload(templates: &ConnectionTemplates, layout: Layout) -> Vec<u8> {
 }
 
 pub(super) fn compress(payload: &[u8], path: &Path) -> Result<Vec<u8>, Error> {
-    let mut options = XzOptions::with_preset(9);
-    options.lzma_options.nice_len = NICE_LEN;
-    options.lzma_options.depth_limit = DEPTH_LIMIT;
-    options.lzma_options.dict_size = options
-        .lzma_options
-        .dict_size
-        .max(u32::try_from(payload.len()).unwrap_or(u32::MAX));
-    let failed = |error: std::io::Error| Error::Rebuild {
-        path: path.to_path_buf(),
-        reason: format!("xz: {error}"),
-    };
-    let mut writer = XzWriter::new(Vec::new(), options).map_err(failed)?;
-    writer.write_all(payload).map_err(failed)?;
-    writer.finish().map_err(failed)
+    compress_xz(payload, path, u32::MAX)
 }
 
 pub fn pack(templates: &ConnectionTemplates, path: &Path) -> Result<u64, Error> {
+    let smaller = pack_bytes(templates, path)?;
+    write_file(path, |writer| writer.write_all(&smaller))?;
+    Ok(std::fs::metadata(path).map_err(io_error(path))?.len())
+}
+
+pub fn pack_bytes(templates: &ConnectionTemplates, path: &Path) -> Result<Vec<u8>, Error> {
     let packed = std::thread::scope(|scope| {
         let handles = Layout::ALL
             .map(|layout| scope.spawn(move || compress(&payload(templates, layout), path)));
@@ -167,19 +152,20 @@ pub fn pack(templates: &ConnectionTemplates, path: &Path) -> Result<u64, Error> 
     });
     let [first, second] = packed;
     let (first, second) = (first?, second?);
-    let smaller = if second.len() < first.len() {
+    Ok(if second.len() < first.len() {
         second
     } else {
         first
-    };
-    write_file(path, |writer| writer.write_all(&smaller))?;
-    Ok(std::fs::metadata(path).map_err(io_error(path))?.len())
+    })
 }
 
 pub(super) fn decompress(path: &Path) -> Result<Vec<u8>, Error> {
-    let file = std::fs::File::open(path).map_err(io_error(path))?;
+    decompress_bytes(&std::fs::read(path).map_err(io_error(path))?, path)
+}
+
+fn decompress_bytes(xz: &[u8], path: &Path) -> Result<Vec<u8>, Error> {
     let mut payload = Vec::new();
-    XzReader::new(std::io::BufReader::new(file), false)
+    XzReader::new(xz, false)
         .read_to_end(&mut payload)
         .map_err(|error| bad(path, format!("xz: {error}")))?;
     Ok(payload)
@@ -372,8 +358,8 @@ fn parse_payload(payload: &[u8], path: &Path) -> Result<ConnectionTemplates, Err
     ConnectionTemplates::new(cost_factor, left_size, right_size, parts)
 }
 
-fn read_pack(path: &Path) -> Result<ConnectionTemplates, Error> {
-    parse_payload(&decompress(path)?, path)
+pub fn unpack_bytes(xz: &[u8], path: &Path) -> Result<ConnectionTemplates, Error> {
+    parse_payload(&decompress_bytes(xz, path)?, path)
 }
 
 pub fn unpack(
@@ -382,6 +368,6 @@ pub fn unpack(
     hot: Option<HotShape>,
     threads: usize,
 ) -> Result<(), Error> {
-    let templates = read_pack(pack)?;
+    let templates = unpack_bytes(&std::fs::read(pack).map_err(io_error(pack))?, pack)?;
     write_matrix_files(&templates, dict_dir, hot, threads)
 }

@@ -10,9 +10,9 @@ use super::features::{FeatureView, Layout as FeatureLayout, NumSpec, check as fe
 use super::{
     BLOCK_CODES, BLOCK_COUNT, CELLS, CELLS_PADDING, CHAR_BLOCKS, CHAR_INDEX, CHAR_TABLE, DICRC,
     FEATURES, FLAG_HOT_MATRIX, FLAG_INT_TEMPLATES, FLAGS_SHIFT, HEADER_BYTES, INLINE_COUNT_MASK,
-    INLINE_COUNT_SHIFT, INLINE_FLAG, MAGIC, MATRIX, MAX_UNITS, PARAMS, SECTION_NAMES, SECTIONS,
-    TEMPLATES, TERMINAL_FLAG, TOKENS, UNIT_BYTES, UNKNOWN_STARTS, UNKNOWN_TOKENS, UNUSED_LABEL,
-    VALUE_MASK, VERSION, label_of,
+    INLINE_COUNT_SHIFT, INLINE_FLAG, MAGIC, MATRIX, MAX_UNITS, PARAMS, SECTIONS, TEMPLATES,
+    TERMINAL_FLAG, TOKENS, UNIT_BYTES, UNKNOWN_STARTS, UNKNOWN_TOKENS, UNUSED_LABEL, VALUE_MASK,
+    VERSION, label_of,
 };
 use crate::char_property::SentenceChars;
 use crate::char_table::{HEADER_BYTES as CHAR_TABLE_HEADER, MAGIC as CHAR_TABLE_MAGIC};
@@ -24,6 +24,8 @@ use crate::mapped_bytes::MappedBytes;
 use crate::section::Section;
 use crate::system_dictionary::PrefixHit;
 pub use crate::system_dictionary::TokenRecord;
+use crate::templates::{TEMPLATE_HEADER_PEEK_BYTES, float_header_sizes, header_sizes};
+use crate::wire::{u16_at, u32_at, u64_at};
 
 const CHUNK: usize = 1 << 20;
 const PARAM_BYTES: usize = 8;
@@ -52,18 +54,6 @@ fn read_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> std::io::Resu
         offset += read as u64;
     }
     Ok(())
-}
-
-fn u16_at(bytes: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([bytes[at], bytes[at + 1]])
-}
-
-fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(*bytes[at..].first_chunk().expect("in range"))
-}
-
-fn u64_at(bytes: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(*bytes[at..].first_chunk().expect("in range"))
 }
 
 pub(super) struct Source<'a> {
@@ -258,27 +248,23 @@ impl PackedDictionary {
             return Err(broken("the matrix size does not match its header"));
         }
         if hot && integer_templates {
-            let mut templates_header = [0u8; 24];
+            let mut templates_header = [0u8; TEMPLATE_HEADER_PEEK_BYTES];
             if length(TEMPLATES) < templates_header.len() {
                 return Err(broken("the integer templates are empty"));
             }
             source.read(TEMPLATES, 0, &mut templates_header)?;
             if !is_runtime_form(&templates_header)
-                || u32_at(&templates_header, 16) as usize != left_size
-                || u32_at(&templates_header, 20) as usize != right_size
+                || header_sizes(&templates_header) != Some((left_size, right_size))
             {
                 return Err(broken("the integer templates do not match the hot matrix"));
             }
         } else if hot {
-            let mut templates_header = [0u8; 24];
+            let mut templates_header = [0u8; TEMPLATE_HEADER_PEEK_BYTES];
             if length(TEMPLATES) < templates_header.len() {
                 return Err(broken("the templates are shorter than their header"));
             }
             source.read(TEMPLATES, 0, &mut templates_header)?;
-            if templates_header[..4] != *b"MXTP"
-                || u32_at(&templates_header, 16) as usize != left_size
-                || u32_at(&templates_header, 20) as usize != right_size
-            {
+            if float_header_sizes(&templates_header) != Some((left_size, right_size)) {
                 return Err(broken("the templates do not match the hot matrix"));
             }
         } else if length(TEMPLATES) != 0 {
@@ -410,24 +396,12 @@ impl PackedDictionary {
         Ok(dictionary)
     }
 
-    pub fn token_count(&self) -> usize {
-        self.token_count
-    }
-
     pub fn left_size(&self) -> usize {
         self.left_size
     }
 
     pub fn right_size(&self) -> usize {
         self.right_size
-    }
-
-    pub fn section_lengths(&self) -> Vec<(&'static str, usize)> {
-        SECTION_NAMES
-            .iter()
-            .zip(&self.sections)
-            .map(|(&name, range)| (name, range.len()))
-            .collect()
     }
 
     #[inline]
@@ -455,33 +429,6 @@ impl PackedDictionary {
 
     pub fn common_prefix_search(&self, key: &[u8], hits: &mut Vec<Hit>) {
         self.view().common_prefix_search(key, hits);
-    }
-
-    pub fn common_prefix_search_codes(&self, codes: &[u16], hits: &mut Vec<Hit>) {
-        hits.clear();
-        let mut cursor = Cursor::new(self.cells.view(&self.map));
-        for (at, &code) in codes.iter().enumerate() {
-            match cursor.step(code) {
-                Step::Stop => return,
-                Step::Inner => {}
-                Step::Key(first_token, token_count) => hits.push(Hit {
-                    length: at + 1,
-                    first_token: first_token as usize,
-                    token_count: token_count as usize,
-                }),
-            }
-        }
-    }
-
-    pub fn exact_match(&self, key: &[u8]) -> Option<Range<usize>> {
-        let mut found = None;
-        self.view().walk_bytes(key, |hit| found = Some(hit));
-        found.filter(|hit| hit.length == key.len()).map(Hit::tokens)
-    }
-
-    #[inline]
-    pub fn token(&self, index: usize) -> TokenRecord {
-        self.view().token(index)
     }
 
     pub fn category_count(&self) -> usize {
@@ -539,12 +486,6 @@ impl PackedDictionary {
             .expect("writing to a string does not fail");
     }
 
-    pub fn feature_string(&self, offset: u32, key: &str) -> String {
-        let mut out = String::new();
-        self.write_feature(offset, key, &mut out);
-        out
-    }
-
     pub fn key_of<'t>(&self, text: &'t str, offset: u32) -> &'t str {
         let mut hits = Vec::new();
         self.common_prefix_search(text.as_bytes(), &mut hits);
@@ -555,10 +496,6 @@ impl PackedDictionary {
                     .any(|index| view.token(index).feature == offset)
             })
             .map_or("", |hit| &text[..hit.length()])
-    }
-
-    pub fn matrix_bytes(&self) -> &[u8] {
-        &self.map[self.sections[MATRIX].clone()]
     }
 
     pub(crate) fn matrix_mapped(&self) -> MappedBytes {
@@ -580,10 +517,6 @@ impl PackedDictionary {
 
     pub fn integer_templates(&self) -> bool {
         self.integer_templates
-    }
-
-    pub fn char_table_bytes(&self) -> &[u8] {
-        &self.map[self.sections[CHAR_TABLE].clone()]
     }
 
     pub(crate) fn char_table_mapped(&self) -> MappedBytes {

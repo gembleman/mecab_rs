@@ -5,7 +5,7 @@ use memmap2::{Mmap, MmapOptions};
 
 use crate::dictionary::map_file;
 use crate::error::Error;
-use crate::hot_shape::HotShape;
+use crate::hot_shape::{CELL_SUM_BOUND, HotShape, MAX_KEYS};
 use crate::int_templates::{
     MAGIC, MAX_COST_FACTOR, MAX_SHIFT, MappedIntTemplates, RuntimeInputs, int_cost,
 };
@@ -20,8 +20,6 @@ const BLOCK_CELLS: usize = 64;
 const BLOCK_BYTES: usize = 12;
 const MIN_SPARSE_GAIN: usize = 1 << 18;
 const ABOVE: u16 = 1 << 15;
-const MAX_KEYS: usize = 0xFFFF;
-const CELL_SUM_BOUND: u128 = 1 << 62;
 
 struct Renumbered {
     new_of_old: Vec<u16>,

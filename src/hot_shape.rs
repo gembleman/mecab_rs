@@ -1,6 +1,14 @@
+use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
 
 pub const HOT_HEADER_BYTES: usize = 8;
+pub(crate) const MAX_KEYS: usize = 0xFFFF;
+pub(crate) const CELL_SUM_BOUND: u128 = 1 << 62;
+const ROWS_PER_BLOCK: usize = 64;
 const ROW_START_BYTES: usize = 4;
 const COST_BYTES: usize = 2;
 const BISECTION_ROUNDS: usize = 64;
@@ -38,6 +46,60 @@ impl PairCount {
 }
 
 impl HotShape {
+    pub(crate) fn write_matrix_in_order<S>(
+        &self,
+        left_size: usize,
+        right_size: usize,
+        threads: usize,
+        output: &mut impl Write,
+        new_scratch: impl Fn() -> S + Sync,
+        render_rows: impl Fn(&mut S, Range<usize>) -> Vec<u8> + Sync,
+    ) -> io::Result<()> {
+        self.write_header(left_size, right_size, output)?;
+        let blocks = self.rows().div_ceil(ROWS_PER_BLOCK);
+        let workers = threads.max(1);
+        let next_block = AtomicUsize::new(0);
+        let (sender, receiver) = mpsc::sync_channel::<(usize, Vec<u8>)>(workers * 2);
+        thread::scope(|scope| {
+            for _ in 0..workers {
+                let sender = sender.clone();
+                let next_block = &next_block;
+                let new_scratch = &new_scratch;
+                let render_rows = &render_rows;
+                scope.spawn(move || {
+                    let mut scratch = new_scratch();
+                    loop {
+                        let block = next_block.fetch_add(1, Ordering::Relaxed);
+                        if block >= blocks {
+                            break;
+                        }
+                        let first = block * ROWS_PER_BLOCK;
+                        let last = (first + ROWS_PER_BLOCK).min(self.rows());
+                        let bytes = render_rows(&mut scratch, first..last);
+                        if sender.send((block, bytes)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(sender);
+            let mut pending = BTreeMap::new();
+            let mut next_to_write = 0;
+            for (block, bytes) in receiver.iter() {
+                pending.insert(block, bytes);
+                while let Some(bytes) = pending.remove(&next_to_write) {
+                    output.write_all(&bytes)?;
+                    next_to_write += 1;
+                }
+            }
+            if next_to_write == blocks {
+                Ok(())
+            } else {
+                Err(io::Error::other("a template worker stopped early"))
+            }
+        })
+    }
+
     pub fn rectangle(hot_left: usize, hot_right: usize) -> Self {
         Self::from_lengths(vec![hot_left as u32; hot_right])
     }

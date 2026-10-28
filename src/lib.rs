@@ -2,7 +2,8 @@ pub mod build;
 mod char_property;
 pub mod char_table;
 mod clusters;
-pub mod codec;
+#[cfg(feature = "xz")]
+mod codec;
 mod constraint;
 mod dictionary;
 mod error;
@@ -27,6 +28,7 @@ mod section;
 mod system_dictionary;
 mod tagger;
 mod templates;
+mod wire;
 
 pub use char_table::{CharTable, migrate_char_table};
 pub use constraint::{BoundaryKind, Constraint};
@@ -35,7 +37,7 @@ pub use error::Error;
 pub use feature_text::FeatureText;
 pub use hot_shape::{HotShape, PAIR_COUNT_BYTES, PairCount};
 pub use int_runtime::RuntimeIntTemplates;
-pub use int_templates::{IntPart, IntTemplates, MappedIntTemplates, int_cost};
+pub use int_templates::{IntPart, IntTemplates, MappedIntTemplates};
 pub use partial::PartialInput;
 pub use tagger::{DEFAULT_THETA, FeatureId, LatticeView, NBest, Node, NodeKind, Path, Tagger};
 pub use templates::{ConnectionTemplates, MappedTemplates, TemplatePart};

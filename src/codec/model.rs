@@ -1,6 +1,7 @@
-use super::coder::{Coder, Flag, UintModel, unzigzag, zigzag};
+use super::coder::{Coder, Flag, UintModel};
 use super::ppm::{FastMap, Interner, NOVEL, Ppm, hash_bytes, mix};
 use super::text::{CharModel, is_kana, kata};
+use crate::wire::{get_varint, put_varint, unzigzag, zigzag};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
@@ -33,31 +34,6 @@ pub struct Plan {
     pub pos_cols: usize,
     pub cat_ctx: Option<usize>,
     pub steps: Vec<Step>,
-}
-
-pub fn put_varint(out: &mut Vec<u8>, mut v: u64) {
-    while v >= 0x80 {
-        out.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
-
-pub fn get_varint(b: &[u8], pos: &mut usize) -> Option<u64> {
-    let mut v = 0u64;
-    let mut shift = 0;
-    loop {
-        let x = *b.get(*pos)?;
-        *pos += 1;
-        if shift > 63 {
-            return None;
-        }
-        v |= ((x & 0x7F) as u64) << shift;
-        if x & 0x80 == 0 {
-            return Some(v);
-        }
-        shift += 7;
-    }
 }
 
 fn put_opt(out: &mut Vec<u8>, v: Option<usize>) {

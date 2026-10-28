@@ -1,10 +1,6 @@
-use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::mem::size_of;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::thread;
 
 use memmap2::Mmap;
 
@@ -15,14 +11,31 @@ use crate::hot_shape::HotShape;
 use crate::mapped_bytes::MappedBytes;
 use crate::section::{Plain, Section, SectionSource};
 
-const TEMPLATE_MAGIC: &[u8; 4] = b"MXTP";
+pub(crate) const TEMPLATE_MAGIC: &[u8; 4] = b"MXTP";
+pub(crate) const TEMPLATE_HEADER_PEEK_BYTES: usize = 24;
+const SIZES_OFFSET: usize = 16;
+const WORD_BYTES: usize = 4;
 const TEMPLATE_VERSION: u32 = 1;
 const ARRAY_ALIGNMENT: usize = 8;
 const MAX_PARTS: usize = 256;
 const DEFAULT_CLUSTER_COUNT: usize = 12;
-const ROWS_PER_BLOCK: usize = 64;
 const MIN_COST: f64 = -32767.0;
 const MAX_COST: f64 = 32767.0;
+
+pub(crate) fn header_sizes(header: &[u8]) -> Option<(usize, usize)> {
+    let word = |at: usize| {
+        let bytes = header.get(at..at + WORD_BYTES)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?) as usize)
+    };
+    Some((word(SIZES_OFFSET)?, word(SIZES_OFFSET + WORD_BYTES)?))
+}
+
+pub(crate) fn float_header_sizes(header: &[u8]) -> Option<(usize, usize)> {
+    header
+        .starts_with(TEMPLATE_MAGIC)
+        .then(|| header_sizes(header))
+        .flatten()
+}
 
 pub struct TemplatePart {
     pub left_count: usize,
@@ -503,11 +516,14 @@ impl ConnectionTemplates {
         write_clusters(&slices, &plans, self.left_size, self.right_size, output)
     }
 
-    fn render_block(&self, block: usize, shape: &HotShape, scratch: &mut RowScratch) -> Vec<u8> {
-        let first = block * ROWS_PER_BLOCK;
-        let last = (first + ROWS_PER_BLOCK).min(shape.rows());
+    fn render_rows(
+        &self,
+        rows: std::ops::Range<usize>,
+        shape: &HotShape,
+        scratch: &mut RowScratch,
+    ) -> Vec<u8> {
         let mut bytes = Vec::new();
-        for right_left_id in first..last {
+        for right_left_id in rows {
             let length = shape.row_length(right_left_id);
             self.fill_row_sums(right_left_id, length, scratch);
             for sum in &scratch.row[..length] {
@@ -523,44 +539,14 @@ impl ConnectionTemplates {
         threads: usize,
         output: &mut impl Write,
     ) -> io::Result<()> {
-        shape.write_header(self.left_size, self.right_size, output)?;
-        let blocks = shape.rows().div_ceil(ROWS_PER_BLOCK);
-        let next_block = AtomicUsize::new(0);
-        let (sender, receiver) = mpsc::sync_channel::<(usize, Vec<u8>)>(threads.max(1) * 2);
-        thread::scope(|scope| {
-            for _ in 0..threads.max(1) {
-                let sender = sender.clone();
-                let next_block = &next_block;
-                scope.spawn(move || {
-                    let mut scratch = RowScratch::new(self);
-                    loop {
-                        let block = next_block.fetch_add(1, Ordering::Relaxed);
-                        if block >= blocks {
-                            break;
-                        }
-                        let bytes = self.render_block(block, shape, &mut scratch);
-                        if sender.send((block, bytes)).is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
-            drop(sender);
-            let mut pending = BTreeMap::new();
-            let mut next_to_write = 0;
-            for (block, bytes) in receiver.iter() {
-                pending.insert(block, bytes);
-                while let Some(bytes) = pending.remove(&next_to_write) {
-                    output.write_all(&bytes)?;
-                    next_to_write += 1;
-                }
-            }
-            if next_to_write == blocks {
-                Ok(())
-            } else {
-                Err(io::Error::other("a template worker stopped early"))
-            }
-        })
+        shape.write_matrix_in_order(
+            self.left_size,
+            self.right_size,
+            threads,
+            output,
+            || RowScratch::new(self),
+            |scratch, rows| self.render_rows(rows, shape, scratch),
+        )
     }
 }
 
