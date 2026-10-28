@@ -1,7 +1,8 @@
+pub(crate) mod int_stream;
 mod lexicon;
-mod matrix;
+pub(crate) mod matrix;
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 
 use lzma_rust2::XzReader;
@@ -9,15 +10,14 @@ use lzma_rust2::XzReader;
 use super::model::{LexiconSections, Model};
 use super::source::read_dictionary;
 use crate::Error;
-use crate::build::write_file;
 use crate::error::io_error;
-use crate::wire::{compress_xz, fnv1a64};
+use crate::file_write::write_file;
+use crate::wire::fnv1a64;
 
 const MAGIC: &[u8; 4] = b"MRDT";
 const VERSION: u32 = 3;
-const MAX_DICT_SIZE: u32 = 512 << 20;
 
-pub(super) use matrix::encode as matrix_part;
+pub use matrix::encode as matrix_part;
 
 fn bad(path: &Path, reason: &'static str) -> Error {
     Error::Format {
@@ -26,10 +26,10 @@ fn bad(path: &Path, reason: &'static str) -> Error {
     }
 }
 
-pub(super) struct Part {
-    pub(super) name: &'static str,
-    pub(super) encoding: u32,
-    pub(super) bytes: Vec<u8>,
+pub struct Part {
+    pub name: &'static str,
+    pub encoding: u32,
+    pub bytes: Vec<u8>,
 }
 
 pub(super) struct Parts<'a> {
@@ -72,7 +72,7 @@ fn dicrc_part(model: &Model) -> Part {
     }
 }
 
-pub(super) fn encode_parts(model: &Model, matrix: Part) -> Result<Vec<Part>, Error> {
+pub fn encode_parts(model: &Model, matrix: Part) -> Result<Vec<Part>, Error> {
     let mut parts = lexicon::encode(model)?;
     parts.push(matrix);
     parts.push(Part {
@@ -84,7 +84,7 @@ pub(super) fn encode_parts(model: &Model, matrix: Part) -> Result<Vec<Part>, Err
     Ok(parts)
 }
 
-pub(super) fn container(parts: &[Part]) -> Vec<u8> {
+pub fn container(parts: &[Part]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
@@ -192,18 +192,10 @@ fn runtime_model(parts: &Parts) -> Result<(Model, LexiconSections), Error> {
     })
 }
 
-pub(super) fn compress(payload: &[u8], path: &Path) -> Result<Vec<u8>, Error> {
-    compress_xz(payload, path, MAX_DICT_SIZE)
-}
-
-pub fn write_transport(dict_dir: &Path, out_xz: &Path) -> Result<u64, Error> {
+pub fn transport_payload(dict_dir: &Path) -> Result<Vec<u8>, Error> {
     let model = read_dictionary(dict_dir)?;
     let matrix = matrix_part(dict_dir, &model)?;
-    let payload = container(&encode_parts(&model, matrix)?);
-    drop(model);
-    let compressed = compress(&payload, out_xz)?;
-    write_file(out_xz, |writer| writer.write_all(&compressed))?;
-    Ok(compressed.len() as u64)
+    Ok(container(&encode_parts(&model, matrix)?))
 }
 
 pub fn expand(xz_file: &Path, out_mrd: &Path) -> Result<(), Error> {

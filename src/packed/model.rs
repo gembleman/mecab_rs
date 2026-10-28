@@ -16,45 +16,45 @@ use crate::hot_shape::HotShape;
 use crate::int_runtime::{is_runtime_form, runtime_form_of};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(super) struct Param {
-    pub(super) left_id: u16,
-    pub(super) right_id: u16,
-    pub(super) pos_id: u16,
-    pub(super) word_cost: i16,
+pub struct Param {
+    pub left_id: u16,
+    pub right_id: u16,
+    pub pos_id: u16,
+    pub word_cost: i16,
 }
 
 #[derive(Default, PartialEq, Debug)]
-pub(super) struct Model {
-    pub(super) keys: Vec<String>,
-    pub(super) counts: Vec<u8>,
-    pub(super) token_params: Vec<u32>,
-    pub(super) token_features: Vec<u32>,
-    pub(super) params: Vec<Param>,
-    pub(super) features: Vec<u8>,
-    pub(super) unknown_starts: Vec<u32>,
-    pub(super) unknown_params: Vec<u32>,
-    pub(super) unknown_features: Vec<u32>,
-    pub(super) matrix: Vec<u8>,
-    pub(super) templates: Vec<u8>,
-    pub(super) char_table: Vec<u8>,
-    pub(super) bos_feature: String,
-    pub(super) unknown_feature: Option<String>,
+pub struct Model {
+    pub keys: Vec<String>,
+    pub counts: Vec<u8>,
+    pub token_params: Vec<u32>,
+    pub token_features: Vec<u32>,
+    pub params: Vec<Param>,
+    pub features: Vec<u8>,
+    pub unknown_starts: Vec<u32>,
+    pub unknown_params: Vec<u32>,
+    pub unknown_features: Vec<u32>,
+    pub matrix: Vec<u8>,
+    pub templates: Vec<u8>,
+    pub char_table: Vec<u8>,
+    pub bos_feature: String,
+    pub unknown_feature: Option<String>,
 }
 
-pub(super) struct LexiconSections {
+pub struct LexiconSections {
     sections: [Cow<'static, [u8]>; SECTIONS],
     code_count: u32,
     param_bits: u32,
     feature_bits: u32,
 }
 
-pub(super) struct Runtime<'a> {
+pub struct Runtime<'a> {
     header: Vec<u8>,
     sections: Vec<Cow<'a, [u8]>>,
 }
 
 impl Runtime<'_> {
-    pub(super) fn write_to(&self, output: &mut impl Write) -> io::Result<()> {
+    pub fn write_to(&self, output: &mut impl Write) -> io::Result<()> {
         output.write_all(&self.header)?;
         for section in &self.sections {
             output.write_all(section)?;
@@ -121,7 +121,7 @@ impl Model {
         features::encode::encode(&self.features, &tokens)
     }
 
-    pub(super) fn encode_runtime(&self) -> Result<Runtime<'_>, Error> {
+    pub fn encode_runtime(&self) -> Result<Runtime<'_>, Error> {
         self.finish_runtime(self.encode_lexicon_sections()?)
     }
 

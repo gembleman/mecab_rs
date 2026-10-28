@@ -40,7 +40,7 @@ pub enum Error {
     Corrupt(&'static str),
 }
 
-pub(crate) fn io_error(path: &std::path::Path) -> impl Fn(io::Error) -> Error + '_ {
+pub fn io_error(path: &std::path::Path) -> impl Fn(io::Error) -> Error + '_ {
     |source| Error::Io {
         path: path.to_path_buf(),
         source,
@@ -111,5 +111,12 @@ impl std::error::Error for Error {
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
+    }
+}
+
+pub(crate) fn rebuild_error(path: &std::path::Path, reason: impl Into<String>) -> Error {
+    Error::Rebuild {
+        path: path.to_path_buf(),
+        reason: reason.into(),
     }
 }

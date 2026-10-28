@@ -1,12 +1,13 @@
 use std::path::Path;
 
+use super::int_stream::{IntContext, decode_payload, encode_payload};
 use super::{Part, Parts, bad, io_error};
 use crate::int_runtime::{is_runtime_form, runtime_form_of};
 use crate::int_templates::DEFAULT_CLUSTER_COUNT;
+use crate::int_templates::IntTemplates;
 use crate::packed::model::Model;
-use crate::rebuild::default_threads;
-use crate::rebuild::int_matrix::{IntContext, decode_payload, encode_payload};
-use crate::{Error, HotShape, IntTemplates};
+use crate::threads::default_threads;
+use crate::{Error, HotShape};
 
 const ENCODING_DENSE_DELTA: u32 = 1;
 const ENCODING_INTEGER_MRIT: u32 = 4;
@@ -191,7 +192,7 @@ fn integer_part(dict_dir: &Path, model: &Model) -> Result<Part, Error> {
     })
 }
 
-pub(in crate::packed) fn encode(dict_dir: &Path, model: &Model) -> Result<Part, Error> {
+pub fn encode(dict_dir: &Path, model: &Model) -> Result<Part, Error> {
     if model.templates.is_empty() {
         return Ok(Part {
             name: "matrix",

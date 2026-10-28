@@ -4,7 +4,6 @@ use std::path::Path;
 
 use super::model::{Model, Param};
 use crate::Error;
-use crate::build::text::key_value;
 use crate::char_property::CharProperty;
 use crate::char_table::CHAR_TABLE_FILE;
 use crate::error::io_error;
@@ -23,6 +22,19 @@ fn broken(path: &Path, reason: &'static str) -> Error {
         file: path.to_path_buf(),
         reason,
     }
+}
+
+fn key_value(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    let equals = line.iter().position(|&byte| byte == b'=')?;
+    let key_end = line[..equals]
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(0, |offset| offset + 1);
+    let value_start = line[equals + 1..]
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .map_or(line.len(), |offset| equals + 1 + offset);
+    Some((&line[..key_end], &line[value_start..]))
 }
 
 fn dicrc_features(path: &Path) -> Result<(String, Option<String>), Error> {
@@ -155,7 +167,7 @@ fn read_keys(path: &Path) -> Result<Vec<RawKey>, Error> {
     Ok(keys)
 }
 
-pub(super) fn read_dictionary(directory: &Path) -> Result<Model, Error> {
+pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
     let (bos_feature, unknown_feature) = dicrc_features(&directory.join("dicrc"))?;
     let system_path = directory.join("sys.dic");
     let system = SystemDictionary::open(&system_path, DictionaryKind::System)?;

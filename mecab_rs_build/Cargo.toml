@@ -1,0 +1,16 @@
+[package]
+name = "mecab_rs_build"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "BSD-3-Clause"
+description = "Dictionary building, learning and packing tools for mecab_rs"
+publish = false
+
+[dependencies]
+mecab_rs = { path = ".." }
+memmap2 = "0.9"
+lzma-rust2 = { version = "0.19", default-features = false, features = ["std", "encoder", "optimization", "xz"] }
+
+[features]
+pair-stats = ["mecab_rs/pair-stats"]

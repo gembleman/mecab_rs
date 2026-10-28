@@ -65,7 +65,7 @@ pub(crate) fn runtime_form_from(
     write_runtime(inputs, shape, MIN_SPARSE_GAIN)
 }
 
-pub(crate) fn runtime_form_of(bytes: &[u8], shape: &HotShape) -> Result<Vec<u8>, Error> {
+pub fn runtime_form_of(bytes: &[u8], shape: &HotShape) -> Result<Vec<u8>, Error> {
     let path = Path::new("matrix.itp");
     let io_error = |source| Error::Io {
         path: path.to_path_buf(),

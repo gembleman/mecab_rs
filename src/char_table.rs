@@ -4,8 +4,8 @@ use std::io::{self, Write};
 use std::ops::RangeInclusive;
 use std::path::Path;
 
-use crate::build::write_file;
 use crate::error::Error;
+use crate::file_write::write_file;
 
 pub(crate) const CHAR_TABLE_FILE: &str = "char.uni";
 const CHAR_BIN_FILE: &str = "char.bin";

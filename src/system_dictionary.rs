@@ -11,25 +11,25 @@ use crate::error::Error;
 use crate::section::{Plain, Section};
 use crate::wire::u32_at;
 
-pub(crate) const MAGIC_ID: u32 = 0xEF71_8F77;
-pub(crate) const DIC_VERSION: u32 = 102;
-pub(crate) const HEADER_SIZE: usize = 72;
-pub(crate) const TOKEN_SIZE: usize = 16;
-pub(crate) const VALUE_SIZE_BITS: u32 = 8;
+pub const MAGIC_ID: u32 = 0xEF71_8F77;
+pub const DIC_VERSION: u32 = 102;
+pub const HEADER_SIZE: usize = 72;
+pub const TOKEN_SIZE: usize = 16;
+pub const VALUE_SIZE_BITS: u32 = 8;
 const VALUE_SIZE_MASK: i32 = 0xff;
-const OUTSIDE_TOKEN_TABLE: &str = "a double array entry points outside the token table";
+pub const OUTSIDE_TOKEN_TABLE: &str = "a double array entry points outside the token table";
 const VERSION_AT: usize = 4;
 const KIND_AT: usize = 8;
 const LEFT_SIZE_AT: usize = 16;
 const RIGHT_SIZE_AT: usize = 20;
-const ARRAY_BYTES_AT: usize = 24;
-const TOKEN_BYTES_AT: usize = 28;
-const FEATURE_BYTES_AT: usize = 32;
+pub const ARRAY_BYTES_AT: usize = 24;
+pub const TOKEN_BYTES_AT: usize = 28;
+pub const FEATURE_BYTES_AT: usize = 32;
 const CHARSET: Range<usize> = 40..HEADER_SIZE;
 const UTF8_NAMES: [&[u8]; 2] = [b"utf-8", b"utf8"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DictionaryKind {
+pub enum DictionaryKind {
     System = 0,
     User = 1,
     Unknown = 2,
@@ -107,7 +107,7 @@ const _: () = assert!(size_of::<RawToken>() == TOKEN_SIZE);
 
 unsafe impl Plain for RawToken {}
 
-pub(crate) struct SystemDictionary {
+pub struct SystemDictionary {
     map: Mmap,
     left_size: usize,
     right_size: usize,
@@ -117,11 +117,11 @@ pub(crate) struct SystemDictionary {
 }
 
 impl SystemDictionary {
-    pub(crate) fn open(path: &Path, kind: DictionaryKind) -> Result<Self, Error> {
+    pub fn open(path: &Path, kind: DictionaryKind) -> Result<Self, Error> {
         Self::open_checking_in_blocks(path, kind, CHECK_BLOCK_BYTES)
     }
 
-    fn open_checking_in_blocks(
+    pub fn open_checking_in_blocks(
         path: &Path,
         kind: DictionaryKind,
         read_block_bytes: usize,
@@ -189,19 +189,19 @@ impl SystemDictionary {
         })
     }
 
-    pub(crate) fn charset(&self) -> &[u8] {
+    pub fn charset(&self) -> &[u8] {
         charset_name(&self.map)
     }
 
-    pub(crate) fn left_size(&self) -> usize {
+    pub fn left_size(&self) -> usize {
         self.left_size
     }
 
-    pub(crate) fn right_size(&self) -> usize {
+    pub fn right_size(&self) -> usize {
         self.right_size
     }
 
-    pub(crate) fn common_prefix_search(&self, key: &[u8], hits: &mut Vec<PrefixHit>) {
+    pub fn common_prefix_search(&self, key: &[u8], hits: &mut Vec<PrefixHit>) {
         hits.clear();
         let cells = self.cells.view(&self.map);
         let Some(&[root, _]) = cells.first() else {
@@ -220,7 +220,7 @@ impl SystemDictionary {
         push_terminal(cells, base, key.len(), hits);
     }
 
-    pub(crate) fn exact_match(&self, key: &[u8]) -> Option<Range<usize>> {
+    pub fn exact_match(&self, key: &[u8]) -> Option<Range<usize>> {
         let cells = self.cells.view(&self.map);
         let (mut base, _) = cell(cells, 0)?;
         for &byte in key {
@@ -235,11 +235,11 @@ impl SystemDictionary {
         found.then(|| PrefixHit::new(-value - 1, key.len()).tokens())
     }
 
-    pub(crate) fn token(&self, index: usize) -> TokenRecord {
+    pub fn token(&self, index: usize) -> TokenRecord {
         self.tokens.view(&self.map)[index].record()
     }
 
-    pub(crate) fn feature(&self, offset: u32) -> &str {
+    pub fn feature(&self, offset: u32) -> &str {
         let rest = &self.map[self.features.start + offset as usize..self.features.end];
         let length = rest
             .iter()
@@ -251,8 +251,8 @@ impl SystemDictionary {
 
 const PARALLEL_MIN_BYTES: usize = 1 << 22;
 const MAX_CHECK_THREADS: usize = 8;
-const CHECK_BLOCK_BYTES: usize = 1 << 18;
-const CELL_SIZE: usize = 8;
+pub const CHECK_BLOCK_BYTES: usize = 1 << 18;
+pub const CELL_SIZE: usize = 8;
 
 fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
     while !buf.is_empty() {

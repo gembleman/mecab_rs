@@ -206,7 +206,7 @@ impl SentenceChars {
     }
 }
 
-pub(crate) struct CharProperty {
+pub struct CharProperty {
     map: MappedBytes,
     category_count: usize,
     palette: Vec<Class>,
@@ -215,7 +215,7 @@ pub(crate) struct CharProperty {
 }
 
 impl CharProperty {
-    pub(crate) fn open(path: &Path) -> Result<Self, Error> {
+    pub fn open(path: &Path) -> Result<Self, Error> {
         if !path.exists() {
             return Err(Error::MissingCharTable {
                 path: path.to_path_buf(),
@@ -287,11 +287,11 @@ impl CharProperty {
         Self::from_mapped(map, path)
     }
 
-    pub(crate) fn category_count(&self) -> usize {
+    pub fn category_count(&self) -> usize {
         self.category_count
     }
 
-    pub(crate) fn name(&self, index: usize) -> &[u8] {
+    pub fn name(&self, index: usize) -> &[u8] {
         let start = HEADER_BYTES + NAME_BYTES * index;
         let bytes = self
             .map

@@ -68,7 +68,7 @@ fn validate(part: &TemplatePart, left_size: usize, right_size: usize) -> Result<
     }
 }
 
-pub(crate) fn to_cost(sum: f64, cost_factor: f64) -> i16 {
+pub fn to_cost(sum: f64, cost_factor: f64) -> i16 {
     (-cost_factor * sum).clamp(MIN_COST, MAX_COST) as i16
 }
 
@@ -226,20 +226,20 @@ impl ConnectionTemplates {
     }
 }
 
-pub(crate) struct ExactRows<'a> {
+pub struct ExactRows<'a> {
     templates: &'a ConnectionTemplates,
     scratch: RowScratch<f64>,
 }
 
 impl<'a> ExactRows<'a> {
-    pub(crate) fn new(templates: &'a ConnectionTemplates) -> Self {
+    pub fn new(templates: &'a ConnectionTemplates) -> Self {
         Self {
             templates,
             scratch: RowScratch::new(templates.slices(), templates.left_size),
         }
     }
 
-    pub(crate) fn render(&mut self, right_left_id: usize, out: &mut [i16]) {
+    pub fn render(&mut self, right_left_id: usize, out: &mut [i16]) {
         let left_size = self.templates.left_size;
         self.scratch
             .fill_row_sums(self.templates.slices(), right_left_id, left_size);

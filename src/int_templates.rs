@@ -149,7 +149,7 @@ fn validate<'a>(
     }
 }
 
-pub(crate) struct IntView<'a> {
+pub struct IntView<'a> {
     pub(crate) cost_factor: u32,
     pub(crate) shift: u32,
     pub(crate) left_size: usize,
@@ -160,12 +160,7 @@ pub(crate) struct IntView<'a> {
 }
 
 impl IntView<'_> {
-    pub(crate) fn render_computed_row(
-        &self,
-        row: usize,
-        scratch: &mut IntRowScratch,
-        out: &mut [i16],
-    ) {
+    pub fn render_computed_row(&self, row: usize, scratch: &mut IntRowScratch, out: &mut [i16]) {
         scratch
             .0
             .fill_row_sums(self.parts.iter().copied(), row, self.left_size);
@@ -191,7 +186,7 @@ impl IntView<'_> {
         }
     }
 
-    pub(crate) fn scratch(&self) -> IntRowScratch {
+    pub fn scratch(&self) -> IntRowScratch {
         IntRowScratch(RowScratch::new(self.parts.iter().copied(), self.left_size))
     }
 
@@ -225,7 +220,7 @@ impl IntView<'_> {
     }
 }
 
-pub(crate) struct IntRowScratch(RowScratch<i32>);
+pub struct IntRowScratch(RowScratch<i32>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntTemplates {
@@ -374,7 +369,7 @@ impl IntTemplates {
             .unwrap_or_else(|| self.computed_cost(left_node_rc, right_node_lc))
     }
 
-    pub(crate) fn view(&self) -> IntView<'_> {
+    pub fn view(&self) -> IntView<'_> {
         IntView {
             cost_factor: self.cost_factor,
             shift: self.shift,

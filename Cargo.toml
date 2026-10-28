@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "mecab_rs_build"]
+exclude = ["compare"]
+
 [package]
 name = "mecab_rs"
 version = "0.1.0"
@@ -12,9 +16,10 @@ include = ["src/", "README.md", "LICENSE", "Cargo.toml"]
 
 [dependencies]
 memmap2 = "0.9"
-lzma-rust2 = { version = "0.19", default-features = false, features = ["std", "encoder", "optimization", "xz"], optional = true }
+lzma-rust2 = { version = "0.19", default-features = false, features = ["std", "optimization", "xz"], optional = true }
 
 [features]
+default = ["xz"]
 xz = ["dep:lzma-rust2"]
 pair-stats = []
 
