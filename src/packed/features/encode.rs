@@ -667,12 +667,7 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
     }
 
     let too_big = || Error::Unsupported("a feature table that does not fit the section");
-    let mut template_offsets: Vec<u32> = vec![0];
-    let mut template_bytes: Vec<u8> = Vec::new();
-    for template in &template_list {
-        template_bytes.extend_from_slice(template);
-        template_offsets.push(u32::try_from(template_bytes.len()).map_err(|_| too_big())?);
-    }
+    let pieces = super::pieces::build(&template_list).ok_or_else(too_big)?;
     let mut shape_offsets: Vec<u32> = vec![0];
     let mut shape_bytes: Vec<u8> = Vec::new();
     for shape in &shape_list {
@@ -689,7 +684,10 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         numerics: stored.len() as u32,
         lo_total: u32::try_from(low_values.len()).map_err(|_| too_big())?,
         chars: recoded.table.len() as u32,
-        template_bytes: template_bytes.len() as u64,
+        pieces: u32::try_from(pieces.offsets.len() - 1).map_err(|_| too_big())?,
+        positions: pieces.positions.len() as u32,
+        entry_bits: pieces.entry_bits,
+        pool_bytes: pieces.pool.len() as u64,
         shape_bytes: shape_bytes.len() as u64,
         strings: area.len() as u64,
         records: records.len() as u64,
@@ -703,12 +701,15 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
     };
     let words =
         |values: &[u32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
-    put(
-        &mut bytes,
-        &layout.template_offsets,
-        &words(&template_offsets),
-    );
-    put(&mut bytes, &layout.templates, &template_bytes);
+    let position_bytes: Vec<u8> = pieces
+        .positions
+        .iter()
+        .flat_map(|position| position.to_bytes())
+        .collect();
+    put(&mut bytes, &layout.positions, &position_bytes);
+    put(&mut bytes, &layout.piece_offsets, &words(&pieces.offsets));
+    put(&mut bytes, &layout.pool, &pieces.pool);
+    put(&mut bytes, &layout.entries, &pieces.entries);
     put(&mut bytes, &layout.shape_offsets, &words(&shape_offsets));
     put(&mut bytes, &layout.shapes, &shape_bytes);
     let spec_bytes: Vec<u8> = stored

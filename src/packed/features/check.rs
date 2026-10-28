@@ -2,6 +2,7 @@ use std::ops::Range;
 use std::thread;
 
 use super::chars::{self, ENTRY_BYTES};
+use super::pieces::{POSITION_BYTES, Position};
 use super::{
     HEADER_BYTES, Layout, MAX_NUMERIC, MAX_SLOTS, NumSpec, OP_COPY, OP_COPY_MAX, OP_EMPTY, OP_HIGH,
     OP_HIGH_MAX, OP_INLINE, OP_KEY, OP_NUM, OP_NUM_MAX, OP_REF, OP_STAR, RECORD_PADDING,
@@ -135,7 +136,8 @@ fn read_range(source: &Source, section: usize, range: &Range<usize>) -> Result<V
 }
 
 struct Tables {
-    holes: Vec<u32>,
+    templates: usize,
+    positions: usize,
     operations: Vec<u32>,
     specs: Vec<NumSpec>,
     string_boundaries: Vec<u64>,
@@ -178,21 +180,7 @@ pub(in crate::packed) fn check(source: &Source, section: usize) -> Result<Checke
         return Err(invalid("the character table of the features is not valid"));
     }
 
-    let mut template_bytes = read_range(source, section, &layout.templates)?;
-    template_bytes.truncate(counts.template_bytes as usize);
-    let template_offsets = offsets_of(
-        &read_range(source, section, &layout.template_offsets)?,
-        template_bytes.len(),
-    )
-    .ok_or_else(|| invalid("the feature templates are not delimited correctly"))?;
-    let mut holes = Vec::with_capacity(template_offsets.len());
-    for pair in template_offsets.windows(2) {
-        holes.push(
-            template_holes(&template_bytes[pair[0]..pair[1]])
-                .ok_or_else(|| invalid("a feature template is not valid"))?,
-        );
-    }
-    drop(template_bytes);
+    check_pieces(source, section, &layout)?;
 
     let shape_bytes = read_range(source, section, &layout.shapes)?;
     let shape_offsets = offsets_of(
@@ -231,7 +219,8 @@ pub(in crate::packed) fn check(source: &Source, section: usize) -> Result<Checke
 
     let string_boundaries = check_strings(source, section, &layout)?;
     let tables = Tables {
-        holes,
+        templates: counts.templates as usize,
+        positions: counts.positions as usize,
         operations,
         specs: specs.clone(),
         string_boundaries,
@@ -251,22 +240,60 @@ pub(in crate::packed) fn check(source: &Source, section: usize) -> Result<Checke
     })
 }
 
-fn template_holes(program: &[u8]) -> Option<u32> {
-    let mut at = 0;
-    let mut pieces = 0u32;
-    while at < program.len() {
-        let (start, length) = if program[at] < 255 {
-            (at + 1, usize::from(program[at]))
-        } else {
-            let bytes = program.get(at + 1..at + 5)?;
-            (at + 5, u32::from_le_bytes(bytes.try_into().ok()?) as usize)
-        };
-        let piece = program.get(start..start.checked_add(length)?)?;
-        str::from_utf8(piece).ok()?;
-        at = start + length;
-        pieces += 1;
+fn check_pieces(source: &Source, section: usize, layout: &Layout) -> Result<(), Error> {
+    let counts = layout.counts;
+    let invalid = |reason: &'static str| source.broken(reason);
+    let position_bytes = read_range(source, section, &layout.positions)?;
+    let entry_bits = counts.entry_bits as usize;
+    let positions: Vec<Position> = position_bytes
+        .as_chunks::<POSITION_BYTES>()
+        .0
+        .iter()
+        .map(Position::parse)
+        .collect::<Option<_>>()
+        .ok_or_else(|| invalid("a piece position of the features is not valid"))?;
+    if positions.iter().any(|position| {
+        !position.constant && position.shift as usize + position.bits as usize > entry_bits
+    }) {
+        return Err(invalid("a piece position of the features leaves its entry"));
     }
-    pieces.checked_sub(1)
+    let mut pool = read_range(source, section, &layout.pool)?;
+    pool.truncate(counts.pool_bytes as usize);
+    let offsets = offsets_of(
+        &read_range(source, section, &layout.piece_offsets)?,
+        pool.len(),
+    )
+    .ok_or_else(|| invalid("the feature pieces are not delimited correctly"))?;
+    for pair in offsets.windows(2) {
+        if str::from_utf8(&pool[pair[0]..pair[1]]).is_err() {
+            return Err(invalid("a feature piece is not valid UTF-8"));
+        }
+    }
+    for position in positions.iter().filter(|position| position.constant) {
+        let start = position.base as usize;
+        let piece = pool.get(start..start + position.shift as usize);
+        if piece.is_none_or(|piece| str::from_utf8(piece).is_err()) {
+            return Err(invalid("a constant feature piece is not valid"));
+        }
+    }
+    drop(pool);
+    let entries = read_range(source, section, &layout.entries)?;
+    let pieces = u64::from(counts.pieces);
+    for template in 0..counts.templates as usize {
+        for position in positions.iter().filter(|position| !position.constant) {
+            let local = read_bits(
+                &entries,
+                template * entry_bits + position.shift as usize,
+                position.bits,
+            );
+            if u64::from(position.base) + local >= pieces {
+                return Err(invalid(
+                    "a feature template names a piece that does not exist",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_strings(source: &Source, section: usize, layout: &Layout) -> Result<Vec<u64>, Error> {
@@ -468,14 +495,16 @@ fn parse_record(record: &[u8], tables: &Tables) -> Result<usize, Fail> {
     bit += tables.template_bits as usize;
     let shape = read(bit, tables.shape_bits)? as usize;
     bit += tables.shape_bits as usize;
-    let (Some(&holes), Some(&operations)) =
-        (tables.holes.get(template), tables.operations.get(shape))
+    let Some(&operations) = tables
+        .operations
+        .get(shape)
+        .filter(|_| template < tables.templates)
     else {
         return Err(Fail::Invalid(
             "a feature record names a template or a shape that does not exist",
         ));
     };
-    if holes != operations {
+    if operations as usize >= tables.positions {
         return Err(Fail::Invalid(
             "a feature record joins a template and a shape that do not fit",
         ));

@@ -18,6 +18,58 @@ impl Acc {
     }
 }
 
+struct Lines<'a> {
+    text: &'a str,
+    ends: Vec<u32>,
+    bytes: usize,
+}
+
+impl<'a> Lines<'a> {
+    fn new(text: &'a str) -> Self {
+        assert!(u32::try_from(text.len()).is_ok());
+        let count = text.bytes().filter(|&byte| byte == b'\n').count() + 1;
+        let mut ends = Vec::with_capacity(count);
+        let base = text.as_ptr() as usize;
+        ends.extend(
+            text.lines()
+                .map(|line| (line.as_ptr() as usize - base + line.len()) as u32),
+        );
+        let mut lines = Self {
+            text,
+            ends,
+            bytes: 0,
+        };
+        lines.bytes = lines.iter().map(str::len).sum();
+        lines
+    }
+
+    fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    fn truncate(&mut self, count: usize) {
+        self.ends.truncate(count);
+        self.bytes = self.iter().map(str::len).sum();
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &'a str> + '_ {
+        let text = self.text;
+        let mut start = 0usize;
+        self.ends.iter().map(move |&end| {
+            let end = end as usize;
+            debug_assert!(text.is_char_boundary(start) && text.is_char_boundary(end));
+            let line = unsafe { text.get_unchecked(start..end) };
+            let terminator = if text.as_bytes().get(end) == Some(&b'\r') {
+                2
+            } else {
+                1
+            };
+            start = end + terminator;
+            line
+        })
+    }
+}
+
 trait Engine {
     fn surface(&mut self, line: &str) -> Acc;
     fn feature(&mut self, line: &str) -> Acc;
@@ -289,14 +341,14 @@ fn parse_args() -> Opts {
 
 fn measure(
     engine: &mut dyn Engine,
-    lines: &[&str],
+    lines: &Lines,
     f: fn(&mut dyn Engine, &str) -> Acc,
     warmup: usize,
     passes: usize,
 ) -> (Vec<f64>, Acc) {
     let mut acc = Acc::default();
     for _ in 0..warmup {
-        for l in lines {
+        for l in lines.iter() {
             acc.add(f(engine, black_box(l)));
         }
     }
@@ -305,7 +357,7 @@ fn measure(
     for _ in 0..passes {
         let mut a = Acc::default();
         let t = Instant::now();
-        for l in lines {
+        for l in lines.iter() {
             a.add(f(engine, black_box(l)));
         }
         times.push(t.elapsed().as_secs_f64());
@@ -335,7 +387,7 @@ fn report(
     base: Mem,
     version: &str,
     load_s: f64,
-    lines: &[&str],
+    lines: &Lines,
     n_bytes: usize,
     es: &mut dyn Engine,
     ef: &mut dyn Engine,
@@ -346,7 +398,7 @@ fn report(
     let end = memory();
     if let Some(p) = &o.dump {
         let mut out = String::new();
-        for l in lines {
+        for l in lines.iter() {
             ef.dump(l, &mut out);
             out.push('\n');
         }
@@ -368,11 +420,11 @@ fn report(
 fn main() {
     let o = parse_args();
     let text = fs::read_to_string(&o.corpus).expect("read corpus");
-    let mut lines: Vec<&str> = text.lines().collect();
+    let mut lines = Lines::new(&text);
     if let Some(n) = o.limit {
         lines.truncate(n);
     }
-    let n_bytes: usize = lines.iter().map(|l| l.len()).sum();
+    let n_bytes = lines.bytes;
     let base = memory();
 
     match o.tool.as_str() {

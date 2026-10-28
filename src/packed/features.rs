@@ -1,6 +1,7 @@
 pub(super) mod chars;
 pub(super) mod check;
 pub(super) mod encode;
+pub(super) mod pieces;
 
 use std::fmt;
 use std::ops::Range;
@@ -16,7 +17,7 @@ pub(super) const OP_HIGH: u8 = 0x30;
 pub(super) const MAX_SLOTS: usize = 16;
 pub(super) const MAX_NUMERIC: usize = 4;
 pub(super) const SPEC_BYTES: usize = 16;
-pub(super) const HEADER_BYTES: usize = 64;
+pub(super) const HEADER_BYTES: usize = 72;
 pub(super) const SYNC_EVERY: usize = 4096;
 pub(super) const RECORD_PADDING: usize = 16;
 pub(super) const SLACK: usize = 16;
@@ -45,7 +46,10 @@ pub(super) struct Counts {
     pub(super) numerics: u32,
     pub(super) lo_total: u32,
     pub(super) chars: u32,
-    pub(super) template_bytes: u64,
+    pub(super) pieces: u32,
+    pub(super) positions: u32,
+    pub(super) entry_bits: u32,
+    pub(super) pool_bytes: u64,
     pub(super) shape_bytes: u64,
     pub(super) strings: u64,
     pub(super) records: u64,
@@ -58,8 +62,10 @@ pub(super) struct Layout {
     pub(super) template_bits: u32,
     pub(super) shape_bits: u32,
     pub(super) ref_bits: u32,
-    pub(super) template_offsets: Range<usize>,
-    pub(super) templates: Range<usize>,
+    pub(super) positions: Range<usize>,
+    pub(super) piece_offsets: Range<usize>,
+    pub(super) pool: Range<usize>,
+    pub(super) entries: Range<usize>,
     pub(super) shape_offsets: Range<usize>,
     pub(super) shapes: Range<usize>,
     pub(super) specs: Range<usize>,
@@ -85,8 +91,14 @@ impl Layout {
             template_bits: bits_for(u64::from(counts.templates)),
             shape_bits: bits_for(u64::from(counts.shapes)),
             ref_bits: bits_for(counts.strings),
-            template_offsets: take(4 * (u64::from(counts.templates) + 1))?,
-            templates: take(counts.template_bytes.checked_add(SLACK as u64)?)?,
+            positions: take(pieces::POSITION_BYTES as u64 * u64::from(counts.positions))?,
+            piece_offsets: take(4 * (u64::from(counts.pieces) + 1))?,
+            pool: take(counts.pool_bytes.checked_add(SLACK as u64)?)?,
+            entries: take(
+                (u64::from(counts.templates) * u64::from(counts.entry_bits))
+                    .div_ceil(8)
+                    .checked_add(SLACK as u64)?,
+            )?,
             shape_offsets: take(4 * (u64::from(counts.shapes) + 1))?,
             shapes: take(counts.shape_bytes)?,
             specs: take(SPEC_BYTES as u64 * u64::from(counts.numerics))?,
@@ -110,12 +122,15 @@ impl Layout {
         header[4..8].copy_from_slice(&counts.shapes.to_le_bytes());
         header[8..12].copy_from_slice(&counts.numerics.to_le_bytes());
         header[12..16].copy_from_slice(&counts.lo_total.to_le_bytes());
-        header[16..24].copy_from_slice(&counts.template_bytes.to_le_bytes());
+        header[16..24].copy_from_slice(&counts.pool_bytes.to_le_bytes());
         header[24..32].copy_from_slice(&counts.shape_bytes.to_le_bytes());
         header[32..40].copy_from_slice(&counts.strings.to_le_bytes());
         header[40..48].copy_from_slice(&counts.records.to_le_bytes());
         header[48..52].copy_from_slice(&counts.record_count.to_le_bytes());
         header[56..60].copy_from_slice(&counts.chars.to_le_bytes());
+        header[60..64].copy_from_slice(&counts.pieces.to_le_bytes());
+        header[64..68].copy_from_slice(&counts.positions.to_le_bytes());
+        header[68..72].copy_from_slice(&counts.entry_bits.to_le_bytes());
         header[52] = self.template_bits as u8;
         header[53] = self.shape_bits as u8;
         header[54] = self.ref_bits as u8;
@@ -132,7 +147,10 @@ impl Layout {
             numerics: u32_at(8),
             lo_total: u32_at(12),
             chars: u32_at(56),
-            template_bytes: u64_at(16),
+            pieces: u32_at(60),
+            positions: u32_at(64),
+            entry_bits: u32_at(68),
+            pool_bytes: u64_at(16),
             shape_bytes: u64_at(24),
             strings: u64_at(32),
             records: u64_at(40),
@@ -140,12 +158,12 @@ impl Layout {
         };
         if counts.numerics as usize > MAX_NUMERIC
             || counts.strings >= LENGTH_LIMIT
-            || counts.template_bytes >= LENGTH_LIMIT
+            || counts.pool_bytes >= LENGTH_LIMIT
+            || counts.entry_bits as usize > pieces::MAX_ENTRY_BITS
             || counts.shape_bytes >= LENGTH_LIMIT
             || counts.records >= LENGTH_LIMIT
             || counts.chars as usize > chars::MAX_CHARS
             || header[55] != 0
-            || header[60..64].iter().any(|&byte| byte != 0)
         {
             return None;
         }
@@ -161,8 +179,10 @@ impl Layout {
     pub(super) fn moved(&self, base: usize) -> Self {
         let shift = |range: &Range<usize>| range.start + base..range.end + base;
         Self {
-            template_offsets: shift(&self.template_offsets),
-            templates: shift(&self.templates),
+            positions: shift(&self.positions),
+            piece_offsets: shift(&self.piece_offsets),
+            pool: shift(&self.pool),
+            entries: shift(&self.entries),
             shape_offsets: shift(&self.shape_offsets),
             shapes: shift(&self.shapes),
             specs: shift(&self.specs),
@@ -427,15 +447,6 @@ mod access {
     use std::ops::Range;
 
     #[inline(always)]
-    pub(super) fn byte<const TRUSTED: bool>(bytes: &[u8], at: usize) -> u8 {
-        if TRUSTED {
-            unsafe { *bytes.get_unchecked(at) }
-        } else {
-            bytes[at]
-        }
-    }
-
-    #[inline(always)]
     pub(super) fn range<const TRUSTED: bool>(bytes: &[u8], range: Range<usize>) -> &[u8] {
         if TRUSTED {
             unsafe { bytes.get_unchecked(range) }
@@ -472,16 +483,6 @@ mod access {
     }
 }
 
-#[inline(always)]
-fn piece_in<const TRUSTED: bool>(program: &[u8], at: usize) -> (usize, usize) {
-    let first = access::byte::<TRUSTED>(program, at);
-    if first < 255 {
-        (at + 1, usize::from(first))
-    } else {
-        (at + 5, access::u32_at::<TRUSTED>(program, at + 1))
-    }
-}
-
 pub(super) fn push_piece(program: &mut Vec<u8>, piece: &[u8]) {
     if piece.len() < 255 {
         program.push(piece.len() as u8);
@@ -494,8 +495,11 @@ pub(super) fn push_piece(program: &mut Vec<u8>, piece: &[u8]) {
 
 #[derive(Clone, Copy)]
 pub(crate) struct FeatureView<'a> {
-    pub(super) template_offsets: &'a [u8],
-    pub(super) templates: &'a [u8],
+    pub(super) positions: &'a [u8],
+    pub(super) piece_offsets: &'a [u8],
+    pub(super) pool: &'a [u8],
+    pub(super) entries: &'a [u8],
+    pub(super) entry_bits: u32,
     pub(super) shape_offsets: &'a [u8],
     pub(super) shapes: &'a [u8],
     pub(super) lo: &'a [u8],
@@ -555,8 +559,7 @@ impl FeatureView<'_> {
         bit += self.template_bits as usize;
         let shape = read_small::<TRUSTED>(record, bit, self.shape_bits) as usize;
         bit += self.shape_bits as usize;
-        let begin = access::u32_at::<TRUSTED>(self.template_offsets, 4 * template);
-        let end = access::u32_at::<TRUSTED>(self.template_offsets, 4 * template + 4);
+        let entry_bit = template * self.entry_bits as usize;
         let ops = access::range::<TRUSTED>(
             self.shapes,
             access::u32_at::<TRUSTED>(self.shape_offsets, 4 * shape)
@@ -565,11 +568,8 @@ impl FeatureView<'_> {
         let mut slots = [(0usize, 0usize); MAX_SLOTS];
         let mut slot_count = 0;
         let mut highs = [0u64; MAX_NUMERIC];
-        let mut at = begin;
-        for &op in ops {
-            let (start, length) = piece_in::<TRUSTED>(self.templates, at);
-            unsafe { sink.put_region(self.templates, start, length)? };
-            at = start + length;
+        for (position, &op) in ops.iter().enumerate() {
+            unsafe { self.put_piece::<TRUSTED, S>(sink, entry_bit, position)? };
             match op {
                 OP_REF => {
                     let target = read_small::<TRUSTED>(record, bit, self.ref_bits) as usize;
@@ -622,11 +622,27 @@ impl FeatureView<'_> {
                 _ => {}
             }
         }
-        if at < end {
-            let (start, length) = piece_in::<TRUSTED>(self.templates, at);
-            unsafe { sink.put_region(self.templates, start, length)? };
-        }
+        unsafe { self.put_piece::<TRUSTED, S>(sink, entry_bit, ops.len())? };
         Ok(())
+    }
+
+    #[inline(always)]
+    unsafe fn put_piece<const TRUSTED: bool, S: Sink + ?Sized>(
+        &self,
+        sink: &mut S,
+        entry_bit: usize,
+        position: usize,
+    ) -> fmt::Result {
+        let word = access::word::<TRUSTED>(self.positions, pieces::POSITION_BYTES * position);
+        let (base, shift, bits) = pieces::unpack_position(word);
+        if word & pieces::CONSTANT_FLAG != 0 {
+            return unsafe { sink.put_region(self.pool, base, shift) };
+        }
+        let local = read_small::<TRUSTED>(self.entries, entry_bit + shift, bits) as usize;
+        let number = base + local;
+        let start = access::u32_at::<TRUSTED>(self.piece_offsets, 4 * number);
+        let end = access::u32_at::<TRUSTED>(self.piece_offsets, 4 * number + 4);
+        unsafe { sink.put_region(self.pool, start, end - start) }
     }
 }
 

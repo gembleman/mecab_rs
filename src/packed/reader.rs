@@ -506,8 +506,11 @@ impl PackedDictionary {
         let map = &self.map[..];
         let part = |range: &Range<usize>| unsafe { map.get_unchecked(range.start..range.end) };
         FeatureView {
-            template_offsets: part(&layout.template_offsets),
-            templates: part(&layout.templates),
+            positions: part(&layout.positions),
+            piece_offsets: part(&layout.piece_offsets),
+            pool: part(&layout.pool),
+            entries: part(&layout.entries),
+            entry_bits: layout.counts.entry_bits,
             shape_offsets: part(&layout.shape_offsets),
             shapes: part(&layout.shapes),
             lo: part(&layout.lo),
