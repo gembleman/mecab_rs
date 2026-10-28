@@ -456,7 +456,8 @@ impl Lattice {
     ) -> Result<NodeId, Error> {
         let sentence_len = sentence.len();
         let view = system.view();
-        self.sentence_chars.fill(&dictionary.chars, sentence);
+        self.sentence_chars
+            .fill(&dictionary.chars, sentence, |code| view.trie_code_of(code));
         let bos = self.push_node(RawNode::boundary(NodeSource::Bos, 0));
         self.ends[0].push(LeftCandidate {
             right_id: 0,
@@ -501,7 +502,8 @@ impl Lattice {
     ) {
         let sentence_len = sentence.len();
         let view = system.view();
-        self.sentence_chars.fill(&dictionary.chars, sentence);
+        self.sentence_chars
+            .fill(&dictionary.chars, sentence, |code| view.trie_code_of(code));
         let bos_candidate = Candidate {
             surface: 0,
             end: 0,
@@ -882,7 +884,11 @@ impl Lattice {
             char_type: char_info.default_type() as u8,
             limit: end,
         };
-        view.common_prefix_search(key, &mut self.hits);
+        if whole {
+            view.common_prefix_search_sentence(&self.sentence_chars, surface, &mut self.hits);
+        } else {
+            view.common_prefix_search(key, &mut self.hits);
+        }
         self.push_packed_hits::<BEST>(
             dictionary,
             system,

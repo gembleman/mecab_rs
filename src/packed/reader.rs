@@ -14,6 +14,7 @@ use super::{
     TEMPLATES, TERMINAL_FLAG, TOKENS, UNIT_BYTES, UNKNOWN_STARTS, UNKNOWN_TOKENS, UNUSED_LABEL,
     VALUE_MASK, VERSION, label_of,
 };
+use crate::char_property::SentenceChars;
 use crate::char_table::{HEADER_BYTES as CHAR_TABLE_HEADER, MAGIC as CHAR_TABLE_MAGIC};
 use crate::dictionary::map_open_file;
 use crate::error::Error;
@@ -712,6 +713,44 @@ impl PackedView<'_> {
     pub fn common_prefix_search(&self, key: &[u8], hits: &mut Vec<Hit>) {
         hits.clear();
         self.walk_bytes(key, |hit| hits.push(hit));
+    }
+
+    #[inline]
+    pub(crate) fn trie_code_of(&self, scalar: u32) -> u16 {
+        match u8::try_from(scalar) {
+            Ok(byte) if byte < 0x80 => self.ascii[usize::from(byte)],
+            _ => {
+                let scalar = scalar as usize;
+                let block = usize::from(self.char_index[scalar / BLOCK_CODES]);
+                self.char_blocks[block * BLOCK_CODES + scalar % BLOCK_CODES]
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn common_prefix_search_sentence(
+        &self,
+        chars: &SentenceChars,
+        start: usize,
+        hits: &mut Vec<Hit>,
+    ) {
+        hits.clear();
+        let mut cursor = Cursor::new(self.cells);
+        let length = chars.len();
+        let mut position = start;
+        while position < length {
+            let (code, width) = chars.trie_step(position);
+            position += width;
+            match cursor.step(code) {
+                Step::Stop => return,
+                Step::Inner => {}
+                Step::Key(first_token, token_count) => hits.push(Hit {
+                    length: position - start,
+                    first_token: first_token as usize,
+                    token_count: token_count as usize,
+                }),
+            }
+        }
     }
 
     #[inline(always)]

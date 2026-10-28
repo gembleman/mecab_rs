@@ -61,11 +61,15 @@ struct Entry {
     info: CharInfo,
     extender: bool,
     single: u8,
+    trie_code: u16,
     width: u32,
     chain_end: u32,
     chain_count: u32,
     chain_last: u32,
 }
+
+const ENTRY_BYTES: usize = 24;
+const _: () = assert!(std::mem::size_of::<Entry>() == ENTRY_BYTES);
 
 #[derive(Default)]
 pub(crate) struct SentenceChars {
@@ -74,7 +78,12 @@ pub(crate) struct SentenceChars {
 }
 
 impl SentenceChars {
-    pub(crate) fn fill(&mut self, chars: &CharProperty, text: &[u8]) {
+    pub(crate) fn fill(
+        &mut self,
+        chars: &CharProperty,
+        text: &[u8],
+        trie_code_of: impl Fn(u32) -> u16,
+    ) {
         let length = text.len();
         let table = chars.table();
         assert!(u32::try_from(length).is_ok());
@@ -118,6 +127,7 @@ impl SentenceChars {
                 info: class.info,
                 extender: class.extender,
                 single: single as u8,
+                trie_code: trie_code_of(code),
                 width,
                 chain_end,
                 chain_count,
@@ -131,6 +141,16 @@ impl SentenceChars {
         let entry = &self.entries[position];
         debug_assert!(entry.single != 0, "entry read at a continuation byte");
         entry
+    }
+
+    #[inline]
+    pub(crate) fn trie_step(&self, position: usize) -> (u16, usize) {
+        let entry = self.entry(position);
+        (entry.trie_code, usize::from(entry.single))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.length
     }
 
     pub(crate) fn char_info(&self, position: usize) -> (CharInfo, usize) {
