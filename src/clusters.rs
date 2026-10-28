@@ -4,13 +4,11 @@ use std::sync::Mutex;
 use std::thread;
 
 use crate::error::Error;
-use crate::part::{PartSlices, Weight, total_of};
+use crate::part::{PartSlices, Weight};
 use crate::section::{Section, SectionSource};
-use crate::templates::{TemplateReader, to_cost, write_array};
+use crate::templates::{TemplateReader, write_array};
 
-const MAX_TABLE_THREADS: usize = 8;
 const ROWS_PER_CHUNK: usize = 16;
-const ERROR_SAFETY_FACTOR: f64 = 4.0;
 const MAX_SHAPES: usize = 256;
 
 pub(crate) struct ClusterPlan {
@@ -165,25 +163,6 @@ pub(crate) fn fill_cells<T: Copy + Default + Send>(
     table
 }
 
-fn fill_float_table(plan: &ClusterPlan, parts: &[PartSlices<f64>]) -> Vec<f64> {
-    let threads = thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(MAX_TABLE_THREADS);
-    fill_cells(plan, threads, |left, right| {
-        total_of(plan.parts.iter().map(|&p| parts[p]), left, right)
-    })
-}
-
-fn error_bound(parts: &[PartSlices<f64>], cluster_count: usize) -> f64 {
-    let largest = |part: &PartSlices<f64>| {
-        part.weight
-            .iter()
-            .fold(0.0_f64, |top, weight| top.max(weight.abs()))
-    };
-    let magnitude: f64 = parts.iter().map(largest).sum();
-    ERROR_SAFETY_FACTOR * (parts.len() + cluster_count) as f64 * magnitude * f64::EPSILON
-}
-
 pub(crate) fn interleaved_ids(
     plans: &[ClusterPlan],
     size: usize,
@@ -218,27 +197,6 @@ pub(crate) fn write_cluster_layout(
     write_array(output, right_keys, u16::to_le_bytes)?;
     output.write_all(&(table_cells as u32).to_le_bytes())?;
     output.write_all(&[0; 4])
-}
-
-pub(crate) fn write_clusters(
-    parts: &[PartSlices<f64>],
-    plans: &[ClusterPlan],
-    left_size: usize,
-    right_size: usize,
-    output: &mut impl Write,
-) -> io::Result<()> {
-    output.write_all(&error_bound(parts, plans.len()).to_le_bytes())?;
-    write_cluster_layout(
-        output,
-        plans.iter().map(|plan| (plan.left_keys, plan.right_keys)),
-        &interleaved_ids(plans, left_size, left_ids),
-        &interleaved_ids(plans, right_size, right_ids),
-        plans.iter().map(ClusterPlan::cells).sum(),
-    )?;
-    for plan in plans {
-        write_array(output, &fill_float_table(plan, parts), f64::to_le_bytes)?;
-    }
-    Ok(())
 }
 
 fn keys_fit(keys: &[u16], limits: &[usize]) -> bool {
@@ -329,42 +287,5 @@ impl<W: Weight> MappedClusters<W> {
             .widen();
         }
         sum
-    }
-}
-
-pub(crate) struct MappedFloatClusters {
-    error_bound: f64,
-    clusters: MappedClusters<f64>,
-}
-
-impl MappedFloatClusters {
-    pub(crate) fn read(
-        reader: &mut TemplateReader,
-        count: usize,
-        left_size: usize,
-        right_size: usize,
-    ) -> Result<Self, Error> {
-        let error_bound = f64::from_le_bytes(reader.bytes()?);
-        let clusters = MappedClusters::read(reader, count, left_size, right_size)?;
-        if error_bound.is_finite() && error_bound >= 0.0 {
-            Ok(Self {
-                error_bound,
-                clusters,
-            })
-        } else {
-            Err(reader.broken("a cluster key is out of range"))
-        }
-    }
-
-    pub(crate) fn cost<S: SectionSource>(
-        &self,
-        file: &S,
-        cost_factor: f64,
-        left_right_id: u16,
-        right_left_id: u16,
-    ) -> Option<i16> {
-        let sum = self.clusters.sum(file, left_right_id, right_left_id);
-        let low = to_cost(sum - self.error_bound, cost_factor);
-        (low == to_cost(sum + self.error_bound, cost_factor)).then_some(low)
     }
 }

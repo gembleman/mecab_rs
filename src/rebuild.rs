@@ -14,13 +14,11 @@ use crate::{Dictionary, Error, Tagger};
 pub mod int_matrix;
 mod runtime;
 mod templates;
-#[cfg(feature = "xz")]
-pub mod xz;
 
 pub use runtime::{RuntimeOptions, RuntimeReport, StatsSource, build_runtime};
 pub use templates::{
     DEFAULT_HOT_CELLS, DEFAULT_HOT_LEFT, DEFAULT_HOT_RIGHT, MAX_HOT_THREADS, compile_templates,
-    default_threads, write_matrix_files,
+    default_threads,
 };
 
 const CONTEXT_FILES: [&str; 2] = ["sys.dic", "unk.dic"];
@@ -30,16 +28,6 @@ pub const UNIDIC_FEATURE_COUNT: usize = 29;
 const MATRIX_FILE: &str = "matrix.bin";
 const RIGHT_STATS: &str = "right.tsv";
 const LEFT_STATS: &str = "left.tsv";
-const ID_FREE_FILES: [&str; 5] = ["dicrc", "char.bin", "char.uni", "license", "feature.def"];
-const MATRIX_FILES: [&str; 6] = [
-    "matrix.hot",
-    "matrix.tpl",
-    "matrix.itp",
-    "matrix.xz",
-    RIGHT_STATS,
-    LEFT_STATS,
-];
-
 fn bad(path: &Path, reason: impl Into<String>) -> Error {
     Error::Rebuild {
         path: path.to_path_buf(),
@@ -304,12 +292,6 @@ fn write_permuted_matrix(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct RenumberReport {
-    pub left_size: usize,
-    pub right_size: usize,
-}
-
 pub(crate) struct Renumbering {
     pub(crate) left_size: usize,
     pub(crate) right_size: usize,
@@ -325,7 +307,6 @@ impl Renumbering {
         dict_dir: &Path,
         stats: &ContextStats,
         stats_dir: &Path,
-        id_defs_dir: Option<&Path>,
     ) -> Result<Self, Error> {
         let (left_size, right_size) = matrix_shape(dict_dir)?;
         if stats.right.len() != left_size || stats.left.len() != right_size {
@@ -343,17 +324,7 @@ impl Renumbering {
         let (new_rc, new_lc) = (inverse_of(&order_rc), inverse_of(&order_lc));
         let mut id_defs = Vec::new();
         for (name, order) in ID_DEF_FILES.iter().zip([&order_lc, &order_rc]) {
-            let source = [Some(dict_dir), id_defs_dir]
-                .into_iter()
-                .flatten()
-                .map(|directory| directory.join(name))
-                .find(|candidate| candidate.is_file())
-                .ok_or_else(|| {
-                    bad(
-                        dict_dir,
-                        format!("{name} not found; pass an id definition directory"),
-                    )
-                })?;
+            let source = dict_dir.join(name);
             let text =
                 String::from_utf8(read_file(&source)?).map_err(|_| bad(&source, "not UTF-8"))?;
             id_defs.push((*name, renumber_id_def(&text, order, &source)?));
@@ -415,25 +386,6 @@ impl Renumbering {
     }
 }
 
-pub fn renumber(
-    dict_dir: &Path,
-    stats_dir: &Path,
-    out_dir: &Path,
-    id_defs_dir: Option<&Path>,
-) -> Result<RenumberReport, Error> {
-    prepare_output(dict_dir, out_dir)?;
-    let stats = ContextStats::read_tsv(stats_dir)?;
-    let plan = Renumbering::plan(dict_dir, &stats, stats_dir, id_defs_dir)?;
-    copy_entries(dict_dir, out_dir, Some(&ID_FREE_FILES))?;
-    plan.write_dictionaries(dict_dir, out_dir, None)?;
-    plan.write_id_defs(out_dir)?;
-    plan.write_matrix(dict_dir, out_dir)?;
-    Ok(RenumberReport {
-        left_size: plan.left_size,
-        right_size: plan.right_size,
-    })
-}
-
 fn split_fields(text: &[u8]) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut quoted = false;
@@ -455,7 +407,6 @@ fn split_fields(text: &[u8]) -> Vec<(usize, usize)> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Keep {
     Fields(Vec<usize>),
-    Prefix { keep: usize, pad: bool },
 }
 
 impl Keep {
@@ -493,18 +444,6 @@ impl Keep {
                         out.extend_from_slice(&raw[from..to]);
                     } else {
                         out.push(b'*');
-                    }
-                }
-                out
-            }
-            Self::Prefix { keep, pad } => {
-                if spans.len() <= *keep || *keep == 0 {
-                    return raw.to_vec();
-                }
-                let mut out = raw[..spans[keep - 1].1].to_vec();
-                if *pad {
-                    for _ in *keep..spans.len().max(UNIDIC_FEATURE_COUNT) {
-                        out.extend_from_slice(b",*");
                     }
                 }
                 out
@@ -592,20 +531,4 @@ fn slim_dictionary(data: &[u8], path: &Path, keep: &Keep) -> Result<(Vec<u8>, Sl
         new_file_size: total,
     };
     Ok((out, report))
-}
-
-pub fn slim(dict_dir: &Path, out_dir: &Path, keep: &Keep) -> Result<SlimReport, Error> {
-    prepare_output(dict_dir, out_dir)?;
-    let mut copied = Vec::from(ID_FREE_FILES);
-    copied.extend(["unk.dic", MATRIX_FILE]);
-    copied.extend(ID_DEF_FILES);
-    copied.extend(MATRIX_FILES);
-    copy_entries(dict_dir, out_dir, Some(&copied))?;
-    let source = dict_dir.join("sys.dic");
-    let data = read_file(&source)?;
-    let (slimmed, report) = slim_dictionary(&data, &source, keep)?;
-    write_file(&out_dir.join("sys.dic"), |writer| {
-        writer.write_all(&slimmed)
-    })?;
-    Ok(report)
 }

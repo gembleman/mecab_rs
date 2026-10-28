@@ -720,10 +720,6 @@ impl<S: SectionSource> RuntimeIntTemplates<S> {
         self.hot_right
     }
 
-    pub fn exception_count(&self) -> usize {
-        self.columns.view_source(&self.map).len()
-    }
-
     pub fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
         let (column, row) = (usize::from(left_node_rc), usize::from(right_node_lc));
         assert!(

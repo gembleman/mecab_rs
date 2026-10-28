@@ -90,19 +90,11 @@ impl Dictionary {
     ) -> Result<Self, Error> {
         let packed = Arc::new(packed);
         let matrix = if packed.template_bytes().is_some() {
-            if packed.integer_templates() {
-                Matrix::open_hot_int_bytes(
-                    path,
-                    packed.matrix_mapped(),
-                    packed.templates_mapped().unwrap(),
-                )?
-            } else {
-                Matrix::open_hot_bytes(
-                    path,
-                    packed.matrix_mapped(),
-                    packed.templates_mapped().unwrap(),
-                )?
-            }
+            Matrix::open_hot_bytes(
+                path,
+                packed.matrix_mapped(),
+                packed.templates_mapped().unwrap(),
+            )?
         } else {
             Matrix::open_dense_bytes(path, packed.matrix_mapped())?
         };

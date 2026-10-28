@@ -5,7 +5,6 @@ use std::path::Path;
 use std::thread;
 
 use super::{bad, read_file};
-use crate::build::write_file;
 use crate::error::io_error;
 use crate::{ConnectionTemplates, Error, HotShape, TemplatePart};
 
@@ -17,17 +16,6 @@ pub const MAX_HOT_THREADS: usize = 8;
 const MODEL_HEADER_LINES: usize = 7;
 const NO_FIRE_LIMIT: usize = 0xFFFF;
 const READ_BUFFER_BYTES: usize = 1 << 20;
-const TEMPLATE_FILE: &str = "matrix.tpl";
-const INT_TEMPLATE_FILE: &str = "matrix.itp";
-const HOT_FILE: &str = "matrix.hot";
-
-pub(super) fn remove_stale(dict_dir: &Path, name: &str) -> Result<(), Error> {
-    let path = dict_dir.join(name);
-    match std::fs::remove_file(&path) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(io_error(&path)(error)),
-        _ => Ok(()),
-    }
-}
 
 pub fn default_threads() -> usize {
     thread::available_parallelism().map_or(1, |count| count.get().min(MAX_HOT_THREADS))
@@ -446,20 +434,4 @@ pub(super) fn hot_shape_or_default(
 ) -> HotShape {
     hot.unwrap_or_else(|| HotShape::rectangle(DEFAULT_HOT_LEFT, DEFAULT_HOT_RIGHT))
         .clamped(left_size, right_size)
-}
-
-pub fn write_matrix_files(
-    templates: &ConnectionTemplates,
-    dict_dir: &Path,
-    hot: Option<HotShape>,
-    threads: usize,
-) -> Result<(), Error> {
-    let shape = hot_shape_or_default(hot, templates.left_size(), templates.right_size());
-    remove_stale(dict_dir, INT_TEMPLATE_FILE)?;
-    write_file(&dict_dir.join(TEMPLATE_FILE), |writer| {
-        templates.write_templates(writer)
-    })?;
-    write_file(&dict_dir.join(HOT_FILE), |writer| {
-        templates.write_hot_matrix(&shape, threads, writer)
-    })
 }

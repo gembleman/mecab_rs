@@ -395,16 +395,6 @@ impl IntTemplates {
         self.view().write_hot_matrix(shape, threads, output)
     }
 
-    pub fn visit_rows(&self, first: usize, end: usize, mut visit: impl FnMut(usize, &[i16])) {
-        let view = self.view();
-        let mut scratch = view.scratch();
-        let mut costs = vec![0i16; self.left_size];
-        for row in first..end.min(self.right_size) {
-            view.render_row(row, &mut scratch, &mut costs);
-            visit(row, &costs);
-        }
-    }
-
     pub fn write_templates(&self, output: &mut impl Write) -> io::Result<()> {
         self.write_clustered_templates(DEFAULT_CLUSTER_COUNT, 4, output)
     }
@@ -656,14 +646,6 @@ impl<S: SectionSource> MappedIntTemplates<S> {
 
     pub fn right_size(&self) -> usize {
         self.right_size
-    }
-
-    pub fn shift(&self) -> u32 {
-        self.shift
-    }
-
-    pub fn exception_count(&self) -> usize {
-        self.exception_cells.view_source(&self.map).len()
     }
 
     pub(crate) fn runtime_inputs(&self) -> Option<RuntimeInputs<'_>> {

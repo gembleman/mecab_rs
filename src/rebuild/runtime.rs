@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use super::int_matrix::{exact_int_templates, write_int_files};
-use super::templates::{compile_templates, write_matrix_files};
+use super::int_matrix::{RUNTIME_SHIFT, exact_int_templates, write_int_files};
+use super::templates::compile_templates;
 use super::{
     ContextStats, Keep, Renumbering, SlimReport, collect_stats, copy_entries, prepare_output,
 };
@@ -19,8 +19,6 @@ pub struct RuntimeOptions<'a> {
     pub keep: Option<Keep>,
     pub hot: Option<HotShape>,
     pub threads: usize,
-    pub int_shift: Option<u32>,
-    pub xz: bool,
     pub matrix_bin: bool,
 }
 
@@ -29,7 +27,6 @@ pub struct RuntimeReport {
     pub left_size: usize,
     pub right_size: usize,
     pub slim: Option<SlimReport>,
-    pub xz_size: Option<u64>,
 }
 
 pub fn build_runtime(
@@ -38,10 +35,6 @@ pub fn build_runtime(
 ) -> Result<RuntimeReport, Error> {
     let RuntimeOptions { source, out, .. } = *options;
     prepare_output(source, out)?;
-    #[cfg(not(feature = "xz"))]
-    if options.xz {
-        return Err(Error::Unsupported("matrix.xz needs the `xz` cargo feature"));
-    }
     let (stats, stats_dir) = match options.stats {
         StatsSource::Directory(directory) => (ContextStats::read_tsv(directory)?, directory),
         StatsSource::Corpora(corpora) => {
@@ -50,7 +43,7 @@ pub fn build_runtime(
             (stats, source)
         }
     };
-    let plan = Renumbering::plan(source, &stats, stats_dir, None)?;
+    let plan = Renumbering::plan(source, &stats, stats_dir)?;
     progress("plan");
 
     copy_entries(
@@ -78,22 +71,9 @@ pub fn build_runtime(
     };
     let templates = compile_templates(source, id_def("left-id.def"), id_def("right-id.def"))?;
     progress("compile templates");
-    if let Some(shift) = options.int_shift {
-        let int = exact_int_templates(&templates, shift, options.threads, out)?;
-        write_int_files(&int, out, options.hot.clone(), options.threads)?;
-        progress("matrix.itp, matrix.hot");
-    } else {
-        write_matrix_files(&templates, out, options.hot.clone(), options.threads)?;
-        progress("matrix.tpl, matrix.hot");
-    }
-
-    #[cfg_attr(not(feature = "xz"), allow(unused_mut))]
-    let mut xz_size = None;
-    #[cfg(feature = "xz")]
-    if options.xz {
-        xz_size = Some(super::xz::pack(&templates, &out.join("matrix.xz"))?);
-        progress("matrix.xz");
-    }
+    let int = exact_int_templates(&templates, RUNTIME_SHIFT, options.threads, out)?;
+    write_int_files(&int, out, options.hot.clone(), options.threads)?;
+    progress("matrix.itp, matrix.hot");
     if options.matrix_bin {
         plan.write_matrix(source, out)?;
         progress("matrix.bin");
@@ -102,6 +82,5 @@ pub fn build_runtime(
         left_size: plan.left_size,
         right_size: plan.right_size,
         slim,
-        xz_size,
     })
 }

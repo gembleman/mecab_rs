@@ -13,7 +13,6 @@ use crate::int_templates::MappedIntTemplates;
 use crate::system_dictionary::{
     DictionaryKind, HEADER_SIZE, SystemDictionary, TOKEN_SIZE, TokenRecord,
 };
-use crate::templates::float_header_sizes;
 
 const ARRAY_BYTES_AT: usize = 24;
 const TOKEN_BYTES_AT: usize = 28;
@@ -165,9 +164,7 @@ pub(super) fn read_dictionary(directory: &Path) -> Result<Model, Error> {
     let chars = CharProperty::open(&directory.join(CHAR_TABLE_FILE))?;
     let hot_path = directory.join("matrix.hot");
     let int_templates_path = directory.join("matrix.itp");
-    let templates_path = directory.join("matrix.tpl");
-    let integer_templates = hot_path.exists() && int_templates_path.exists();
-    let hot = integer_templates || (hot_path.exists() && templates_path.exists());
+    let hot = hot_path.exists() && int_templates_path.exists();
     let matrix_path = if hot {
         hot_path
     } else {
@@ -175,17 +172,12 @@ pub(super) fn read_dictionary(directory: &Path) -> Result<Model, Error> {
     };
     if !hot && !matrix_path.exists() {
         return Err(Error::Unsupported(
-            "a dictionary without matrix.bin or matrix.hot and matrix.tpl",
+            "a dictionary without matrix.bin or matrix.hot and matrix.itp",
         ));
     }
     let matrix = fs::read(&matrix_path).map_err(io_error(&matrix_path))?;
-    let templates_path = if integer_templates {
-        int_templates_path
-    } else {
-        templates_path
-    };
     let templates = if hot {
-        fs::read(&templates_path).map_err(io_error(&templates_path))?
+        fs::read(&int_templates_path).map_err(io_error(&int_templates_path))?
     } else {
         Vec::new()
     };
@@ -210,19 +202,14 @@ pub(super) fn read_dictionary(directory: &Path) -> Result<Model, Error> {
         }
         (left_size, right_size)
     };
-    if hot && integer_templates {
-        let mapped = MappedIntTemplates::open(&templates_path)?;
+    if hot {
+        let mapped = MappedIntTemplates::open(&int_templates_path)?;
         if mapped.left_size() != left_size || mapped.right_size() != right_size {
             return Err(broken(
-                &templates_path,
+                &int_templates_path,
                 "the integer templates do not match the hot matrix",
             ));
         }
-    } else if hot && float_header_sizes(&templates) != Some((left_size, right_size)) {
-        return Err(broken(
-            &templates_path,
-            "the templates are not valid or do not match the hot matrix",
-        ));
     }
     let matches_matrix = |dictionary: &SystemDictionary| {
         dictionary.left_size() == left_size && dictionary.right_size() == right_size
@@ -238,7 +225,6 @@ pub(super) fn read_dictionary(directory: &Path) -> Result<Model, Error> {
     let mut model = Model {
         matrix,
         templates,
-        integer_templates,
         char_table: fs::read(directory.join(CHAR_TABLE_FILE))
             .map_err(io_error(&directory.join(CHAR_TABLE_FILE)))?,
         bos_feature,

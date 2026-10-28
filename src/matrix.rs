@@ -5,7 +5,6 @@ use crate::hot_shape::{HOT_HEADER_BYTES, HotShape};
 use crate::int_runtime::{RuntimeIntTemplates, is_runtime_form};
 use crate::mapped_bytes::MappedBytes;
 use crate::section::{Section, SectionSource};
-use crate::templates::MappedTemplates;
 
 const HEADER_BYTES: usize = 4;
 const COST_BYTES: usize = 2;
@@ -60,26 +59,7 @@ impl<S: SectionSource> DenseMatrix<S> {
     }
 }
 
-pub(crate) enum ColdPath<S = MappedBytes> {
-    Float(MappedTemplates<S>),
-    Runtime(Box<RuntimeIntTemplates<S>>),
-}
-
-impl<S: SectionSource> ColdPath<S> {
-    fn left_size(&self) -> usize {
-        match self {
-            Self::Float(templates) => templates.left_size(),
-            Self::Runtime(templates) => templates.left_size(),
-        }
-    }
-
-    fn right_size(&self) -> usize {
-        match self {
-            Self::Float(templates) => templates.right_size(),
-            Self::Runtime(templates) => templates.right_size(),
-        }
-    }
-}
+pub(crate) type ColdPath<S = MappedBytes> = Box<RuntimeIntTemplates<S>>;
 
 pub(crate) struct HotMatrix<S = MappedBytes> {
     map: S,
@@ -101,10 +81,7 @@ fn cold_cost<S: SectionSource>(
     left_right_id: u16,
     right_left_id: u16,
 ) -> i16 {
-    match templates {
-        ColdPath::Float(templates) => templates.cost(left_right_id, right_left_id),
-        ColdPath::Runtime(templates) => templates.cost(left_right_id, right_left_id),
-    }
+    templates.cost(left_right_id, right_left_id)
 }
 
 impl<'m, S: SectionSource> HotColumn<'m, S> {
@@ -135,9 +112,7 @@ impl<S: SectionSource> HotMatrix<S> {
                 "the hot matrix size does not match the templates",
             ));
         }
-        if let ColdPath::Runtime(runtime) = &templates
-            && !shape.contains_rectangle(runtime.hot_left(), runtime.hot_right())
-        {
+        if !shape.contains_rectangle(templates.hot_left(), templates.hot_right()) {
             return Err(broken(
                 path,
                 "the integer templates were made for another hot block",
@@ -210,20 +185,15 @@ impl Matrix {
     pub(crate) fn from_mapped_hot(
         map: MappedBytes,
         templates: MappedBytes,
-        integer: bool,
         path: &Path,
     ) -> Result<Self, Error> {
-        let templates = if integer {
-            if !is_runtime_form(&templates) {
-                return Err(Error::Format {
-                    file: path.to_path_buf(),
-                    reason: "the integer templates are not in the runtime form",
-                });
-            }
-            ColdPath::Runtime(Box::new(RuntimeIntTemplates::from_mapped(templates, path)?))
-        } else {
-            ColdPath::Float(MappedTemplates::from_mapped(templates, path)?)
-        };
+        if !is_runtime_form(&templates) {
+            return Err(Error::Format {
+                file: path.to_path_buf(),
+                reason: "the integer templates are not in the runtime form",
+            });
+        }
+        let templates = Box::new(RuntimeIntTemplates::from_mapped(templates, path)?);
         HotMatrix::from_source(map, templates, path).map(Self::PackedHot)
     }
 
@@ -236,15 +206,7 @@ impl Matrix {
         map: MappedBytes,
         templates: MappedBytes,
     ) -> Result<Self, Error> {
-        Self::from_mapped_hot(map, templates, false, path)
-    }
-
-    pub(crate) fn open_hot_int_bytes(
-        path: &Path,
-        map: MappedBytes,
-        templates: MappedBytes,
-    ) -> Result<Self, Error> {
-        Self::from_mapped_hot(map, templates, true, path)
+        Self::from_mapped_hot(map, templates, path)
     }
 
     pub(crate) fn left_size(&self) -> usize {

@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6,9 +5,6 @@ use std::thread;
 
 use super::bad;
 use super::templates::{UniverseSide, read_bigrams, universe_projections};
-use crate::dictionary::map_file;
-#[cfg(feature = "xz")]
-use crate::error::io_error;
 use crate::templates::ExactRows;
 use crate::wire::{fnv1a64, get_varint, put_varint, u32_at, unzigzag, zigzag};
 use crate::{ConnectionTemplates, Error, HotShape, IntPart, IntTemplates};
@@ -16,8 +12,6 @@ use crate::{ConnectionTemplates, Error, HotShape, IntPart, IntTemplates};
 const MAGIC: &[u8; 4] = b"MRIT";
 const VERSION: u32 = 1;
 const DIGEST_LEN: usize = 8;
-pub use crate::int_templates::MAX_SHIFT;
-pub const DEFAULT_SHIFTS: std::ops::RangeInclusive<u32> = 16..=26;
 pub const RUNTIME_SHIFT: u32 = 20;
 
 fn integer_cost_factor(templates: &ConnectionTemplates, path: &Path) -> Result<u32, Error> {
@@ -80,7 +74,6 @@ pub fn quantize(
 
 pub fn find_exceptions(
     exact: &ConnectionTemplates,
-    reference: Option<&Path>,
     candidates: &[IntTemplates],
     threads: usize,
 ) -> Result<Vec<Vec<(u32, i16)>>, Error> {
@@ -91,17 +84,6 @@ pub fn find_exceptions(
             .any(|c| c.left_size() != left_size || c.right_size() != right_size)
     {
         return Err(Error::Corrupt("the candidates do not fit the matrix"));
-    }
-    let map = reference.map(map_file).transpose()?;
-    if let (Some(map), Some(path)) = (&map, reference)
-        && (map.len() != 4 + 2 * left_size * right_size
-            || usize::from(u16::from_le_bytes([map[0], map[1]])) != left_size
-            || usize::from(u16::from_le_bytes([map[2], map[3]])) != right_size)
-    {
-        return Err(bad(
-            path,
-            "the matrix does not have the size of the templates",
-        ));
     }
     let views: Vec<_> = candidates.iter().map(IntTemplates::view).collect();
     let next_row = AtomicUsize::new(0);
@@ -119,15 +101,7 @@ pub fn find_exceptions(
                     if row >= right_size {
                         break;
                     }
-                    match &map {
-                        Some(map) => {
-                            let bytes = &map[4 + 2 * row * left_size..][..2 * left_size];
-                            for (cost, chunk) in real.iter_mut().zip(bytes.as_chunks::<2>().0) {
-                                *cost = i16::from_le_bytes(*chunk);
-                            }
-                        }
-                        None => exact_rows.render(row, &mut real),
-                    }
+                    exact_rows.render(row, &mut real);
                     for ((view, scratch), list) in views.iter().zip(&mut scratch).zip(&mut local) {
                         view.render_computed_row(row, scratch, &mut computed);
                         for (column, (&a, &b)) in computed.iter().zip(&real).enumerate() {
@@ -504,220 +478,6 @@ pub fn decode_payload(
     plain.with_exceptions(exceptions)
 }
 
-fn log2_binomial(n: f64, k: f64) -> f64 {
-    if k <= 0.0 || k >= n {
-        return 0.0;
-    }
-    (ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0)) / std::f64::consts::LN_2
-}
-
-const STIRLING_MIN_ARG: f64 = 15.0;
-
-fn ln_gamma(mut x: f64) -> f64 {
-    let mut shift = 0.0;
-    while x < STIRLING_MIN_ARG {
-        shift -= x.ln();
-        x += 1.0;
-    }
-    let series = 1.0 / (12.0 * x) - 1.0 / (360.0 * x.powi(3)) + 1.0 / (1260.0 * x.powi(5));
-    shift + (x - 0.5) * x.ln() - x + 0.5 * (2.0 * std::f64::consts::PI).ln() + series
-}
-
-fn adaptive_bits(values: impl Iterator<Item = i64>) -> f64 {
-    let mut counts: std::collections::HashMap<i64, u64> = std::collections::HashMap::new();
-    let (mut total, mut bits) = (0u64, 0.0);
-    for value in values {
-        let seen = counts.get(&value).copied().unwrap_or(0);
-        let distinct = counts.len() as f64;
-        if seen > 0 {
-            bits -= (seen as f64 / (total as f64 + distinct)).log2();
-        } else {
-            if total > 0 {
-                bits -= (distinct / (total as f64 + distinct)).log2();
-            }
-            let folded = zigzag(value);
-            bits += f64::from(2 * (u64::BITS - (folded + 1).leading_zeros() - 1) + 1);
-        }
-        *counts.entry(value).or_insert(0) += 1;
-        total += 1;
-    }
-    bits
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct IdealBytes {
-    pub pattern: f64,
-    pub weights: f64,
-    pub exceptions: f64,
-}
-
-impl IdealBytes {
-    pub fn total(&self) -> f64 {
-        self.pattern + self.weights + self.exceptions
-    }
-}
-
-pub fn ideal_bytes(templates: &IntTemplates) -> IdealBytes {
-    let pattern: f64 = templates
-        .parts()
-        .iter()
-        .map(|part| {
-            log2_binomial(
-                (part.left_count * part.right_count) as f64,
-                part.weight.len() as f64,
-            )
-        })
-        .sum();
-    let weights = adaptive_bits(
-        templates
-            .parts()
-            .iter()
-            .flat_map(|part| part.weight.iter().map(|&weight| i64::from(weight))),
-    );
-    let cells = (templates.left_size() * templates.right_size()) as f64;
-    let count = templates.exception_count();
-    let mut corrections: BTreeMap<i64, u64> = BTreeMap::new();
-    for (cell, value) in templates.exceptions() {
-        let left_size = templates.left_size();
-        let computed = templates.computed_cost(
-            (cell as usize % left_size) as u16,
-            (cell as usize / left_size) as u16,
-        );
-        *corrections
-            .entry(i64::from(value) - i64::from(computed))
-            .or_insert(0) += 1;
-    }
-    let entropy: f64 = corrections
-        .values()
-        .map(|&seen| {
-            let share = seen as f64 / count as f64;
-            -share * share.log2()
-        })
-        .sum();
-    let exceptions = log2_binomial(cells, count as f64) + count as f64 * (entropy + 0.5);
-    IdealBytes {
-        pattern: pattern / 8.0,
-        weights: weights / 8.0,
-        exceptions: exceptions / 8.0,
-    }
-}
-
-#[cfg(feature = "xz")]
-#[derive(Debug, Clone, Copy)]
-pub struct PieceSizes {
-    pub header: (usize, usize),
-    pub pattern: (usize, usize),
-    pub weights: (usize, usize),
-    pub exceptions: (usize, usize),
-    pub total: (usize, usize),
-}
-
-#[cfg(feature = "xz")]
-pub fn piece_sizes(streams: &Streams, path: &Path) -> Result<PieceSizes, Error> {
-    let measure = |bytes: &[u8]| -> Result<(usize, usize), Error> {
-        Ok((bytes.len(), super::xz::compress(bytes, path)?.len()))
-    };
-    let join = |a: &[u8], b: &[u8]| [a, b].concat();
-    Ok(PieceSizes {
-        header: measure(&streams.header)?,
-        pattern: measure(&join(&streams.counts, &streams.lefts))?,
-        weights: measure(&streams.weights)?,
-        exceptions: measure(&join(&streams.exception_cells, &streams.exception_values))?,
-        total: measure(&streams.payload())?,
-    })
-}
-
-#[cfg(feature = "xz")]
-#[derive(Debug, Clone)]
-pub struct ShiftReport {
-    pub shift: u32,
-    pub entries: usize,
-    pub exceptions: usize,
-    pub sizes: PieceSizes,
-    pub ideal: IdealBytes,
-}
-
-#[cfg(feature = "xz")]
-#[allow(clippy::too_many_arguments)]
-pub fn pack_int(
-    templates: &ConnectionTemplates,
-    source_dir: &Path,
-    left_id_def: &str,
-    right_id_def: &str,
-    shifts: &[u32],
-    reference: Option<&Path>,
-    threads: usize,
-    out: &Path,
-    log: &mut dyn FnMut(&str),
-) -> Result<(Vec<ShiftReport>, usize), Error> {
-    let started = std::time::Instant::now();
-    let context = IntContext::load(source_dir, left_id_def, right_id_def)?;
-    let plain = shifts
-        .iter()
-        .map(|&shift| quantize(templates, shift, out))
-        .collect::<Result<Vec<_>, _>>()?;
-    log(&format!(
-        "quantized: {:.1} s",
-        started.elapsed().as_secs_f64()
-    ));
-    let exceptions = find_exceptions(templates, reference, &plain, threads)?;
-    log(&format!(
-        "exceptions found: {:.1} s",
-        started.elapsed().as_secs_f64()
-    ));
-    let mut reports = Vec::new();
-    let mut best: Option<(usize, Vec<u8>)> = None;
-    for ((plain, exceptions), &shift) in plain.iter().zip(exceptions).zip(shifts) {
-        let with = plain.with_exceptions(exceptions)?;
-        let streams = encode_streams(&with, &context, out)?;
-        let sizes = piece_sizes(&streams, out)?;
-        let report = ShiftReport {
-            shift,
-            entries: with.parts().iter().map(|part| part.weight.len()).sum(),
-            exceptions: with.exception_count(),
-            sizes,
-            ideal: ideal_bytes(&with),
-        };
-        log(&format!(
-            "shift {shift}: {} entries, {} exceptions, xz {} bytes, ideal {:.0} bytes ({:.1} s)",
-            report.entries,
-            report.exceptions,
-            sizes.total.1,
-            report.ideal.total(),
-            started.elapsed().as_secs_f64()
-        ));
-        if best.as_ref().is_none_or(|(size, _)| sizes.total.1 < *size) {
-            let packed = super::xz::compress(&streams.payload(), out)?;
-            best = Some((packed.len(), packed));
-            reports.push(report);
-            continue;
-        }
-        reports.push(report);
-    }
-    let (_, packed) = best.ok_or_else(|| bad(out, "no grid given"))?;
-    let chosen = reports
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, report)| report.sizes.total.1)
-        .map_or(0, |(index, _)| index);
-    crate::build::write_file(out, |writer| std::io::Write::write_all(writer, &packed))?;
-    Ok((reports, chosen))
-}
-
-#[cfg(feature = "xz")]
-pub fn read_int_pack(
-    path: &Path,
-    left_id_def: &str,
-    right_id_def: &str,
-) -> Result<IntTemplates, Error> {
-    decode_payload(
-        &super::xz::decompress(path)?,
-        left_id_def,
-        right_id_def,
-        path,
-    )
-}
-
 pub fn exact_int_templates(
     templates: &ConnectionTemplates,
     shift: u32,
@@ -725,7 +485,7 @@ pub fn exact_int_templates(
     path: &Path,
 ) -> Result<IntTemplates, Error> {
     let plain = quantize(templates, shift, path)?;
-    let exceptions = find_exceptions(templates, None, std::slice::from_ref(&plain), threads)?
+    let exceptions = find_exceptions(templates, std::slice::from_ref(&plain), threads)?
         .pop()
         .expect("one candidate gives one exception list");
     plain.with_exceptions(exceptions)
@@ -740,27 +500,10 @@ pub fn write_int_files(
     use crate::build::write_file;
     let shape =
         super::templates::hot_shape_or_default(hot, templates.left_size(), templates.right_size());
-    super::templates::remove_stale(dict_dir, "matrix.tpl")?;
     write_file(&dict_dir.join("matrix.itp"), |writer| {
         templates.write_templates(writer)
     })?;
     write_file(&dict_dir.join("matrix.hot"), |writer| {
         templates.write_hot_matrix(&shape, threads, writer)
     })
-}
-
-#[cfg(feature = "xz")]
-pub fn unpack_int(
-    pack: &Path,
-    id_defs: &Path,
-    dict_dir: &Path,
-    hot: Option<HotShape>,
-    threads: usize,
-) -> Result<(), Error> {
-    let read = |name: &str| {
-        let path = id_defs.join(name);
-        std::fs::read_to_string(&path).map_err(io_error(&path))
-    };
-    let templates = read_int_pack(pack, &read("left-id.def")?, &read("right-id.def")?)?;
-    write_int_files(&templates, dict_dir, hot, threads)
 }

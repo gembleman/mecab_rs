@@ -19,154 +19,26 @@ dictionary rebuilding:
   mecab-rs-migrate pack-transport <dict-dir> <out.mrd.xz>  (feature xz)
   mecab-rs-migrate expand <in.mrd.xz> <out.mrd>           (feature xz)
       Writes a packed runtime dictionary, or packs and expands its transport form.
-  mecab-rs-migrate stats <dict-dir> <out-dir> <corpus>...
-      Analyzes every line of the corpora and writes right.tsv and left.tsv (id<TAB>count) to
-      <out-dir>. Needs char.uni in <dict-dir>.
-  mecab-rs-migrate renumber <dict-dir> <stats-dir> <out-dir> [--id-defs <dir>]
-      Renumbers left/right ids by frequency: patches sys.dic and unk.dic, rewrites
-      left-id.def/right-id.def and permutes matrix.bin; copies only dicrc, char.bin, char.uni
-      and license/.
-  mecab-rs-migrate slim <dict-dir> <out-dir> --keep <fields>
-  mecab-rs-migrate slim <dict-dir> <out-dir> <count> [--pad]
-      Rewrites sys.dic keeping only the listed feature fields (for example 0-7,9,10,12,20,22;
-      the others become `*`, in features of 29 fields only), or the first <count> fields.
-      Copies the runtime files (dicrc, char.bin, char.uni, license/, unk.dic, left-id.def,
-      right-id.def, matrix.bin, matrix.hot, matrix.tpl, matrix.xz, right.tsv, left.tsv).
-  mecab-rs-migrate templates <source-dir> <dict-dir> [--id-defs <dir>] [--hot L R] [--threads N]
-      Compiles the connection templates of <source-dir> (feature.def, model.def, dicrc) for
-      the id definitions in <id-defs-dir> (default: <source-dir>) and writes matrix.tpl and
-      matrix.hot into <dict-dir>. The hot block defaults to 4480 x 3136 (clamped).
-  mecab-rs-migrate check-templates <source-dir> <matrix.bin> [--id-defs <dir>] [--threads N]
-      Compiles the templates like `templates` and compares the cost of every cell with the
-      dense matrix.bin; exits with an error at the first mismatch.
-  mecab-rs-migrate pack-matrix <source-dir> <out.xz> [--id-defs <dir>]      (feature xz)
-  mecab-rs-migrate unpack-matrix <file.xz> <dict-dir> [--hot L R] [--threads N]   (feature xz)
-      Packs the compiled templates into one xz file, or writes matrix.tpl and matrix.hot
-      from such a file.
-  mecab-rs-migrate pack-int <source-dir> <out.xz> [--id-defs <dir>] [--shift N | --shift A-B]
-                            [--reference <matrix.bin>] [--threads N]           (feature xz)
-  mecab-rs-migrate unpack-int <file.xz> <id-defs-dir> <dict-dir> [--hot L R] [--threads N]
-                                                                                (feature xz)
-  mecab-rs-migrate check-int <file.xz> <id-defs-dir> <matrix.bin> [--threads N]  (feature xz)
-      Integer matrix: rounds the template weights to the grid 2^-shift (the shifts given, default
-      16-26), lists the cells where the integer sum differs from the real matrix (taken from
-      --reference or else from the exact templates) and writes the smallest xz file; unpack-int
-      writes matrix.itp and matrix.hot from it; check-int compares every cell of the decoded
-      integer matrix with matrix.bin. The cold lookups of two template files (matrix.tpl,
-      matrix.itp or the runtime form) are timed by `cargo run --release --example bench_cold`.
-  mecab-rs-migrate runtime-int <matrix.itp> <matrix.hot> <out>
   mecab-rs-migrate check-runtime-int <matrix.itp> <runtime> [<matrix.bin>] [--threads N]
-      Writes the runtime form of matrix.itp (what pack puts into the .mrd file) for the hot block
-      of matrix.hot, and compares every cell outside of the hot block with matrix.itp and, if
-      given, with the dense matrix.bin.
+      Compares every cell of the runtime form of matrix.itp (what pack puts into the .mrd file)
+      outside of its hot block with matrix.itp and, if given, with the dense matrix.bin.
   mecab-rs-migrate pair-stats <mrd> <corpus>... -o <file>                  (feature pair-stats)
       Parses every line of the corpora with max grouping size 10 and writes how often the lattice
       asked for each (right node left id, left node right id) pair of the hot matrix as records
       of row u16, column u16, count u32 (little endian), for rebuild --pairs.
-  mecab-rs-migrate pair-cover <matrix.hot> <pairs>
-      Prints how many of the lookups counted in <pairs> fall inside the hot part of <matrix.hot>.
   mecab-rs-migrate rebuild <unidic-full-dir> <out-dir> (--stats <dir> | --corpus <file>...)
-                         [--keep <fields>] [--threads N] [--int [--shift N]]
+                         [--keep <fields>] [--threads N] [--int]
                          [--hot L R | --pairs <file> [--hot-cells N]]
-                         [--xz] [--matrix-bin]
+                         [--matrix-bin]
       One-shot build of the runtime files only (dicrc, char.bin, char.uni, license/, sys.dic,
-      unk.dic, left-id.def, right-id.def, right.tsv, left.tsv, matrix.tpl, matrix.hot): renumbers
+      unk.dic, left-id.def, right-id.def, right.tsv, left.tsv, matrix.itp, matrix.hot): renumbers
       by the stats (given, or counted from the corpora), slims with --keep, and compiles the
-      templates instead of writing matrix.bin. --int writes the integer templates matrix.itp
-      (grid 2^-20 unless --shift, every cell exact, about half of matrix.tpl) in place of
-      matrix.tpl. --xz also writes matrix.xz (feature xz), --matrix-bin the permuted dense
+      integer templates matrix.itp (grid 2^-20, every cell exact) instead of writing matrix.bin;
+      --int is accepted and changes nothing. --matrix-bin also writes the permuted dense
       matrix.bin. --hot L R makes the hot part a rectangle; --pairs with --hot-cells N makes it a
       staircase of at most N cells (default 14,000,000) whose row lengths follow the pair counts.";
 
 type Args = [std::ffi::OsString];
-
-fn path_argument(command: &str, args: &Args, index: usize, what: &str) -> Result<PathBuf, String> {
-    args.get(index)
-        .map(PathBuf::from)
-        .ok_or_else(|| format!("{command}: missing {what}"))
-}
-
-fn stats(args: &Args) -> Result<(), String> {
-    let (dictionary, out) = (
-        path_argument("stats", args, 0, "<dict-dir>")?,
-        path_argument("stats", args, 1, "<out-dir>")?,
-    );
-    let corpora: Vec<PathBuf> = args[2..].iter().map(PathBuf::from).collect();
-    if corpora.is_empty() {
-        return Err("stats: no corpus given".into());
-    }
-    let stats = rebuild::collect_stats(&dictionary, &corpora).map_err(shown)?;
-    stats.write_tsv(&out).map_err(shown)?;
-    let seen = |counts: &[u64]| counts.iter().filter(|&&count| count > 0).count();
-    println!(
-        "lookups {} rc seen {} lc seen {}",
-        stats.right.iter().sum::<u64>(),
-        seen(&stats.right),
-        seen(&stats.left)
-    );
-    Ok(())
-}
-
-fn renumber(args: &Args) -> Result<(), String> {
-    let (dictionary, stats, out) = (
-        path_argument("renumber", args, 0, "<dict-dir>")?,
-        path_argument("renumber", args, 1, "<stats-dir>")?,
-        path_argument("renumber", args, 2, "<out-dir>")?,
-    );
-    let id_defs = match args.get(3) {
-        None => None,
-        Some(flag) if flag == "--id-defs" => Some(path_argument(
-            "renumber",
-            args,
-            4,
-            "the --id-defs directory",
-        )?),
-        Some(other) => {
-            return Err(format!("unexpected argument {}", other.to_string_lossy()));
-        }
-    };
-    if args.len() > 5 {
-        return Err("renumber: too many arguments".into());
-    }
-    let report = rebuild::renumber(&dictionary, &stats, &out, id_defs.as_deref()).map_err(shown)?;
-    println!(
-        "renumbered {} x {} ids into {}",
-        report.left_size,
-        report.right_size,
-        out.display()
-    );
-    Ok(())
-}
-
-fn slim(args: &Args) -> Result<(), String> {
-    let (dictionary, out) = (
-        path_argument("slim", args, 0, "<dict-dir>")?,
-        path_argument("slim", args, 1, "<out-dir>")?,
-    );
-    let keep = match args.get(2).and_then(|argument| argument.to_str()) {
-        Some("--keep") => {
-            let spec = args.get(3).and_then(|spec| spec.to_str());
-            rebuild::Keep::parse_fields(spec.ok_or("slim: --keep needs a field set")?)?
-        }
-        Some(count) => rebuild::Keep::Prefix {
-            keep: count
-                .parse()
-                .map_err(|_| format!("slim: `{count}` is not a field count"))?,
-            pad: args.get(3).is_some_and(|flag| flag == "--pad"),
-        },
-        None => return Err("slim: give --keep <fields> or a field count".into()),
-    };
-    let report = rebuild::slim(&dictionary, &out, &keep).map_err(shown)?;
-    println!(
-        "sys.dic features {} -> {} bytes, {} unique, file {} -> {}",
-        report.old_feature_size,
-        report.new_feature_size,
-        report.unique_features,
-        report.old_file_size,
-        report.new_file_size
-    );
-    Ok(())
-}
 
 fn shown(error: mecab_rs::Error) -> String {
     error.to_string()
@@ -175,30 +47,14 @@ fn shown(error: mecab_rs::Error) -> String {
 #[derive(Default)]
 struct MatrixArgs {
     positional: Vec<PathBuf>,
-    id_defs: Option<PathBuf>,
     stats: Option<PathBuf>,
     corpora: Vec<PathBuf>,
     keep: Option<rebuild::Keep>,
     hot: Option<(usize, usize)>,
     hot_cells: Option<usize>,
     threads: Option<usize>,
-    xz: bool,
-    int: bool,
     matrix_bin: bool,
-    shifts: Option<Vec<u32>>,
-    reference: Option<PathBuf>,
     pairs: Option<PathBuf>,
-}
-
-fn parse_shifts(text: &str) -> Result<Vec<u32>, String> {
-    let bad = || format!("`{text}` is not a shift or a range like 16-26");
-    let (first, last) = text.split_once('-').unwrap_or((text, text));
-    let first: u32 = first.parse().map_err(|_| bad())?;
-    let last: u32 = last.parse().map_err(|_| bad())?;
-    if first > last || last > rebuild::int_matrix::MAX_SHIFT {
-        return Err(bad());
-    }
-    Ok((first..=last).collect())
 }
 
 fn parse_matrix_args(command: &str, args: &[std::ffi::OsString]) -> Result<MatrixArgs, String> {
@@ -217,7 +73,6 @@ fn parse_matrix_args(command: &str, args: &[std::ffi::OsString]) -> Result<Matri
     };
     while let Some(argument) = iterator.next() {
         match argument.to_str() {
-            Some("--id-defs") => parsed.id_defs = Some(text(iterator.next(), "--id-defs")?),
             Some("--stats") => parsed.stats = Some(text(iterator.next(), "--stats")?),
             Some("--corpus") => {
                 while let Some(file) = iterator
@@ -241,14 +96,8 @@ fn parse_matrix_args(command: &str, args: &[std::ffi::OsString]) -> Result<Matri
                 parsed.hot_cells = Some(number(iterator.next(), "--hot-cells")?);
             }
             Some("--threads") => parsed.threads = Some(number(iterator.next(), "--threads")?),
-            Some("--shift") => {
-                let value = text(iterator.next(), "--shift")?;
-                parsed.shifts = Some(parse_shifts(&value.to_string_lossy())?);
-            }
-            Some("--reference") => parsed.reference = Some(text(iterator.next(), "--reference")?),
             Some("--pairs") => parsed.pairs = Some(text(iterator.next(), "--pairs")?),
-            Some("--xz") => parsed.xz = true,
-            Some("--int") => parsed.int = true,
+            Some("--int") => {}
             Some("--matrix-bin") => parsed.matrix_bin = true,
             Some(flag) if flag.starts_with("--") => {
                 return Err(format!("{command}: unknown option {flag}"));
@@ -259,24 +108,9 @@ fn parse_matrix_args(command: &str, args: &[std::ffi::OsString]) -> Result<Matri
     Ok(parsed)
 }
 
-fn read_id_defs(source: &Path, id_defs: Option<&Path>) -> Result<(String, String), String> {
-    let read = |name: &str| {
-        let path = id_defs.unwrap_or(source).join(name);
-        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))
-    };
-    Ok((read("left-id.def")?, read("right-id.def")?))
-}
-
-fn compile(source: &Path, id_defs: Option<&Path>) -> Result<mecab_rs::ConnectionTemplates, String> {
-    let (left, right) = read_id_defs(source, id_defs)?;
-    rebuild::compile_templates(source, &left, &right).map_err(|error| error.to_string())
-}
-
 const ROWS_PER_CHUNK: usize = 64;
 const DENSE_HEADER_BYTES: usize = 4;
 const DENSE_CELL_BYTES: usize = 2;
-#[cfg(feature = "xz")]
-const SINGLE_CELL_STRIDE: usize = 997;
 
 type FirstMismatch = (usize, usize, i16, i16);
 
@@ -298,13 +132,6 @@ impl Comparison {
             .lock()
             .unwrap()
             .get_or_insert((column, row, expected, found));
-    }
-
-    fn check(&self, column: usize, row: usize, expected: i16, found: i16) {
-        self.compared_cell();
-        if expected != found {
-            self.mismatch(column, row, expected, found);
-        }
     }
 
     fn mismatch_count(&self) -> usize {
@@ -350,47 +177,6 @@ fn read_dense(path: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
-fn check_templates(
-    templates: &mecab_rs::ConnectionTemplates,
-    matrix: &Path,
-    threads: usize,
-) -> Result<(), String> {
-    let bytes = read_dense(matrix)?;
-    let (left_size, right_size) = (templates.left_size(), templates.right_size());
-    let header_size = |at: usize| usize::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
-    if !dense_has_size(&bytes, left_size, right_size)
-        || header_size(0) != left_size
-        || header_size(2) != right_size
-    {
-        return Err("the matrix does not have the size of the templates".into());
-    }
-    let comparison = Comparison::default();
-    compare_row_chunks(right_size, threads, |rows| {
-        for row in rows {
-            for column in 0..left_size {
-                let found = templates.cost(column as u16, row as u16);
-                comparison.check(
-                    column,
-                    row,
-                    dense_cell(&bytes, left_size, column, row),
-                    found,
-                );
-            }
-        }
-    });
-    println!(
-        "compared {} cells, {} mismatches",
-        left_size * right_size,
-        comparison.mismatch_count()
-    );
-    match comparison.first_mismatch() {
-        Some((rc, lc, expected, found)) => Err(format!(
-            "first mismatch at rc {rc} lc {lc}: matrix {expected}, templates {found}"
-        )),
-        None => Ok(()),
-    }
-}
-
 fn positional<'a, const COUNT: usize>(
     command: &str,
     parsed: &'a MatrixArgs,
@@ -400,12 +186,6 @@ fn positional<'a, const COUNT: usize>(
     found
         .try_into()
         .map_err(|_| format!("{command}: expected {usage}"))
-}
-
-fn rectangle_of(parsed: &MatrixArgs) -> Option<mecab_rs::HotShape> {
-    parsed
-        .hot
-        .map(|(left, right)| mecab_rs::HotShape::rectangle(left, right))
 }
 
 fn read_pair_counts(path: &Path) -> Result<Vec<mecab_rs::PairCount>, String> {
@@ -442,163 +222,6 @@ fn hot_shape_of(parsed: &MatrixArgs) -> Result<Option<mecab_rs::HotShape>, Strin
 
 fn threads_of(parsed: &MatrixArgs) -> usize {
     parsed.threads.unwrap_or_else(rebuild::default_threads)
-}
-
-fn templates(args: &Args, start: Instant) -> Result<(), String> {
-    let parsed = parse_matrix_args("templates", args)?;
-    let [source, dictionary] = positional("templates", &parsed, "<source-dir> <dict-dir>")?;
-    let templates = compile(source, parsed.id_defs.as_deref())?;
-    println!("compiled in {:.2} s", start.elapsed().as_secs_f64());
-    std::fs::create_dir_all(dictionary).map_err(|error| error.to_string())?;
-    rebuild::write_matrix_files(
-        &templates,
-        dictionary,
-        rectangle_of(&parsed),
-        threads_of(&parsed),
-    )
-    .map_err(shown)
-}
-
-fn check_templates_command(args: &Args, start: Instant) -> Result<(), String> {
-    let parsed = parse_matrix_args("check-templates", args)?;
-    let [source, matrix] = positional("check-templates", &parsed, "<source-dir> <matrix.bin>")?;
-    let templates = compile(source, parsed.id_defs.as_deref())?;
-    println!("compiled in {:.2} s", start.elapsed().as_secs_f64());
-    check_templates(&templates, matrix, threads_of(&parsed))
-}
-
-#[cfg(feature = "xz")]
-fn pack_int(args: &Args, start: Instant) -> Result<(), String> {
-    let parsed = parse_matrix_args("pack-int", args)?;
-    let [source, out] = positional("pack-int", &parsed, "<source-dir> <out.xz>")?;
-    let shifts = parsed
-        .shifts
-        .clone()
-        .unwrap_or_else(|| rebuild::int_matrix::DEFAULT_SHIFTS.collect());
-    let (left, right) = read_id_defs(source, parsed.id_defs.as_deref())?;
-    let templates = compile(source, parsed.id_defs.as_deref())?;
-    println!("compiled in {:.2} s", start.elapsed().as_secs_f64());
-    let (reports, chosen) = rebuild::int_matrix::pack_int(
-        &templates,
-        source,
-        &left,
-        &right,
-        &shifts,
-        parsed.reference.as_deref(),
-        threads_of(&parsed),
-        out,
-        &mut |line| println!("{line}"),
-    )
-    .map_err(shown)?;
-    for report in &reports {
-        let sizes = &report.sizes;
-        println!(
-            "shift {:2}: exceptions {:>9}  xz header {} pattern {} weights {} exceptions {} total {}  |  ideal pattern {:.0} weights {:.0} exceptions {:.0} total {:.0}",
-            report.shift,
-            report.exceptions,
-            sizes.header.1,
-            sizes.pattern.1,
-            sizes.weights.1,
-            sizes.exceptions.1,
-            sizes.total.1,
-            report.ideal.pattern,
-            report.ideal.weights,
-            report.ideal.exceptions,
-            report.ideal.total(),
-        );
-    }
-    println!(
-        "chosen shift {}: {} bytes in {}",
-        reports[chosen].shift,
-        reports[chosen].sizes.total.1,
-        out.display()
-    );
-    Ok(())
-}
-
-#[cfg(feature = "xz")]
-fn unpack_int(args: &Args) -> Result<(), String> {
-    let parsed = parse_matrix_args("unpack-int", args)?;
-    let [pack, id_defs, dictionary] =
-        positional("unpack-int", &parsed, "<file.xz> <id-defs-dir> <dict-dir>")?;
-    std::fs::create_dir_all(dictionary).map_err(|error| error.to_string())?;
-    rebuild::int_matrix::unpack_int(
-        pack,
-        id_defs,
-        dictionary,
-        rectangle_of(&parsed),
-        threads_of(&parsed),
-    )
-    .map_err(shown)
-}
-
-#[cfg(feature = "xz")]
-fn check_int(args: &Args, start: Instant) -> Result<(), String> {
-    let parsed = parse_matrix_args("check-int", args)?;
-    let [pack, id_defs, matrix] =
-        positional("check-int", &parsed, "<file.xz> <id-defs-dir> <matrix.bin>")?;
-    let (left, right) = read_id_defs(id_defs, None)?;
-    let templates = rebuild::int_matrix::read_int_pack(pack, &left, &right).map_err(shown)?;
-    println!(
-        "decoded in {:.2} s: shift {}, {} exceptions",
-        start.elapsed().as_secs_f64(),
-        templates.shift(),
-        templates.exception_count()
-    );
-    let bytes = read_dense(matrix)?;
-    let (left_size, right_size) = (templates.left_size(), templates.right_size());
-    if !dense_has_size(&bytes, left_size, right_size) {
-        return Err("the matrix does not have the size of the templates".into());
-    }
-    let comparison = Comparison::default();
-    compare_row_chunks(right_size, threads_of(&parsed), |rows| {
-        templates.visit_rows(rows.start, rows.end, |row, costs| {
-            for (column, &found) in costs.iter().enumerate() {
-                let expected = dense_cell(&bytes, left_size, column, row);
-                comparison.check(column, row, expected, found);
-            }
-        });
-    });
-    let cells = left_size * right_size;
-    let exception_cells: Vec<usize> = templates
-        .exceptions()
-        .map(|(cell, _)| cell as usize)
-        .collect();
-    let mut single = 0usize;
-    let mut single_mismatches = 0usize;
-    for cell in (0..cells)
-        .step_by(SINGLE_CELL_STRIDE)
-        .chain(exception_cells)
-    {
-        let (column, row) = (cell % left_size, cell / left_size);
-        let expected = dense_cell(&bytes, left_size, column, row);
-        if templates.cost(column as u16, row as u16) != expected {
-            single_mismatches += 1;
-        }
-        single += 1;
-    }
-    let mismatches = comparison.mismatch_count() + single_mismatches;
-    println!("compared {cells} cells by rows and {single} by cell, {mismatches} mismatches");
-    match comparison.first_mismatch() {
-        Some((column, row, expected, found)) => Err(format!(
-            "first mismatch at rc {column} lc {row}: matrix {expected}, integer templates {found}"
-        )),
-        None if mismatches > 0 => Err("the single-cell path differs".into()),
-        None => Ok(()),
-    }
-}
-
-fn runtime_int(args: &Args) -> Result<(), String> {
-    let parsed = parse_matrix_args("runtime-int", args)?;
-    let [itp, hot, out] = positional("runtime-int", &parsed, "<matrix.itp> <matrix.hot> <out>")?;
-    let ints = mecab_rs::MappedIntTemplates::open(itp).map_err(shown)?;
-    let matrix = std::fs::read(hot).map_err(|error| format!("{}: {error}", hot.display()))?;
-    let (_, _, shape) = mecab_rs::HotShape::parse(&matrix)
-        .map_err(|reason| format!("{}: {reason}", hot.display()))?;
-    let bytes = ints.runtime_form(&shape).map_err(shown)?;
-    std::fs::write(out, &bytes).map_err(|error| format!("{}: {error}", out.display()))?;
-    println!("wrote {} bytes", bytes.len());
-    Ok(())
 }
 
 fn check_runtime_int(args: &Args) -> Result<(), String> {
@@ -651,10 +274,12 @@ fn check_runtime_int(args: &Args) -> Result<(), String> {
     println!(
         "compared {compared} cells outside of the {hot_left} x {hot_right} hot block, {mismatches} mismatches"
     );
-    if mismatches > 0 {
-        return Err("the runtime form differs".into());
+    match comparison.first_mismatch() {
+        Some((column, row, expected, found)) => Err(format!(
+            "the runtime form differs, first at rc {column} lc {row}: expected {expected}, found {found}"
+        )),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 #[cfg(feature = "pair-stats")]
@@ -706,32 +331,6 @@ fn pair_stats(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-fn pair_cover(args: &Args) -> Result<(), String> {
-    let [hot, pairs] = match args {
-        [hot, pairs] => [Path::new(hot), Path::new(pairs)],
-        _ => return Err("pair-cover: expected <matrix.hot> <pairs>".into()),
-    };
-    let matrix = std::fs::read(hot).map_err(|error| format!("{}: {error}", hot.display()))?;
-    let (_, _, shape) = mecab_rs::HotShape::parse(&matrix)
-        .map_err(|reason| format!("{}: {reason}", hot.display()))?;
-    let (mut inside, mut outside) = (0u64, 0u64);
-    for pair in read_pair_counts(pairs)? {
-        let count = u64::from(pair.count);
-        if shape.contains(usize::from(pair.row), usize::from(pair.column)) {
-            inside += count;
-        } else {
-            outside += count;
-        }
-    }
-    println!(
-        "{} cells in {} rows: {inside} lookups inside, {outside} outside ({:.2}%)",
-        shape.cells(),
-        shape.rows(),
-        outside as f64 * 100.0 / (inside + outside).max(1) as f64
-    );
-    Ok(())
-}
-
 fn rebuild_command(args: &Args) -> Result<(), String> {
     let parsed = parse_matrix_args("rebuild", args)?;
     let [source, out] = positional("rebuild", &parsed, "<unidic-full-dir> <out-dir>")?;
@@ -747,13 +346,6 @@ fn rebuild_command(args: &Args) -> Result<(), String> {
         keep: parsed.keep.clone(),
         hot: hot_shape_of(&parsed)?,
         threads: threads_of(&parsed),
-        int_shift: match parsed.shifts.as_deref() {
-            _ if !parsed.int => None,
-            None => Some(rebuild::int_matrix::RUNTIME_SHIFT),
-            Some(&[shift]) => Some(shift),
-            Some(_) => return Err("rebuild: --int takes one --shift".into()),
-        },
-        xz: parsed.xz,
         matrix_bin: parsed.matrix_bin,
     };
     let mut previous = Instant::now();
@@ -774,29 +366,7 @@ fn rebuild_command(args: &Args) -> Result<(), String> {
             slim.old_feature_size, slim.new_feature_size, slim.old_file_size, slim.new_file_size
         );
     }
-    if let Some(size) = report.xz_size {
-        println!("matrix.xz: {size} bytes");
-    }
     Ok(())
-}
-
-#[cfg(feature = "xz")]
-fn pack_matrix(args: &Args, start: Instant) -> Result<(), String> {
-    let parsed = parse_matrix_args("pack-matrix", args)?;
-    let [source, out] = positional("pack-matrix", &parsed, "<source-dir> <out.xz>")?;
-    let templates = compile(source, parsed.id_defs.as_deref())?;
-    println!("compiled in {:.2} s", start.elapsed().as_secs_f64());
-    let size = rebuild::xz::pack(&templates, out).map_err(shown)?;
-    println!("{}: {size} bytes", out.display());
-    Ok(())
-}
-
-#[cfg(feature = "xz")]
-fn unpack_matrix(args: &Args) -> Result<(), String> {
-    let parsed = parse_matrix_args("unpack-matrix", args)?;
-    let [pack, dictionary] = positional("unpack-matrix", &parsed, "<file.xz> <dict-dir>")?;
-    std::fs::create_dir_all(dictionary).map_err(|error| error.to_string())?;
-    rebuild::xz::unpack(pack, dictionary, rectangle_of(&parsed), threads_of(&parsed)).map_err(shown)
 }
 
 fn run() -> Result<(), String> {
@@ -808,37 +378,16 @@ fn run() -> Result<(), String> {
             "pack" => packed_command(command, args),
             #[cfg(feature = "xz")]
             "pack-transport" | "expand" => packed_command(command, args),
-            "stats" => stats(args),
-            "renumber" => renumber(args),
-            "slim" => slim(args),
-            "templates" => templates(args, start),
-            "check-templates" => check_templates_command(args, start),
             "rebuild" => rebuild_command(args),
-            #[cfg(feature = "xz")]
-            "pack-matrix" => pack_matrix(args, start),
-            #[cfg(feature = "xz")]
-            "unpack-matrix" => unpack_matrix(args),
-            #[cfg(feature = "xz")]
-            "pack-int" => pack_int(args, start),
-            #[cfg(feature = "xz")]
-            "unpack-int" => unpack_int(args),
-            #[cfg(feature = "xz")]
-            "check-int" => check_int(args, start),
-            "pair-cover" => pair_cover(args),
             #[cfg(feature = "pair-stats")]
             "pair-stats" => pair_stats(args),
             #[cfg(not(feature = "pair-stats"))]
             "pair-stats" => Err(format!(
                 "{command}: this build has no pair counting; build with --features pair-stats"
             )),
-            "runtime-int" => runtime_int(args),
             "check-runtime-int" => check_runtime_int(args),
             #[cfg(not(feature = "xz"))]
-            "pack-int" | "unpack-int" | "check-int" => Err(format!(
-                "{command}: this build has no xz support; build with --features xz"
-            )),
-            #[cfg(not(feature = "xz"))]
-            "pack-matrix" | "unpack-matrix" | "pack-transport" | "expand" => Err(format!(
+            "pack-transport" | "expand" => Err(format!(
                 "{command}: this build has no xz support; build with --features xz"
             )),
             _ => return migrate_char_table(all),

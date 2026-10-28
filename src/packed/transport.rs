@@ -176,12 +176,11 @@ fn lexicon_model(parts: &Parts) -> Result<Model, Error> {
 fn attach_matrix(model: &mut Model, (matrix, templates): (Vec<u8>, Vec<u8>)) {
     model.matrix = matrix;
     model.templates = templates;
-    model.integer_templates = model.templates.starts_with(crate::int_templates::MAGIC);
 }
 
-fn runtime_model(parts: &Parts, next_to: &Path) -> Result<(Model, LexiconSections), Error> {
+fn runtime_model(parts: &Parts) -> Result<(Model, LexiconSections), Error> {
     std::thread::scope(|scope| {
-        let matrix = scope.spawn(|| matrix::decode(parts, next_to));
+        let matrix = scope.spawn(|| matrix::decode(parts));
         let lexicon = lexicon_model(parts).and_then(|model| {
             let sections = model.encode_lexicon_sections()?;
             Ok((model, sections))
@@ -216,7 +215,7 @@ pub fn expand(xz_file: &Path, out_mrd: &Path) -> Result<(), Error> {
             path: xz_file.to_path_buf(),
             reason: format!("xz: {error}"),
         })?;
-    let (model, sections) = runtime_model(&parse_container(&payload, xz_file)?, out_mrd)?;
+    let (model, sections) = runtime_model(&parse_container(&payload, xz_file)?)?;
     drop(payload);
     let runtime = model.finish_runtime(sections)?;
     write_file(out_mrd, |writer| runtime.write_to(writer))

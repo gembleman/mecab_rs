@@ -6,11 +6,9 @@ use crate::int_templates::DEFAULT_CLUSTER_COUNT;
 use crate::packed::model::Model;
 use crate::rebuild::default_threads;
 use crate::rebuild::int_matrix::{IntContext, decode_payload, encode_payload};
-use crate::templates::TEMPLATE_MAGIC;
 use crate::{Error, HotShape, IntTemplates};
 
 const ENCODING_DENSE_DELTA: u32 = 1;
-const ENCODING_TEMPLATES_XZ: u32 = 2;
 const ENCODING_INTEGER_MRIT: u32 = 4;
 const ROW_LENGTH_BYTES: usize = 2;
 const WORD_BYTES: usize = 4;
@@ -38,79 +36,6 @@ fn row_delta(matrix: &[u8], encode: bool) -> Vec<u8> {
         }
     }
     out
-}
-
-fn regenerate(xz: &[u8], hot: &HotShape, path: &Path) -> Result<(Vec<u8>, Vec<u8>), Error> {
-    let templates = crate::rebuild::xz::unpack_bytes(xz, path)?;
-    let (mut matrix, mut tpl) = (Vec::new(), Vec::new());
-    templates
-        .write_hot_matrix(hot, default_threads(), &mut matrix)
-        .map_err(io_error(path))?;
-    templates
-        .write_templates(&mut tpl)
-        .map_err(io_error(path))?;
-    Ok((matrix, tpl))
-}
-
-fn read_templates(bytes: &[u8], path: &Path) -> Result<crate::ConnectionTemplates, Error> {
-    let broken = || bad(path, "the templates are not valid");
-    let mut at = 0;
-    let mut take = |length: usize| -> Result<&[u8], Error> {
-        let slice = bytes.get(at..at + length).ok_or_else(broken)?;
-        at += length;
-        Ok(slice)
-    };
-    let word = |slice: &[u8]| u32::from_le_bytes(slice.try_into().expect("four bytes")) as usize;
-    if !take(8)?.starts_with(TEMPLATE_MAGIC) {
-        return Err(broken());
-    }
-    let cost_factor = f64::from_le_bytes(take(8)?.try_into().expect("eight bytes"));
-    let (left_size, right_size, part_count) = (word(take(4)?), word(take(4)?), word(take(4)?));
-    take(4)?;
-    let mut parts = Vec::new();
-    for _ in 0..part_count {
-        let (left_count, right_count, nnz) = (word(take(4)?), word(take(4)?), word(take(4)?));
-        take(4)?;
-        let mut padded = |count: usize, width: usize| -> Result<&[u8], Error> {
-            let length = count.checked_mul(width).ok_or_else(broken)?;
-            let items = take(length)?;
-            take(length.next_multiple_of(8) - length)?;
-            Ok(items)
-        };
-        let u16s = |items: &[u8]| -> Vec<u16> {
-            items
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|&item| u16::from_le_bytes(item))
-                .collect()
-        };
-        let left_projection = u16s(padded(left_size, 2)?);
-        let right_projection = u16s(padded(right_size, 2)?);
-        let indptr = padded(right_count + 1, 4)?
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&item| u32::from_le_bytes(item))
-            .collect();
-        let left_index = u16s(padded(nnz, 2)?);
-        let weight = padded(nnz, 8)?
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|&item| f64::from_le_bytes(item))
-            .collect();
-        parts.push(crate::TemplatePart {
-            left_count,
-            right_count,
-            left_projection,
-            right_projection,
-            indptr,
-            left_index,
-            weight,
-        });
-    }
-    crate::ConnectionTemplates::new(cost_factor, left_size, right_size, parts)
 }
 
 fn read_text(dict_dir: &Path, name: &str) -> Result<String, Error> {
@@ -274,41 +199,10 @@ pub(in crate::packed) fn encode(dict_dir: &Path, model: &Model) -> Result<Part, 
             bytes: row_delta(&model.matrix, true),
         });
     }
-    if model.integer_templates {
-        return integer_part(dict_dir, model);
-    }
-    let (_, _, hot) = HotShape::parse(&model.matrix)
-        .map_err(|reason| bad(&dict_dir.join("matrix.hot"), reason))?;
-    let existing = dict_dir.join("matrix.xz");
-    let xz = if existing.is_file() {
-        std::fs::read(&existing).map_err(io_error(&existing))?
-    } else {
-        let templates = read_templates(&model.templates, &dict_dir.join("matrix.tpl"))?;
-        crate::rebuild::xz::pack_bytes(&templates, &existing)?
-    };
-    let (regenerated_hot, regenerated_templates) = regenerate(&xz, &hot, &existing)?;
-    if regenerated_hot != model.matrix || regenerated_templates != model.templates {
-        return Err(Error::Unsupported(
-            "matrix.hot and matrix.tpl that matrix.xz does not regenerate",
-        ));
-    }
-    let mut bytes = Vec::with_capacity(xz.len() + 4 + hot.rows() * 2);
-    bytes.extend_from_slice(&(hot.rows() as u32).to_le_bytes());
-    for &length in hot.lengths() {
-        bytes.extend_from_slice(&(length as u16).to_le_bytes());
-    }
-    bytes.extend_from_slice(&xz);
-    Ok(Part {
-        name: "matrix",
-        encoding: ENCODING_TEMPLATES_XZ,
-        bytes,
-    })
+    integer_part(dict_dir, model)
 }
 
-pub(in crate::packed) fn decode(
-    parts: &Parts,
-    next_to: &Path,
-) -> Result<(Vec<u8>, Vec<u8>), Error> {
+pub(in crate::packed) fn decode(parts: &Parts) -> Result<(Vec<u8>, Vec<u8>), Error> {
     let corrupt = |reason| parts.corrupt(reason);
     match parts.get("matrix")? {
         (ENCODING_DENSE_DELTA, bytes) => {
@@ -324,28 +218,6 @@ pub(in crate::packed) fn decode(
                 return Err(corrupt("the matrix is not valid"));
             }
             Ok((row_delta(bytes, false), Vec::new()))
-        }
-        (ENCODING_TEMPLATES_XZ, bytes) => {
-            let Some(rows) = bytes.get(..4) else {
-                return Err(corrupt("the matrix is too short"));
-            };
-            let rows = u32::from_le_bytes(rows.try_into().expect("four bytes")) as usize;
-            let lengths_end = rows
-                .checked_mul(2)
-                .and_then(|length| length.checked_add(4))
-                .ok_or_else(|| corrupt("the hot rows are too many"))?;
-            let lengths = bytes
-                .get(4..lengths_end)
-                .ok_or_else(|| corrupt("the matrix is too short"))?;
-            let hot = HotShape::from_lengths(
-                lengths
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|&length| u32::from(u16::from_le_bytes(length)))
-                    .collect(),
-            );
-            regenerate(&bytes[lengths_end..], &hot, next_to)
         }
         (ENCODING_INTEGER_MRIT, bytes) => decode_integer(bytes, parts.path),
         _ => Err(Error::Unsupported("a matrix with an unknown encoding")),

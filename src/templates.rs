@@ -2,24 +2,14 @@ use std::io::{self, Write};
 use std::mem::size_of;
 use std::path::Path;
 
-use memmap2::Mmap;
-
-use crate::clusters::{MappedFloatClusters, plan_clusters, write_clusters};
-use crate::dictionary::map_file;
 use crate::error::Error;
-use crate::hot_shape::HotShape;
-use crate::mapped_bytes::MappedBytes;
-use crate::part::{MappedPart, PartSlices, RowScratch, TemplatePart, total_of};
-use crate::section::{Plain, Section, SectionSource};
+use crate::part::{PartSlices, RowScratch, TemplatePart, total_of};
+use crate::section::{Plain, Section};
 
-pub(crate) const TEMPLATE_MAGIC: &[u8; 4] = b"MXTP";
 pub(crate) const TEMPLATE_HEADER_PEEK_BYTES: usize = 24;
 const SIZES_OFFSET: usize = 16;
 const WORD_BYTES: usize = 4;
-const TEMPLATE_VERSION: u32 = 1;
 const ARRAY_ALIGNMENT: usize = 8;
-const MAX_PARTS: usize = 256;
-const DEFAULT_CLUSTER_COUNT: usize = 12;
 const MIN_COST: f64 = -32767.0;
 const MAX_COST: f64 = 32767.0;
 
@@ -29,13 +19,6 @@ pub(crate) fn header_sizes(header: &[u8]) -> Option<(usize, usize)> {
         Some(u32::from_le_bytes(bytes.try_into().ok()?) as usize)
     };
     Some((word(SIZES_OFFSET)?, word(SIZES_OFFSET + WORD_BYTES)?))
-}
-
-pub(crate) fn float_header_sizes(header: &[u8]) -> Option<(usize, usize)> {
-    header
-        .starts_with(TEMPLATE_MAGIC)
-        .then(|| header_sizes(header))
-        .flatten()
 }
 
 pub struct ConnectionTemplates {
@@ -194,101 +177,6 @@ impl<'a> TemplateReader<'a> {
     }
 }
 
-pub struct MappedTemplates<S = Mmap> {
-    map: S,
-    cost_factor: f64,
-    left_size: usize,
-    right_size: usize,
-    parts: Vec<MappedPart<f64>>,
-    clusters: Option<MappedFloatClusters>,
-}
-
-impl MappedTemplates<Mmap> {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let path = path.as_ref();
-        Self::from_source(map_file(path)?, path)
-    }
-}
-
-impl MappedTemplates<MappedBytes> {
-    pub(crate) fn from_mapped(map: MappedBytes, path: &Path) -> Result<Self, Error> {
-        Self::from_source(map, path)
-    }
-}
-
-#[allow(private_bounds)]
-impl<S: SectionSource> MappedTemplates<S> {
-    fn from_source(map: S, path: &Path) -> Result<Self, Error> {
-        let file = map.all_bytes();
-        let mut reader = TemplateReader {
-            file,
-            path,
-            offset: 0,
-        };
-        if reader.bytes::<4>()? != *TEMPLATE_MAGIC
-            || u32::from_le_bytes(reader.bytes()?) != TEMPLATE_VERSION
-        {
-            return Err(reader.broken("the file is not a template file of this version"));
-        }
-        let cost_factor = f64::from_le_bytes(reader.bytes()?);
-        let left_size = reader.count()?;
-        let right_size = reader.count()?;
-        let part_count = reader.count()?;
-        let cluster_count = reader.count()?;
-        if left_size == 0 || right_size == 0 || left_size > 0xFFFF || right_size > 0xFFFF {
-            return Err(reader.broken("the template matrix size is out of range"));
-        }
-        let mut parts = Vec::with_capacity(part_count.min(MAX_PARTS));
-        for _ in 0..part_count {
-            let part = MappedPart::read(&mut reader, left_size, right_size)?;
-            if !part.slices(&map).is_consistent() {
-                return Err(reader.broken("a connection template is inconsistent"));
-            }
-            parts.push(part);
-        }
-        let clusters = match cluster_count {
-            0 => None,
-            count => Some(MappedFloatClusters::read(
-                &mut reader,
-                count,
-                left_size,
-                right_size,
-            )?),
-        };
-        if reader.offset != file.len() {
-            return Err(reader.broken("the file has trailing bytes"));
-        }
-        Ok(Self {
-            map,
-            cost_factor,
-            left_size,
-            right_size,
-            parts,
-            clusters,
-        })
-    }
-
-    pub fn left_size(&self) -> usize {
-        self.left_size
-    }
-
-    pub fn right_size(&self) -> usize {
-        self.right_size
-    }
-
-    pub fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
-        let clustered = self.clusters.as_ref().and_then(|clusters| {
-            clusters.cost(&self.map, self.cost_factor, left_node_rc, right_node_lc)
-        });
-        clustered.unwrap_or_else(|| self.exact_cost(left_node_rc, right_node_lc))
-    }
-
-    fn exact_cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
-        let parts = self.parts.iter().map(|part| part.slices(&self.map));
-        connection_cost(parts, self.cost_factor, left_node_rc, right_node_lc)
-    }
-}
-
 impl ConnectionTemplates {
     pub fn new(
         cost_factor: f64,
@@ -335,74 +223,6 @@ impl ConnectionTemplates {
 
     pub fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
         connection_cost(self.slices(), self.cost_factor, left_node_rc, right_node_lc)
-    }
-
-    pub fn write_templates(&self, output: &mut impl Write) -> io::Result<()> {
-        self.write_clustered_templates(DEFAULT_CLUSTER_COUNT, output)
-    }
-
-    pub fn write_clustered_templates(
-        &self,
-        cluster_count: usize,
-        output: &mut impl Write,
-    ) -> io::Result<()> {
-        let slices: Vec<PartSlices<f64>> = self.slices().collect();
-        let plans = if cluster_count == 0 {
-            Vec::new()
-        } else {
-            plan_clusters(&slices, cluster_count)
-        };
-        output.write_all(TEMPLATE_MAGIC)?;
-        output.write_all(&TEMPLATE_VERSION.to_le_bytes())?;
-        output.write_all(&self.cost_factor.to_le_bytes())?;
-        for count in [
-            self.left_size,
-            self.right_size,
-            self.parts.len(),
-            plans.len(),
-        ] {
-            output.write_all(&(count as u32).to_le_bytes())?;
-        }
-        for part in &self.parts {
-            part.write(output, f64::to_le_bytes)?;
-        }
-        if plans.is_empty() {
-            return Ok(());
-        }
-        write_clusters(&slices, &plans, self.left_size, self.right_size, output)
-    }
-
-    fn render_rows(
-        &self,
-        rows: std::ops::Range<usize>,
-        shape: &HotShape,
-        scratch: &mut RowScratch<f64>,
-    ) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        for right_left_id in rows {
-            let length = shape.row_length(right_left_id);
-            scratch.fill_row_sums(self.slices(), right_left_id, length);
-            for sum in &scratch.sums[..length] {
-                bytes.extend_from_slice(&to_cost(*sum, self.cost_factor).to_le_bytes());
-            }
-        }
-        bytes
-    }
-
-    pub fn write_hot_matrix(
-        &self,
-        shape: &HotShape,
-        threads: usize,
-        output: &mut impl Write,
-    ) -> io::Result<()> {
-        shape.write_matrix_in_order(
-            self.left_size,
-            self.right_size,
-            threads,
-            output,
-            || RowScratch::new(self.slices(), self.left_size),
-            |scratch, rows| self.render_rows(rows, shape, scratch),
-        )
     }
 }
 

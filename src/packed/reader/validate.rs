@@ -30,10 +30,6 @@ impl Header {
     pub(super) fn hot(&self) -> bool {
         self.flags & FLAG_HOT_MATRIX != 0
     }
-
-    pub(super) fn integer_templates(&self) -> bool {
-        self.flags & FLAG_INT_TEMPLATES != 0
-    }
 }
 
 pub(super) fn format_error(path: &Path, reason: &'static str) -> Error {
@@ -47,8 +43,11 @@ fn check_flags(flags: u32, path: &Path) -> Result<(), Error> {
     if flags & !KNOWN_FLAGS != 0 {
         return Err(format_error(path, "the flags are not valid"));
     }
-    if flags & FLAG_INT_TEMPLATES != 0 && flags & FLAG_HOT_MATRIX == 0 {
-        return Err(format_error(path, "integer templates require a hot matrix"));
+    if (flags & FLAG_INT_TEMPLATES != 0) != (flags & FLAG_HOT_MATRIX != 0) {
+        return Err(format_error(
+            path,
+            "a hot matrix and integer templates come together",
+        ));
     }
     Ok(())
 }
@@ -179,23 +178,14 @@ fn check_templates(
             Err(source.broken("a dense matrix comes with templates"))
         };
     }
-    let integer = header.integer_templates();
     if length < TEMPLATE_HEADER_PEEK_BYTES {
-        return Err(source.broken(if integer {
-            "the integer templates are empty"
-        } else {
-            "the templates are shorter than their header"
-        }));
+        return Err(source.broken("the integer templates are empty"));
     }
     let mut templates_header = [0u8; TEMPLATE_HEADER_PEEK_BYTES];
     source.read(TEMPLATES, 0, &mut templates_header)?;
     let sizes = Some((left_size, right_size));
-    if integer {
-        if !is_runtime_form(&templates_header) || header_sizes(&templates_header) != sizes {
-            return Err(source.broken("the integer templates do not match the hot matrix"));
-        }
-    } else if float_header_sizes(&templates_header) != sizes {
-        return Err(source.broken("the templates do not match the hot matrix"));
+    if !is_runtime_form(&templates_header) || header_sizes(&templates_header) != sizes {
+        return Err(source.broken("the integer templates do not match the hot matrix"));
     }
     Ok(())
 }

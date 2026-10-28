@@ -24,7 +24,7 @@ use crate::mapped_bytes::MappedBytes;
 use crate::section::Section;
 use crate::system_dictionary::PrefixHit;
 pub use crate::system_dictionary::TokenRecord;
-use crate::templates::{TEMPLATE_HEADER_PEEK_BYTES, float_header_sizes, header_sizes};
+use crate::templates::{TEMPLATE_HEADER_PEEK_BYTES, header_sizes};
 use crate::wire::{u16_at, u32_at, u64_at};
 
 const CHUNK: usize = 1 << 20;
@@ -131,7 +131,6 @@ pub struct PackedDictionary {
     right_size: usize,
     category_count: usize,
     hot: bool,
-    integer_templates: bool,
     ascii: [u16; 128],
     bos_feature: Range<usize>,
     unknown_feature: Option<Range<usize>>,
@@ -213,7 +212,6 @@ impl PackedDictionary {
             right_size,
             category_count: header.category_count,
             hot: header.hot(),
-            integer_templates: header.integer_templates(),
             bos_feature: dicrc_start..dicrc_start + bos_length,
             unknown_feature: (unknown_length > 0)
                 .then(|| dicrc_start + bos_length..dicrc_start + bos_length + unknown_length),
@@ -343,10 +341,6 @@ impl PackedDictionary {
             MappedBytes::from_arc(Arc::clone(&self.map), self.sections[TEMPLATES].clone())
                 .expect("the template section is inside the mapping")
         })
-    }
-
-    pub fn integer_templates(&self) -> bool {
-        self.integer_templates
     }
 
     pub(crate) fn char_table_mapped(&self) -> MappedBytes {
