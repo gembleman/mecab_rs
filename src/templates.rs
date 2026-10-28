@@ -215,6 +215,32 @@ impl<'a> TemplateReader<'a> {
         self.bytes().map(|bytes| u32::from_le_bytes(bytes) as usize)
     }
 
+    pub(crate) fn copied<T, const WIDTH: usize>(
+        &mut self,
+        count: usize,
+        decode: fn([u8; WIDTH]) -> T,
+    ) -> Result<Vec<T>, Error> {
+        let length = count
+            .checked_mul(WIDTH)
+            .ok_or_else(|| self.broken("an array is too long"))?;
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| self.broken("an array is too long"))?;
+        let bytes = self
+            .file
+            .get(self.offset..end)
+            .ok_or_else(|| self.broken("the file ends inside an array"))?;
+        let items = bytes
+            .as_chunks::<WIDTH>()
+            .0
+            .iter()
+            .map(|&item| decode(item))
+            .collect();
+        self.offset = end + padding_after(length);
+        Ok(items)
+    }
+
     pub(crate) fn section<T: Plain>(&mut self, count: usize) -> Result<Section<T>, Error> {
         let length = count
             .checked_mul(size_of::<T>())

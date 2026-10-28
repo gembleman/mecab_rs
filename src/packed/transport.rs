@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 
 use lzma_rust2::{XzOptions, XzReader, XzWriter};
 
-use super::model::Model;
+use super::model::{LexiconSections, Model};
 use super::source::read_dictionary;
 use crate::Error;
 use crate::build::write_file;
 
 const MAGIC: &[u8; 4] = b"MRDT";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
 const NICE_LEN: u32 = 273;
@@ -136,8 +136,14 @@ pub(super) fn parse_container<'a>(payload: &'a [u8], path: &'a Path) -> Result<P
         Ok(slice)
     };
     let word = |bytes: &[u8]| u32::from_le_bytes(bytes.try_into().expect("four bytes"));
-    if take(4)? != MAGIC || word(take(4)?) != VERSION {
-        return Err(bad(path, "the magic or the version is not valid"));
+    if take(4)? != MAGIC {
+        return Err(bad(path, "the magic is not valid"));
+    }
+    if word(take(4)?) != VERSION {
+        return Err(bad(
+            path,
+            "the transport format version is not supported; pack the dictionary again",
+        ));
     }
     let count = word(take(4)?) as usize;
     let mut parts: Vec<(&str, u32, &[u8])> = Vec::new();
@@ -159,11 +165,8 @@ pub(super) fn parse_container<'a>(payload: &'a [u8], path: &'a Path) -> Result<P
     Ok(Parts { path, parts })
 }
 
-fn model_from_parts(parts: &Parts, next_to: &Path) -> Result<Model, Error> {
-    let mut model = Model::default();
-    lexicon::decode(parts, &mut model)?;
-    (model.matrix, model.templates) = matrix::decode(parts, next_to)?;
-    model.integer_templates = model.templates.starts_with(b"MXIT");
+fn lexicon_model(parts: &Parts) -> Result<Model, Error> {
+    let mut model = lexicon::decode(parts)?;
     model.char_table = parts.plain("char table", 0)?.to_vec();
     let dicrc = parts.plain("dicrc", 0)?;
     let corrupt = |reason| parts.corrupt(reason);
@@ -183,6 +186,26 @@ fn model_from_parts(parts: &Parts, next_to: &Path) -> Result<Model, Error> {
         .then(|| text(&dicrc[8 + bos_length..]))
         .transpose()?;
     Ok(model)
+}
+
+fn attach_matrix(model: &mut Model, (matrix, templates): (Vec<u8>, Vec<u8>)) {
+    model.matrix = matrix;
+    model.templates = templates;
+    model.integer_templates = model.templates.starts_with(b"MXIT");
+}
+
+fn runtime_model(parts: &Parts, next_to: &Path) -> Result<(Model, LexiconSections), Error> {
+    std::thread::scope(|scope| {
+        let matrix = scope.spawn(|| matrix::decode(parts, next_to));
+        let lexicon = lexicon_model(parts).and_then(|model| {
+            let sections = model.encode_lexicon_sections()?;
+            Ok((model, sections))
+        });
+        let matrix = matrix.join().expect("the matrix decoder panicked");
+        let ((mut model, sections), matrix) = (lexicon?, matrix?);
+        attach_matrix(&mut model, matrix);
+        Ok((model, sections))
+    })
 }
 
 pub(super) fn compress(payload: &[u8], path: &Path) -> Result<Vec<u8>, Error> {
@@ -227,8 +250,8 @@ pub fn expand(xz_file: &Path, out_mrd: &Path) -> Result<(), Error> {
             path: xz_file.to_path_buf(),
             reason: format!("xz: {error}"),
         })?;
-    let model = model_from_parts(&parse_container(&payload, xz_file)?, out_mrd)?;
+    let (model, sections) = runtime_model(&parse_container(&payload, xz_file)?, out_mrd)?;
     drop(payload);
-    let runtime = model.encode_runtime()?;
+    let runtime = model.finish_runtime(sections)?;
     write_file(out_mrd, |writer| runtime.write_to(writer))
 }

@@ -28,7 +28,7 @@ pub const UNIDIC_FEATURE_COUNT: usize = 29;
 const MATRIX_FILE: &str = "matrix.bin";
 const RIGHT_STATS: &str = "right.tsv";
 const LEFT_STATS: &str = "left.tsv";
-const ID_FREE_FILES: [&str; 4] = ["dicrc", "char.bin", "char.uni", "license"];
+const ID_FREE_FILES: [&str; 5] = ["dicrc", "char.bin", "char.uni", "license", "feature.def"];
 const MATRIX_FILES: [&str; 6] = [
     "matrix.hot",
     "matrix.tpl",

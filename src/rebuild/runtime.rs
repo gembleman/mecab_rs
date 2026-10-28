@@ -53,7 +53,11 @@ pub fn build_runtime(
     let plan = Renumbering::plan(source, &stats, stats_dir, None)?;
     progress("plan");
 
-    copy_entries(source, out, Some(&["dicrc", "char.bin", "license"]))?;
+    copy_entries(
+        source,
+        out,
+        Some(&["dicrc", "char.bin", "license", "feature.def"]),
+    )?;
     let char_def = source.join("char.def");
     CharTable::convert(
         &source.join("char.bin"),

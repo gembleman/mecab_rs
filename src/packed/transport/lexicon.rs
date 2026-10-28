@@ -1,17 +1,22 @@
 use std::collections::HashMap;
-use std::ops::Range;
+use std::io::Write;
 
 use super::{Part, Parts};
 use crate::Error;
+use crate::codec::{decode_lexicon, encode_lexicon};
 use crate::packed::model::{Model, Param};
 
 const ENCODING_PLAIN: u32 = 0;
-const ENCODING_PACKED: u32 = 1;
-const SURFACE_MARKER: u8 = 1;
-const PREVIOUS_MARKER: u8 = 2;
-const FIELD_MARKER: u8 = 3;
-const MAX_MARKED_FIELD: usize = 0x1F - FIELD_MARKER as usize;
-const META_COUNT: usize = 7;
+const ENCODING_CODEC: u32 = 2;
+const LEXICON_PART: &str = "lexicon";
+const UNKNOWN_PART: &str = "unknown tokens";
+const POS_PART: &str = "pos ids";
+const NUL: u8 = 0;
+const COMMA: u8 = b',';
+const QUOTE: u8 = b'"';
+const LINE_END: u8 = b'\n';
+const UNKNOWN_PARAM_BYTES: usize = 6;
+const NUMBER_FIELDS: usize = 3;
 
 fn put_varint(out: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
@@ -21,23 +26,41 @@ fn put_varint(out: &mut Vec<u8>, mut value: u64) {
     out.push(value as u8);
 }
 
-struct Varints<'a> {
+struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
 }
 
-impl Varints<'_> {
-    fn next(&mut self) -> Option<u64> {
+impl<'a> Reader<'a> {
+    fn varint(&mut self) -> Result<u64, Error> {
         let mut value = 0u64;
         for shift in (0..64).step_by(7) {
-            let byte = *self.bytes.get(self.at)?;
+            let byte = *self
+                .bytes
+                .get(self.at)
+                .ok_or(Error::Corrupt("the unknown tokens end early"))?;
             self.at += 1;
             value |= u64::from(byte & 0x7F) << shift;
             if byte & 0x80 == 0 {
-                return Some(value);
+                return Ok(value);
             }
         }
-        None
+        Err(Error::Corrupt("a varint of the unknown tokens is too long"))
+    }
+
+    fn count(&mut self) -> Result<usize, Error> {
+        usize::try_from(self.varint()?).map_err(|_| Error::Corrupt("a count is too large"))
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], Error> {
+        let end = self
+            .at
+            .checked_add(length)
+            .filter(|&end| end <= self.bytes.len())
+            .ok_or(Error::Corrupt("the unknown tokens end early"))?;
+        let slice = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(slice)
     }
 
     fn at_end(&self) -> bool {
@@ -45,401 +68,346 @@ impl Varints<'_> {
     }
 }
 
-fn id_width(count: usize) -> usize {
-    match count {
-        0..=0x1_0000 => 2,
-        0x1_0001..=0x100_0000 => 3,
-        _ => 4,
+struct Interner<'a> {
+    params: HashMap<Param, u32>,
+    features: HashMap<&'a str, u32>,
+}
+
+impl<'a> Interner<'a> {
+    fn intern(&mut self, model: &mut Model, param: Param, feature: &'a str) -> (u32, u32) {
+        let next = self.params.len() as u32;
+        let param_number = *self.params.entry(param).or_insert_with(|| {
+            model.params.push(param);
+            next
+        });
+        let next = self.features.len() as u32;
+        let feature_number = *self.features.entry(feature).or_insert_with(|| {
+            model.features.extend_from_slice(feature.as_bytes());
+            model.features.push(NUL);
+            next
+        });
+        (param_number, feature_number)
     }
 }
 
-fn shrink(feature: &[u8], surface: Option<&[u8]>, previous: &[u8], out: &mut Vec<u8>) {
-    let mut first: HashMap<&[u8], usize> = HashMap::new();
-    let mut before = previous.split(|&byte| byte == b',');
-    for (number, field) in feature.split(|&byte| byte == b',').enumerate() {
-        if number > 0 {
-            out.push(b',');
-        }
-        let same_place = before.next();
-        if field == b"*" || field.is_empty() {
-            out.extend_from_slice(field);
-        } else if Some(field) == same_place {
-            out.push(PREVIOUS_MARKER);
-        } else if Some(field) == surface {
-            out.push(SURFACE_MARKER);
-        } else if let Some(&earlier) = first.get(field) {
-            out.push(FIELD_MARKER + earlier as u8);
-        } else {
-            if number <= MAX_MARKED_FIELD {
-                first.insert(field, number);
+fn check_encodable(model: &Model) -> Result<(), Error> {
+    let counted: usize = model.counts.iter().map(|&count| usize::from(count)).sum();
+    if model.counts.len() != model.keys.len()
+        || counted != model.token_params.len()
+        || counted != model.token_features.len()
+        || model.unknown_params.len() != model.unknown_features.len()
+    {
+        return Err(Error::Unsupported(
+            "token counts that do not match the tokens",
+        ));
+    }
+    if model.keys.iter().any(|key| key.contains(LINE_END as char)) {
+        return Err(Error::Unsupported("a key with a line break"));
+    }
+    if model.features.contains(&LINE_END) {
+        return Err(Error::Unsupported("a feature with a line break"));
+    }
+    Ok(())
+}
+
+fn feature_table(model: &Model) -> Vec<&[u8]> {
+    let mut features: Vec<&[u8]> = model.features.split(|&byte| byte == NUL).collect();
+    features.pop();
+    features
+}
+
+fn push_key(csv: &mut Vec<u8>, key: &str) {
+    if key.bytes().any(|byte| byte == COMMA || byte == QUOTE) {
+        csv.push(QUOTE);
+        for byte in key.bytes() {
+            if byte == QUOTE {
+                csv.push(QUOTE);
             }
-            out.extend_from_slice(field);
+            csv.push(byte);
         }
+        csv.push(QUOTE);
+    } else {
+        csv.extend_from_slice(key.as_bytes());
     }
 }
 
-fn restore(
-    shrunk: &[u8],
-    surface: Option<&[u8]>,
-    previous: Range<usize>,
-    out: &mut Vec<u8>,
-) -> Option<()> {
-    let mut before: Vec<Range<usize>> = Vec::new();
-    let mut from = previous.start;
-    for field in out[previous.clone()].split(|&byte| byte == b',') {
-        if previous.is_empty() {
-            break;
-        }
-        before.push(from..from + field.len());
-        from += field.len() + 1;
+fn model_to_csv(model: &Model) -> Result<Vec<u8>, Error> {
+    let features = feature_table(model);
+    let in_range = |numbers: &[u32], limit: usize| numbers.iter().all(|&n| (n as usize) < limit);
+    if !in_range(&model.token_params, model.params.len())
+        || !in_range(&model.unknown_params, model.params.len())
+        || !in_range(&model.token_features, features.len())
+        || !in_range(&model.unknown_features, features.len())
+    {
+        return Err(Error::Unsupported("a token number out of range"));
     }
-    let mut before = before.into_iter();
-    let mut fields: Vec<(usize, usize)> = Vec::new();
-    for (number, field) in shrunk.split(|&byte| byte == b',').enumerate() {
-        if number > 0 {
-            out.push(b',');
+    let mut csv = Vec::with_capacity(model.features.len() * 8);
+    let mut token = 0usize;
+    for (key, &count) in model.keys.iter().zip(&model.counts) {
+        for _ in 0..count {
+            let param = model.params[model.token_params[token] as usize];
+            push_key(&mut csv, key);
+            write!(
+                csv,
+                ",{},{},{},",
+                param.left_id, param.right_id, param.word_cost
+            )
+            .expect("a vector accepts writes");
+            csv.extend_from_slice(features[model.token_features[token] as usize]);
+            csv.push(LINE_END);
+            token += 1;
         }
-        let same_place = before.next();
-        let begin = out.len();
-        match field {
-            [SURFACE_MARKER] => out.extend_from_slice(surface?),
-            [PREVIOUS_MARKER] => out.extend_from_within(same_place?),
-            [marker @ FIELD_MARKER..=0x1F] => {
-                let (from, to) = *fields.get(usize::from(marker - FIELD_MARKER))?;
-                out.extend_from_within(from..to);
+    }
+    Ok(csv)
+}
+
+fn pos_runs(model: &Model) -> Vec<u8> {
+    let tokens = model.token_params.iter().chain(&model.unknown_params);
+    let mut out = Vec::new();
+    let mut run: Option<(u16, u64)> = None;
+    for &param in tokens {
+        let pos_id = model.params[param as usize].pos_id;
+        run = match run {
+            Some((current, length)) if current == pos_id => Some((current, length + 1)),
+            Some((current, length)) => {
+                put_varint(&mut out, u64::from(current));
+                put_varint(&mut out, length);
+                Some((pos_id, 1))
             }
-            _ => out.extend_from_slice(field),
+            None => Some((pos_id, 1)),
+        };
+    }
+    if let Some((current, length)) = run {
+        put_varint(&mut out, u64::from(current));
+        put_varint(&mut out, length);
+    }
+    out
+}
+
+struct PosIds<'a> {
+    reader: Reader<'a>,
+    current: u16,
+    left: usize,
+}
+
+impl<'a> PosIds<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            reader: Reader { bytes, at: 0 },
+            current: 0,
+            left: 0,
         }
-        fields.push((begin, out.len()));
     }
-    Some(())
+
+    fn next(&mut self) -> Result<u16, Error> {
+        if self.left == 0 {
+            self.current = u16::try_from(self.reader.varint()?)
+                .map_err(|_| Error::Corrupt("a part-of-speech id is too large"))?;
+            self.left = self.reader.count()?;
+        }
+        self.left = self
+            .left
+            .checked_sub(1)
+            .ok_or(Error::Corrupt("a part-of-speech run is empty"))?;
+        Ok(self.current)
+    }
+
+    fn at_end(&self) -> bool {
+        self.left == 0 && self.reader.at_end()
+    }
 }
 
-fn plain(name: &'static str, bytes: Vec<u8>) -> Part {
-    Part {
-        name,
-        encoding: ENCODING_PLAIN,
-        bytes,
+fn unknown_tokens(model: &Model) -> Vec<u8> {
+    let features = feature_table(model);
+    let mut out = Vec::new();
+    let categories = model.unknown_starts.len().saturating_sub(1);
+    put_varint(&mut out, categories as u64);
+    for pair in model.unknown_starts.windows(2) {
+        put_varint(&mut out, u64::from(pair[1] - pair[0]));
+    }
+    for (&param, &feature) in model.unknown_params.iter().zip(&model.unknown_features) {
+        let param = model.params[param as usize];
+        out.extend_from_slice(&param.left_id.to_le_bytes());
+        out.extend_from_slice(&param.right_id.to_le_bytes());
+        out.extend_from_slice(&param.word_cost.to_le_bytes());
+        let feature = features[feature as usize];
+        put_varint(&mut out, feature.len() as u64);
+        out.extend_from_slice(feature);
+    }
+    out
+}
+
+struct CsvLine<'a> {
+    key: String,
+    param: Param,
+    feature: &'a str,
+}
+
+fn split_key(line: &str) -> Option<(String, &str)> {
+    let Some(quoted) = line.strip_prefix(QUOTE as char) else {
+        let (key, rest) = line.split_once(COMMA as char)?;
+        return Some((key.to_string(), rest));
+    };
+    let mut key = String::new();
+    let mut rest = quoted;
+    loop {
+        let (before, after) = rest.split_once(QUOTE as char)?;
+        key.push_str(before);
+        match after.strip_prefix(QUOTE as char) {
+            Some(escaped) => {
+                key.push(QUOTE as char);
+                rest = escaped;
+            }
+            None => return Some((key, after.strip_prefix(COMMA as char)?)),
+        }
     }
 }
 
-fn packed(name: &'static str, bytes: Vec<u8>) -> Part {
-    Part {
-        name,
-        encoding: ENCODING_PACKED,
-        bytes,
+fn parse_line(line: &str) -> Option<CsvLine<'_>> {
+    let (key, rest) = split_key(line)?;
+    let mut fields = rest.splitn(NUMBER_FIELDS + 1, COMMA as char);
+    let left_id = fields.next()?.parse().ok()?;
+    let right_id = fields.next()?.parse().ok()?;
+    let word_cost = fields.next()?.parse().ok()?;
+    let feature = fields.next()?;
+    Some(CsvLine {
+        key,
+        param: Param {
+            left_id,
+            right_id,
+            pos_id: 0,
+            word_cost,
+        },
+        feature,
+    })
+}
+
+fn decode_unknown<'a>(
+    mut reader: Reader<'a>,
+    pos_ids: &mut PosIds,
+    model: &mut Model,
+    interner: &mut Interner<'a>,
+) -> Result<(), Error> {
+    let categories = reader.count()?;
+    let mut counts = Vec::with_capacity(categories.min(reader.bytes.len()));
+    for _ in 0..categories {
+        counts.push(reader.count()?);
     }
+    model.unknown_starts.push(0);
+    for count in counts {
+        for _ in 0..count {
+            let fixed = reader.take(UNKNOWN_PARAM_BYTES)?;
+            let param = Param {
+                left_id: u16::from_le_bytes([fixed[0], fixed[1]]),
+                right_id: u16::from_le_bytes([fixed[2], fixed[3]]),
+                pos_id: pos_ids.next()?,
+                word_cost: i16::from_le_bytes([fixed[4], fixed[5]]),
+            };
+            let length = reader.count()?;
+            let feature = str::from_utf8(reader.take(length)?)
+                .map_err(|_| Error::Corrupt("an unknown feature is not valid UTF-8"))?;
+            let (param, feature) = interner.intern(model, param, feature);
+            model.unknown_params.push(param);
+            model.unknown_features.push(feature);
+        }
+        let end = u32::try_from(model.unknown_params.len())
+            .map_err(|_| Error::Corrupt("too many unknown tokens"))?;
+        model.unknown_starts.push(end);
+    }
+    if !reader.at_end() {
+        return Err(Error::Corrupt("the unknown tokens have trailing bytes"));
+    }
+    Ok(())
+}
+
+fn model_from_csv(csv: &[u8], unknown: &[u8], pos: &[u8]) -> Result<Model, Error> {
+    let text = str::from_utf8(csv).map_err(|_| Error::Corrupt("the lexicon is not UTF-8"))?;
+    let unknown = Reader {
+        bytes: unknown,
+        at: 0,
+    };
+    let mut pos_ids = PosIds::new(pos);
+    let mut model = Model::default();
+    let mut interner = Interner {
+        params: HashMap::new(),
+        features: HashMap::new(),
+    };
+    for line in text.split_terminator(LINE_END as char) {
+        let CsvLine {
+            key,
+            mut param,
+            feature,
+        } = parse_line(line).ok_or(Error::Corrupt("the lexicon text is not valid"))?;
+        param.pos_id = pos_ids.next()?;
+        let (param, feature) = interner.intern(&mut model, param, feature);
+        model.token_params.push(param);
+        model.token_features.push(feature);
+        match (model.keys.last(), model.counts.last_mut()) {
+            (Some(last), Some(count)) if *last == key => {
+                *count = count
+                    .checked_add(1)
+                    .ok_or(Error::Corrupt("a key has more than 255 tokens"))?;
+            }
+            _ => {
+                model.keys.push(key);
+                model.counts.push(1);
+            }
+        }
+    }
+    decode_unknown(unknown, &mut pos_ids, &mut model, &mut interner)?;
+    if !pos_ids.at_end() {
+        return Err(Error::Corrupt("the part-of-speech ids have trailing bytes"));
+    }
+    Ok(model)
+}
+
+fn same_lexicon(a: &Model, b: &Model) -> bool {
+    a.keys == b.keys
+        && a.counts == b.counts
+        && a.token_params == b.token_params
+        && a.token_features == b.token_features
+        && a.params == b.params
+        && a.features == b.features
+        && a.unknown_starts == b.unknown_starts
+        && a.unknown_params == b.unknown_params
+        && a.unknown_features == b.unknown_features
+}
+
+fn restore(lexicon: &[u8], unknown: &[u8], pos: &[u8]) -> Result<Model, Error> {
+    model_from_csv(&decode_lexicon(lexicon)?, unknown, pos)
 }
 
 pub(super) fn encode(model: &Model) -> Result<Vec<Part>, Error> {
-    let mut keys = Vec::new();
-    let mut previous: &str = "";
-    for key in &model.keys {
-        if key.contains('\0') {
-            return Err(Error::Unsupported("a key with a NUL byte"));
-        }
-        let shared = key
-            .char_indices()
-            .zip(previous.chars())
-            .take_while(|((_, a), b)| a == b)
-            .count();
-        let skip = key
-            .char_indices()
-            .nth(shared)
-            .map_or(key.len(), |(at, _)| at);
-        put_varint(&mut keys, shared as u64);
-        keys.extend_from_slice(&key.as_bytes()[skip..]);
-        keys.push(0);
-        previous = key;
+    check_encodable(model)?;
+    let lexicon = encode_lexicon(&model_to_csv(model)?);
+    let (unknown, pos) = (unknown_tokens(model), pos_runs(model));
+    if !same_lexicon(&restore(&lexicon, &unknown, &pos)?, model) {
+        return Err(Error::Unsupported(
+            "a lexicon that the codec form does not restore exactly",
+        ));
     }
-
-    let width = id_width(model.params.len());
-    let param_numbers: Vec<u8> = model
-        .token_params
-        .iter()
-        .chain(&model.unknown_params)
-        .flat_map(|number| number.to_le_bytes()[..width].to_vec())
-        .collect();
-    let params: Vec<u8> = model
-        .params
-        .iter()
-        .flat_map(|param| {
-            let [a, b] = param.left_id.to_le_bytes();
-            let [c, d] = param.right_id.to_le_bytes();
-            let [e, f] = param.pos_id.to_le_bytes();
-            let [g, h] = param.word_cost.to_le_bytes();
-            [a, b, c, d, e, f, g, h]
-        })
-        .collect();
-
-    let mut references = Vec::new();
-    let mut first_key: Vec<Option<usize>> = Vec::new();
-    let mut key_of_token = Vec::with_capacity(model.token_params.len());
-    for (number, &count) in model.counts.iter().enumerate() {
-        key_of_token.extend(std::iter::repeat_n(number, usize::from(count)));
-    }
-    let tokens = model.token_features.iter().chain(&model.unknown_features);
-    for (token, &feature) in tokens.enumerate() {
-        let seen = first_key.len() as u64;
-        if u64::from(feature) == seen {
-            first_key.push(key_of_token.get(token).copied());
-        }
-        put_varint(&mut references, seen - u64::from(feature));
-    }
-
-    let mut unknown_counts = Vec::new();
-    for pair in model.unknown_starts.windows(2) {
-        put_varint(&mut unknown_counts, u64::from(pair[1] - pair[0]));
-    }
-
-    let shrinkable = !model.features.iter().any(|&byte| byte != 0 && byte < 0x20);
-    let mut features = Vec::with_capacity(model.features.len());
-    let mut previous: &[u8] = &[];
-    for (number, feature) in model.features.split(|&byte| byte == 0).enumerate() {
-        if number == first_key.len() {
-            break;
-        }
-        if shrinkable {
-            let surface = first_key[number].map(|key| model.keys[key].as_bytes());
-            shrink(feature, surface, previous, &mut features);
-            previous = feature;
-        } else {
-            features.extend_from_slice(feature);
-        }
-        features.push(0);
-    }
-
-    let meta: Vec<u8> = [
-        model.keys.len(),
-        model.token_params.len(),
-        model.unknown_params.len(),
-        model.params.len(),
-        first_key.len(),
-        model.unknown_starts.len().saturating_sub(1),
-        width,
-    ]
-    .iter()
-    .flat_map(|&value| (value as u32).to_le_bytes())
-    .collect();
-
     Ok(vec![
-        plain("meta", meta),
-        packed("keys", keys),
-        plain("counts", model.counts.clone()),
-        plain("param numbers", param_numbers),
-        plain("params", params),
-        packed("feature references", references),
-        packed("unknown counts", unknown_counts),
         Part {
-            name: "features",
-            encoding: u32::from(shrinkable),
-            bytes: features,
+            name: LEXICON_PART,
+            encoding: ENCODING_CODEC,
+            bytes: lexicon,
+        },
+        Part {
+            name: UNKNOWN_PART,
+            encoding: ENCODING_PLAIN,
+            bytes: unknown,
+        },
+        Part {
+            name: POS_PART,
+            encoding: ENCODING_PLAIN,
+            bytes: pos,
         },
     ])
 }
 
-pub(super) fn decode(parts: &Parts, model: &mut Model) -> Result<(), Error> {
-    let corrupt = |reason| parts.corrupt(reason);
-    let meta = parts.plain("meta", ENCODING_PLAIN)?;
-    if meta.len() != META_COUNT * 4 {
-        return Err(corrupt("the meta part has a wrong length"));
-    }
-    let meta: Vec<usize> = meta
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|&word| u32::from_le_bytes(word) as usize)
-        .collect();
-    let [
-        key_count,
-        system_count,
-        unknown_count,
-        param_count,
-        feature_count,
-        category_count,
-        width,
-    ] = meta[..]
-    else {
-        unreachable!("the meta part has seven numbers");
-    };
-    if width != id_width(param_count) {
-        return Err(corrupt("the parameter number width is not valid"));
-    }
-    let token_count = system_count
-        .checked_add(unknown_count)
-        .ok_or_else(|| corrupt("too many tokens"))?;
-
-    let keys_part = parts.plain("keys", ENCODING_PACKED)?;
-    let counts = parts.plain("counts", ENCODING_PLAIN)?.to_vec();
-    let mut keys: Vec<String> = Vec::with_capacity(key_count.min(1 << 24));
-    let mut varints = Varints {
-        bytes: keys_part,
-        at: 0,
-    };
-    while !varints.at_end() {
-        let shared = varints.next().ok_or_else(|| corrupt("a key is cut off"))? as usize;
-        let at = varints.at;
-        let end = keys_part[at..]
-            .iter()
-            .position(|&byte| byte == 0)
-            .ok_or_else(|| corrupt("a key is cut off"))?
-            + at;
-        let previous = keys.last().map_or("", String::as_str);
-        let mut chars = previous.char_indices().skip(shared);
-        let skip = match chars.next() {
-            Some((skip, _)) => skip,
-            None if previous.chars().count() == shared => previous.len(),
-            None => return Err(corrupt("a key shares more than the key before it")),
-        };
-        let mut key = previous.as_bytes()[..skip].to_vec();
-        key.extend_from_slice(&keys_part[at..end]);
-        keys.push(String::from_utf8(key).map_err(|_| corrupt("a key is not valid UTF-8"))?);
-        varints.at = end + 1;
-    }
-    if keys.len() != key_count || counts.len() != key_count {
-        return Err(corrupt("the number of keys does not match"));
-    }
-    if counts
-        .iter()
-        .map(|&count| usize::from(count))
-        .sum::<usize>()
-        != system_count
-    {
-        return Err(corrupt("the token counts do not match the tokens"));
-    }
-
-    let params_part = parts.plain("params", ENCODING_PLAIN)?;
-    if params_part.len() != param_count * 8 {
-        return Err(corrupt("the parameter sets do not match their number"));
-    }
-    let params: Vec<Param> = params_part
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|param| Param {
-            left_id: u16::from_le_bytes([param[0], param[1]]),
-            right_id: u16::from_le_bytes([param[2], param[3]]),
-            pos_id: u16::from_le_bytes([param[4], param[5]]),
-            word_cost: i16::from_le_bytes([param[6], param[7]]),
-        })
-        .collect();
-    let numbers = parts.plain("param numbers", ENCODING_PLAIN)?;
-    if numbers.len() != token_count * width {
-        return Err(corrupt("the parameter numbers do not match the tokens"));
-    }
-    let all_params: Vec<u32> = numbers
-        .chunks_exact(width)
-        .map(|number| {
-            let mut bytes = [0u8; 4];
-            bytes[..width].copy_from_slice(number);
-            u32::from_le_bytes(bytes)
-        })
-        .collect();
-    if all_params
-        .iter()
-        .any(|&number| number as usize >= param_count)
-    {
-        return Err(corrupt("a parameter number is out of range"));
-    }
-
-    let references_part = parts.plain("feature references", ENCODING_PACKED)?;
-    let mut references = Varints {
-        bytes: references_part,
-        at: 0,
-    };
-    let mut all_features = Vec::with_capacity(token_count);
-    let mut key_of_feature: Vec<Option<usize>> = Vec::new();
-    let mut key = 0;
-    let mut left_in_key = counts.first().map_or(0, |&count| usize::from(count));
-    for token in 0..token_count {
-        let back = references
-            .next()
-            .ok_or_else(|| corrupt("the feature references end early"))?;
-        let seen = key_of_feature.len() as u64;
-        let feature = seen
-            .checked_sub(back)
-            .ok_or_else(|| corrupt("a feature reference is out of range"))?;
-        if feature == seen {
-            key_of_feature.push((token < system_count).then_some(key));
-        }
-        all_features.push(feature as u32);
-        if token < system_count {
-            left_in_key -= 1;
-            while left_in_key == 0 && key + 1 < counts.len() {
-                key += 1;
-                left_in_key = usize::from(counts[key]);
-            }
-        }
-    }
-    if !references.at_end() || key_of_feature.len() != feature_count {
-        return Err(corrupt("the feature references do not match the features"));
-    }
-
-    let unknown_counts_part = parts.plain("unknown counts", ENCODING_PACKED)?;
-    let mut unknown_starts = vec![0u32];
-    let mut counts_reader = Varints {
-        bytes: unknown_counts_part,
-        at: 0,
-    };
-    for _ in 0..category_count {
-        let count = counts_reader
-            .next()
-            .ok_or_else(|| corrupt("the unknown counts end early"))?;
-        let last = *unknown_starts.last().expect("starts has a first element");
-        unknown_starts.push(
-            u32::try_from(u64::from(last) + count)
-                .map_err(|_| corrupt("too many unknown tokens"))?,
-        );
-    }
-    if !counts_reader.at_end()
-        || unknown_starts.last().map(|&last| last as usize) != Some(unknown_count)
-    {
-        return Err(corrupt("the unknown counts do not match the tokens"));
-    }
-
-    let (encoding, features_part) = parts.get("features")?;
-    if encoding > 1 {
-        return Err(Error::Unsupported("a part with an unknown encoding"));
-    }
-    let mut features = Vec::with_capacity(features_part.len() * 2);
-    let mut previous = 0..0;
-    let mut seen = 0;
-    for shrunk in features_part.split(|&byte| byte == 0) {
-        if seen == feature_count {
-            if !shrunk.is_empty() {
-                return Err(corrupt("the features do not end with a NUL byte"));
-            }
-            break;
-        }
-        if encoding == 1 {
-            let surface = key_of_feature[seen].map(|key| keys[key].as_bytes());
-            let begin = features.len();
-            restore(shrunk, surface, previous.clone(), &mut features)
-                .ok_or_else(|| corrupt("a feature refers to a missing field"))?;
-            previous = begin..features.len();
-        } else {
-            features.extend_from_slice(shrunk);
-        }
-        features.push(0);
-        seen += 1;
-    }
-    if seen != feature_count {
-        return Err(corrupt("the number of features does not match"));
-    }
-    if str::from_utf8(&features).is_err() {
-        return Err(corrupt("the features are not valid UTF-8"));
-    }
-
-    let (token_params, unknown_params) = all_params.split_at(system_count);
-    let (token_features, unknown_features) = all_features.split_at(system_count);
-    model.keys = keys;
-    model.counts = counts;
-    model.token_params = token_params.to_vec();
-    model.token_features = token_features.to_vec();
-    model.params = params;
-    model.features = features;
-    model.unknown_starts = unknown_starts;
-    model.unknown_params = unknown_params.to_vec();
-    model.unknown_features = unknown_features.to_vec();
-    Ok(())
+pub(super) fn decode(parts: &Parts) -> Result<Model, Error> {
+    let lexicon = parts.plain(LEXICON_PART, ENCODING_CODEC)?;
+    let unknown = parts.plain(UNKNOWN_PART, ENCODING_PLAIN)?;
+    let pos = parts.plain(POS_PART, ENCODING_PLAIN)?;
+    restore(lexicon, unknown, pos)
 }

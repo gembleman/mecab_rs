@@ -42,6 +42,13 @@ pub(super) struct Model {
     pub(super) unknown_feature: Option<String>,
 }
 
+pub(super) struct LexiconSections {
+    sections: [Cow<'static, [u8]>; SECTIONS],
+    code_count: u32,
+    param_bits: u32,
+    feature_bits: u32,
+}
+
 pub(super) struct Runtime<'a> {
     header: Vec<u8>,
     sections: Vec<Cow<'a, [u8]>>,
@@ -85,16 +92,7 @@ impl Model {
         Ok(table)
     }
 
-    pub(super) fn encode_runtime(&self) -> Result<Runtime<'_>, Error> {
-        let table = self.code_table()?;
-        let code_count = table.iter().max().map_or(1, |&max| u32::from(max) + 1);
-        let counted: usize = self.counts.iter().map(|&count| usize::from(count)).sum();
-        if counted != self.token_params.len() || counted != self.token_features.len() {
-            return Err(Error::Unsupported(
-                "token counts that do not match the tokens",
-            ));
-        }
-        let layout = order::by_word_cost(self);
+    fn trie_cells(&self, table: &[u16], layout: &order::Layout) -> Result<Vec<u64>, Error> {
         let mut sequences: Vec<(Vec<u16>, u32, u8)> = Vec::with_capacity(self.keys.len());
         for ((key, &count), &first_token) in
             self.keys.iter().zip(&self.counts).zip(&layout.first_tokens)
@@ -111,17 +109,41 @@ impl Model {
                 count: *count,
             })
             .collect();
-        let cells = trie::build(&entries)?;
+        trie::build(&entries)
+    }
 
+    fn encode_features(&self, layout: &order::Layout) -> Result<features::encode::Encoded, Error> {
         let mut tokens: Vec<(u32, &str)> =
             Vec::with_capacity(self.token_features.len() + self.unknown_features.len());
         for (&feature, &key) in layout.token_features.iter().zip(&layout.token_keys) {
             tokens.push((feature, &self.keys[key as usize]));
         }
         tokens.extend(self.unknown_features.iter().map(|&feature| (feature, "")));
-        let encoded = features::encode::encode(&self.features, &tokens)?;
+        features::encode::encode(&self.features, &tokens)
+    }
+
+    pub(super) fn encode_runtime(&self) -> Result<Runtime<'_>, Error> {
+        self.finish_runtime(self.encode_lexicon_sections()?)
+    }
+
+    pub(super) fn encode_lexicon_sections(&self) -> Result<LexiconSections, Error> {
+        let table = self.code_table()?;
+        let code_count = table.iter().max().map_or(1, |&max| u32::from(max) + 1);
+        let counted: usize = self.counts.iter().map(|&count| usize::from(count)).sum();
+        if counted != self.token_params.len() || counted != self.token_features.len() {
+            return Err(Error::Unsupported(
+                "token counts that do not match the tokens",
+            ));
+        }
+        let layout = order::by_word_cost(self);
+        let (cells, encoded) = std::thread::scope(|scope| {
+            let encoded = scope.spawn(|| self.encode_features(&layout));
+            let cells = self.trie_cells(&table, &layout);
+            (cells, encoded.join().expect("the feature encoder panicked"))
+        });
+        let (cells, encoded) = (cells?, encoded?);
         let (system_starts, unknown_starts) = encoded.starts.split_at(self.token_features.len());
-        let mut sections: [Cow<[u8]>; SECTIONS] = Default::default();
+        let mut sections: [Cow<'static, [u8]>; SECTIONS] = Default::default();
         let (index, blocks) = char_map(&table);
         sections[CHAR_INDEX] = le_bytes(&index, u16::to_le_bytes).into();
         sections[CHAR_BLOCKS] = le_bytes(&blocks, u16::to_le_bytes).into();
@@ -171,6 +193,22 @@ impl Model {
             feature_bits,
         )
         .into();
+        Ok(LexiconSections {
+            sections,
+            code_count,
+            param_bits,
+            feature_bits,
+        })
+    }
+
+    pub(super) fn finish_runtime(&self, lexicon: LexiconSections) -> Result<Runtime<'_>, Error> {
+        let LexiconSections {
+            sections,
+            code_count,
+            param_bits,
+            feature_bits,
+        } = lexicon;
+        let mut sections: [Cow<'_, [u8]>; SECTIONS] = sections;
         sections[MATRIX] = Cow::Borrowed(&self.matrix);
         sections[TEMPLATES] = if self.integer_templates && !is_runtime_form(&self.templates) {
             let (_, _, shape) = HotShape::parse(&self.matrix).map_err(|reason| Error::Format {

@@ -55,8 +55,15 @@ impl MappedIntTemplates<Mmap> {
         let inputs = self.runtime_inputs().ok_or(Error::Unsupported(
             "integer templates without clusters have no runtime form",
         ))?;
-        write_runtime(&inputs, shape, MIN_SPARSE_GAIN)
+        runtime_form_from(&inputs, shape)
     }
+}
+
+pub(crate) fn runtime_form_from(
+    inputs: &RuntimeInputs,
+    shape: &HotShape,
+) -> Result<Vec<u8>, Error> {
+    write_runtime(inputs, shape, MIN_SPARSE_GAIN)
 }
 
 pub(crate) fn runtime_form_of(bytes: &[u8], shape: &HotShape) -> Result<Vec<u8>, Error> {

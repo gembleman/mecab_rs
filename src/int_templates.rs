@@ -12,6 +12,8 @@ use crate::clusters::{ClusterPlan, plan_projection_clusters, representatives};
 use crate::dictionary::map_file;
 use crate::error::Error;
 use crate::hot_shape::HotShape;
+#[cfg(feature = "xz")]
+use crate::int_runtime::runtime_form_from;
 use crate::section::{Section, SectionSource};
 use crate::templates::{TemplateReader, write_array};
 
@@ -425,6 +427,55 @@ impl IntTemplates {
         })
     }
 
+    pub fn from_file_bytes(file: &[u8], path: &Path) -> Result<Self, Error> {
+        let mut reader = TemplateReader::new(file, path);
+        if reader.bytes::<4>()? != *MAGIC || u32::from_le_bytes(reader.bytes()?) != VERSION {
+            return Err(reader.broken("the file is not an integer template file of this version"));
+        }
+        let cost_factor = reader.count()? as u32;
+        let shift = reader.count()? as u32;
+        let left_size = reader.count()?;
+        let right_size = reader.count()?;
+        let part_count = reader.count()?;
+        let exception_count = reader.count()?;
+        reader.count()?;
+        if left_size == 0 || right_size == 0 || left_size > MAX_KEYS || right_size > MAX_KEYS {
+            return Err(reader.broken("the template matrix size is out of range"));
+        }
+        if part_count > MAX_PARTS {
+            return Err(reader.broken("too many template parts"));
+        }
+        let mut parts = Vec::with_capacity(part_count);
+        for _ in 0..part_count {
+            let left_count = reader.count()?;
+            let right_count = reader.count()?;
+            let entries = reader.count()?;
+            reader.count()?;
+            let right_bound = right_count
+                .checked_add(1)
+                .ok_or_else(|| reader.broken("an array is too long"))?;
+            parts.push(IntPart {
+                left_count,
+                right_count,
+                left_projection: reader.copied(left_size, u16::from_le_bytes)?,
+                right_projection: reader.copied(right_size, u16::from_le_bytes)?,
+                indptr: reader.copied(right_bound, u32::from_le_bytes)?,
+                left_index: reader.copied(entries, u16::from_le_bytes)?,
+                weight: reader.copied(entries, i32::from_le_bytes)?,
+            });
+        }
+        let cells = reader.copied(exception_count, u32::from_le_bytes)?;
+        let values = reader.copied(exception_count, i16::from_le_bytes)?;
+        Self::new(
+            cost_factor,
+            shift,
+            left_size,
+            right_size,
+            parts,
+            cells.into_iter().zip(values).collect(),
+        )
+    }
+
     pub fn cost_factor(&self) -> u32 {
         self.cost_factor
     }
@@ -524,15 +575,7 @@ impl IntTemplates {
         output: &mut impl Write,
     ) -> io::Result<()> {
         let slices: Vec<IntSlices> = self.parts.iter().map(IntPart::slices).collect();
-        let plans = if cluster_count == 0 {
-            Vec::new()
-        } else {
-            let projections: Vec<(&[u16], &[u16])> = slices
-                .iter()
-                .map(|part| (part.left_projection, part.right_projection))
-                .collect();
-            plan_projection_clusters(&projections, cluster_count)
-        };
+        let plans = cluster_plans(&slices, cluster_count);
         output.write_all(MAGIC)?;
         output.write_all(&VERSION.to_le_bytes())?;
         for value in [
@@ -561,15 +604,46 @@ impl IntTemplates {
         if plans.is_empty() {
             return Ok(());
         }
-        write_clusters(
-            &slices,
-            &plans,
-            self.left_size,
-            self.right_size,
-            threads,
-            output,
-        )
+        let data = cluster_data(&slices, &plans, self.left_size, self.right_size, threads)?;
+        write_clusters(&data, output)
     }
+
+    #[cfg(feature = "xz")]
+    pub(crate) fn runtime_form(
+        &self,
+        shape: &HotShape,
+        cluster_count: usize,
+        threads: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let slices: Vec<IntSlices> = self.parts.iter().map(IntPart::slices).collect();
+        let plans = cluster_plans(&slices, cluster_count);
+        let data = cluster_data(&slices, &plans, self.left_size, self.right_size, threads)
+            .map_err(|_| Error::Unsupported("a cluster sum that does not fit an i32"))?;
+        let inputs = RuntimeInputs {
+            cost_factor: self.cost_factor,
+            shift: self.shift,
+            left_size: self.left_size,
+            right_size: self.right_size,
+            shapes: &data.shapes,
+            left_keys: &data.left_keys,
+            right_keys: &data.right_keys,
+            tables: &data.tables,
+            exception_cells: &self.exception_cells,
+            exception_values: &self.exception_values,
+        };
+        runtime_form_from(&inputs, shape)
+    }
+}
+
+fn cluster_plans(slices: &[IntSlices], cluster_count: usize) -> Vec<ClusterPlan> {
+    if cluster_count == 0 {
+        return Vec::new();
+    }
+    let projections: Vec<(&[u16], &[u16])> = slices
+        .iter()
+        .map(|part| (part.left_projection, part.right_projection))
+        .collect();
+    plan_projection_clusters(&projections, cluster_count)
 }
 
 fn fill_int_table(plan: &ClusterPlan, parts: &[IntSlices], threads: usize) -> io::Result<Vec<i32>> {
@@ -615,40 +689,66 @@ fn fill_int_table(plan: &ClusterPlan, parts: &[IntSlices], threads: usize) -> io
     Ok(table)
 }
 
-fn write_clusters(
+struct ClusterData {
+    shapes: Vec<ClusterShape>,
+    left_keys: Vec<u16>,
+    right_keys: Vec<u16>,
+    tables: Vec<i32>,
+}
+
+fn interleaved_ids(
+    plans: &[ClusterPlan],
+    size: usize,
+    ids_of: fn(&ClusterPlan) -> &Vec<u16>,
+) -> Vec<u16> {
+    (0..size)
+        .flat_map(|index| plans.iter().map(move |plan| ids_of(plan)[index]))
+        .collect()
+}
+
+fn cluster_data(
     parts: &[IntSlices],
     plans: &[ClusterPlan],
     left_size: usize,
     right_size: usize,
     threads: usize,
-    output: &mut impl Write,
-) -> io::Result<()> {
+) -> io::Result<ClusterData> {
+    let mut table_start = 0;
+    let shapes = plans
+        .iter()
+        .map(|plan| {
+            let shape = ClusterShape {
+                table_start,
+                left_keys: plan.left_keys,
+                right_keys: plan.right_keys,
+            };
+            table_start += plan.cells();
+            shape
+        })
+        .collect();
+    let mut tables = Vec::with_capacity(table_start);
     for plan in plans {
-        for keys in [plan.left_keys, plan.right_keys] {
+        tables.extend(fill_int_table(plan, parts, threads)?);
+    }
+    Ok(ClusterData {
+        shapes,
+        left_keys: interleaved_ids(plans, left_size, |plan| &plan.left_ids),
+        right_keys: interleaved_ids(plans, right_size, |plan| &plan.right_ids),
+        tables,
+    })
+}
+
+fn write_clusters(data: &ClusterData, output: &mut impl Write) -> io::Result<()> {
+    for shape in &data.shapes {
+        for keys in [shape.left_keys, shape.right_keys] {
             output.write_all(&(keys as u32).to_le_bytes())?;
         }
     }
-    for (size, ids_of) in [
-        (
-            left_size,
-            (|plan| &plan.left_ids) as fn(&ClusterPlan) -> &Vec<u16>,
-        ),
-        (right_size, |plan| &plan.right_ids),
-    ] {
-        let interleaved: Vec<u16> = (0..size)
-            .flat_map(|index| plans.iter().map(move |plan| ids_of(plan)[index]))
-            .collect();
-        write_array(output, &interleaved, u16::to_le_bytes)?;
-    }
-    let total: usize = plans.iter().map(ClusterPlan::cells).sum();
-    output.write_all(&(total as u32).to_le_bytes())?;
+    write_array(output, &data.left_keys, u16::to_le_bytes)?;
+    write_array(output, &data.right_keys, u16::to_le_bytes)?;
+    output.write_all(&(data.tables.len() as u32).to_le_bytes())?;
     output.write_all(&[0; 4])?;
-    let mut cells = Vec::with_capacity(total);
-    for plan in plans {
-        cells.extend(fill_int_table(plan, parts, threads)?);
-    }
-    write_array(output, &cells, i32::to_le_bytes)?;
-    Ok(())
+    write_array(output, &data.tables, i32::to_le_bytes)
 }
 
 fn keys_fit(keys: &[u16], limits: &[usize]) -> bool {
