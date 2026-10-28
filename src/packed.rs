@@ -1,6 +1,7 @@
 mod bits;
 mod features;
 mod model;
+mod order;
 mod reader;
 mod source;
 #[cfg(feature = "xz")]

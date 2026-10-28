@@ -4,6 +4,7 @@ use std::io::{self, Write};
 
 use super::bits::{BitWriter, MAX_RECORD_BITS, PADDING, width_of};
 use super::features;
+use super::order;
 use super::trie::{self, Entry};
 use super::{
     BLOCK_CODES, BLOCK_COUNT, CELLS, CELLS_PADDING, CHAR_BLOCKS, CHAR_INDEX, CHAR_TABLE, DICRC,
@@ -87,17 +88,19 @@ impl Model {
     pub(super) fn encode_runtime(&self) -> Result<Runtime<'_>, Error> {
         let table = self.code_table()?;
         let code_count = table.iter().max().map_or(1, |&max| u32::from(max) + 1);
-        let mut sequences: Vec<(Vec<u16>, u32, u8)> = Vec::with_capacity(self.keys.len());
-        let mut first_token = 0u32;
-        for (key, &count) in self.keys.iter().zip(&self.counts) {
-            let codes = key.chars().map(|char| table[char as usize]).collect();
-            sequences.push((codes, first_token, count));
-            first_token += u32::from(count);
-        }
-        if first_token as usize != self.token_params.len() {
+        let counted: usize = self.counts.iter().map(|&count| usize::from(count)).sum();
+        if counted != self.token_params.len() || counted != self.token_features.len() {
             return Err(Error::Unsupported(
                 "token counts that do not match the tokens",
             ));
+        }
+        let layout = order::by_word_cost(self);
+        let mut sequences: Vec<(Vec<u16>, u32, u8)> = Vec::with_capacity(self.keys.len());
+        for ((key, &count), &first_token) in
+            self.keys.iter().zip(&self.counts).zip(&layout.first_tokens)
+        {
+            let codes = key.chars().map(|char| table[char as usize]).collect();
+            sequences.push((codes, first_token, count));
         }
         sequences.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let entries: Vec<Entry> = sequences
@@ -112,11 +115,8 @@ impl Model {
 
         let mut tokens: Vec<(u32, &str)> =
             Vec::with_capacity(self.token_features.len() + self.unknown_features.len());
-        let mut next = self.token_features.iter();
-        for (key, &count) in self.keys.iter().zip(&self.counts) {
-            for &feature in next.by_ref().take(usize::from(count)) {
-                tokens.push((feature, key));
-            }
+        for (&feature, &key) in layout.token_features.iter().zip(&layout.token_keys) {
+            tokens.push((feature, &self.keys[key as usize]));
         }
         tokens.extend(self.unknown_features.iter().map(|&feature| (feature, "")));
         let encoded = features::encode::encode(&self.features, &tokens)?;
@@ -127,7 +127,7 @@ impl Model {
         sections[CHAR_BLOCKS] = le_bytes(&blocks, u16::to_le_bytes).into();
         sections[CELLS] = encode_cells(&cells).into();
         let param_bits = width_of(
-            (self.token_params.iter().chain(&self.unknown_params))
+            (layout.token_params.iter().chain(&layout.unknown_params))
                 .copied()
                 .max()
                 .map_or(0, u64::from),
@@ -143,9 +143,14 @@ impl Model {
                 "a token needs more than 56 bits for its parameter set and feature",
             ));
         }
-        sections[TOKENS] =
-            encode_tokens(&self.token_params, system_starts, param_bits, feature_bits).into();
-        sections[PARAMS] = self
+        sections[TOKENS] = encode_tokens(
+            &layout.token_params,
+            system_starts,
+            param_bits,
+            feature_bits,
+        )
+        .into();
+        sections[PARAMS] = layout
             .params
             .iter()
             .flat_map(|param| {
@@ -160,7 +165,7 @@ impl Model {
         sections[FEATURES] = encoded.bytes.into();
         sections[UNKNOWN_STARTS] = le_bytes(&self.unknown_starts, u32::to_le_bytes).into();
         sections[UNKNOWN_TOKENS] = encode_tokens(
-            &self.unknown_params,
+            &layout.unknown_params,
             unknown_starts,
             param_bits,
             feature_bits,
