@@ -1,25 +1,25 @@
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 
 use memmap2::Mmap;
 
-use crate::clusters::{ClusterPlan, plan_projection_clusters, representatives};
+use crate::clusters::{
+    ClusterPlan, ClusterShape, MappedClusters, fill_cells, interleaved_ids, left_ids,
+    plan_clusters, right_ids, write_cluster_layout,
+};
 use crate::dictionary::map_file;
 use crate::error::Error;
 use crate::hot_shape::{CELL_SUM_BOUND, HotShape, MAX_KEYS};
 #[cfg(feature = "xz")]
 use crate::int_runtime::runtime_form_from;
+use crate::part::{IntPart, MappedPart, PartSlices, RowScratch, total_of};
 use crate::section::{Section, SectionSource};
 use crate::templates::{TemplateReader, write_array};
 
 pub(crate) const MAGIC: &[u8; 4] = b"MXIT";
 const VERSION: u32 = 1;
 const MAX_PARTS: usize = 256;
-const MAX_SHAPES: usize = 256;
-const ROWS_PER_CHUNK: usize = 16;
 pub const DEFAULT_CLUSTER_COUNT: usize = 12;
 const MAX_COST: i64 = 32767;
 pub const MAX_SHIFT: u32 = 40;
@@ -35,30 +35,7 @@ pub fn int_cost(total: i64, cost_factor: u32, shift: u32) -> i16 {
     cost.clamp(-MAX_COST, MAX_COST) as i16
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IntPart {
-    pub left_count: usize,
-    pub right_count: usize,
-    pub left_projection: Vec<u16>,
-    pub right_projection: Vec<u16>,
-    pub indptr: Vec<u32>,
-    pub left_index: Vec<u16>,
-    pub weight: Vec<i32>,
-}
-
 impl IntPart {
-    pub(crate) fn slices(&self) -> IntSlices<'_> {
-        IntSlices {
-            left_count: self.left_count,
-            right_count: self.right_count,
-            left_projection: &self.left_projection,
-            right_projection: &self.right_projection,
-            indptr: &self.indptr,
-            left_index: &self.left_index,
-            weight: &self.weight,
-        }
-    }
-
     pub fn compacted(&self) -> Self {
         let mut left_used = vec![false; self.left_count];
         for &key in &self.left_index {
@@ -118,78 +95,16 @@ impl IntPart {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct IntSlices<'a> {
-    left_count: usize,
-    right_count: usize,
-    left_projection: &'a [u16],
-    right_projection: &'a [u16],
-    indptr: &'a [u32],
-    left_index: &'a [u16],
-    weight: &'a [i32],
+fn max_weight(part: &PartSlices<i32>) -> u64 {
+    part.weight
+        .iter()
+        .map(|weight| u64::from(weight.unsigned_abs()))
+        .max()
+        .unwrap_or(0)
 }
 
-impl IntSlices<'_> {
-    #[inline]
-    fn weight_of(&self, left_node_rc: u16, right_node_lc: u16) -> Option<i32> {
-        let right_key = usize::from(self.right_projection[usize::from(right_node_lc)]);
-        if right_key == self.right_count {
-            return None;
-        }
-        let left_key = self.left_projection[usize::from(left_node_rc)];
-        let span = self.indptr[right_key] as usize..self.indptr[right_key + 1] as usize;
-        let found = self.left_index[span.clone()]
-            .binary_search(&left_key)
-            .ok()?;
-        Some(self.weight[span.start + found])
-    }
-
-    fn is_consistent(&self, left_size: usize, right_size: usize) -> bool {
-        let nnz = self.left_index.len();
-        self.left_projection.len() == left_size
-            && self.right_projection.len() == right_size
-            && self.weight.len() == nnz
-            && self.indptr.len() == self.right_count + 1
-            && self.indptr.first() == Some(&0)
-            && self.indptr.last().is_some_and(|&end| end as usize == nnz)
-            && self.indptr.windows(2).all(|span| {
-                span[0] <= span[1]
-                    && self.left_index[span[0] as usize..span[1] as usize]
-                        .windows(2)
-                        .all(|pair| pair[0] < pair[1])
-            })
-            && self
-                .left_projection
-                .iter()
-                .all(|&key| usize::from(key) <= self.left_count)
-            && self
-                .right_projection
-                .iter()
-                .all(|&key| usize::from(key) <= self.right_count)
-            && self
-                .left_index
-                .iter()
-                .all(|&key| usize::from(key) < self.left_count)
-    }
-
-    fn max_weight(&self) -> u64 {
-        self.weight
-            .iter()
-            .map(|weight| u64::from(weight.unsigned_abs()))
-            .max()
-            .unwrap_or(0)
-    }
-}
-
-fn total_of<'a>(
-    parts: impl Iterator<Item = IntSlices<'a>>,
-    left_node_rc: u16,
-    right_node_lc: u16,
-) -> i64 {
-    parts
-        .filter_map(|part| part.weight_of(left_node_rc, right_node_lc))
-        .map(i64::from)
-        .sum()
+fn is_valid_part(part: &PartSlices<i32>, left_size: usize, right_size: usize) -> bool {
+    part.has_sizes(left_size, right_size) && part.is_consistent() && part.has_sorted_spans()
 }
 
 fn exception_of(cells: &[u32], values: &[i16], cell: usize) -> Option<i16> {
@@ -198,7 +113,7 @@ fn exception_of(cells: &[u32], values: &[i16], cell: usize) -> Option<i16> {
 }
 
 fn validate<'a>(
-    parts: impl Iterator<Item = IntSlices<'a>>,
+    parts: impl Iterator<Item = PartSlices<'a, i32>>,
     cost_factor: u32,
     shift: u32,
     left_size: usize,
@@ -214,10 +129,10 @@ fn validate<'a>(
     }
     let mut magnitude = 0u64;
     for part in parts {
-        if !part.is_consistent(left_size, right_size) {
+        if !is_valid_part(&part, left_size, right_size) {
             return Err(corrupt);
         }
-        magnitude += part.max_weight();
+        magnitude += max_weight(&part);
     }
     if u128::from(magnitude) * u128::from(cost_factor) >= CELL_SUM_BOUND {
         return Err(corrupt);
@@ -234,65 +149,26 @@ fn validate<'a>(
     }
 }
 
-struct RowScratch {
-    sums: Vec<i64>,
-    lookups: Vec<Vec<i32>>,
-}
-
-impl RowScratch {
-    fn new(parts: &[IntSlices], left_size: usize) -> Self {
-        Self {
-            sums: vec![0; left_size],
-            lookups: parts
-                .iter()
-                .map(|part| vec![0; part.left_count + 1])
-                .collect(),
-        }
-    }
-}
-
 pub(crate) struct IntView<'a> {
     pub(crate) cost_factor: u32,
     pub(crate) shift: u32,
     pub(crate) left_size: usize,
     pub(crate) right_size: usize,
-    parts: Vec<IntSlices<'a>>,
+    parts: Vec<PartSlices<'a, i32>>,
     exception_cells: &'a [u32],
     exception_values: &'a [i16],
 }
 
 impl IntView<'_> {
-    fn fill_row_sums(&self, row: usize, scratch: &mut RowScratch) {
-        scratch.sums.fill(0);
-        for (part, lookup) in self.parts.iter().zip(&mut scratch.lookups) {
-            let right_key = usize::from(part.right_projection[row]);
-            if right_key == part.right_count {
-                continue;
-            }
-            let span = part.indptr[right_key] as usize..part.indptr[right_key + 1] as usize;
-            if span.is_empty() {
-                continue;
-            }
-            let left_index = &part.left_index[span.clone()];
-            for (index, weight) in left_index.iter().zip(&part.weight[span]) {
-                lookup[usize::from(*index)] = *weight;
-            }
-            for (sum, projected) in scratch.sums.iter_mut().zip(part.left_projection) {
-                *sum += i64::from(lookup[usize::from(*projected)]);
-            }
-            for index in left_index {
-                lookup[usize::from(*index)] = 0;
-            }
-        }
-    }
-
     pub(crate) fn render_computed_row(
         &self,
         row: usize,
         scratch: &mut IntRowScratch,
         out: &mut [i16],
     ) {
-        self.fill_row_sums(row, &mut scratch.0);
+        scratch
+            .0
+            .fill_row_sums(self.parts.iter().copied(), row, self.left_size);
         for (cost, &sum) in out.iter_mut().zip(&scratch.0.sums) {
             *cost = int_cost(sum, self.cost_factor, self.shift);
         }
@@ -316,7 +192,7 @@ impl IntView<'_> {
     }
 
     pub(crate) fn scratch(&self) -> IntRowScratch {
-        IntRowScratch(RowScratch::new(&self.parts, self.left_size))
+        IntRowScratch(RowScratch::new(self.parts.iter().copied(), self.left_size))
     }
 
     pub(crate) fn write_hot_matrix(
@@ -349,7 +225,7 @@ impl IntView<'_> {
     }
 }
 
-pub(crate) struct IntRowScratch(RowScratch);
+pub(crate) struct IntRowScratch(RowScratch<i32>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntTemplates {
@@ -539,7 +415,7 @@ impl IntTemplates {
         threads: usize,
         output: &mut impl Write,
     ) -> io::Result<()> {
-        let slices: Vec<IntSlices> = self.parts.iter().map(IntPart::slices).collect();
+        let slices: Vec<PartSlices<i32>> = self.parts.iter().map(IntPart::slices).collect();
         let plans = cluster_plans(&slices, cluster_count);
         output.write_all(MAGIC)?;
         output.write_all(&VERSION.to_le_bytes())?;
@@ -555,14 +431,7 @@ impl IntTemplates {
             output.write_all(&value.to_le_bytes())?;
         }
         for part in &self.parts {
-            for count in [part.left_count, part.right_count, part.weight.len(), 0] {
-                output.write_all(&(count as u32).to_le_bytes())?;
-            }
-            write_array(output, &part.left_projection, u16::to_le_bytes)?;
-            write_array(output, &part.right_projection, u16::to_le_bytes)?;
-            write_array(output, &part.indptr, u32::to_le_bytes)?;
-            write_array(output, &part.left_index, u16::to_le_bytes)?;
-            write_array(output, &part.weight, i32::to_le_bytes)?;
+            part.write(output, i32::to_le_bytes)?;
         }
         write_array(output, &self.exception_cells, u32::to_le_bytes)?;
         write_array(output, &self.exception_values, i16::to_le_bytes)?;
@@ -580,7 +449,7 @@ impl IntTemplates {
         cluster_count: usize,
         threads: usize,
     ) -> Result<Vec<u8>, Error> {
-        let slices: Vec<IntSlices> = self.parts.iter().map(IntPart::slices).collect();
+        let slices: Vec<PartSlices<i32>> = self.parts.iter().map(IntPart::slices).collect();
         let plans = cluster_plans(&slices, cluster_count);
         let data = cluster_data(&slices, &plans, self.left_size, self.right_size, threads)
             .map_err(|_| Error::Unsupported("a cluster sum that does not fit an i32"))?;
@@ -600,51 +469,25 @@ impl IntTemplates {
     }
 }
 
-fn cluster_plans(slices: &[IntSlices], cluster_count: usize) -> Vec<ClusterPlan> {
+fn cluster_plans(slices: &[PartSlices<i32>], cluster_count: usize) -> Vec<ClusterPlan> {
     if cluster_count == 0 {
         return Vec::new();
     }
-    let projections: Vec<(&[u16], &[u16])> = slices
-        .iter()
-        .map(|part| (part.left_projection, part.right_projection))
-        .collect();
-    plan_projection_clusters(&projections, cluster_count)
+    plan_clusters(slices, cluster_count)
 }
 
-fn fill_int_table(plan: &ClusterPlan, parts: &[IntSlices], threads: usize) -> io::Result<Vec<i32>> {
-    let lefts = representatives(&plan.left_ids, plan.left_keys);
-    let rights = representatives(&plan.right_ids, plan.right_keys);
-    let mut table = vec![0i32; plan.cells()];
-    let chunks = Mutex::new(
-        table
-            .chunks_mut(ROWS_PER_CHUNK * plan.left_keys)
-            .enumerate(),
-    );
+fn fill_int_table(
+    plan: &ClusterPlan,
+    parts: &[PartSlices<i32>],
+    threads: usize,
+) -> io::Result<Vec<i32>> {
     let overflow = AtomicBool::new(false);
-    thread::scope(|scope| {
-        for _ in 0..threads.max(1) {
-            scope.spawn(|| {
-                loop {
-                    let next = chunks.lock().expect("a table worker panicked").next();
-                    let Some((chunk, cells)) = next else { break };
-                    for (row, cells) in cells.chunks_mut(plan.left_keys).enumerate() {
-                        let right = rights[chunk * ROWS_PER_CHUNK + row];
-                        for (cell, &left) in cells.iter_mut().zip(&lefts) {
-                            let total = plan
-                                .parts
-                                .iter()
-                                .filter_map(|&p| parts[p].weight_of(left, right))
-                                .map(i64::from)
-                                .sum::<i64>();
-                            match i32::try_from(total) {
-                                Ok(total) => *cell = total,
-                                Err(_) => overflow.store(true, Ordering::Relaxed),
-                            }
-                        }
-                    }
-                }
-            });
-        }
+    let table = fill_cells(plan, threads, |left, right| {
+        let total = total_of(plan.parts.iter().map(|&p| parts[p]), left, right);
+        i32::try_from(total).unwrap_or_else(|_| {
+            overflow.store(true, Ordering::Relaxed);
+            0
+        })
     });
     if overflow.into_inner() {
         return Err(io::Error::other(
@@ -661,18 +504,8 @@ struct ClusterData {
     tables: Vec<i32>,
 }
 
-fn interleaved_ids(
-    plans: &[ClusterPlan],
-    size: usize,
-    ids_of: fn(&ClusterPlan) -> &Vec<u16>,
-) -> Vec<u16> {
-    (0..size)
-        .flat_map(|index| plans.iter().map(move |plan| ids_of(plan)[index]))
-        .collect()
-}
-
 fn cluster_data(
-    parts: &[IntSlices],
+    parts: &[PartSlices<i32>],
     plans: &[ClusterPlan],
     left_size: usize,
     right_size: usize,
@@ -697,134 +530,23 @@ fn cluster_data(
     }
     Ok(ClusterData {
         shapes,
-        left_keys: interleaved_ids(plans, left_size, |plan| &plan.left_ids),
-        right_keys: interleaved_ids(plans, right_size, |plan| &plan.right_ids),
+        left_keys: interleaved_ids(plans, left_size, left_ids),
+        right_keys: interleaved_ids(plans, right_size, right_ids),
         tables,
     })
 }
 
 fn write_clusters(data: &ClusterData, output: &mut impl Write) -> io::Result<()> {
-    for shape in &data.shapes {
-        for keys in [shape.left_keys, shape.right_keys] {
-            output.write_all(&(keys as u32).to_le_bytes())?;
-        }
-    }
-    write_array(output, &data.left_keys, u16::to_le_bytes)?;
-    write_array(output, &data.right_keys, u16::to_le_bytes)?;
-    output.write_all(&(data.tables.len() as u32).to_le_bytes())?;
-    output.write_all(&[0; 4])?;
+    write_cluster_layout(
+        output,
+        data.shapes
+            .iter()
+            .map(|shape| (shape.left_keys, shape.right_keys)),
+        &data.left_keys,
+        &data.right_keys,
+        data.tables.len(),
+    )?;
     write_array(output, &data.tables, i32::to_le_bytes)
-}
-
-fn keys_fit(keys: &[u16], limits: &[usize]) -> bool {
-    keys.chunks_exact(limits.len()).all(|row| {
-        row.iter()
-            .zip(limits)
-            .all(|(&key, &limit)| usize::from(key) < limit)
-    })
-}
-
-pub(crate) struct ClusterShape {
-    table_start: usize,
-    pub(crate) left_keys: usize,
-    pub(crate) right_keys: usize,
-}
-
-struct MappedIntClusters {
-    shapes: Vec<ClusterShape>,
-    left_keys: Section<u16>,
-    right_keys: Section<u16>,
-    tables: Section<i32>,
-}
-
-impl MappedIntClusters {
-    fn read(
-        reader: &mut TemplateReader,
-        count: usize,
-        left_size: usize,
-        right_size: usize,
-    ) -> Result<Self, Error> {
-        let mut shapes = Vec::with_capacity(count.min(MAX_SHAPES));
-        let mut left_limits = Vec::with_capacity(count.min(MAX_SHAPES));
-        let mut right_limits = Vec::with_capacity(count.min(MAX_SHAPES));
-        let mut table_cells = 0usize;
-        for _ in 0..count {
-            let left_keys = reader.count()?;
-            let right_keys = reader.count()?;
-            shapes.push(ClusterShape {
-                table_start: table_cells,
-                left_keys,
-                right_keys,
-            });
-            left_limits.push(left_keys);
-            right_limits.push(right_keys);
-            table_cells = left_keys
-                .checked_mul(right_keys)
-                .and_then(|cells| table_cells.checked_add(cells))
-                .ok_or_else(|| reader.broken("a cluster table is too large"))?;
-        }
-        let left_keys = reader.section(left_size * count)?;
-        let right_keys = reader.section(right_size * count)?;
-        let declared = reader.count()?;
-        reader.count()?;
-        if declared != table_cells {
-            return Err(reader.broken("the cluster tables do not match their shapes"));
-        }
-        let tables = reader.section(table_cells)?;
-        let valid = keys_fit(left_keys.view(reader.file), &left_limits)
-            && keys_fit(right_keys.view(reader.file), &right_limits);
-        if valid {
-            Ok(Self {
-                shapes,
-                left_keys,
-                right_keys,
-                tables,
-            })
-        } else {
-            Err(reader.broken("a cluster key is out of range"))
-        }
-    }
-
-    #[inline]
-    fn total<S: SectionSource>(&self, file: &S, left_right_id: u16, right_left_id: u16) -> i64 {
-        let count = self.shapes.len();
-        let left = &self.left_keys.view_source(file)[usize::from(left_right_id) * count..][..count];
-        let right =
-            &self.right_keys.view_source(file)[usize::from(right_left_id) * count..][..count];
-        let tables = self.tables.view_source(file);
-        let mut total = 0i64;
-        for ((shape, &left), &right) in self.shapes.iter().zip(left).zip(right) {
-            total += i64::from(
-                tables
-                    [shape.table_start + usize::from(right) * shape.left_keys + usize::from(left)],
-            );
-        }
-        total
-    }
-}
-
-struct MappedIntPart {
-    left_count: usize,
-    right_count: usize,
-    left_projection: Section<u16>,
-    right_projection: Section<u16>,
-    indptr: Section<u32>,
-    left_index: Section<u16>,
-    weight: Section<i32>,
-}
-
-impl MappedIntPart {
-    fn slices<'a, S: SectionSource>(&self, file: &'a S) -> IntSlices<'a> {
-        IntSlices {
-            left_count: self.left_count,
-            right_count: self.right_count,
-            left_projection: self.left_projection.view_source(file),
-            right_projection: self.right_projection.view_source(file),
-            indptr: self.indptr.view_source(file),
-            left_index: self.left_index.view_source(file),
-            weight: self.weight.view_source(file),
-        }
-    }
 }
 
 pub(crate) struct RuntimeInputs<'a> {
@@ -846,10 +568,10 @@ pub struct MappedIntTemplates<S = Mmap> {
     shift: u32,
     left_size: usize,
     right_size: usize,
-    parts: Vec<MappedIntPart>,
+    parts: Vec<MappedPart<i32>>,
     exception_cells: Section<u32>,
     exception_values: Section<i16>,
-    clusters: Option<MappedIntClusters>,
+    clusters: Option<MappedClusters<i32>>,
     exception_rows: Vec<u32>,
 }
 
@@ -879,25 +601,13 @@ impl<S: SectionSource> MappedIntTemplates<S> {
         }
         let mut parts = Vec::with_capacity(part_count.min(MAX_PARTS));
         for _ in 0..part_count {
-            let left_count = reader.count()?;
-            let right_count = reader.count()?;
-            let nnz = reader.count()?;
-            reader.count()?;
-            parts.push(MappedIntPart {
-                left_count,
-                right_count,
-                left_projection: reader.section(left_size)?,
-                right_projection: reader.section(right_size)?,
-                indptr: reader.section(right_count + 1)?,
-                left_index: reader.section(nnz)?,
-                weight: reader.section(nnz)?,
-            });
+            parts.push(MappedPart::read(&mut reader, left_size, right_size)?);
         }
         let exception_cells = reader.section(exception_count)?;
         let exception_values = reader.section(exception_count)?;
         let clusters = match cluster_count {
             0 => None,
-            count => Some(MappedIntClusters::read(
+            count => Some(MappedClusters::read(
                 &mut reader,
                 count,
                 left_size,
@@ -994,7 +704,7 @@ impl<S: SectionSource> MappedIntTemplates<S> {
         exception.unwrap_or_else(|| {
             let total = match &self.clusters {
                 Some(clusters) if use_clusters => {
-                    clusters.total(&self.map, left_node_rc, right_node_lc)
+                    clusters.sum(&self.map, left_node_rc, right_node_lc)
                 }
                 _ => total_of(
                     self.parts.iter().map(|part| part.slices(&self.map)),

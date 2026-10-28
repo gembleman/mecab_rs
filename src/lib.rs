@@ -22,6 +22,7 @@ mod nbest;
 pub mod packed;
 #[cfg(feature = "pair-stats")]
 pub mod pair_stats;
+mod part;
 mod partial;
 pub mod rebuild;
 mod section;
@@ -37,7 +38,8 @@ pub use error::Error;
 pub use feature_text::FeatureText;
 pub use hot_shape::{HotShape, PAIR_COUNT_BYTES, PairCount};
 pub use int_runtime::RuntimeIntTemplates;
-pub use int_templates::{IntPart, IntTemplates, MappedIntTemplates};
+pub use int_templates::{IntTemplates, MappedIntTemplates};
+pub use part::{IntPart, Part, TemplatePart};
 pub use partial::PartialInput;
 pub use tagger::{DEFAULT_THETA, FeatureId, LatticeView, NBest, Node, NodeKind, Path, Tagger};
-pub use templates::{ConnectionTemplates, MappedTemplates, TemplatePart};
+pub use templates::{ConnectionTemplates, MappedTemplates};

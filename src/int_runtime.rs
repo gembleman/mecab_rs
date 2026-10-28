@@ -3,6 +3,7 @@ use std::path::Path;
 
 use memmap2::{Mmap, MmapOptions};
 
+use crate::clusters::ClusterShape;
 use crate::dictionary::map_file;
 use crate::error::Error;
 use crate::hot_shape::{CELL_SUM_BOUND, HotShape, MAX_KEYS};
@@ -79,23 +80,8 @@ pub(crate) fn runtime_form_of(bytes: &[u8], shape: &HotShape) -> Result<Vec<u8>,
     MappedIntTemplates::from_source(map, path)?.runtime_form(shape)
 }
 
-fn write_runtime(
-    inputs: &RuntimeInputs,
-    shape: &HotShape,
-    min_sparse_gain: usize,
-) -> Result<Vec<u8>, Error> {
-    let (left_size, right_size) = (inputs.left_size, inputs.right_size);
-    if !shape.fits(left_size, right_size) {
-        return Err(Error::Corrupt("the hot block lies outside of the matrix"));
-    }
-    let (hot_left, hot_right) = shape.inscribed_rectangle();
-    if left_size > usize::from(!ABOVE) {
-        return Err(Error::Unsupported(
-            "too many left ids for the exceptions of a runtime form",
-        ));
-    }
-    let count = inputs.shapes.len();
-    let starts: Vec<usize> = inputs
+fn cluster_starts(inputs: &RuntimeInputs) -> Vec<usize> {
+    inputs
         .shapes
         .iter()
         .scan(0, |start, shape| {
@@ -103,45 +89,108 @@ fn write_runtime(
             *start += shape.left_keys * shape.right_keys;
             Some(at)
         })
-        .collect();
+        .collect()
+}
+
+fn computed_total(inputs: &RuntimeInputs, starts: &[usize], row: usize, column: usize) -> i64 {
+    let count = inputs.shapes.len();
+    inputs
+        .shapes
+        .iter()
+        .zip(starts)
+        .enumerate()
+        .map(|(cluster, (shape, &start))| {
+            let left = usize::from(inputs.left_keys[column * count + cluster]);
+            let right = usize::from(inputs.right_keys[row * count + cluster]);
+            i64::from(inputs.tables[start + right * shape.left_keys + left])
+        })
+        .sum()
+}
+
+struct ExceptionColumns {
+    row_starts: Vec<u32>,
+    columns: Vec<u16>,
+}
+
+fn exceptions_outside_hot(
+    inputs: &RuntimeInputs,
+    shape: &HotShape,
+    starts: &[usize],
+) -> Result<ExceptionColumns, Error> {
+    let (left_size, right_size) = (inputs.left_size, inputs.right_size);
     let mut row_starts = vec![0u32; right_size + 1];
     let mut columns = Vec::new();
     for (&cell, &value) in inputs.exception_cells.iter().zip(inputs.exception_values) {
         let (row, column) = (cell as usize / left_size, cell as usize % left_size);
-        if !shape.contains(row, column) {
-            let total: i64 = inputs
-                .shapes
-                .iter()
-                .zip(&starts)
-                .enumerate()
-                .map(|(cluster, (shape, &start))| {
-                    let left = usize::from(inputs.left_keys[column * count + cluster]);
-                    let right = usize::from(inputs.right_keys[row * count + cluster]);
-                    i64::from(inputs.tables[start + right * shape.left_keys + left])
-                })
-                .sum();
-            let computed = int_cost(total, inputs.cost_factor, inputs.shift);
-            match i32::from(value) - i32::from(computed) {
-                1 => columns.push(column as u16 | ABOVE),
-                -1 => columns.push(column as u16),
-                _ => {
-                    return Err(Error::Unsupported(
-                        "an exception differs from the computed cost by more than one",
-                    ));
-                }
-            }
-            row_starts[row + 1] += 1;
+        if shape.contains(row, column) {
+            continue;
         }
+        let total = computed_total(inputs, starts, row, column);
+        let computed = int_cost(total, inputs.cost_factor, inputs.shift);
+        match i32::from(value) - i32::from(computed) {
+            1 => columns.push(column as u16 | ABOVE),
+            -1 => columns.push(column as u16),
+            _ => {
+                return Err(Error::Unsupported(
+                    "an exception differs from the computed cost by more than one",
+                ));
+            }
+        }
+        row_starts[row + 1] += 1;
     }
     for row in 0..right_size {
         row_starts[row + 1] += row_starts[row];
     }
+    Ok(ExceptionColumns {
+        row_starts,
+        columns,
+    })
+}
 
-    let mut left_keys = vec![0u16; left_size * count];
-    let mut right_keys = vec![0u16; right_size * count];
-    let mut tables = Vec::new();
-    let mut shapes = Vec::new();
-    for (cluster, (shape, &original_start)) in inputs.shapes.iter().zip(&starts).enumerate() {
+struct RenumberedClusters {
+    left_keys: Vec<u16>,
+    right_keys: Vec<u16>,
+    tables: Vec<u8>,
+    shapes: Vec<[u32; 8]>,
+}
+
+fn reordered_cells(
+    table: &[i32],
+    shape: &ClusterShape,
+    left: &Renumbered,
+    right: &Renumbered,
+) -> Vec<i32> {
+    let mut cells = Vec::new();
+    for (new_right, &old_right) in right.old_of_new.iter().enumerate() {
+        let row = &table[usize::from(old_right) * shape.left_keys..][..shape.left_keys];
+        let wanted = if new_right < right.mixed {
+            shape.left_keys
+        } else {
+            left.mixed
+        };
+        cells.extend(
+            left.old_of_new[..wanted]
+                .iter()
+                .map(|&old| row[usize::from(old)]),
+        );
+    }
+    cells
+}
+
+fn renumber_clusters(
+    inputs: &RuntimeInputs,
+    starts: &[usize],
+    (hot_left, hot_right): (usize, usize),
+    min_sparse_gain: usize,
+) -> RenumberedClusters {
+    let count = inputs.shapes.len();
+    let mut result = RenumberedClusters {
+        left_keys: vec![0u16; inputs.left_size * count],
+        right_keys: vec![0u16; inputs.right_size * count],
+        tables: Vec::new(),
+        shapes: Vec::new(),
+    };
+    for (cluster, (shape, &original_start)) in inputs.shapes.iter().zip(starts).enumerate() {
         let side = |keys: &[u16], key_count, hot| {
             renumber(
                 keys.iter().skip(cluster).step_by(count).copied(),
@@ -151,76 +200,89 @@ fn write_runtime(
         };
         let left = side(inputs.left_keys, shape.left_keys, hot_left);
         let right = side(inputs.right_keys, shape.right_keys, hot_right);
-        for (new, old) in left_keys
-            .iter_mut()
-            .skip(cluster)
-            .step_by(count)
-            .zip(inputs.left_keys.iter().skip(cluster).step_by(count))
-        {
-            *new = left.new_of_old[usize::from(*old)];
+        for (new_keys, old_keys, renumbered) in [
+            (&mut result.left_keys, inputs.left_keys, &left),
+            (&mut result.right_keys, inputs.right_keys, &right),
+        ] {
+            for (new, old) in new_keys
+                .iter_mut()
+                .skip(cluster)
+                .step_by(count)
+                .zip(old_keys.iter().skip(cluster).step_by(count))
+            {
+                *new = renumbered.new_of_old[usize::from(*old)];
+            }
         }
-        for (new, old) in right_keys
-            .iter_mut()
-            .skip(cluster)
-            .step_by(count)
-            .zip(inputs.right_keys.iter().skip(cluster).step_by(count))
-        {
-            *new = right.new_of_old[usize::from(*old)];
-        }
-        let mut cells = Vec::new();
-        for (new_right, &old_right) in right.old_of_new.iter().enumerate() {
-            let row = &inputs.tables[original_start + usize::from(old_right) * shape.left_keys..]
-                [..shape.left_keys];
-            let wanted = if new_right < right.mixed {
-                shape.left_keys
-            } else {
-                left.mixed
-            };
-            cells.extend(
-                left.old_of_new[..wanted]
-                    .iter()
-                    .map(|&old| row[usize::from(old)]),
-            );
-        }
-        let table = encode_table(&cells, min_sparse_gain);
-        tables.extend_from_slice(&table.bytes);
-        shapes.push([
+        let table = &inputs.tables[original_start..];
+        let cells = reordered_cells(table, shape, &left, &right);
+        let encoded = encode_table(&cells, min_sparse_gain);
+        result.tables.extend_from_slice(&encoded.bytes);
+        result.shapes.push([
             shape.left_keys as u32,
             shape.right_keys as u32,
             left.mixed as u32,
             right.mixed as u32,
-            u32::from(table.sparse),
-            table.width as u32,
-            table.base as u32,
-            table.nonzero as u32,
+            u32::from(encoded.sparse),
+            encoded.width as u32,
+            encoded.base as u32,
+            encoded.nonzero as u32,
         ]);
     }
+    result
+}
 
+fn write_runtime(
+    inputs: &RuntimeInputs,
+    shape: &HotShape,
+    min_sparse_gain: usize,
+) -> Result<Vec<u8>, Error> {
+    let (left_size, right_size) = (inputs.left_size, inputs.right_size);
+    if !shape.fits(left_size, right_size) {
+        return Err(Error::Corrupt("the hot block lies outside of the matrix"));
+    }
+    let hot = shape.inscribed_rectangle();
+    if left_size > usize::from(!ABOVE) {
+        return Err(Error::Unsupported(
+            "too many left ids for the exceptions of a runtime form",
+        ));
+    }
+    let starts = cluster_starts(inputs);
+    let exceptions = exceptions_outside_hot(inputs, shape, &starts)?;
+    let clusters = renumber_clusters(inputs, &starts, hot, min_sparse_gain);
+    assemble_runtime(inputs, hot, &exceptions, &clusters)
+}
+
+fn assemble_runtime(
+    inputs: &RuntimeInputs,
+    (hot_left, hot_right): (usize, usize),
+    exceptions: &ExceptionColumns,
+    clusters: &RenumberedClusters,
+) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     for word in [
         RUNTIME_VERSION,
         inputs.cost_factor,
         inputs.shift,
-        left_size as u32,
-        right_size as u32,
+        inputs.left_size as u32,
+        inputs.right_size as u32,
         hot_left as u32,
         hot_right as u32,
-        columns.len() as u32,
-        count as u32,
+        exceptions.columns.len() as u32,
+        inputs.shapes.len() as u32,
     ] {
         out.extend_from_slice(&word.to_le_bytes());
     }
-    for word in shapes.iter().flatten() {
+    for word in clusters.shapes.iter().flatten() {
         out.extend_from_slice(&word.to_le_bytes());
     }
     pad(&mut out);
     let io_error = |_| Error::Corrupt("a runtime template array could not be written");
-    write_array(&mut out, &row_starts, u32::to_le_bytes).map_err(io_error)?;
-    write_array(&mut out, &columns, u16::to_le_bytes).map_err(io_error)?;
-    write_array(&mut out, &left_keys, u16::to_le_bytes).map_err(io_error)?;
-    write_array(&mut out, &right_keys, u16::to_le_bytes).map_err(io_error)?;
-    out.extend_from_slice(&tables);
+    write_array(&mut out, &exceptions.row_starts, u32::to_le_bytes).map_err(io_error)?;
+    write_array(&mut out, &exceptions.columns, u16::to_le_bytes).map_err(io_error)?;
+    write_array(&mut out, &clusters.left_keys, u16::to_le_bytes).map_err(io_error)?;
+    write_array(&mut out, &clusters.right_keys, u16::to_le_bytes).map_err(io_error)?;
+    out.extend_from_slice(&clusters.tables);
     out.extend_from_slice(&[0; TABLE_SLACK]);
     pad(&mut out);
     Ok(out)
@@ -342,6 +404,209 @@ fn keys_fit(
         })
 }
 
+struct RuntimeHeader {
+    cost_factor: u32,
+    shift: u32,
+    left_size: usize,
+    right_size: usize,
+    hot_left: usize,
+    hot_right: usize,
+    exception_count: usize,
+    cluster_count: usize,
+}
+
+impl RuntimeHeader {
+    fn read(reader: &mut TemplateReader) -> Result<Self, Error> {
+        if reader.bytes::<4>()? != *MAGIC || u32::from_le_bytes(reader.bytes()?) != RUNTIME_VERSION
+        {
+            return Err(reader.broken("the file is not a runtime integer template file"));
+        }
+        let cost_factor = reader.count()? as u32;
+        let shift = reader.count()? as u32;
+        let (left_size, right_size) = (reader.count()?, reader.count()?);
+        let (hot_left, hot_right) = (reader.count()?, reader.count()?);
+        let exception_count = reader.count()?;
+        let cluster_count = reader.count()?;
+        if left_size == 0
+            || right_size == 0
+            || left_size > usize::from(!ABOVE)
+            || right_size > MAX_KEYS
+        {
+            return Err(reader.broken("the template matrix size is out of range"));
+        }
+        if hot_left == 0 || hot_right == 0 || hot_left > left_size || hot_right > right_size {
+            return Err(reader.broken("the hot block lies outside of the matrix"));
+        }
+        if shift > MAX_SHIFT || cost_factor > MAX_COST_FACTOR || cluster_count > MAX_SHAPES {
+            return Err(reader.broken("the integer templates are inconsistent"));
+        }
+        Ok(Self {
+            cost_factor,
+            shift,
+            left_size,
+            right_size,
+            hot_left,
+            hot_right,
+            exception_count,
+            cluster_count,
+        })
+    }
+}
+
+struct ClusterLayouts {
+    dense: Vec<Layout>,
+    sparse: Vec<SparseShape>,
+    limits: Vec<Limits>,
+    table_bytes: usize,
+    base: i64,
+    sparse_tables: Vec<(usize, usize, usize)>,
+}
+
+fn table_cells(
+    (left_keys, left_mixed): (usize, usize),
+    (right_keys, right_mixed): (usize, usize),
+) -> Option<usize> {
+    (left_mixed <= left_keys && right_mixed <= right_keys)
+        .then(|| {
+            right_mixed
+                .checked_mul(left_keys)?
+                .checked_add((right_keys - right_mixed).checked_mul(left_mixed)?)
+        })
+        .flatten()
+}
+
+fn table_byte_count(
+    cells: Option<usize>,
+    sparse: usize,
+    nonzero: usize,
+    width: usize,
+) -> Option<usize> {
+    match (cells, sparse) {
+        (Some(cells), 0) if nonzero == 0 => cells.checked_mul(width),
+        (Some(cells), 1) if nonzero <= cells => cells
+            .div_ceil(BLOCK_CELLS)
+            .checked_mul(BLOCK_BYTES)
+            .zip(nonzero.checked_mul(width))
+            .and_then(|(blocks, values)| blocks.checked_add(values)),
+        _ => None,
+    }
+}
+
+impl ClusterLayouts {
+    fn read(reader: &mut TemplateReader, header: &RuntimeHeader) -> Result<Self, Error> {
+        let mut layouts = Self {
+            dense: Vec::new(),
+            sparse: Vec::new(),
+            limits: Vec::with_capacity(header.cluster_count),
+            table_bytes: 0,
+            base: 0,
+            sparse_tables: Vec::new(),
+        };
+        let mut magnitude = 0u128;
+        for _ in 0..header.cluster_count {
+            magnitude += layouts.read_cluster(reader)?;
+        }
+        if magnitude * u128::from(header.cost_factor) >= CELL_SUM_BOUND {
+            return Err(reader.broken("the integer templates are inconsistent"));
+        }
+        Ok(layouts)
+    }
+
+    fn read_cluster(&mut self, reader: &mut TemplateReader) -> Result<u128, Error> {
+        let left_keys = reader.count()?;
+        let right_keys = reader.count()?;
+        let left_mixed = reader.count()?;
+        let right_mixed = reader.count()?;
+        let sparse = reader.count()?;
+        let width = reader.count()?;
+        let cluster_base = i64::from(reader.count()? as u32 as i32);
+        let nonzero = reader.count()?;
+        let cells = table_cells((left_keys, left_mixed), (right_keys, right_mixed));
+        let bytes = table_byte_count(cells, sparse, nonzero, width);
+        let (Some(bytes), true) = (bytes, (2..=4).contains(&width)) else {
+            return Err(reader.broken("a cluster table is malformed"));
+        };
+        let blocks_bytes = cells.map_or(0, |cells| cells.div_ceil(BLOCK_CELLS) * BLOCK_BYTES);
+        if sparse == 1 {
+            self.sparse_tables
+                .push((self.table_bytes, cells.unwrap_or(0), nonzero));
+        }
+        let layout = Layout {
+            cluster: self.limits.len(),
+            table_start: self.table_bytes,
+            left_mixed,
+            left_gap: left_keys - left_mixed,
+            right_mixed,
+            stride: width,
+            mask: u32::MAX >> (32 - 8 * width),
+        };
+        if sparse == 1 {
+            self.sparse.push(SparseShape {
+                layout,
+                values_start: self.table_bytes + blocks_bytes,
+                base: cluster_base,
+            });
+        } else {
+            self.dense.push(layout);
+        }
+        self.limits
+            .push((left_keys, left_mixed, right_keys, right_mixed));
+        self.table_bytes = self
+            .table_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| reader.broken("a cluster table is malformed"))?;
+        if sparse == 0 {
+            self.base += cluster_base;
+        }
+        Ok(u128::from(cluster_base.unsigned_abs()) + (1u128 << (8 * width)))
+    }
+}
+
+fn sparse_tables_fit(bytes: &[u8], sparse_tables: &[(usize, usize, usize)]) -> bool {
+    sparse_tables.iter().all(|&(start, cells, nonzero)| {
+        let mut before = 0u32;
+        let blocks = bytes[start..]
+            .as_chunks::<BLOCK_BYTES>()
+            .0
+            .iter()
+            .take(cells.div_ceil(BLOCK_CELLS));
+        let mut seen = 0;
+        for (at, block) in blocks.enumerate() {
+            let (count, bits) = block.split_at(4);
+            let bits = u64::from_le_bytes(bits.try_into().expect("eight bytes"));
+            let used = (cells - at * BLOCK_CELLS).min(BLOCK_CELLS);
+            let outside = if used == BLOCK_CELLS { 0 } else { bits >> used };
+            if count != before.to_le_bytes() || outside != 0 {
+                return false;
+            }
+            before += bits.count_ones();
+            seen += 1;
+        }
+        seen == cells.div_ceil(BLOCK_CELLS) && before as usize == nonzero
+    })
+}
+
+fn exception_rows_fit(
+    starts: &[u32],
+    listed: &[u16],
+    exception_count: usize,
+    left_size: usize,
+) -> bool {
+    starts.first() == Some(&0)
+        && starts
+            .last()
+            .is_some_and(|&end| end as usize == exception_count)
+        && starts.windows(2).all(|span| {
+            span[0] <= span[1]
+                && listed[span[0] as usize..span[1] as usize]
+                    .windows(2)
+                    .all(|pair| pair[0] & !ABOVE < pair[1] & !ABOVE)
+        })
+        && listed
+            .iter()
+            .all(|&column| usize::from(column & !ABOVE) < left_size)
+}
+
 pub struct RuntimeIntTemplates<S = Mmap> {
     map: S,
     cost_factor: u32,
@@ -383,168 +648,54 @@ pub(crate) fn is_runtime_form(bytes: &[u8]) -> bool {
 impl<S: SectionSource> RuntimeIntTemplates<S> {
     fn from_source(map: S, path: &Path) -> Result<Self, Error> {
         let mut reader = TemplateReader::new(map.all_bytes(), path);
-        if reader.bytes::<4>()? != *MAGIC || u32::from_le_bytes(reader.bytes()?) != RUNTIME_VERSION
-        {
-            return Err(reader.broken("the file is not a runtime integer template file"));
-        }
-        let cost_factor = reader.count()? as u32;
-        let shift = reader.count()? as u32;
-        let (left_size, right_size) = (reader.count()?, reader.count()?);
-        let (hot_left, hot_right) = (reader.count()?, reader.count()?);
-        let exception_count = reader.count()?;
-        let cluster_count = reader.count()?;
-        if left_size == 0
-            || right_size == 0
-            || left_size > usize::from(!ABOVE)
-            || right_size > MAX_KEYS
-        {
-            return Err(reader.broken("the template matrix size is out of range"));
-        }
-        if hot_left == 0 || hot_right == 0 || hot_left > left_size || hot_right > right_size {
-            return Err(reader.broken("the hot block lies outside of the matrix"));
-        }
-        if shift > MAX_SHIFT || cost_factor > MAX_COST_FACTOR || cluster_count > MAX_SHAPES {
-            return Err(reader.broken("the integer templates are inconsistent"));
-        }
-        let (mut dense, mut sparse_shapes) = (Vec::new(), Vec::new());
-        let mut limits: Vec<Limits> = Vec::with_capacity(cluster_count);
-        let mut table_bytes = 0usize;
-        let mut base = 0i64;
-        let mut magnitude = 0u128;
-        let mut sparse_tables = Vec::new();
-        for _ in 0..cluster_count {
-            let left_keys = reader.count()?;
-            let right_keys = reader.count()?;
-            let left_mixed = reader.count()?;
-            let right_mixed = reader.count()?;
-            let sparse = reader.count()?;
-            let width = reader.count()?;
-            let cluster_base = i64::from(reader.count()? as u32 as i32);
-            let nonzero = reader.count()?;
-            let cells = (left_mixed <= left_keys && right_mixed <= right_keys)
-                .then(|| {
-                    right_mixed
-                        .checked_mul(left_keys)?
-                        .checked_add((right_keys - right_mixed).checked_mul(left_mixed)?)
-                })
-                .flatten();
-            let bytes = match (cells, sparse) {
-                (Some(cells), 0) if nonzero == 0 => cells.checked_mul(width),
-                (Some(cells), 1) if nonzero <= cells => cells
-                    .div_ceil(BLOCK_CELLS)
-                    .checked_mul(BLOCK_BYTES)
-                    .zip(nonzero.checked_mul(width))
-                    .and_then(|(blocks, values)| blocks.checked_add(values)),
-                _ => None,
-            };
-            let (Some(bytes), true) = (bytes, (2..=4).contains(&width)) else {
-                return Err(reader.broken("a cluster table is malformed"));
-            };
-            let blocks_bytes = cells.map_or(0, |cells| cells.div_ceil(BLOCK_CELLS) * BLOCK_BYTES);
-            if sparse == 1 {
-                sparse_tables.push((table_bytes, cells.unwrap_or(0), nonzero));
-            }
-            let layout = Layout {
-                cluster: limits.len(),
-                table_start: table_bytes,
-                left_mixed,
-                left_gap: left_keys - left_mixed,
-                right_mixed,
-                stride: width,
-                mask: u32::MAX >> (32 - 8 * width),
-            };
-            if sparse == 1 {
-                sparse_shapes.push(SparseShape {
-                    layout,
-                    values_start: table_bytes + blocks_bytes,
-                    base: cluster_base,
-                });
-            } else {
-                dense.push(layout);
-            }
-            limits.push((left_keys, left_mixed, right_keys, right_mixed));
-            table_bytes = table_bytes
-                .checked_add(bytes)
-                .ok_or_else(|| reader.broken("a cluster table is malformed"))?;
-            if sparse == 0 {
-                base += cluster_base;
-            }
-            magnitude += u128::from(cluster_base.unsigned_abs()) + (1u128 << (8 * width));
-        }
-        if magnitude * u128::from(cost_factor) >= CELL_SUM_BOUND {
-            return Err(reader.broken("the integer templates are inconsistent"));
-        }
-        let row_starts: Section<u32> = reader.section(right_size + 1)?;
-        let columns: Section<u16> = reader.section(exception_count)?;
-        let left_keys: Section<u16> = reader.section(left_size * cluster_count)?;
-        let right_keys: Section<u16> = reader.section(right_size * cluster_count)?;
-        let tables: Section<u8> = reader.section(table_bytes + TABLE_SLACK)?;
+        let header = RuntimeHeader::read(&mut reader)?;
+        let layouts = ClusterLayouts::read(&mut reader, &header)?;
+        let row_starts: Section<u32> = reader.section(header.right_size + 1)?;
+        let columns: Section<u16> = reader.section(header.exception_count)?;
+        let left_keys: Section<u16> = reader.section(header.left_size * header.cluster_count)?;
+        let right_keys: Section<u16> = reader.section(header.right_size * header.cluster_count)?;
+        let tables: Section<u8> = reader.section(layouts.table_bytes + TABLE_SLACK)?;
         if !reader.at_end() {
             return Err(reader.broken("the file has trailing bytes"));
         }
-        let bytes = tables.view_source(&map);
-        let sparse_fits = sparse_tables.iter().all(|&(start, cells, nonzero)| {
-            let mut before = 0u32;
-            let blocks = bytes[start..]
-                .as_chunks::<BLOCK_BYTES>()
-                .0
-                .iter()
-                .take(cells.div_ceil(BLOCK_CELLS));
-            let mut seen = 0;
-            for (at, block) in blocks.enumerate() {
-                let (count, bits) = block.split_at(4);
-                let bits = u64::from_le_bytes(bits.try_into().expect("eight bytes"));
-                let used = (cells - at * BLOCK_CELLS).min(BLOCK_CELLS);
-                let outside = if used == BLOCK_CELLS { 0 } else { bits >> used };
-                if count != before.to_le_bytes() || outside != 0 {
-                    return false;
-                }
-                before += bits.count_ones();
-                seen += 1;
-            }
-            seen == cells.div_ceil(BLOCK_CELLS) && before as usize == nonzero
-        });
-        if !sparse_fits {
+        if !sparse_tables_fit(tables.view_source(&map), &layouts.sparse_tables) {
             return Err(reader.broken("a sparse cluster table is inconsistent"));
         }
-        let starts = row_starts.view_source(&map);
-        let listed = columns.view_source(&map);
-        let rows_fit = starts.first() == Some(&0)
-            && starts
-                .last()
-                .is_some_and(|&end| end as usize == exception_count)
-            && starts.windows(2).all(|span| {
-                span[0] <= span[1]
-                    && listed[span[0] as usize..span[1] as usize]
-                        .windows(2)
-                        .all(|pair| pair[0] & !ABOVE < pair[1] & !ABOVE)
-            })
-            && listed
-                .iter()
-                .all(|&column| usize::from(column & !ABOVE) < left_size);
+        let rows_fit = exception_rows_fit(
+            row_starts.view_source(&map),
+            columns.view_source(&map),
+            header.exception_count,
+            header.left_size,
+        );
         if !rows_fit {
             return Err(reader.broken("the exception list is inconsistent"));
         }
-        let valid = keys_fit(left_keys.view_source(&map), hot_left, &limits, |l| {
-            (l.0, l.1)
-        }) && keys_fit(right_keys.view_source(&map), hot_right, &limits, |l| {
-            (l.2, l.3)
-        });
+        let valid = keys_fit(
+            left_keys.view_source(&map),
+            header.hot_left,
+            &layouts.limits,
+            |l| (l.0, l.1),
+        ) && keys_fit(
+            right_keys.view_source(&map),
+            header.hot_right,
+            &layouts.limits,
+            |l| (l.2, l.3),
+        );
         if !valid {
             return Err(reader.broken("a cluster key is out of range"));
         }
         Ok(Self {
             map,
-            cost_factor,
-            shift,
-            left_size,
-            right_size,
-            hot_left,
-            hot_right,
-            cluster_count,
-            dense,
-            sparse: sparse_shapes,
-            base,
+            cost_factor: header.cost_factor,
+            shift: header.shift,
+            left_size: header.left_size,
+            right_size: header.right_size,
+            hot_left: header.hot_left,
+            hot_right: header.hot_right,
+            cluster_count: header.cluster_count,
+            dense: layouts.dense,
+            sparse: layouts.sparse,
+            base: layouts.base,
             row_starts,
             columns,
             left_keys,

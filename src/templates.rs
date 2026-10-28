@@ -4,11 +4,12 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
-use crate::clusters::{MappedClusters, plan_clusters, write_clusters};
+use crate::clusters::{MappedFloatClusters, plan_clusters, write_clusters};
 use crate::dictionary::map_file;
 use crate::error::Error;
 use crate::hot_shape::HotShape;
 use crate::mapped_bytes::MappedBytes;
+use crate::part::{MappedPart, PartSlices, RowScratch, TemplatePart, total_of};
 use crate::section::{Plain, Section, SectionSource};
 
 pub(crate) const TEMPLATE_MAGIC: &[u8; 4] = b"MXTP";
@@ -37,16 +38,6 @@ pub(crate) fn float_header_sizes(header: &[u8]) -> Option<(usize, usize)> {
         .flatten()
 }
 
-pub struct TemplatePart {
-    pub left_count: usize,
-    pub right_count: usize,
-    pub left_projection: Vec<u16>,
-    pub right_projection: Vec<u16>,
-    pub indptr: Vec<u32>,
-    pub left_index: Vec<u16>,
-    pub weight: Vec<f64>,
-}
-
 pub struct ConnectionTemplates {
     cost_factor: f64,
     left_size: usize,
@@ -55,11 +46,7 @@ pub struct ConnectionTemplates {
 }
 
 fn is_strictly_sorted(part: &TemplatePart) -> bool {
-    part.indptr.windows(2).all(|span| {
-        part.left_index[span[0] as usize..span[1] as usize]
-            .windows(2)
-            .all(|pair| pair[0] < pair[1])
-    })
+    part.slices().has_sorted_spans()
 }
 
 fn sort_spans(part: &mut TemplatePart) {
@@ -89,20 +76,8 @@ fn sort_spans(part: &mut TemplatePart) {
 }
 
 fn validate(part: &TemplatePart, left_size: usize, right_size: usize) -> Result<(), Error> {
-    let slices = PartSlices {
-        left_count: part.left_count,
-        right_count: part.right_count,
-        left_projection: &part.left_projection,
-        right_projection: &part.right_projection,
-        indptr: &part.indptr,
-        left_index: &part.left_index,
-        weight: &part.weight,
-    };
-    let consistent = part.left_projection.len() == left_size
-        && part.right_projection.len() == right_size
-        && part.weight.len() == part.left_index.len()
-        && part.indptr.len() == part.right_count + 1
-        && slices.is_consistent();
+    let slices = part.slices();
+    let consistent = slices.has_sizes(left_size, right_size) && slices.is_consistent();
     if consistent {
         Ok(())
     } else {
@@ -114,39 +89,13 @@ pub(crate) fn to_cost(sum: f64, cost_factor: f64) -> i16 {
     (-cost_factor * sum).clamp(MIN_COST, MAX_COST) as i16
 }
 
-pub(crate) struct PartSlices<'a> {
-    left_count: usize,
-    right_count: usize,
-    pub(crate) left_projection: &'a [u16],
-    pub(crate) right_projection: &'a [u16],
-    indptr: &'a [u32],
-    left_index: &'a [u16],
-    pub(crate) weight: &'a [f64],
-}
-
-impl PartSlices<'_> {
-    pub(crate) fn weight_of(&self, left_node_rc: u16, right_node_lc: u16) -> Option<f64> {
-        let right_key = usize::from(self.right_projection[usize::from(right_node_lc)]);
-        if right_key == self.right_count {
-            return None;
-        }
-        let left_key = self.left_projection[usize::from(left_node_rc)];
-        let span = self.indptr[right_key] as usize..self.indptr[right_key + 1] as usize;
-        let found = self.left_index[span.clone()]
-            .binary_search(&left_key)
-            .ok()?;
-        Some(self.weight[span.start + found])
-    }
-}
-
 fn connection_cost<'a>(
-    parts: impl Iterator<Item = PartSlices<'a>>,
+    parts: impl Iterator<Item = PartSlices<'a, f64>>,
     cost_factor: f64,
     left_node_rc: u16,
     right_node_lc: u16,
 ) -> i16 {
-    let weights = parts.filter_map(|part| part.weight_of(left_node_rc, right_node_lc));
-    to_cost(weights.fold(0.0, |sum, weight| sum + weight), cost_factor)
+    to_cost(total_of(parts, left_node_rc, right_node_lc), cost_factor)
 }
 
 fn padding_after(bytes: usize) -> usize {
@@ -162,30 +111,6 @@ pub(crate) fn write_array<T: Copy, const WIDTH: usize>(
         output.write_all(&encode(*item))?;
     }
     output.write_all(&[0; ARRAY_ALIGNMENT][..padding_after(items.len() * WIDTH)])
-}
-
-struct MappedPart {
-    left_count: usize,
-    right_count: usize,
-    left_projection: Section<u16>,
-    right_projection: Section<u16>,
-    indptr: Section<u32>,
-    left_index: Section<u16>,
-    weight: Section<f64>,
-}
-
-impl MappedPart {
-    fn slices<'a, S: SectionSource>(&self, file: &'a S) -> PartSlices<'a> {
-        PartSlices {
-            left_count: self.left_count,
-            right_count: self.right_count,
-            left_projection: self.left_projection.view_source(file),
-            right_projection: self.right_projection.view_source(file),
-            indptr: self.indptr.view_source(file),
-            left_index: self.left_index.view_source(file),
-            weight: self.weight.view_source(file),
-        }
-    }
 }
 
 pub(crate) struct TemplateReader<'a> {
@@ -274,8 +199,8 @@ pub struct MappedTemplates<S = Mmap> {
     cost_factor: f64,
     left_size: usize,
     right_size: usize,
-    parts: Vec<MappedPart>,
-    clusters: Option<MappedClusters>,
+    parts: Vec<MappedPart<f64>>,
+    clusters: Option<MappedFloatClusters>,
 }
 
 impl MappedTemplates<Mmap> {
@@ -315,19 +240,7 @@ impl<S: SectionSource> MappedTemplates<S> {
         }
         let mut parts = Vec::with_capacity(part_count.min(MAX_PARTS));
         for _ in 0..part_count {
-            let left_count = reader.count()?;
-            let right_count = reader.count()?;
-            let nnz = reader.count()?;
-            reader.count()?;
-            let part = MappedPart {
-                left_count,
-                right_count,
-                left_projection: reader.section(left_size)?,
-                right_projection: reader.section(right_size)?,
-                indptr: reader.section(right_count + 1)?,
-                left_index: reader.section(nnz)?,
-                weight: reader.section(nnz)?,
-            };
+            let part = MappedPart::read(&mut reader, left_size, right_size)?;
             if !part.slices(&map).is_consistent() {
                 return Err(reader.broken("a connection template is inconsistent"));
             }
@@ -335,7 +248,7 @@ impl<S: SectionSource> MappedTemplates<S> {
         }
         let clusters = match cluster_count {
             0 => None,
-            count => Some(MappedClusters::read(
+            count => Some(MappedFloatClusters::read(
                 &mut reader,
                 count,
                 left_size,
@@ -373,27 +286,6 @@ impl<S: SectionSource> MappedTemplates<S> {
     fn exact_cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
         let parts = self.parts.iter().map(|part| part.slices(&self.map));
         connection_cost(parts, self.cost_factor, left_node_rc, right_node_lc)
-    }
-}
-
-impl PartSlices<'_> {
-    fn is_consistent(&self) -> bool {
-        let nnz = self.left_index.len();
-        self.indptr.first() == Some(&0)
-            && self.indptr.last().is_some_and(|&end| end as usize == nnz)
-            && self.indptr.windows(2).all(|span| span[0] <= span[1])
-            && self
-                .left_projection
-                .iter()
-                .all(|&key| usize::from(key) <= self.left_count)
-            && self
-                .right_projection
-                .iter()
-                .all(|&key| usize::from(key) <= self.right_count)
-            && self
-                .left_index
-                .iter()
-                .all(|&key| usize::from(key) < self.left_count)
     }
 }
 
@@ -437,41 +329,12 @@ impl ConnectionTemplates {
         &self.parts
     }
 
-    fn slices(&self) -> impl Iterator<Item = PartSlices<'_>> {
-        self.parts.iter().map(|part| PartSlices {
-            left_count: part.left_count,
-            right_count: part.right_count,
-            left_projection: &part.left_projection,
-            right_projection: &part.right_projection,
-            indptr: &part.indptr,
-            left_index: &part.left_index,
-            weight: &part.weight,
-        })
+    fn slices(&self) -> impl Iterator<Item = PartSlices<'_, f64>> {
+        self.parts.iter().map(TemplatePart::slices)
     }
 
     pub fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
         connection_cost(self.slices(), self.cost_factor, left_node_rc, right_node_lc)
-    }
-
-    fn fill_row_sums(&self, right_left_id: usize, hot_left: usize, scratch: &mut RowScratch) {
-        scratch.row[..hot_left].fill(0.0);
-        for (part, lookup) in self.slices().zip(&mut scratch.lookups) {
-            let right_key = usize::from(part.right_projection[right_left_id]);
-            if right_key == part.right_count {
-                continue;
-            }
-            let span = part.indptr[right_key] as usize..part.indptr[right_key + 1] as usize;
-            let left_index = &part.left_index[span.clone()];
-            for (index, weight) in left_index.iter().zip(&part.weight[span]) {
-                lookup[usize::from(*index)] = *weight;
-            }
-            for (sum, projected) in scratch.row[..hot_left].iter_mut().zip(part.left_projection) {
-                *sum += lookup[usize::from(*projected)];
-            }
-            for index in left_index {
-                lookup[usize::from(*index)] = 0.0;
-            }
-        }
     }
 
     pub fn write_templates(&self, output: &mut impl Write) -> io::Result<()> {
@@ -483,7 +346,7 @@ impl ConnectionTemplates {
         cluster_count: usize,
         output: &mut impl Write,
     ) -> io::Result<()> {
-        let slices: Vec<PartSlices> = self.slices().collect();
+        let slices: Vec<PartSlices<f64>> = self.slices().collect();
         let plans = if cluster_count == 0 {
             Vec::new()
         } else {
@@ -501,14 +364,7 @@ impl ConnectionTemplates {
             output.write_all(&(count as u32).to_le_bytes())?;
         }
         for part in &self.parts {
-            for count in [part.left_count, part.right_count, part.weight.len(), 0] {
-                output.write_all(&(count as u32).to_le_bytes())?;
-            }
-            write_array(output, &part.left_projection, u16::to_le_bytes)?;
-            write_array(output, &part.right_projection, u16::to_le_bytes)?;
-            write_array(output, &part.indptr, u32::to_le_bytes)?;
-            write_array(output, &part.left_index, u16::to_le_bytes)?;
-            write_array(output, &part.weight, f64::to_le_bytes)?;
+            part.write(output, f64::to_le_bytes)?;
         }
         if plans.is_empty() {
             return Ok(());
@@ -520,13 +376,13 @@ impl ConnectionTemplates {
         &self,
         rows: std::ops::Range<usize>,
         shape: &HotShape,
-        scratch: &mut RowScratch,
+        scratch: &mut RowScratch<f64>,
     ) -> Vec<u8> {
         let mut bytes = Vec::new();
         for right_left_id in rows {
             let length = shape.row_length(right_left_id);
-            self.fill_row_sums(right_left_id, length, scratch);
-            for sum in &scratch.row[..length] {
+            scratch.fill_row_sums(self.slices(), right_left_id, length);
+            for sum in &scratch.sums[..length] {
                 bytes.extend_from_slice(&to_cost(*sum, self.cost_factor).to_le_bytes());
             }
         }
@@ -544,7 +400,7 @@ impl ConnectionTemplates {
             self.right_size,
             threads,
             output,
-            || RowScratch::new(self),
+            || RowScratch::new(self.slices(), self.left_size),
             |scratch, rows| self.render_rows(rows, shape, scratch),
         )
     }
@@ -552,41 +408,23 @@ impl ConnectionTemplates {
 
 pub(crate) struct ExactRows<'a> {
     templates: &'a ConnectionTemplates,
-    scratch: RowScratch,
+    scratch: RowScratch<f64>,
 }
 
 impl<'a> ExactRows<'a> {
     pub(crate) fn new(templates: &'a ConnectionTemplates) -> Self {
         Self {
             templates,
-            scratch: RowScratch::new(templates),
+            scratch: RowScratch::new(templates.slices(), templates.left_size),
         }
     }
 
     pub(crate) fn render(&mut self, right_left_id: usize, out: &mut [i16]) {
         let left_size = self.templates.left_size;
-        self.templates
-            .fill_row_sums(right_left_id, left_size, &mut self.scratch);
-        for (cost, sum) in out.iter_mut().zip(&self.scratch.row) {
+        self.scratch
+            .fill_row_sums(self.templates.slices(), right_left_id, left_size);
+        for (cost, sum) in out.iter_mut().zip(&self.scratch.sums) {
             *cost = to_cost(*sum, self.templates.cost_factor);
-        }
-    }
-}
-
-struct RowScratch {
-    row: Vec<f64>,
-    lookups: Vec<Vec<f64>>,
-}
-
-impl RowScratch {
-    fn new(templates: &ConnectionTemplates) -> Self {
-        Self {
-            row: vec![0.0; templates.left_size],
-            lookups: templates
-                .parts
-                .iter()
-                .map(|part| vec![0.0; part.left_count + 1])
-                .collect(),
         }
     }
 }

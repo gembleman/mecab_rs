@@ -17,7 +17,7 @@ use super::{
 use crate::char_property::SentenceChars;
 use crate::char_table::{HEADER_BYTES as CHAR_TABLE_HEADER, MAGIC as CHAR_TABLE_MAGIC};
 use crate::dictionary::map_open_file;
-use crate::error::Error;
+use crate::error::{Error, io_error};
 use crate::hot_shape::HotShape;
 use crate::int_runtime::is_runtime_form;
 use crate::mapped_bytes::MappedBytes;
@@ -35,6 +35,10 @@ const SECTION_ENTRY_BYTES: usize = 16;
 const MATRIX_HEADER_BYTES: usize = 4;
 const HOT_ROWS_BYTES: usize = 4;
 const ROW_START_BYTES: usize = 4;
+
+mod validate;
+
+use validate::format_error;
 
 pub type Hit = PrefixHit;
 
@@ -137,60 +141,15 @@ pub struct PackedDictionary {
 
 impl PackedDictionary {
     pub fn open(path: &Path) -> Result<Self, Error> {
-        let io_error = |source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        };
-        let broken = |reason| Error::Format {
-            file: path.to_path_buf(),
-            reason,
-        };
-        let file = File::open(path).map_err(io_error)?;
-        let file_length = file.metadata().map_err(io_error)?.len();
-        let mut header = [0u8; HEADER_BYTES];
+        let file = File::open(path).map_err(io_error(path))?;
+        let file_length = file.metadata().map_err(io_error(path))?.len();
+        let mut header_bytes = [0u8; HEADER_BYTES];
         if file_length < HEADER_BYTES as u64 {
-            return Err(broken("the file is shorter than its header"));
+            return Err(format_error(path, "the file is shorter than its header"));
         }
-        read_at(&file, &mut header, 0).map_err(io_error)?;
-        if header[..MAGIC_BYTES] != *MAGIC {
-            return Err(broken("the magic number is not valid"));
-        }
-        if u32_at(&header, 8) != VERSION {
-            return Err(broken(
-                "the file has another format version; pack the dictionary again",
-            ));
-        }
-        let flags = u32_at(&header, 12);
-        if flags & !(FLAG_HOT_MATRIX | FLAG_INT_TEMPLATES) != 0 {
-            return Err(broken("the flags are not valid"));
-        }
-        if flags & FLAG_INT_TEMPLATES != 0 && flags & FLAG_HOT_MATRIX == 0 {
-            return Err(broken("integer templates require a hot matrix"));
-        }
-        let code_count = u32_at(&header, 16) as usize;
-        let token_count = u32_at(&header, 20) as usize;
-        let param_count = u32_at(&header, 24) as usize;
-        let category_count = u32_at(&header, 28) as usize;
-        let (param_bits, feature_bits) = (u32_at(&header, 32), u32_at(&header, 36));
-        if param_bits == 0 || feature_bits == 0 || param_bits > 32 || feature_bits > 32 {
-            return Err(broken("the widths of the token fields are not valid"));
-        }
-        let format = TokenFormat::new(param_bits, feature_bits);
-        if format.bits > MAX_RECORD_BITS as usize {
-            return Err(broken("the widths of the token fields are not valid"));
-        }
-        let mut sections: [Range<usize>; SECTIONS] = Default::default();
-        let mut end = HEADER_BYTES as u64;
-        for (number, section) in sections.iter_mut().enumerate() {
-            let at = SECTION_TABLE_AT + SECTION_ENTRY_BYTES * number;
-            let (offset, length) = (u64_at(&header, at), u64_at(&header, at + 8));
-            let stop = offset.checked_add(length);
-            if offset % 8 != 0 || offset < end || stop.is_none_or(|stop| stop > file_length) {
-                return Err(broken("a section is misplaced or outside the file"));
-            }
-            end = offset + length;
-            *section = offset as usize..(offset + length) as usize;
-        }
+        read_at(&file, &mut header_bytes, 0).map_err(io_error(path))?;
+        let header = validate::parse_header(&header_bytes, path)?;
+        let sections = validate::parse_sections(&header_bytes, file_length, path)?;
         let source = Source {
             file: &file,
             path,
@@ -198,192 +157,63 @@ impl PackedDictionary {
         };
         let map = Arc::new(map_open_file(&file, path)?);
         if map.len() as u64 != file_length {
-            return Err(broken("the file changed while it was opened"));
+            return Err(format_error(path, "the file changed while it was opened"));
         }
-        let length = |section: usize| sections[section].len();
-        if length(CHAR_INDEX) != BLOCK_COUNT * 2
-            || length(CHAR_BLOCKS) == 0
-            || length(CHAR_BLOCKS) % (BLOCK_CODES * 2) != 0
-            || length(CELLS) < UNIT_BYTES + CELLS_PADDING
-            || !(length(CELLS) - CELLS_PADDING).is_multiple_of(UNIT_BYTES)
-            || (length(CELLS) - CELLS_PADDING) / UNIT_BYTES > MAX_UNITS
-            || length(TOKENS) as u64 != section_bytes(token_count, format.bits)
-            || length(PARAMS) != param_count * PARAM_BYTES
-            || length(UNKNOWN_STARTS) != (category_count + 1) * 4
-            || code_count == 0
-            || code_count > 1 << 16
-            || token_count > MAX_UNITS
-        {
-            return Err(broken("the size of a section does not match the header"));
-        }
-
-        let mut matrix_header = [0u8; MATRIX_HEADER_BYTES];
-        if length(MATRIX) < MATRIX_HEADER_BYTES {
-            return Err(broken("the matrix is shorter than its header"));
-        }
-        source.read(MATRIX, 0, &mut matrix_header)?;
-        let left_size = usize::from(u16_at(&matrix_header, 0));
-        let right_size = usize::from(u16_at(&matrix_header, 2));
-        let hot = flags & FLAG_HOT_MATRIX != 0;
-        let integer_templates = flags & FLAG_INT_TEMPLATES != 0;
-        let expected_length = if hot {
-            let mut hot_header = [0u8; HOT_ROWS_BYTES];
-            source.read(MATRIX, MATRIX_HEADER_BYTES, &mut hot_header)?;
-            let rows = u32_at(&hot_header, 0) as usize;
-            if rows == 0 || rows > right_size {
-                return Err(broken("the hot block lies outside of the matrix"));
-            }
-            let mut last_start = [0u8; ROW_START_BYTES];
-            source.read(
-                MATRIX,
-                HotShape::header_bytes(rows) - ROW_START_BYTES,
-                &mut last_start,
-            )?;
-            let cells = u32::from_le_bytes(last_start) as usize;
-            HotShape::header_bytes(rows) + cells * 2
-        } else {
-            MATRIX_HEADER_BYTES + left_size * right_size * 2
-        };
-        if left_size == 0 || right_size == 0 || length(MATRIX) != expected_length {
-            return Err(broken("the matrix size does not match its header"));
-        }
-        if hot && integer_templates {
-            let mut templates_header = [0u8; TEMPLATE_HEADER_PEEK_BYTES];
-            if length(TEMPLATES) < templates_header.len() {
-                return Err(broken("the integer templates are empty"));
-            }
-            source.read(TEMPLATES, 0, &mut templates_header)?;
-            if !is_runtime_form(&templates_header)
-                || header_sizes(&templates_header) != Some((left_size, right_size))
-            {
-                return Err(broken("the integer templates do not match the hot matrix"));
-            }
-        } else if hot {
-            let mut templates_header = [0u8; TEMPLATE_HEADER_PEEK_BYTES];
-            if length(TEMPLATES) < templates_header.len() {
-                return Err(broken("the templates are shorter than their header"));
-            }
-            source.read(TEMPLATES, 0, &mut templates_header)?;
-            if float_header_sizes(&templates_header) != Some((left_size, right_size)) {
-                return Err(broken("the templates do not match the hot matrix"));
-            }
-        } else if length(TEMPLATES) != 0 {
-            return Err(broken("a dense matrix comes with templates"));
-        }
-        if length(CHAR_TABLE) < CHAR_TABLE_HEADER {
-            return Err(broken("the character table is shorter than its header"));
-        }
-        let mut table_header = vec![0u8; CHAR_TABLE_HEADER];
-        source.read(CHAR_TABLE, 0, &mut table_header)?;
-        if table_header[..4] != *CHAR_TABLE_MAGIC
-            || u32_at(&table_header, 8) as usize != category_count
-        {
-            return Err(broken(
-                "the character table is not valid or has other categories than the unknown words",
-            ));
-        }
-
-        let index = source.read_all(CHAR_INDEX)?;
-        let block_count = length(CHAR_BLOCKS) / (BLOCK_CODES * 2);
-        if index
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .any(|&pair| usize::from(u16::from_le_bytes(pair)) >= block_count)
-        {
-            return Err(broken("a character block does not exist"));
-        }
-        source.chunks(
-            CHAR_BLOCKS,
-            2,
-            |_, part| {
-                part.as_chunks::<2>()
-                    .0
-                    .iter()
-                    .all(|&pair| usize::from(u16::from_le_bytes(pair)) < code_count)
-            },
-            "a character code is out of range",
-        )?;
-
+        validate::check_section_sizes(&source, &header)?;
+        let (left_size, right_size) = validate::check_matrix(&source, &header)?;
+        validate::check_char_table(&source, header.category_count)?;
+        validate::check_char_codes(&source, header.code_count)?;
         let checked = feature_check::check(&source, FEATURES)?;
-
-        source.chunks(
-            PARAMS,
-            PARAM_BYTES,
-            |_, part| {
-                part.as_chunks::<PARAM_BYTES>().0.iter().all(|param| {
-                    usize::from(u16_at(param, 0)) < right_size
-                        && usize::from(u16_at(param, 2)) < left_size
-                })
-            },
-            "a parameter set has a context id outside the matrix",
-        )?;
-
-        let unknown_starts = source.read_all(UNKNOWN_STARTS)?;
-        let unknown_starts: Vec<u32> = unknown_starts
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&word| u32::from_le_bytes(word))
-            .collect();
-        if unknown_starts[0] != 0 || unknown_starts.windows(2).any(|pair| pair[0] > pair[1]) {
-            return Err(broken("the unknown tokens of the categories do not add up"));
-        }
-        let unknown_count = unknown_starts[category_count] as usize;
-        if length(UNKNOWN_TOKENS) as u64 != section_bytes(unknown_count, format.bits) {
-            return Err(broken("the unknown tokens of the categories do not add up"));
-        }
-
-        let valid_token = |param: u64, feature: u64| {
-            param < param_count as u64 && checked.is_record(feature as usize)
-        };
-        let reason = "a token has a parameter set or a feature that does not exist";
-        check_tokens(&source, TOKENS, token_count, format, valid_token, reason)?;
-        check_tokens(
-            &source,
-            UNKNOWN_TOKENS,
+        validate::check_params(&source, left_size, right_size)?;
+        let unknown_count = validate::check_unknown_starts(&source, &header)?;
+        validate::check_token_sections(&source, &header, unknown_count, &checked)?;
+        check_cells(&source, &map[sections[CELLS].clone()], header.token_count)?;
+        let dicrc = validate::check_dicrc(&source)?;
+        let validated = validate::Validated {
+            header,
+            left_size,
+            right_size,
             unknown_count,
-            format,
-            valid_token,
-            reason,
-        )?;
+            checked,
+            dicrc,
+        };
+        Self::from_validated(path, map, sections, validated)
+    }
 
-        check_cells(&source, &map[sections[CELLS].clone()], token_count)?;
-
-        let dicrc = source.read_all(DICRC)?;
-        if dicrc.len() < 8 {
-            return Err(broken("dicrc is shorter than its header"));
-        }
-        let bos_length = u32_at(&dicrc, 0) as usize;
-        let unknown_length = u32_at(&dicrc, 4) as usize;
-        if bos_length == 0 || 8 + bos_length + unknown_length != dicrc.len() {
-            return Err(broken("the bos-feature or unk-feature length is not valid"));
-        }
-        if str::from_utf8(&dicrc[8..]).is_err()
-            || str::from_utf8(&dicrc[8..8 + bos_length]).is_err()
-        {
-            return Err(broken("bos-feature or unk-feature is not valid UTF-8"));
-        }
-
-        let view_error = || broken("a section is misaligned");
+    fn from_validated(
+        path: &Path,
+        map: Arc<Mmap>,
+        sections: [Range<usize>; SECTIONS],
+        validated: validate::Validated,
+    ) -> Result<Self, Error> {
+        let validate::Validated {
+            header,
+            left_size,
+            right_size,
+            unknown_count,
+            checked,
+            dicrc,
+        } = validated;
+        let view_error = || format_error(path, "a section is misaligned");
         let char_index = Section::new(&map, sections[CHAR_INDEX].clone()).ok_or_else(view_error)?;
         let char_blocks =
             Section::new(&map, sections[CHAR_BLOCKS].clone()).ok_or_else(view_error)?;
         let cells = Section::new(&map, sections[CELLS].clone()).ok_or_else(view_error)?;
-        let dicrc_start = sections[DICRC].start + 8;
+        let dicrc_start = sections[DICRC].start + validate::DICRC_HEADER_BYTES;
+        let (bos_length, unknown_length) = (dicrc.bos_length, dicrc.unknown_length);
         let mut dictionary = Self {
             map,
             char_index,
             char_blocks,
             cells,
-            format,
-            token_count,
+            format: header.format,
+            token_count: header.token_count,
             unknown_count,
             left_size,
             right_size,
-            category_count,
-            hot: flags & FLAG_HOT_MATRIX != 0,
-            integer_templates,
+            category_count: header.category_count,
+            hot: header.hot(),
+            integer_templates: header.integer_templates(),
             bos_feature: dicrc_start..dicrc_start + bos_length,
             unknown_feature: (unknown_length > 0)
                 .then(|| dicrc_start + bos_length..dicrc_start + bos_length + unknown_length),
