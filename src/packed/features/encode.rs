@@ -3,8 +3,9 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 use super::{
     BLOB_SYNC_EVERY, BitWriter, Counts, Layout, MAX_BLOB_FIELDS, MAX_ID_BYTES, MAX_NUMERIC,
-    MAX_SLOTS, NumSpec, OP_BLOB, OP_BLOB_NEXT, OP_COPY, OP_EMPTY, OP_HIGH, OP_INLINE, OP_KEY,
-    OP_NUM, OP_NUM_MAX, OP_NUMB, OP_NUMB_MAX, OP_REF, OP_STAR, SYNC_EVERY, bits_for, chars,
+    MAX_RULE_SUFFIX, MAX_RULES, MAX_SLOTS, NumSpec, OP_BLOB, OP_BLOB_NEXT, OP_COPY, OP_DERIVE,
+    OP_EMPTY, OP_HIGH, OP_INLINE, OP_KEY, OP_NUM, OP_NUM_MAX, OP_NUMB, OP_NUMB_MAX, OP_REF,
+    OP_STAR, RULE_BYTES, RULE_CHAR_BITS, RULE_HEADER_BYTES, SYNC_EVERY, bits_for, chars,
     push_piece,
 };
 use crate::Error;
@@ -14,6 +15,10 @@ const FOLD_MAX_VALUES: usize = 256;
 const MAX_TEMPLATES: usize = 1 << 16;
 const MAX_LOW_PARTS: usize = 1 << 16;
 const ABSENT: u16 = u16::MAX;
+const DERIVE_TARGET: usize = 10;
+const DERIVE_CONTEXT: [usize; 2] = [4, 5];
+const MIN_RULE_USES: u32 = 2;
+const MAX_REMOVED_CHARS: usize = 15;
 const HASH_MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
 const FINAL_MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
 
@@ -232,25 +237,261 @@ fn choose_split(values: &[u64], preferred_shift: Option<u32>) -> (u32, Vec<u64>)
     (shift, table)
 }
 
+#[derive(Clone, Copy)]
 enum TextOp {
+    Key,
     Star,
     Empty,
     Copy(u8),
+    Derive,
     New,
 }
 
-fn text_op<'a>(value: &'a [u8], slots: &mut Vec<&'a [u8]>) -> TextOp {
+fn text_op<'a>(value: &'a [u8], key: &[u8], derivable: bool, slots: &mut Vec<&'a [u8]>) -> TextOp {
+    if is_key(value, key) {
+        return TextOp::Key;
+    }
     if value == b"*" {
-        TextOp::Star
-    } else if value.is_empty() {
-        TextOp::Empty
-    } else if let Some(slot) = slots.iter().position(|&slot| slot == value) {
-        TextOp::Copy(slot as u8)
+        return TextOp::Star;
+    }
+    if value.is_empty() {
+        return TextOp::Empty;
+    }
+    if let Some(slot) = slots.iter().position(|&slot| slot == value) {
+        return TextOp::Copy(slot as u8);
+    }
+    if slots.len() < MAX_SLOTS {
+        slots.push(value);
+    }
+    if derivable {
+        TextOp::Derive
     } else {
-        if slots.len() < MAX_SLOTS {
-            slots.push(value);
-        }
         TextOp::New
+    }
+}
+
+type Context<'a> = (&'a [u8], &'a [u8]);
+type Split<'a> = (u8, &'a [u8]);
+type RuleSite = (u32, char);
+
+fn context_of<'a>(text: &'a [u8], fields: &[(usize, usize)]) -> Option<Context<'a>> {
+    if fields.len() <= DERIVE_TARGET {
+        return None;
+    }
+    let field = |number: usize| &text[fields[number].0..fields[number].1];
+    Some((field(DERIVE_CONTEXT[0]), field(DERIVE_CONTEXT[1])))
+}
+
+fn split_derivation<'v>(key: &str, value: &'v [u8]) -> Option<(u8, &'v [u8])> {
+    let mut common = key
+        .as_bytes()
+        .iter()
+        .zip(value)
+        .take_while(|(left, right)| left == right)
+        .count();
+    while !key.is_char_boundary(common) {
+        common -= 1;
+    }
+    let removed = key[common..].chars().count();
+    let suffix = &value[common..];
+    let valid = removed <= MAX_REMOVED_CHARS
+        && suffix.len() <= MAX_RULE_SUFFIX
+        && std::str::from_utf8(suffix).is_ok();
+    valid.then_some((removed as u8, suffix))
+}
+
+fn kept_bytes(key: &str, removed: u8) -> Option<usize> {
+    let mut keep = key.len();
+    for _ in 0..removed {
+        keep -= key[..keep].chars().next_back()?.len_utf8();
+    }
+    Some(keep)
+}
+
+#[derive(Default)]
+struct Derive<'a> {
+    contexts: SmallKeyMap<Context<'a>, u32>,
+    table_of_context: Vec<u16>,
+    rules: SmallKeyMap<(u16, char), u16>,
+    rule_list: Vec<(u8, Vec<u8>)>,
+    entries: Vec<u32>,
+    group_starts: Vec<u32>,
+}
+
+impl<'a> Derive<'a> {
+    fn learn(
+        entries: &[&'a [u8]],
+        tokens: &[(u32, &str)],
+        classes: &[Class],
+        blob_slot: &dyn Fn(usize, usize) -> Option<usize>,
+    ) -> Self {
+        let enabled = classes.len() > DERIVE_TARGET
+            && DERIVE_CONTEXT
+                .iter()
+                .all(|&field| classes[field] == Class::Folded)
+            && classes[DERIVE_TARGET] == Class::Text;
+        let mut derive = Self::default();
+        if !enabled {
+            return derive;
+        }
+        let mut counts: SmallKeyMap<RuleSite, SmallKeyMap<Split<'a>, u32>> = SmallKeyMap::default();
+        let mut fields = Vec::new();
+        for &(feature, key) in tokens {
+            let entry = feature as usize;
+            let Some(&text) = entries.get(entry) else {
+                continue;
+            };
+            let Some(last) = key.chars().next_back() else {
+                continue;
+            };
+            split_fields(text, &mut fields);
+            let Some(context) = context_of(text, &fields) else {
+                continue;
+            };
+            let next = derive.contexts.len() as u32;
+            let id = *derive.contexts.entry(context).or_insert(next);
+            let (begin, end) = fields[DERIVE_TARGET];
+            let value = &text[begin..end];
+            if blob_slot(entry, DERIVE_TARGET).is_some()
+                || is_key(value, key.as_bytes())
+                || value == b"*"
+                || value.is_empty()
+            {
+                continue;
+            }
+            if let Some(split) = split_derivation(key, value) {
+                *counts
+                    .entry((id, last))
+                    .or_default()
+                    .entry(split)
+                    .or_insert(0) += 1;
+            }
+        }
+        let mut chosen: Vec<(RuleSite, Split)> = counts
+            .into_iter()
+            .filter_map(|(at, uses)| {
+                let (split, count) = uses
+                    .into_iter()
+                    .max_by_key(|&(split, count)| (count, std::cmp::Reverse(split)))?;
+                (count >= MIN_RULE_USES).then_some((at, split))
+            })
+            .collect();
+        chosen.sort_unstable_by_key(|&(at, _)| at);
+        derive.table_of_context = vec![0; derive.contexts.len()];
+        let mut rule_index: SmallKeyMap<(u8, &[u8]), u16> = SmallKeyMap::default();
+        let mut table = 0u16;
+        let mut current: Option<u32> = None;
+        for ((id, last), split) in chosen {
+            let known = rule_index.get(&split).copied();
+            let rule = match known {
+                Some(rule) => rule,
+                None if derive.rule_list.len() < MAX_RULES => {
+                    let rule = derive.rule_list.len() as u16;
+                    derive.rule_list.push((split.0, split.1.to_vec()));
+                    rule_index.insert(split, rule);
+                    rule
+                }
+                None => continue,
+            };
+            if current != Some(id) {
+                current = Some(id);
+                table += 1;
+                derive.table_of_context[id as usize] = table;
+                derive.group_starts.push(derive.entries.len() as u32);
+            }
+            derive.rules.insert((table, last), rule);
+            derive
+                .entries
+                .push(last as u32 | u32::from(rule) << RULE_CHAR_BITS);
+        }
+        derive
+    }
+
+    fn groups(&self) -> u32 {
+        self.group_starts.len() as u32
+    }
+
+    fn table_of(&self, text: &[u8], fields: &[(usize, usize)]) -> u16 {
+        context_of(text, fields)
+            .and_then(|context| self.contexts.get(&context))
+            .map_or(0, |&id| self.table_of_context[id as usize])
+    }
+
+    fn accepts(&self, table: u16, key: &[u8], value: &[u8]) -> bool {
+        if table == 0 {
+            return false;
+        }
+        let Ok(key) = std::str::from_utf8(key) else {
+            return false;
+        };
+        let Some(last) = key.chars().next_back() else {
+            return false;
+        };
+        let Some(&rule) = self.rules.get(&(table, last)) else {
+            return false;
+        };
+        let (removed, suffix) = &self.rule_list[usize::from(rule)];
+        let Some(keep) = kept_bytes(key, *removed) else {
+            return false;
+        };
+        value.len() == keep + suffix.len()
+            && value[..keep] == key.as_bytes()[..keep]
+            && value[keep..] == suffix[..]
+    }
+
+    fn rule_bytes(&self) -> Vec<u8> {
+        let mut bytes = vec![0u8; RULE_BYTES * self.rule_list.len()];
+        for (number, (removed, suffix)) in self.rule_list.iter().enumerate() {
+            let at = number * RULE_BYTES;
+            bytes[at] = *removed;
+            bytes[at + 1] = suffix.len() as u8;
+            let start = at + RULE_HEADER_BYTES;
+            bytes[start..start + suffix.len()].copy_from_slice(suffix);
+        }
+        bytes
+    }
+}
+
+struct Planner<'p, 'a> {
+    classes: &'p [Class],
+    derive: &'p Derive<'a>,
+    blob_slot: &'p dyn Fn(usize, usize) -> Option<usize>,
+}
+
+impl<'a> Planner<'_, 'a> {
+    fn plan(
+        &self,
+        entry: usize,
+        text: &'a [u8],
+        fields: &[(usize, usize)],
+        key: &[u8],
+        slots: &mut Vec<&'a [u8]>,
+        ops: &mut Vec<Option<TextOp>>,
+    ) {
+        ops.clear();
+        slots.clear();
+        let table = self.derive.table_of(text, fields);
+        for (field, &(begin, end)) in fields.iter().enumerate() {
+            if self.classes[field] != Class::Text {
+                ops.push(None);
+                continue;
+            }
+            let value = &text[begin..end];
+            if (self.blob_slot)(entry, field).is_some() {
+                if slots.len() < MAX_SLOTS {
+                    slots.push(value);
+                }
+                ops.push(None);
+                continue;
+            }
+            let derivable = field == DERIVE_TARGET && self.derive.accepts(table, key, value);
+            ops.push(Some(text_op(value, key, derivable, slots)));
+        }
+    }
+
+    fn uses_key(&self, ops: &[Option<TextOp>]) -> bool {
+        ops.iter()
+            .any(|op| matches!(op, Some(TextOp::Key | TextOp::Derive)))
     }
 }
 
@@ -680,9 +921,17 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         values[stored_values[blob.number]][entry] >> stored[blob.number].spec.shift
     };
 
+    let derive = Derive::learn(&entries, tokens, &classes, &blob_slot);
+    let planner = Planner {
+        classes: &classes,
+        derive: &derive,
+        blob_slot: &blob_slot,
+    };
+    let mut planned: Vec<Option<TextOp>> = Vec::new();
     let mut variants: Vec<(usize, &[u8])> = Vec::new();
     let mut variant_of: SmallKeyMap<(u32, &[u8]), u32> = SmallKeyMap::default();
     let mut starts_of: Vec<u32> = Vec::with_capacity(tokens.len());
+    let mut slots: Vec<&[u8]> = Vec::new();
     for &(feature, key) in tokens {
         let entry = feature as usize;
         let text = *entries.get(entry).ok_or(Error::Unsupported(
@@ -690,11 +939,8 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         ))?;
         let key = key.as_bytes();
         split_fields(text, &mut fields);
-        let keyed = fields.iter().enumerate().any(|(field, &(begin, end))| {
-            classes[field] == Class::Text
-                && blob_slot(entry, field).is_none()
-                && is_key(&text[begin..end], key)
-        });
+        planner.plan(entry, text, &fields, key, &mut slots, &mut planned);
+        let keyed = planner.uses_key(&planned);
         let key: &[u8] = if keyed { key } else { b"" };
         let next = variants.len() as u32;
         let number = *variant_of.entry((feature, key)).or_insert(next);
@@ -706,26 +952,13 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
     drop(variant_of);
 
     let mut string_uses: SmallKeyMap<&[u8], u32> = SmallKeyMap::default();
-    let mut slots: Vec<&[u8]> = Vec::new();
     for &(entry, key) in &variants {
         let text = entries[entry];
         split_fields(text, &mut fields);
-        slots.clear();
-        for (field, &(begin, end)) in fields.iter().enumerate() {
-            if classes[field] == Class::Text {
-                let value = &text[begin..end];
-                if blob_slot(entry, field).is_some() {
-                    if slots.len() < MAX_SLOTS {
-                        slots.push(value);
-                    }
-                    continue;
-                }
-                if is_key(value, key) {
-                    continue;
-                }
-                if let TextOp::New = text_op(value, &mut slots) {
-                    *string_uses.entry(value).or_insert(0) += 1;
-                }
+        planner.plan(entry, text, &fields, key, &mut slots, &mut planned);
+        for (&(begin, end), op) in fields.iter().zip(&planned) {
+            if let Some(TextOp::New) = op {
+                *string_uses.entry(&text[begin..end]).or_insert(0) += 1;
             }
         }
     }
@@ -740,6 +973,7 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
     let mut entry_shape: Vec<u32> = Vec::with_capacity(variants.len());
     let mut references: Vec<u32> = Vec::new();
     let mut inline: Vec<&[u8]> = Vec::new();
+    let mut template_groups: Vec<u16> = Vec::new();
     let mut numbers: Vec<(u64, u32)> = Vec::new();
     let mut blob_ids: Vec<u64> = Vec::new();
     let mut program: Vec<u8> = Vec::new();
@@ -751,7 +985,7 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         program.clear();
         piece.clear();
         ops.clear();
-        slots.clear();
+        planner.plan(entry, text, &fields, key, &mut slots, &mut planned);
         for (field, &(begin, end)) in fields.iter().enumerate() {
             if field > 0 {
                 piece.push(b',');
@@ -766,9 +1000,6 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
             match classes[field] {
                 Class::Folded => {}
                 Class::Text if blob_slot(entry, field).is_some() => {
-                    if slots.len() < MAX_SLOTS {
-                        slots.push(value);
-                    }
                     if blob_slot(entry, field) == Some(0) {
                         ops.push(OP_BLOB);
                         blob_ids.push(blob_id(entry));
@@ -776,11 +1007,12 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
                         ops.push(OP_BLOB_NEXT);
                     }
                 }
-                Class::Text if is_key(value, key) => ops.push(OP_KEY),
-                Class::Text => match text_op(value, &mut slots) {
+                Class::Text => match planned[field].expect("a text field has an operation") {
+                    TextOp::Key => ops.push(OP_KEY),
                     TextOp::Star => ops.push(OP_STAR),
                     TextOp::Empty => ops.push(OP_EMPTY),
                     TextOp::Copy(slot) => ops.push(OP_COPY + slot),
+                    TextOp::Derive => ops.push(OP_DERIVE),
                     TextOp::New if string_uses[value] == 1 => {
                         ops.push(OP_INLINE);
                         inline.push(value);
@@ -817,7 +1049,11 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         if area.len() > u32::MAX as usize {
             return Err(Error::Unsupported("feature strings of more than 4 GiB"));
         }
-        entry_template.push(intern_bytes(&mut templates, &mut template_list, &program));
+        let template = intern_bytes(&mut templates, &mut template_list, &program);
+        if template as usize == template_groups.len() {
+            template_groups.push(derive.table_of(text, &fields));
+        }
+        entry_template.push(template);
         entry_shape.push(intern_bytes(&mut shapes, &mut shape_list, &ops));
     }
     drop(values);
@@ -923,6 +1159,9 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         strings: area.len() as u64,
         blob_bytes: recoded.blob.len() as u64,
         blob_entries: recoded.blob_starts.len() as u32,
+        rule_groups: derive.groups(),
+        rule_entries: derive.entries.len() as u32,
+        rule_count: derive.rule_list.len() as u32,
         blob_fields: blob.as_ref().map_or(0, |blob| blob.fields.len() as u32),
         blob_number: blob.as_ref().map_or(0, |blob| blob.number as u32),
         id_bytes: blob.as_ref().map_or(0, |blob| blob.id_bytes as u32),
@@ -972,6 +1211,18 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         .collect();
     put(&mut bytes, &layout.blob_sync, &words(&blob_sync));
     put(&mut bytes, &layout.blob, &recoded.blob);
+    if derive.groups() > 0 {
+        let group_bytes: Vec<u8> = template_groups
+            .iter()
+            .flat_map(|group| group.to_le_bytes())
+            .collect();
+        put(&mut bytes, &layout.template_groups, &group_bytes);
+        let mut group_starts = derive.group_starts.clone();
+        group_starts.push(derive.entries.len() as u32);
+        put(&mut bytes, &layout.group_starts, &words(&group_starts));
+        put(&mut bytes, &layout.rule_entries, &words(&derive.entries));
+        put(&mut bytes, &layout.rules, &derive.rule_bytes());
+    }
     put(&mut bytes, &layout.records, &records);
     let starts = starts_of
         .iter()

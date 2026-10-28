@@ -4,10 +4,11 @@ use std::thread;
 use super::chars::{self, ENTRY_BYTES};
 use super::pieces::{POSITION_BYTES, Position};
 use super::{
-    BLOB_SYNC_EVERY, HEADER_BYTES, Layout, MAX_NUMERIC, MAX_SLOTS, NumSpec, OP_BLOB, OP_BLOB_NEXT,
-    OP_COPY, OP_COPY_MAX, OP_EMPTY, OP_HIGH, OP_HIGH_MAX, OP_INLINE, OP_KEY, OP_NUM, OP_NUM_MAX,
-    OP_NUMB, OP_NUMB_MAX, OP_REF, OP_STAR, RECORD_PADDING, SPEC_BYTES, SYNC_EVERY, find_byte,
-    read_bits,
+    BLOB_SYNC_EVERY, HEADER_BYTES, Layout, MAX_NUMERIC, MAX_RULE_SUFFIX, MAX_SLOTS, NumSpec,
+    OP_BLOB, OP_BLOB_NEXT, OP_COPY, OP_COPY_MAX, OP_DERIVE, OP_EMPTY, OP_HIGH, OP_HIGH_MAX,
+    OP_INLINE, OP_KEY, OP_NUM, OP_NUM_MAX, OP_NUMB, OP_NUMB_MAX, OP_REF, OP_STAR, RECORD_PADDING,
+    RULE_BYTES, RULE_CHAR_BITS, RULE_CHAR_MASK, RULE_HEADER_BYTES, SPEC_BYTES, SYNC_EVERY,
+    find_byte, read_bits,
 };
 use crate::Error;
 use crate::packed::reader::Source;
@@ -224,6 +225,7 @@ pub(in crate::packed) fn check(source: &Source, section: usize) -> Result<Checke
                 {
                     numbers |= 1 << (op - OP_NUMB);
                 }
+                OP_DERIVE if counts.rule_groups > 0 => slots = (slots + 1).min(MAX_SLOTS),
                 OP_EMPTY | OP_STAR | OP_KEY => {}
                 OP_COPY..=OP_COPY_MAX if usize::from(op - OP_COPY) < slots => {}
                 OP_NUM..=OP_NUM_MAX if usize::from(op - OP_NUM) < specs.len() => {
@@ -244,6 +246,7 @@ pub(in crate::packed) fn check(source: &Source, section: usize) -> Result<Checke
     }
     drop(shape_bytes);
 
+    check_rules(source, section, &layout)?;
     let string_boundaries = check_strings(source, section, &layout)?;
     let blob_starts = check_blob(source, section, &layout, &specs)?;
     let tables = Tables {
@@ -269,6 +272,78 @@ pub(in crate::packed) fn check(source: &Source, section: usize) -> Result<Checke
         starts,
         records: counts.records as usize,
     })
+}
+
+fn words_of<const WIDTH: usize>(bytes: &[u8], read: fn([u8; WIDTH]) -> u32) -> Vec<u32> {
+    bytes
+        .as_chunks::<WIDTH>()
+        .0
+        .iter()
+        .map(|&word| read(word))
+        .collect()
+}
+
+fn check_rules(source: &Source, section: usize, layout: &Layout) -> Result<(), Error> {
+    let counts = layout.counts;
+    if counts.rule_groups == 0 {
+        return Ok(());
+    }
+    let invalid = || source.broken("the derivation rules of the features are not valid");
+    let groups = counts.rule_groups as usize;
+    let entry_count = counts.rule_entries as usize;
+    let group_of_template = words_of::<2>(
+        &read_range(source, section, &layout.template_groups)?,
+        |word| u32::from(u16::from_le_bytes(word)),
+    );
+    if group_of_template
+        .iter()
+        .any(|&group| group as usize > groups)
+    {
+        return Err(invalid());
+    }
+    let starts = words_of::<4>(
+        &read_range(source, section, &layout.group_starts)?,
+        u32::from_le_bytes,
+    );
+    let starts_are_valid = starts.len() == groups + 1
+        && starts.first() == Some(&0)
+        && starts
+            .last()
+            .is_some_and(|&last| last as usize == entry_count)
+        && starts.windows(2).all(|pair| pair[0] < pair[1]);
+    if !starts_are_valid {
+        return Err(invalid());
+    }
+    let entries = words_of::<4>(
+        &read_range(source, section, &layout.rule_entries)?,
+        u32::from_le_bytes,
+    );
+    let rule_count = counts.rule_count;
+    for pair in starts.windows(2) {
+        let group = &entries[pair[0] as usize..pair[1] as usize];
+        let entry_is_valid = |&entry: &u32| {
+            char::from_u32(entry & RULE_CHAR_MASK).is_some() && entry >> RULE_CHAR_BITS < rule_count
+        };
+        let ascending = group
+            .windows(2)
+            .all(|pair| pair[0] & RULE_CHAR_MASK < pair[1] & RULE_CHAR_MASK);
+        if !group.iter().all(entry_is_valid) || !ascending {
+            return Err(invalid());
+        }
+    }
+    let rules = read_range(source, section, &layout.rules)?;
+    let rules = &rules[..RULE_BYTES * counts.rule_count as usize];
+    for rule in rules.as_chunks::<RULE_BYTES>().0 {
+        let length = usize::from(rule[1]);
+        let suffix_end = RULE_HEADER_BYTES + length;
+        let is_valid = length <= MAX_RULE_SUFFIX
+            && rule[suffix_end..].iter().all(|&byte| byte == 0)
+            && str::from_utf8(&rule[RULE_HEADER_BYTES..suffix_end]).is_ok();
+        if !is_valid {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 fn check_pieces(source: &Source, section: usize, layout: &Layout) -> Result<(), Error> {

@@ -13,6 +13,7 @@ pub(super) const OP_INLINE: u8 = 0x03;
 pub(super) const OP_KEY: u8 = 0x04;
 pub(super) const OP_BLOB: u8 = 0x05;
 pub(super) const OP_BLOB_NEXT: u8 = 0x06;
+pub(super) const OP_DERIVE: u8 = 0x07;
 pub(super) const OP_COPY: u8 = 0x10;
 pub(super) const OP_NUM: u8 = 0x20;
 pub(super) const OP_HIGH: u8 = 0x30;
@@ -20,11 +21,18 @@ pub(super) const OP_NUMB: u8 = 0x40;
 pub(super) const MAX_SLOTS: usize = 16;
 pub(super) const MAX_NUMERIC: usize = 4;
 pub(super) const SPEC_BYTES: usize = 16;
-pub(super) const HEADER_BYTES: usize = 88;
+pub(super) const HEADER_BYTES: usize = 104;
 pub(super) const MAX_BLOB_FIELDS: usize = 4;
 pub(super) const MAX_ID_BYTES: usize = 4;
 pub(super) const SYNC_EVERY: usize = 4096;
 pub(super) const BLOB_SYNC_EVERY: usize = 1024;
+pub(super) const RULE_BYTES: usize = 16;
+pub(super) const RULE_HEADER_BYTES: usize = 2;
+pub(super) const MAX_RULE_SUFFIX: usize = RULE_BYTES - RULE_HEADER_BYTES;
+pub(super) const RULE_CHAR_BITS: u32 = 21;
+pub(super) const RULE_CHAR_MASK: u32 = (1 << RULE_CHAR_BITS) - 1;
+pub(super) const MAX_RULES: usize = 1 << (32 - RULE_CHAR_BITS);
+pub(super) const NO_RULE: usize = usize::MAX >> 4;
 pub(super) const RECORD_PADDING: usize = 16;
 pub(super) const SLACK: usize = 16;
 pub(super) const OP_COPY_MAX: u8 = OP_NUM - 1;
@@ -61,6 +69,9 @@ pub(super) struct Counts {
     pub(super) strings: u64,
     pub(super) blob_bytes: u64,
     pub(super) blob_entries: u32,
+    pub(super) rule_groups: u32,
+    pub(super) rule_entries: u32,
+    pub(super) rule_count: u32,
     pub(super) blob_fields: u32,
     pub(super) blob_number: u32,
     pub(super) id_bytes: u32,
@@ -86,6 +97,18 @@ impl Counts {
     }
 }
 
+impl Counts {
+    fn rules_are_consistent(&self) -> bool {
+        if self.rule_groups == 0 {
+            return self.rule_entries == 0 && self.rule_count == 0;
+        }
+        self.rule_count as usize <= MAX_RULES
+            && self.rule_groups <= self.rule_entries
+            && self.rule_count >= 1
+            && self.rule_groups <= u32::from(u16::MAX)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct Layout {
     pub(super) counts: Counts,
@@ -106,6 +129,10 @@ pub(super) struct Layout {
     pub(super) strings: Range<usize>,
     pub(super) blob_sync: Range<usize>,
     pub(super) blob: Range<usize>,
+    pub(super) template_groups: Range<usize>,
+    pub(super) group_starts: Range<usize>,
+    pub(super) rule_entries: Range<usize>,
+    pub(super) rules: Range<usize>,
     pub(super) records: Range<usize>,
 }
 
@@ -143,6 +170,18 @@ impl Layout {
             strings: take(counts.strings.checked_add(SLACK as u64)?)?,
             blob_sync: take(4 * blob_sync_count)?,
             blob: take(counts.blob_bytes.checked_add(SLACK as u64)?)?,
+            template_groups: take(if counts.rule_groups == 0 {
+                0
+            } else {
+                2 * u64::from(counts.templates)
+            })?,
+            group_starts: take(if counts.rule_groups == 0 {
+                0
+            } else {
+                4 * (u64::from(counts.rule_groups) + 1)
+            })?,
+            rule_entries: take(4 * u64::from(counts.rule_entries))?,
+            rules: take(RULE_BYTES as u64 * u64::from(counts.rule_count) + SLACK as u64)?,
             records: take(counts.records.checked_add(RECORD_PADDING as u64)?)?,
         };
         Some(layout)
@@ -177,6 +216,9 @@ impl Layout {
         header[82] = counts.id_bytes as u8;
         header[83] = self.blob_bits as u8;
         header[84..88].copy_from_slice(&counts.blob_entries.to_le_bytes());
+        header[88..92].copy_from_slice(&counts.rule_groups.to_le_bytes());
+        header[92..96].copy_from_slice(&counts.rule_entries.to_le_bytes());
+        header[96..100].copy_from_slice(&counts.rule_count.to_le_bytes());
         header
     }
 
@@ -200,6 +242,9 @@ impl Layout {
             record_count: u32_at(48),
             blob_bytes: u64_at(72),
             blob_entries: u32_at(84),
+            rule_groups: u32_at(88),
+            rule_entries: u32_at(92),
+            rule_count: u32_at(96),
             blob_fields: u32::from(header[80]),
             blob_number: u32::from(header[81]),
             id_bytes: u32::from(header[82]),
@@ -213,7 +258,9 @@ impl Layout {
             || counts.chars as usize > chars::MAX_CHARS
             || counts.blob_bytes >= LENGTH_LIMIT
             || header[55] != 0
+            || header[100..HEADER_BYTES] != [0; HEADER_BYTES - 100]
             || !counts.blob_is_consistent()
+            || !counts.rules_are_consistent()
         {
             return None;
         }
@@ -247,6 +294,10 @@ impl Layout {
             strings: shift(&self.strings),
             blob_sync: shift(&self.blob_sync),
             blob: shift(&self.blob),
+            template_groups: shift(&self.template_groups),
+            group_starts: shift(&self.group_starts),
+            rule_entries: shift(&self.rule_entries),
+            rules: shift(&self.rules),
             records: shift(&self.records),
             ..self.clone()
         }
@@ -531,6 +582,15 @@ mod access {
     }
 
     #[inline(always)]
+    pub(super) fn u16_at<const TRUSTED: bool>(bytes: &[u8], at: usize) -> usize {
+        if TRUSTED {
+            u16::from_le(unsafe { bytes.as_ptr().add(at).cast::<u16>().read_unaligned() }) as usize
+        } else {
+            u16::from_le_bytes(bytes[at..at + 2].try_into().expect("two bytes")) as usize
+        }
+    }
+
+    #[inline(always)]
     pub(super) fn u32_at<const TRUSTED: bool>(bytes: &[u8], at: usize) -> usize {
         if TRUSTED {
             u32::from_le(unsafe { bytes.as_ptr().add(at).cast::<u32>().read_unaligned() }) as usize
@@ -563,6 +623,10 @@ pub(crate) struct FeatureView<'a> {
     pub(super) chars: &'a [u8],
     pub(super) strings: &'a [u8],
     pub(super) blob: &'a [u8],
+    pub(super) template_groups: &'a [u8],
+    pub(super) group_starts: &'a [u8],
+    pub(super) rule_entries: &'a [u8],
+    pub(super) rules: &'a [u8],
     pub(super) records: &'a [u8],
     pub(super) specs: &'a [NumSpec],
     pub(super) template_bits: u32,
@@ -579,7 +643,8 @@ unsafe fn text_of(bytes: &[u8]) -> &str {
 
 const IN_RECORD: usize = 1 << 62;
 const IN_BLOB: usize = 1 << 61;
-const REGION_FLAGS: usize = IN_RECORD | IN_BLOB;
+const IN_DERIVED: usize = 1 << 60;
+const REGION_FLAGS: usize = IN_RECORD | IN_BLOB | IN_DERIVED;
 
 impl FeatureView<'_> {
     #[inline(always)]
@@ -677,12 +742,25 @@ impl FeatureView<'_> {
                     let codes = access::range::<TRUSTED>(self.blob, start..start + length);
                     unsafe { sink.put_coded(self.chars, codes)? };
                 }
+                OP_DERIVE => {
+                    let (rule, keep) = self.derive::<TRUSTED>(template, key);
+                    if slot_count < MAX_SLOTS {
+                        slots[slot_count] = (rule | IN_DERIVED, keep);
+                        slot_count += 1;
+                    }
+                    unsafe { self.put_derived::<TRUSTED, S>(sink, key, rule, keep)? };
+                }
                 OP_COPY..=OP_COPY_MAX => {
                     let (start, length) = slots[usize::from(op - OP_COPY)];
                     let region = match start & REGION_FLAGS {
                         0 => self.strings,
                         IN_RECORD => record,
-                        _ => self.blob,
+                        IN_BLOB => self.blob,
+                        _ => {
+                            let rule = start & !REGION_FLAGS;
+                            unsafe { self.put_derived::<TRUSTED, S>(sink, key, rule, length)? };
+                            continue;
+                        }
                     };
                     let start = start & !REGION_FLAGS;
                     let codes = access::range::<TRUSTED>(region, start..start + length);
@@ -718,6 +796,66 @@ impl FeatureView<'_> {
         }
         unsafe { self.put_piece::<TRUSTED, S>(sink, entry_bit, ops.len())? };
         Ok(())
+    }
+
+    #[inline(always)]
+    fn derive<const TRUSTED: bool>(&self, template: usize, key: &str) -> (usize, usize) {
+        const NONE: (usize, usize) = (NO_RULE, 0);
+        if self.template_groups.is_empty() {
+            return NONE;
+        }
+        let Some(last) = key.chars().next_back() else {
+            return NONE;
+        };
+        let group = access::u16_at::<TRUSTED>(self.template_groups, 2 * template);
+        if group == 0 {
+            return NONE;
+        }
+        let mut low = access::u32_at::<TRUSTED>(self.group_starts, 4 * (group - 1));
+        let mut high = access::u32_at::<TRUSTED>(self.group_starts, 4 * group);
+        let wanted = last as u32;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let entry = access::u32_at::<TRUSTED>(self.rule_entries, 4 * middle) as u32;
+            let found = entry & RULE_CHAR_MASK;
+            if found == wanted {
+                let rule = (entry >> RULE_CHAR_BITS) as usize;
+                let removed =
+                    access::range::<TRUSTED>(self.rules, rule * RULE_BYTES..rule * RULE_BYTES + 1)
+                        [0];
+                let mut keep = key.len();
+                for _ in 0..removed {
+                    match key[..keep].chars().next_back() {
+                        Some(ch) => keep -= ch.len_utf8(),
+                        None => break,
+                    }
+                }
+                return (rule, keep);
+            }
+            if found < wanted {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        NONE
+    }
+
+    #[inline(always)]
+    unsafe fn put_derived<const TRUSTED: bool, S: Sink + ?Sized>(
+        &self,
+        sink: &mut S,
+        key: &str,
+        rule: usize,
+        keep: usize,
+    ) -> fmt::Result {
+        if rule == NO_RULE {
+            return Ok(());
+        }
+        sink.put(&key[..keep])?;
+        let at = rule * RULE_BYTES;
+        let length = usize::from(access::range::<TRUSTED>(self.rules, at + 1..at + 2)[0]);
+        unsafe { sink.put_region(self.rules, at + RULE_HEADER_BYTES, length) }
     }
 
     #[inline(always)]

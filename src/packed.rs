@@ -18,7 +18,7 @@ pub use reader::{Hit, PackedDictionary, PackedView, TokenRecord};
 pub use transport::{expand, write_transport};
 
 pub(crate) const MAGIC: &[u8; 8] = b"MRDPACK1";
-pub(crate) const VERSION: u32 = 7;
+pub(crate) const VERSION: u32 = 8;
 pub(crate) const FLAG_HOT_MATRIX: u32 = 2;
 pub(crate) const FLAG_INT_TEMPLATES: u32 = 4;
 pub(crate) const HEADER_BYTES: usize = 40 + 16 * SECTIONS;
