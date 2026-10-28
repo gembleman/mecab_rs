@@ -11,6 +11,8 @@ use crate::mapped_bytes::MappedBytes;
 
 const SPACE_CODE: u32 = 0x20;
 const FOUR_BYTE_LEAD: u8 = 0xf0;
+const CONTINUATION_MASK: u8 = 0xc0;
+const CONTINUATION_TAG: u8 = 0x80;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CharInfo(u32);
@@ -86,10 +88,18 @@ impl SentenceChars {
             width: 1,
             ..Entry::default()
         };
+        debug_assert!(std::str::from_utf8(text).is_ok());
         for position in (0..length).rev() {
+            if text[position] & CONTINUATION_MASK == CONTINUATION_TAG {
+                #[cfg(debug_assertions)]
+                {
+                    self.entries[position] = Entry::default();
+                }
+                continue;
+            }
             let (code, single) = decode_utf8(text, position, length - position);
             let class = chars.class_of_table_code(table, code);
-            let following = self.entries[position + single];
+            let following = *self.entry(position + single);
             let width = single as u32
                 + if following.extender {
                     following.width
@@ -97,7 +107,7 @@ impl SentenceChars {
                     0
                 };
             let next = position + width as usize;
-            let after = self.entries[next];
+            let after = *self.entry(next);
             let (chain_end, chain_count, chain_last) =
                 if next < length && class.info.is_kind_of(after.info) {
                     (after.chain_end, after.chain_count + 1, after.chain_last)
@@ -116,8 +126,15 @@ impl SentenceChars {
         }
     }
 
-    pub(crate) fn char_info(&self, position: usize) -> (CharInfo, usize) {
+    #[inline]
+    fn entry(&self, position: usize) -> &Entry {
         let entry = &self.entries[position];
+        debug_assert!(entry.single != 0, "entry read at a continuation byte");
+        entry
+    }
+
+    pub(crate) fn char_info(&self, position: usize) -> (CharInfo, usize) {
+        let entry = self.entry(position);
         (entry.info, entry.width as usize)
     }
 
@@ -126,7 +143,7 @@ impl SentenceChars {
         if begin >= length {
             return (begin, Scan::default());
         }
-        let entry = &self.entries[begin];
+        let entry = self.entry(begin);
         if !start.is_kind_of(entry.info) {
             let scan = Scan {
                 info: entry.info,
@@ -136,11 +153,11 @@ impl SentenceChars {
             return (begin, scan);
         }
         let chain_end = entry.chain_end as usize;
-        let described = &self.entries[if chain_end < length {
+        let described = self.entry(if chain_end < length {
             chain_end
         } else {
             entry.chain_last as usize
-        }];
+        });
         let scan = Scan {
             info: described.info,
             width: described.width as usize,
@@ -155,7 +172,7 @@ impl SentenceChars {
         let mut current = space;
         let mut scan = Scan::default();
         while position < length {
-            let entry = &self.entries[position];
+            let entry = self.entry(position);
             scan.info = entry.info;
             scan.width = entry.width as usize;
             if !current.is_kind_of(entry.info) {
@@ -174,6 +191,7 @@ pub(crate) struct CharProperty {
     category_count: usize,
     palette: Vec<Class>,
     table_start: usize,
+    space: CharInfo,
 }
 
 impl CharProperty {
@@ -235,11 +253,13 @@ impl CharProperty {
         {
             return Err(broken("a code point of the BMP is an extender"));
         }
+        let space = palette[usize::from(table[SPACE_CODE as usize])].info;
         Ok(Self {
             map,
             category_count,
             palette,
             table_start,
+            space,
         })
     }
 
@@ -282,8 +302,9 @@ impl CharProperty {
             .expect("the character table is inside the validated map")
     }
 
+    #[inline]
     pub(crate) fn space(&self) -> CharInfo {
-        self.class_of_code(SPACE_CODE).info
+        self.space
     }
 
     fn code_class(&self, text: &[u8], begin: usize, end: usize) -> (Class, usize) {
@@ -358,6 +379,7 @@ impl CharProperty {
     }
 }
 
+#[inline]
 fn decode_utf8(text: &[u8], begin: usize, available: usize) -> (u32, usize) {
     let byte = |offset: usize| text.get(begin + offset).copied().unwrap_or(0);
     let first = byte(0);
