@@ -516,11 +516,14 @@ impl PackedDictionary {
             lo: part(&layout.lo),
             chars: part(&layout.chars),
             strings: part(&layout.strings),
+            blob: part(&layout.blob),
             records: part(&layout.records),
             specs: &self.numbers,
             template_bits: layout.template_bits,
             shape_bits: layout.shape_bits,
             ref_bits: layout.ref_bits,
+            blob_bits: layout.blob_bits,
+            id_bytes: layout.counts.id_bytes as usize,
         }
     }
 

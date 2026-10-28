@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 
 use super::{
-    BitWriter, Counts, Layout, MAX_NUMERIC, MAX_SLOTS, NumSpec, OP_COPY, OP_EMPTY, OP_HIGH,
-    OP_INLINE, OP_KEY, OP_NUM, OP_NUM_MAX, OP_REF, OP_STAR, SYNC_EVERY, bits_for, chars,
+    BLOB_SYNC_EVERY, BitWriter, Counts, Layout, MAX_BLOB_FIELDS, MAX_ID_BYTES, MAX_NUMERIC,
+    MAX_SLOTS, NumSpec, OP_BLOB, OP_BLOB_NEXT, OP_COPY, OP_EMPTY, OP_HIGH, OP_INLINE, OP_KEY,
+    OP_NUM, OP_NUM_MAX, OP_NUMB, OP_NUMB_MAX, OP_REF, OP_STAR, SYNC_EVERY, bits_for, chars,
     push_piece,
 };
 use crate::Error;
@@ -287,20 +288,168 @@ struct Stored {
     low_table: Vec<u64>,
 }
 
+struct Blob<'a> {
+    number: usize,
+    fields: Vec<usize>,
+    id_bytes: usize,
+    entries: Vec<(u64, Vec<&'a [u8]>)>,
+    eligible: Vec<bool>,
+}
+
+impl Blob<'_> {
+    fn slot(&self, entry: usize, field: usize) -> Option<usize> {
+        if self.eligible[entry] {
+            self.fields.iter().position(|&candidate| candidate == field)
+        } else {
+            None
+        }
+    }
+
+    fn entry_of(&self, id: u64) -> usize {
+        self.entries
+            .binary_search_by_key(&id, |&(entry_id, _)| entry_id)
+            .expect("every id is in the blob")
+    }
+}
+
+fn blob_for_number<'a>(
+    entries: &[&'a [u8]],
+    field_counts: &[u16],
+    classes: &[Class],
+    stored: &[Stored],
+    ids: &[u64],
+    number: usize,
+) -> Option<Blob<'a>> {
+    let number_field = stored[number].field;
+    let spec = stored[number].spec;
+    let shift_ok = spec.shift > 0 && (1..=8 * MAX_ID_BYTES as u32).contains(&(spec.hi_bits));
+    if !shift_ok {
+        return None;
+    }
+    let texts: Vec<usize> = (0..classes.len())
+        .filter(|&field| classes[field] == Class::Text && field != number_field)
+        .collect();
+    let mut maps: Vec<Option<SmallKeyMap<u64, &[u8]>>> =
+        texts.iter().map(|_| Some(SmallKeyMap::default())).collect();
+    let mut fields = Vec::new();
+    for (entry, text) in entries.iter().enumerate() {
+        if usize::from(field_counts[entry]) <= number_field {
+            continue;
+        }
+        split_fields(text, &mut fields);
+        for (slot, &field) in texts.iter().enumerate() {
+            let (Some(map), Some(&(begin, end))) = (maps[slot].as_mut(), fields.get(field)) else {
+                continue;
+            };
+            let value = &text[begin..end];
+            if *map.entry(ids[entry]).or_insert(value) != value {
+                maps[slot] = None;
+            }
+        }
+    }
+    let chosen: Vec<usize> = texts
+        .iter()
+        .zip(&maps)
+        .filter(|(_, map)| map.as_ref().is_some_and(|map| !map.is_empty()))
+        .map(|(&field, _)| field)
+        .take(MAX_BLOB_FIELDS)
+        .collect();
+    drop(maps);
+    let first = *chosen.first()?;
+    if first >= number_field {
+        return None;
+    }
+    let last = number_field.max(*chosen.last()?);
+    let eligible: Vec<bool> = field_counts
+        .iter()
+        .map(|&count| usize::from(count) > last)
+        .collect();
+    let mut known: SmallKeyMap<u64, Vec<&[u8]>> = SmallKeyMap::default();
+    let mut eligible_count = 0usize;
+    for (entry, text) in entries.iter().enumerate() {
+        if !eligible[entry] {
+            continue;
+        }
+        eligible_count += 1;
+        let id = ids[entry];
+        if known.contains_key(&id) {
+            continue;
+        }
+        split_fields(text, &mut fields);
+        known.insert(
+            id,
+            chosen
+                .iter()
+                .map(|&field| &text[fields[field].0..fields[field].1])
+                .collect(),
+        );
+    }
+    if known.len() * 2 > eligible_count {
+        return None;
+    }
+    let mut blob_entries: Vec<(u64, Vec<&[u8]>)> = known.into_iter().collect();
+    blob_entries.sort_unstable_by_key(|&(id, _)| id);
+    Some(Blob {
+        number,
+        fields: chosen,
+        id_bytes: spec.hi_bits.div_ceil(8) as usize,
+        entries: blob_entries,
+        eligible,
+    })
+}
+
+fn plan_blob<'a>(
+    entries: &[&'a [u8]],
+    field_counts: &[u16],
+    classes: &[Class],
+    stored: &[Stored],
+    stored_values: &[usize],
+    values: &[Vec<u64>],
+) -> Option<Blob<'a>> {
+    let mut best: Option<Blob<'a>> = None;
+    for number in 0..stored.len() {
+        let shift = stored[number].spec.shift;
+        let ids: Vec<u64> = values[stored_values[number]]
+            .iter()
+            .map(|&value| value >> shift)
+            .collect();
+        let found = blob_for_number(entries, field_counts, classes, stored, &ids, number);
+        if let Some(found) = found
+            && best
+                .as_ref()
+                .is_none_or(|best| found.fields.len() > best.fields.len())
+        {
+            best = Some(found);
+        }
+    }
+    best
+}
+
 struct Recoded {
     table: Vec<u64>,
     area: Vec<u8>,
     references: Vec<u32>,
     inline: Vec<Vec<u8>>,
+    blob: Vec<u8>,
+    blob_starts: Vec<u32>,
 }
 
 fn text_of(bytes: &[u8]) -> Result<&str, Error> {
     std::str::from_utf8(bytes).map_err(|_| Error::Unsupported("feature text that is not UTF-8"))
 }
 
-fn char_ranks(area: &[u8], inline: &[&[u8]]) -> Result<Vec<char>, Error> {
+fn char_ranks(area: &[u8], inline: &[&[u8]], blob: Option<&Blob>) -> Result<Vec<char>, Error> {
     let mut counts: HashMap<char, u64> = HashMap::new();
-    for bytes in area.split(|&byte| byte == 0).chain(inline.iter().copied()) {
+    let blob_texts = blob.into_iter().flat_map(|blob| {
+        blob.entries
+            .iter()
+            .flat_map(|(_, texts)| texts.iter().copied())
+    });
+    for bytes in area
+        .split(|&byte| byte == 0)
+        .chain(inline.iter().copied())
+        .chain(blob_texts)
+    {
         for ch in text_of(bytes)?.chars() {
             *counts.entry(ch).or_insert(0) += 1;
         }
@@ -322,8 +471,13 @@ fn code_text(text: &[u8], rank_of: &HashMap<char, usize>, out: &mut Vec<u8>) -> 
     Ok(())
 }
 
-fn recode(area: &[u8], references: &[u32], inline: &[&[u8]]) -> Result<Recoded, Error> {
-    let ranked = char_ranks(area, inline)?;
+fn recode(
+    area: &[u8],
+    references: &[u32],
+    inline: &[&[u8]],
+    blob: Option<&Blob>,
+) -> Result<Recoded, Error> {
+    let ranked = char_ranks(area, inline, blob)?;
     let rank_of: HashMap<char, usize> = ranked
         .iter()
         .enumerate()
@@ -359,11 +513,31 @@ fn recode(area: &[u8], references: &[u32], inline: &[&[u8]]) -> Result<Recoded, 
         code_text(text, &rank_of, &mut codes)?;
         coded_inline.push(codes);
     }
+    let mut coded_blob: Vec<u8> = Vec::new();
+    let mut blob_starts: Vec<u32> = Vec::new();
+    if let Some(blob) = blob {
+        for (id, texts) in &blob.entries {
+            blob_starts.push(
+                u32::try_from(coded_blob.len())
+                    .map_err(|_| Error::Unsupported("feature strings of more than 4 GiB"))?,
+            );
+            coded_blob.extend_from_slice(&id.to_le_bytes()[..blob.id_bytes]);
+            for text in texts {
+                code_text(text, &rank_of, &mut coded_blob)?;
+                coded_blob.push(0);
+            }
+        }
+    }
+    if coded_blob.len() > u32::MAX as usize {
+        return Err(Error::Unsupported("feature strings of more than 4 GiB"));
+    }
     Ok(Recoded {
         table: ranked.into_iter().map(chars::entry_of).collect(),
         area: coded_area,
         references,
         inline: coded_inline,
+        blob: coded_blob,
+        blob_starts,
     })
 }
 
@@ -490,6 +664,22 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         stored_values.push(slot);
     }
 
+    let blob = plan_blob(
+        &entries,
+        &field_counts,
+        &classes,
+        &stored,
+        &stored_values,
+        &values,
+    );
+    let blob_slot = |entry: usize, field: usize| -> Option<usize> {
+        blob.as_ref().and_then(|blob| blob.slot(entry, field))
+    };
+    let blob_id = |entry: usize| -> u64 {
+        let blob = blob.as_ref().expect("a blob field needs a blob");
+        values[stored_values[blob.number]][entry] >> stored[blob.number].spec.shift
+    };
+
     let mut variants: Vec<(usize, &[u8])> = Vec::new();
     let mut variant_of: SmallKeyMap<(u32, &[u8]), u32> = SmallKeyMap::default();
     let mut starts_of: Vec<u32> = Vec::with_capacity(tokens.len());
@@ -501,7 +691,9 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         let key = key.as_bytes();
         split_fields(text, &mut fields);
         let keyed = fields.iter().enumerate().any(|(field, &(begin, end))| {
-            classes[field] == Class::Text && is_key(&text[begin..end], key)
+            classes[field] == Class::Text
+                && blob_slot(entry, field).is_none()
+                && is_key(&text[begin..end], key)
         });
         let key: &[u8] = if keyed { key } else { b"" };
         let next = variants.len() as u32;
@@ -522,6 +714,12 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         for (field, &(begin, end)) in fields.iter().enumerate() {
             if classes[field] == Class::Text {
                 let value = &text[begin..end];
+                if blob_slot(entry, field).is_some() {
+                    if slots.len() < MAX_SLOTS {
+                        slots.push(value);
+                    }
+                    continue;
+                }
                 if is_key(value, key) {
                     continue;
                 }
@@ -543,6 +741,7 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
     let mut references: Vec<u32> = Vec::new();
     let mut inline: Vec<&[u8]> = Vec::new();
     let mut numbers: Vec<(u64, u32)> = Vec::new();
+    let mut blob_ids: Vec<u64> = Vec::new();
     let mut program: Vec<u8> = Vec::new();
     let mut piece: Vec<u8> = Vec::new();
     let mut ops: Vec<u8> = Vec::new();
@@ -566,6 +765,17 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
             piece.clear();
             match classes[field] {
                 Class::Folded => {}
+                Class::Text if blob_slot(entry, field).is_some() => {
+                    if slots.len() < MAX_SLOTS {
+                        slots.push(value);
+                    }
+                    if blob_slot(entry, field) == Some(0) {
+                        ops.push(OP_BLOB);
+                        blob_ids.push(blob_id(entry));
+                    } else {
+                        ops.push(OP_BLOB_NEXT);
+                    }
+                }
                 Class::Text if is_key(value, key) => ops.push(OP_KEY),
                 Class::Text => match text_op(value, &mut slots) {
                     TextOp::Star => ops.push(OP_STAR),
@@ -587,7 +797,10 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
                     }
                 },
                 Class::Number(number) => {
-                    ops.push(OP_NUM + number as u8);
+                    let from_blob = blob
+                        .as_ref()
+                        .is_some_and(|blob| blob.number == number && blob.eligible[entry]);
+                    ops.push(if from_blob { OP_NUMB } else { OP_NUM } + number as u8);
                     let spec = &stored[number];
                     let value = values[stored_values[number]][entry];
                     let low = value & ((1u64 << spec.spec.shift) - 1);
@@ -610,7 +823,7 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
     drop(values);
     drop(known_strings);
     drop(string_uses);
-    let recoded = recode(&area, &references, &inline)?;
+    let recoded = recode(&area, &references, &inline, blob.as_ref())?;
     let (area, references, inline) = (recoded.area, recoded.references, recoded.inline);
     if area.len() > u32::MAX as usize {
         return Err(Error::Unsupported("feature strings of more than 4 GiB"));
@@ -619,9 +832,17 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
     let template_bits = bits_for(template_list.len() as u64);
     let shape_bits = bits_for(shape_list.len() as u64);
     let ref_bits = bits_for(area.len() as u64);
+    let blob_bits = bits_for(recoded.blob.len() as u64);
+    let blob_offsets: Vec<u32> = blob_ids
+        .iter()
+        .map(|&id| {
+            let blob = blob.as_ref().expect("a blob id needs a blob");
+            recoded.blob_starts[blob.entry_of(id)]
+        })
+        .collect();
     let mut writer = BitWriter::default();
     let mut starts: Vec<u32> = Vec::with_capacity(variants.len());
-    let (mut next_reference, mut next_inline, mut next_number) = (0, 0, 0);
+    let (mut next_reference, mut next_inline, mut next_number, mut next_blob) = (0, 0, 0, 0);
     for entry in 0..variants.len() {
         let start = writer.bytes.len();
         starts.push(
@@ -639,6 +860,16 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
                 OP_INLINE => {
                     writer.put_bytes(&inline[next_inline]);
                     next_inline += 1;
+                }
+                OP_BLOB => {
+                    writer.put(u64::from(blob_offsets[next_blob]), blob_bits);
+                    next_blob += 1;
+                }
+                OP_NUMB..=OP_NUMB_MAX => {
+                    let (_, index) = numbers[next_number];
+                    next_number += 1;
+                    let spec = &stored[usize::from(op - OP_NUMB)].spec;
+                    writer.put(u64::from(index), spec.lo_bits);
                 }
                 OP_NUM..=OP_NUM_MAX => {
                     let (high, index) = numbers[next_number];
@@ -690,6 +921,11 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         pool_bytes: pieces.pool.len() as u64,
         shape_bytes: shape_bytes.len() as u64,
         strings: area.len() as u64,
+        blob_bytes: recoded.blob.len() as u64,
+        blob_entries: recoded.blob_starts.len() as u32,
+        blob_fields: blob.as_ref().map_or(0, |blob| blob.fields.len() as u32),
+        blob_number: blob.as_ref().map_or(0, |blob| blob.number as u32),
+        id_bytes: blob.as_ref().map_or(0, |blob| blob.id_bytes as u32),
         records: records.len() as u64,
         record_count: variants.len() as u32,
     };
@@ -728,6 +964,14 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         .collect();
     put(&mut bytes, &layout.chars, &table_bytes);
     put(&mut bytes, &layout.strings, &area);
+    let blob_sync: Vec<u32> = recoded
+        .blob_starts
+        .iter()
+        .step_by(BLOB_SYNC_EVERY)
+        .copied()
+        .collect();
+    put(&mut bytes, &layout.blob_sync, &words(&blob_sync));
+    put(&mut bytes, &layout.blob, &recoded.blob);
     put(&mut bytes, &layout.records, &records);
     let starts = starts_of
         .iter()

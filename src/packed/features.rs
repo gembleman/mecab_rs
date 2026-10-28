@@ -11,19 +11,26 @@ pub(super) const OP_EMPTY: u8 = 0x01;
 pub(super) const OP_STAR: u8 = 0x02;
 pub(super) const OP_INLINE: u8 = 0x03;
 pub(super) const OP_KEY: u8 = 0x04;
+pub(super) const OP_BLOB: u8 = 0x05;
+pub(super) const OP_BLOB_NEXT: u8 = 0x06;
 pub(super) const OP_COPY: u8 = 0x10;
 pub(super) const OP_NUM: u8 = 0x20;
 pub(super) const OP_HIGH: u8 = 0x30;
+pub(super) const OP_NUMB: u8 = 0x40;
 pub(super) const MAX_SLOTS: usize = 16;
 pub(super) const MAX_NUMERIC: usize = 4;
 pub(super) const SPEC_BYTES: usize = 16;
-pub(super) const HEADER_BYTES: usize = 72;
+pub(super) const HEADER_BYTES: usize = 88;
+pub(super) const MAX_BLOB_FIELDS: usize = 4;
+pub(super) const MAX_ID_BYTES: usize = 4;
 pub(super) const SYNC_EVERY: usize = 4096;
+pub(super) const BLOB_SYNC_EVERY: usize = 1024;
 pub(super) const RECORD_PADDING: usize = 16;
 pub(super) const SLACK: usize = 16;
 pub(super) const OP_COPY_MAX: u8 = OP_NUM - 1;
 pub(super) const OP_NUM_MAX: u8 = OP_NUM + MAX_NUMERIC as u8 - 1;
 pub(super) const OP_HIGH_MAX: u8 = OP_HIGH + MAX_NUMERIC as u8 - 1;
+pub(super) const OP_NUMB_MAX: u8 = OP_NUMB + MAX_NUMERIC as u8 - 1;
 const LENGTH_LIMIT: u64 = 1 << 40;
 const MAX_DIGITS: usize = 20;
 
@@ -52,8 +59,31 @@ pub(super) struct Counts {
     pub(super) pool_bytes: u64,
     pub(super) shape_bytes: u64,
     pub(super) strings: u64,
+    pub(super) blob_bytes: u64,
+    pub(super) blob_entries: u32,
+    pub(super) blob_fields: u32,
+    pub(super) blob_number: u32,
+    pub(super) id_bytes: u32,
     pub(super) records: u64,
     pub(super) record_count: u32,
+}
+
+impl Counts {
+    fn blob_is_consistent(&self) -> bool {
+        if self.blob_fields == 0 {
+            return self.blob_bytes == 0
+                && self.blob_entries == 0
+                && self.blob_number == 0
+                && self.id_bytes == 0;
+        }
+        self.blob_fields as usize <= MAX_BLOB_FIELDS
+            && (self.blob_number as usize) < MAX_NUMERIC
+            && (1..=MAX_ID_BYTES as u32).contains(&self.id_bytes)
+            && self.blob_entries >= 1
+            && u64::from(self.blob_entries)
+                * (u64::from(self.id_bytes) + u64::from(self.blob_fields))
+                <= self.blob_bytes
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -62,6 +92,7 @@ pub(super) struct Layout {
     pub(super) template_bits: u32,
     pub(super) shape_bits: u32,
     pub(super) ref_bits: u32,
+    pub(super) blob_bits: u32,
     pub(super) positions: Range<usize>,
     pub(super) piece_offsets: Range<usize>,
     pub(super) pool: Range<usize>,
@@ -73,6 +104,8 @@ pub(super) struct Layout {
     pub(super) chars: Range<usize>,
     pub(super) sync: Range<usize>,
     pub(super) strings: Range<usize>,
+    pub(super) blob_sync: Range<usize>,
+    pub(super) blob: Range<usize>,
     pub(super) records: Range<usize>,
 }
 
@@ -86,11 +119,13 @@ impl Layout {
             Some(usize::try_from(start).ok()?..usize::try_from(end).ok()?)
         };
         let sync_count = (counts.record_count as usize).div_ceil(SYNC_EVERY) as u64;
+        let blob_sync_count = (counts.blob_entries as usize).div_ceil(BLOB_SYNC_EVERY) as u64;
         let layout = Self {
             counts,
             template_bits: bits_for(u64::from(counts.templates)),
             shape_bits: bits_for(u64::from(counts.shapes)),
             ref_bits: bits_for(counts.strings),
+            blob_bits: bits_for(counts.blob_bytes),
             positions: take(pieces::POSITION_BYTES as u64 * u64::from(counts.positions))?,
             piece_offsets: take(4 * (u64::from(counts.pieces) + 1))?,
             pool: take(counts.pool_bytes.checked_add(SLACK as u64)?)?,
@@ -106,6 +141,8 @@ impl Layout {
             chars: take(chars::ENTRY_BYTES as u64 * u64::from(counts.chars))?,
             sync: take(4 * sync_count)?,
             strings: take(counts.strings.checked_add(SLACK as u64)?)?,
+            blob_sync: take(4 * blob_sync_count)?,
+            blob: take(counts.blob_bytes.checked_add(SLACK as u64)?)?,
             records: take(counts.records.checked_add(RECORD_PADDING as u64)?)?,
         };
         Some(layout)
@@ -134,6 +171,12 @@ impl Layout {
         header[52] = self.template_bits as u8;
         header[53] = self.shape_bits as u8;
         header[54] = self.ref_bits as u8;
+        header[72..80].copy_from_slice(&counts.blob_bytes.to_le_bytes());
+        header[80] = counts.blob_fields as u8;
+        header[81] = counts.blob_number as u8;
+        header[82] = counts.id_bytes as u8;
+        header[83] = self.blob_bits as u8;
+        header[84..88].copy_from_slice(&counts.blob_entries.to_le_bytes());
         header
     }
 
@@ -155,6 +198,11 @@ impl Layout {
             strings: u64_at(32),
             records: u64_at(40),
             record_count: u32_at(48),
+            blob_bytes: u64_at(72),
+            blob_entries: u32_at(84),
+            blob_fields: u32::from(header[80]),
+            blob_number: u32::from(header[81]),
+            id_bytes: u32::from(header[82]),
         };
         if counts.numerics as usize > MAX_NUMERIC
             || counts.strings >= LENGTH_LIMIT
@@ -163,13 +211,20 @@ impl Layout {
             || counts.shape_bytes >= LENGTH_LIMIT
             || counts.records >= LENGTH_LIMIT
             || counts.chars as usize > chars::MAX_CHARS
+            || counts.blob_bytes >= LENGTH_LIMIT
             || header[55] != 0
+            || !counts.blob_is_consistent()
         {
             return None;
         }
         let layout = Self::new(counts)?;
-        let widths = [header[52], header[53], header[54]];
-        let expected = [layout.template_bits, layout.shape_bits, layout.ref_bits];
+        let widths = [header[52], header[53], header[54], header[83]];
+        let expected = [
+            layout.template_bits,
+            layout.shape_bits,
+            layout.ref_bits,
+            layout.blob_bits,
+        ];
         if widths.map(u32::from) != expected || layout.length() != length {
             return None;
         }
@@ -190,6 +245,8 @@ impl Layout {
             chars: shift(&self.chars),
             sync: shift(&self.sync),
             strings: shift(&self.strings),
+            blob_sync: shift(&self.blob_sync),
+            blob: shift(&self.blob),
             records: shift(&self.records),
             ..self.clone()
         }
@@ -505,11 +562,14 @@ pub(crate) struct FeatureView<'a> {
     pub(super) lo: &'a [u8],
     pub(super) chars: &'a [u8],
     pub(super) strings: &'a [u8],
+    pub(super) blob: &'a [u8],
     pub(super) records: &'a [u8],
     pub(super) specs: &'a [NumSpec],
     pub(super) template_bits: u32,
     pub(super) shape_bits: u32,
     pub(super) ref_bits: u32,
+    pub(super) blob_bits: u32,
+    pub(super) id_bytes: usize,
 }
 
 #[inline(always)]
@@ -518,6 +578,8 @@ unsafe fn text_of(bytes: &[u8]) -> &str {
 }
 
 const IN_RECORD: usize = 1 << 62;
+const IN_BLOB: usize = 1 << 61;
+const REGION_FLAGS: usize = IN_RECORD | IN_BLOB;
 
 impl FeatureView<'_> {
     #[inline(always)]
@@ -568,6 +630,8 @@ impl FeatureView<'_> {
         let mut slots = [(0usize, 0usize); MAX_SLOTS];
         let mut slot_count = 0;
         let mut highs = [0u64; MAX_NUMERIC];
+        let mut blob_at = 0usize;
+        let mut blob_next = 0usize;
         for (position, &op) in ops.iter().enumerate() {
             unsafe { self.put_piece::<TRUSTED, S>(sink, entry_bit, position)? };
             match op {
@@ -596,13 +660,31 @@ impl FeatureView<'_> {
                 OP_EMPTY => {}
                 OP_STAR => sink.put("*")?,
                 OP_KEY => sink.put(key)?,
+                OP_BLOB | OP_BLOB_NEXT => {
+                    if op == OP_BLOB {
+                        blob_at = read_small::<TRUSTED>(record, bit, self.blob_bits) as usize;
+                        bit += self.blob_bits as usize;
+                        blob_next = blob_at + self.id_bytes;
+                    }
+                    let start = blob_next;
+                    let tail = access::from::<TRUSTED>(self.blob, start);
+                    let length = find_byte(tail, 0);
+                    blob_next = start + length + 1;
+                    if slot_count < MAX_SLOTS {
+                        slots[slot_count] = (start | IN_BLOB, length);
+                        slot_count += 1;
+                    }
+                    let codes = access::range::<TRUSTED>(self.blob, start..start + length);
+                    unsafe { sink.put_coded(self.chars, codes)? };
+                }
                 OP_COPY..=OP_COPY_MAX => {
                     let (start, length) = slots[usize::from(op - OP_COPY)];
-                    let (region, start) = if start & IN_RECORD != 0 {
-                        (record, start & !IN_RECORD)
-                    } else {
-                        (self.strings, start)
+                    let region = match start & REGION_FLAGS {
+                        0 => self.strings,
+                        IN_RECORD => record,
+                        _ => self.blob,
                     };
+                    let start = start & !REGION_FLAGS;
                     let codes = access::range::<TRUSTED>(region, start..start + length);
                     unsafe { sink.put_coded(self.chars, codes)? };
                 }
@@ -611,6 +693,18 @@ impl FeatureView<'_> {
                     let spec = &self.specs[number];
                     let high = read_bits(record, bit, spec.hi_bits);
                     bit += spec.hi_bits as usize;
+                    let index = read_small::<TRUSTED>(record, bit, spec.lo_bits) as usize;
+                    bit += spec.lo_bits as usize;
+                    let low_at = 8 * (spec.lo_start as usize + index);
+                    let low = access::word::<TRUSTED>(self.lo, low_at);
+                    highs[number] = high;
+                    put_number(sink, high << spec.shift | low)?;
+                }
+                OP_NUMB..=OP_NUMB_MAX => {
+                    let number = usize::from(op - OP_NUMB);
+                    let spec = &self.specs[number];
+                    let id_mask = (1u64 << (8 * self.id_bytes)) - 1;
+                    let high = access::word::<TRUSTED>(self.blob, blob_at) & id_mask;
                     let index = read_small::<TRUSTED>(record, bit, spec.lo_bits) as usize;
                     bit += spec.lo_bits as usize;
                     let low_at = 8 * (spec.lo_start as usize + index);

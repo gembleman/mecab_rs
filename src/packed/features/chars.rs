@@ -1,7 +1,7 @@
 use std::fmt;
 
 pub(super) const SINGLE_CODES: usize = 127;
-const FIRST_LEAD: u8 = 0x80;
+pub(super) const FIRST_LEAD: u8 = 0x80;
 const LEAD_CODES: usize = 128;
 const SECOND_CODES: usize = 255;
 pub(super) const MAX_CHARS: usize = SINGLE_CODES + LEAD_CODES * SECOND_CODES;

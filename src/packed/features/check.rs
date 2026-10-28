@@ -4,9 +4,10 @@ use std::thread;
 use super::chars::{self, ENTRY_BYTES};
 use super::pieces::{POSITION_BYTES, Position};
 use super::{
-    HEADER_BYTES, Layout, MAX_NUMERIC, MAX_SLOTS, NumSpec, OP_COPY, OP_COPY_MAX, OP_EMPTY, OP_HIGH,
-    OP_HIGH_MAX, OP_INLINE, OP_KEY, OP_NUM, OP_NUM_MAX, OP_REF, OP_STAR, RECORD_PADDING,
-    SPEC_BYTES, SYNC_EVERY, find_byte, read_bits,
+    BLOB_SYNC_EVERY, HEADER_BYTES, Layout, MAX_NUMERIC, MAX_SLOTS, NumSpec, OP_BLOB, OP_BLOB_NEXT,
+    OP_COPY, OP_COPY_MAX, OP_EMPTY, OP_HIGH, OP_HIGH_MAX, OP_INLINE, OP_KEY, OP_NUM, OP_NUM_MAX,
+    OP_NUMB, OP_NUMB_MAX, OP_REF, OP_STAR, RECORD_PADDING, SPEC_BYTES, SYNC_EVERY, find_byte,
+    read_bits,
 };
 use crate::Error;
 use crate::packed::reader::Source;
@@ -17,6 +18,7 @@ const BOUNDARY_SCAN_BYTES: usize = 4096;
 const INITIAL_RECORD_WINDOW: usize = 128;
 const PARALLEL_MIN_BYTES: usize = 1 << 22;
 const PARALLEL_MIN_RECORDS: usize = 1 << 15;
+const PARALLEL_MIN_BLOB_BYTES: usize = 1 << 20;
 const MAX_THREADS: usize = 8;
 
 pub(in crate::packed) struct Checked {
@@ -141,6 +143,9 @@ struct Tables {
     operations: Vec<u32>,
     specs: Vec<NumSpec>,
     string_boundaries: Vec<u64>,
+    blob_starts: Vec<u64>,
+    blob_bytes: usize,
+    blob_bits: u32,
     strings: usize,
     chars: usize,
     ref_bits: u32,
@@ -170,6 +175,14 @@ pub(in crate::packed) fn check(source: &Source, section: usize) -> Result<Checke
         .collect::<Option<_>>()
         .ok_or_else(|| invalid("a number of the features is not specified correctly"))?;
 
+    let blob_is_valid = counts.blob_fields == 0
+        || specs
+            .get(counts.blob_number as usize)
+            .is_some_and(|spec| spec.hi_bits >= 1 && counts.id_bytes == spec.hi_bits.div_ceil(8));
+    if !blob_is_valid {
+        return Err(invalid("the lemma table of the features is not valid"));
+    }
+
     let table = read_range(source, section, &layout.chars)?;
     let table_is_valid = table
         .as_chunks::<ENTRY_BYTES>()
@@ -194,9 +207,23 @@ pub(in crate::packed) fn check(source: &Source, section: usize) -> Result<Checke
         let ops = &shape_bytes[pair[0]..pair[1]];
         let mut slots = 0usize;
         let mut numbers = 0u8;
+        let mut blob_seen = 0u32;
         for &op in ops {
             match op {
                 OP_REF | OP_INLINE => slots = (slots + 1).min(MAX_SLOTS),
+                OP_BLOB if blob_seen == 0 && counts.blob_fields > 0 => {
+                    blob_seen = 1;
+                    slots = (slots + 1).min(MAX_SLOTS);
+                }
+                OP_BLOB_NEXT if blob_seen > 0 && blob_seen < counts.blob_fields => {
+                    blob_seen += 1;
+                    slots = (slots + 1).min(MAX_SLOTS);
+                }
+                OP_NUMB..=OP_NUMB_MAX
+                    if blob_seen > 0 && u32::from(op - OP_NUMB) == counts.blob_number =>
+                {
+                    numbers |= 1 << (op - OP_NUMB);
+                }
                 OP_EMPTY | OP_STAR | OP_KEY => {}
                 OP_COPY..=OP_COPY_MAX if usize::from(op - OP_COPY) < slots => {}
                 OP_NUM..=OP_NUM_MAX if usize::from(op - OP_NUM) < specs.len() => {
@@ -218,12 +245,16 @@ pub(in crate::packed) fn check(source: &Source, section: usize) -> Result<Checke
     drop(shape_bytes);
 
     let string_boundaries = check_strings(source, section, &layout)?;
+    let blob_starts = check_blob(source, section, &layout, &specs)?;
     let tables = Tables {
         templates: counts.templates as usize,
         positions: counts.positions as usize,
         operations,
         specs: specs.clone(),
         string_boundaries,
+        blob_starts,
+        blob_bytes: counts.blob_bytes as usize,
+        blob_bits: layout.blob_bits,
         strings: counts.strings as usize,
         chars: counts.chars as usize,
         ref_bits: layout.ref_bits,
@@ -321,6 +352,152 @@ fn check_strings(source: &Source, section: usize, layout: &Layout) -> Result<Vec
         check_string_range(source, section, base, range, char_count, sink)
     })?;
     Ok(words)
+}
+
+enum Entry {
+    Complete(usize),
+    Short,
+    Invalid,
+}
+
+fn parse_blob_entry(bytes: &[u8], layout: &Layout, id_limit_bits: u32) -> Entry {
+    let counts = layout.counts;
+    let id_bytes = counts.id_bytes as usize;
+    let Some(id) = bytes.get(..id_bytes) else {
+        return Entry::Short;
+    };
+    let id = id
+        .iter()
+        .rev()
+        .fold(0u64, |value, &byte| value << 8 | u64::from(byte));
+    if id >> id_limit_bits != 0 {
+        return Entry::Invalid;
+    }
+    let mut at = id_bytes;
+    for _ in 0..counts.blob_fields {
+        loop {
+            match bytes.get(at) {
+                None => return Entry::Short,
+                Some(0) => {
+                    at += 1;
+                    break;
+                }
+                Some(&first) if first >= chars::FIRST_LEAD && at + 1 >= bytes.len() => {
+                    return Entry::Short;
+                }
+                Some(_) => match chars::rank_at(bytes, at) {
+                    Some((rank, next)) if rank < counts.chars as usize => at = next,
+                    _ => return Entry::Invalid,
+                },
+            }
+        }
+    }
+    Entry::Complete(at)
+}
+
+fn check_blob(
+    source: &Source,
+    section: usize,
+    layout: &Layout,
+    specs: &[NumSpec],
+) -> Result<Vec<u64>, Error> {
+    let length = layout.counts.blob_bytes as usize;
+    let entry_count = layout.counts.blob_entries as usize;
+    let mut words = vec![0u64; length / 64 + 2];
+    if length == 0 {
+        return Ok(words);
+    }
+    let invalid = || source.broken("the lemma table of the features is not valid");
+    let sync: Vec<usize> = read_range(source, section, &layout.blob_sync)?
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&word| u32::from_le_bytes(word) as usize)
+        .collect();
+    if sync.len() != entry_count.div_ceil(BLOB_SYNC_EVERY)
+        || sync.first() != Some(&0)
+        || sync.windows(2).any(|pair| pair[0] >= pair[1])
+        || sync.last().is_some_and(|&last| last >= length)
+    {
+        return Err(invalid());
+    }
+    let id_limit_bits = specs[layout.counts.blob_number as usize].hi_bits;
+    let threads = thread_count(length >= PARALLEL_MIN_BLOB_BYTES).min(sync.len());
+    let per_part = sync.len().div_ceil(threads);
+    let parts: Vec<(usize, usize)> = (0..threads)
+        .map(|number| (number * per_part, ((number + 1) * per_part).min(sync.len())))
+        .filter(|&(first, last)| first < last)
+        .collect();
+    let mut bounds: Vec<usize> = parts.iter().map(|&(first, _)| sync[first]).collect();
+    bounds.push(length);
+    let interval_end = |index: usize| sync.get(index + 1).copied().unwrap_or(length);
+    let interval_entries = |index: usize| {
+        if index + 1 == sync.len() {
+            entry_count - index * BLOB_SYNC_EVERY
+        } else {
+            BLOB_SYNC_EVERY
+        }
+    };
+    fill_bits(&mut words, &bounds, |number, _, sink| {
+        let (first, last) = parts[number];
+        (first..last).try_for_each(|index| {
+            check_blob_range(
+                source,
+                section,
+                layout,
+                id_limit_bits,
+                sync[index]..interval_end(index),
+                interval_entries(index),
+                sink,
+            )
+        })
+    })?;
+    Ok(words)
+}
+
+fn check_blob_range(
+    source: &Source,
+    section: usize,
+    layout: &Layout,
+    id_limit_bits: u32,
+    range: Range<usize>,
+    expected: usize,
+    sink: &mut BitSink,
+) -> Result<(), Error> {
+    let invalid = || source.broken("the lemma table of the features is not valid");
+    let base = layout.blob.start;
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut carry = 0;
+    let mut done = range.start;
+    let mut entries = 0;
+    while done < range.end {
+        let part = READ_CHUNK.min(range.end - done);
+        buffer.resize(carry + part, 0);
+        source.read(section, base + done, &mut buffer[carry..])?;
+        let origin = done - carry;
+        let mut at = 0;
+        while at < buffer.len() {
+            if entries == expected {
+                return Err(invalid());
+            }
+            match parse_blob_entry(&buffer[at..], layout, id_limit_bits) {
+                Entry::Complete(size) => {
+                    sink.set(origin + at, true);
+                    entries += 1;
+                    at += size;
+                }
+                Entry::Short => break,
+                Entry::Invalid => return Err(invalid()),
+            }
+        }
+        buffer.copy_within(at.., 0);
+        carry = buffer.len() - at;
+        done += part;
+    }
+    if carry != 0 || entries != expected {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn next_boundary(
@@ -519,6 +696,27 @@ fn parse_record(record: &[u8], tables: &Tables) -> Result<usize, Fail> {
                 {
                     return Err(Fail::Invalid(
                         "a feature record names a string that does not exist",
+                    ));
+                }
+            }
+            OP_BLOB => {
+                let target = read(bit, tables.blob_bits)? as usize;
+                bit += tables.blob_bits as usize;
+                if target >= tables.blob_bytes
+                    || tables.blob_starts[target >> 6] >> (target & 63) & 1 == 0
+                {
+                    return Err(Fail::Invalid(
+                        "a feature record names a lemma that does not exist",
+                    ));
+                }
+            }
+            OP_NUMB..=OP_NUMB_MAX => {
+                let spec = &tables.specs[usize::from(op - OP_NUMB)];
+                let index = read(bit, spec.lo_bits)?;
+                bit += spec.lo_bits as usize;
+                if index >= u64::from(spec.lo_count) {
+                    return Err(Fail::Invalid(
+                        "a feature record names a number part that does not exist",
                     ));
                 }
             }
