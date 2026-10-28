@@ -14,13 +14,19 @@ use crate::system_dictionary::{DictionaryKind, SystemDictionary, TokenRecord};
 const MAX_USER_DICTIONARIES: usize = u8::MAX as usize;
 const DEFAULT_MAX_GROUPING_SIZE: usize = 24;
 
-pub(crate) fn map_file(path: &Path) -> Result<Mmap, Error> {
-    let io_error = |source| Error::Io {
+pub(crate) fn map_open_file(file: &File, path: &Path) -> Result<Mmap, Error> {
+    unsafe { Mmap::map(file) }.map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
-    };
-    let file = File::open(path).map_err(io_error)?;
-    unsafe { Mmap::map(&file) }.map_err(io_error)
+    })
+}
+
+pub(crate) fn map_file(path: &Path) -> Result<Mmap, Error> {
+    let file = File::open(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    map_open_file(&file, path)
 }
 
 const _: () = assert!(cfg!(target_endian = "little"));
@@ -69,7 +75,7 @@ impl Dictionary {
         let (cache, expanded) = expand_cache::ensure(path, false)?;
         match PackedDictionary::open(&cache) {
             Ok(packed) => Self::open_packed(&cache, packed, user_dictionaries),
-            Err(_) if !expanded => {
+            Err(Error::Format { .. } | Error::Corrupt(_)) if !expanded => {
                 let (cache, _) = expand_cache::ensure(path, true)?;
                 Self::open_packed(&cache, PackedDictionary::open(&cache)?, user_dictionaries)
             }

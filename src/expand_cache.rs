@@ -3,14 +3,17 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::Error;
+use crate::packed::VERSION as MRD_VERSION;
 
 const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0];
 const IDENTITY_HEAD_BYTES: u64 = 4096;
 const IDENTITY_TAIL_BYTES: u64 = 64 << 10;
 const CONCURRENT_WRITER_WAIT: Duration = Duration::from_secs(2);
+const STALE_TEMPORARY_AGE: Duration = Duration::from_secs(3600);
+const MARKER_SUFFIX: &str = ".src";
 
 static EXPAND_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_TEMPORARY_NUMBER: AtomicUsize = AtomicUsize::new(0);
@@ -43,7 +46,7 @@ pub(crate) fn cache_path(xz: &Path) -> PathBuf {
 
 fn marker_path(cache: &Path) -> PathBuf {
     let mut name = cache.file_name().unwrap_or_default().to_os_string();
-    name.push(".src");
+    name.push(MARKER_SUFFIX);
     cache.with_file_name(name)
 }
 
@@ -96,8 +99,8 @@ fn identify(xz: &Path) -> Result<TransportIdentity, Error> {
 
 fn marker_text(identity: TransportIdentity, cache_length: u64) -> String {
     format!(
-        "mecab_rs transport cache 1\nsource_length={}\nsource_digest={:016x}\ncache_length={}\n",
-        identity.length, identity.head_tail_digest, cache_length
+        "mecab_rs transport cache 1\nmrd_version={}\nsource_length={}\nsource_digest={:016x}\ncache_length={}\n",
+        MRD_VERSION, identity.length, identity.head_tail_digest, cache_length
     )
 }
 
@@ -153,7 +156,10 @@ pub(crate) fn ensure(xz: &Path, force: bool) -> Result<(PathBuf, bool), Error> {
     if !force && is_fresh(&cache, &marker, identity) {
         return Ok((cache, false));
     }
-    let _ = fs::remove_file(&marker);
+    remove_stale_temporaries(&cache);
+    if force {
+        let _ = fs::remove_file(&marker);
+    }
     let temporary = temporary_path(&cache, "mrd");
     let expanded = expand(xz, &temporary).and_then(|()| flush_to_disk(&temporary));
     let length = match expanded {
@@ -163,20 +169,78 @@ pub(crate) fn ensure(xz: &Path, force: bool) -> Result<(PathBuf, bool), Error> {
             return Err(error);
         }
     };
-    if let Err(error) = fs::rename(&temporary, &cache).map_err(io_error(&cache)) {
-        let _ = fs::remove_file(&temporary);
-        if wait_until_fresh(&cache, &marker, identity) {
-            return Ok((cache, false));
+    let installed = install(&temporary, &cache, &marker, identity, length)?;
+    Ok((cache, installed))
+}
+
+fn install(
+    temporary: &Path,
+    cache: &Path,
+    marker: &Path,
+    identity: TransportIdentity,
+    length: u64,
+) -> Result<bool, Error> {
+    if let Err(error) = fs::rename(temporary, cache).map_err(io_error(cache)) {
+        let _ = fs::remove_file(temporary);
+        if wait_until_fresh(cache, marker, identity) {
+            return Ok(false);
         }
         return Err(error);
     }
     let text = marker_text(identity, length);
-    if let Err(error) = write_replacing(&marker, text.as_bytes())
-        && !is_fresh(&cache, &marker, identity)
+    if let Err(error) = write_replacing(marker, text.as_bytes())
+        && !is_fresh(cache, marker, identity)
     {
         return Err(error);
     }
-    Ok((cache, true))
+    Ok(true)
+}
+
+fn is_temporary_of(entry: &str, cache_name: &str) -> bool {
+    let after_name = entry
+        .strip_prefix("..")
+        .or_else(|| entry.strip_prefix('.'))
+        .and_then(|rest| rest.strip_prefix(cache_name));
+    let Some(rest) = after_name else {
+        return false;
+    };
+    let rest = rest.strip_prefix(MARKER_SUFFIX).unwrap_or(rest);
+    let mut parts = rest.strip_prefix('.').unwrap_or("").splitn(3, '.');
+    let is_number = |part: Option<&str>| {
+        part.is_some_and(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+    };
+    is_number(parts.next()) && is_number(parts.next()) && parts.next().is_some()
+}
+
+fn is_stale(path: &Path, now: SystemTime) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|modified| {
+            now.duration_since(modified)
+                .is_ok_and(|age| age >= STALE_TEMPORARY_AGE)
+        })
+}
+
+fn remove_stale_temporaries(cache: &Path) {
+    let name = cache.file_name().unwrap_or_default().to_string_lossy();
+    let directory = cache
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let Ok(entries) = fs::read_dir(directory.unwrap_or(Path::new("."))) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_temporary_of(&entry.file_name().to_string_lossy(), &name) || !is_stale(&path, now) {
+            continue;
+        }
+        if path.is_dir() {
+            let _ = fs::remove_dir_all(&path);
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 #[cfg(feature = "xz")]

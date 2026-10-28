@@ -6,7 +6,7 @@ use std::thread;
 
 use memmap2::Mmap;
 
-use crate::dictionary::map_file;
+use crate::dictionary::map_open_file;
 use crate::error::Error;
 use crate::section::{Plain, Section};
 
@@ -133,7 +133,12 @@ impl SystemDictionary {
         kind: DictionaryKind,
         read_block_bytes: usize,
     ) -> Result<Self, Error> {
-        let map = map_file(path)?;
+        let io_error = |source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        };
+        let file = File::open(path).map_err(io_error)?;
+        let map = map_open_file(&file, path)?;
         let broken = |reason| Error::Format {
             file: path.to_path_buf(),
             reason,
@@ -163,11 +168,6 @@ impl SystemDictionary {
             .ok_or_else(|| broken("the double array is misaligned"))?;
         let tokens = Section::new(bytes, array_end..tokens_end)
             .ok_or_else(|| broken("the token table is misaligned"))?;
-        let io_error = |source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        };
-        let file = File::open(path).map_err(io_error)?;
         if features_end > tokens_end {
             let mut last_feature_byte = [0];
             read_exact_at(&file, &mut last_feature_byte, features_end as u64 - 1)
@@ -177,7 +177,7 @@ impl SystemDictionary {
             }
         }
         let checked = Checked {
-            path,
+            file: &file,
             cells: HEADER_SIZE..array_end,
             tokens: array_end..tokens_end,
             features: tokens_end..features_end,
@@ -277,7 +277,7 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result
 }
 
 struct Checked<'a> {
-    path: &'a Path,
+    file: &'a File,
     cells: Range<usize>,
     tokens: Range<usize>,
     features: Range<usize>,
@@ -346,14 +346,14 @@ impl Checked<'_> {
         range: Range<usize>,
         mut check: impl FnMut(usize, &[u8]) -> bool,
     ) -> io::Result<bool> {
-        let file = File::open(self.path)?;
+        let file = self.file;
         let per_block = (self.read_block_bytes / size).max(1);
         let mut buf = vec![0; per_block.min(range.len()) * size];
         let mut index = range.start;
         while index < range.end {
             let count = per_block.min(range.end - index);
             let bytes = &mut buf[..count * size];
-            read_exact_at(&file, bytes, (section + index * size) as u64)?;
+            read_exact_at(file, bytes, (section + index * size) as u64)?;
             if !check(index, bytes) {
                 return Ok(false);
             }
@@ -422,16 +422,16 @@ impl Checked<'_> {
         parts: usize,
         offsets: &[u32],
     ) -> io::Result<(bool, bool)> {
-        let file = File::open(self.path)?;
+        let file = self.file;
         let length = self.features.len();
         let start = match part {
             0 => 0,
-            _ => self.after_nul(&file, length / parts * part)?,
+            _ => self.after_nul(file, length / parts * part)?,
         };
         let end = if part + 1 == parts {
             length
         } else {
-            self.after_nul(&file, length / parts * (part + 1))?
+            self.after_nul(file, length / parts * (part + 1))?
         };
         let offsets = &offsets[offsets.partition_point(|&offset| (offset as usize) < start)..];
         let offsets = &offsets[..offsets.partition_point(|&offset| (offset as usize) < end)];
@@ -445,7 +445,7 @@ impl Checked<'_> {
             let old = buf.len();
             buf.resize(old + count, 0);
             read_exact_at(
-                &file,
+                file,
                 &mut buf[old..],
                 (self.features.start + position) as u64,
             )?;

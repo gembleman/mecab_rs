@@ -15,7 +15,7 @@ use super::{
     VALUE_MASK, VERSION, label_of,
 };
 use crate::char_table::{HEADER_BYTES as CHAR_TABLE_HEADER, MAGIC as CHAR_TABLE_MAGIC};
-use crate::dictionary::map_file;
+use crate::dictionary::map_open_file;
 use crate::error::Error;
 use crate::hot_shape::HotShape;
 use crate::int_runtime::is_runtime_form;
@@ -205,7 +205,7 @@ impl PackedDictionary {
             path,
             sections: sections.clone(),
         };
-        let map = Arc::new(map_file(path)?);
+        let map = Arc::new(map_open_file(&file, path)?);
         if map.len() as u64 != file_length {
             return Err(broken("the file changed while it was opened"));
         }
