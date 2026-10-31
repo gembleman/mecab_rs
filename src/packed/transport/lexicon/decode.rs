@@ -1,4 +1,5 @@
 use super::*;
+use crate::wire::{i16_at, u16_at};
 
 pub(super) struct Reader<'a> {
     pub(super) bytes: &'a [u8],
@@ -153,10 +154,10 @@ pub(super) fn decode_unknown<'a>(
         for _ in 0..count {
             let fixed = reader.take(UNKNOWN_PARAM_BYTES)?;
             let param = Param {
-                left_id: u16::from_le_bytes([fixed[0], fixed[1]]),
-                right_id: u16::from_le_bytes([fixed[2], fixed[3]]),
+                left_id: u16_at(fixed, 0),
+                right_id: u16_at(fixed, 2),
                 pos_id: pos_ids.next()?,
-                word_cost: i16::from_le_bytes([fixed[4], fixed[5]]),
+                word_cost: i16_at(fixed, 4),
             };
             let length = reader.count()?;
             let feature = str::from_utf8(reader.take(length)?)

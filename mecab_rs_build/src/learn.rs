@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
 
-use crate::build::text::{BUF_SIZE, Lines, key_value};
+use crate::build::text::{LINE_BUFFER_BYTES, Lines, key_value};
 use mecab_rs::__private::io_error;
 use mecab_rs::Error;
 
@@ -19,26 +19,25 @@ pub use dict_gen::{GenerateOptions, generate};
 pub use eval::{evaluate, test_sentences};
 pub use trainer::{TrainOptions, TrainReport, train};
 
-pub(crate) fn failure(path: &Path, reason: impl Into<String>) -> Error {
-    Error::Learn {
-        path: path.to_path_buf(),
-        reason: reason.into(),
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Existing {
+    Keep,
+    Replace,
 }
 
 #[derive(Default)]
 pub(crate) struct Config(HashMap<String, String>);
 
 impl Config {
-    pub(crate) fn set(&mut self, key: &str, value: &str, overwrite: bool) {
-        if overwrite || !self.0.contains_key(key) {
+    pub(crate) fn set(&mut self, key: &str, value: &str, existing: Existing) {
+        if existing == Existing::Replace || !self.0.contains_key(key) {
             self.0.insert(key.to_owned(), value.to_owned());
         }
     }
 
     pub(crate) fn load(&mut self, path: &Path) -> Result<(), Error> {
         let bytes = std::fs::read(path).map_err(|_| {
-            failure(
+            Error::learn(
                 path,
                 format!("no such file or directory: {}", path.display()),
             )
@@ -49,7 +48,7 @@ impl Config {
                 continue;
             }
             let Some((key, value)) = key_value(line) else {
-                return Err(failure(
+                return Err(Error::learn(
                     path,
                     format!("format error: {}", String::from_utf8_lossy(line)),
                 ));
@@ -57,7 +56,7 @@ impl Config {
             self.set(
                 &String::from_utf8_lossy(key),
                 &String::from_utf8_lossy(value),
-                false,
+                Existing::Keep,
             );
         }
         Ok(())
@@ -116,20 +115,32 @@ pub(crate) fn format_g(value: f64) -> String {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LineEnding {
+    Lf,
+    CrLf,
+}
+
+impl From<bool> for LineEnding {
+    fn from(crlf: bool) -> Self {
+        if crlf { Self::CrLf } else { Self::Lf }
+    }
+}
+
 pub(crate) struct LineEnds<W: Write> {
     inner: W,
-    crlf: bool,
+    ending: LineEnding,
 }
 
 impl<W: Write> LineEnds<W> {
-    pub(crate) fn new(inner: W, crlf: bool) -> Self {
-        Self { inner, crlf }
+    pub(crate) fn new(inner: W, ending: LineEnding) -> Self {
+        Self { inner, ending }
     }
 }
 
 impl<W: Write> Write for LineEnds<W> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        if !self.crlf {
+        if self.ending == LineEnding::Lf {
             return self.inner.write(buffer);
         }
         let mut start = 0;
@@ -160,8 +171,8 @@ pub(crate) fn surface_and_feature(line: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 pub(crate) fn open_lines(path: &Path) -> Result<Lines, Error> {
-    Lines::open(path, Some(BUF_SIZE)).map_err(|error| match error {
-        Error::Io { .. } => failure(
+    Lines::open(path, Some(LINE_BUFFER_BYTES)).map_err(|error| match error {
+        Error::Io { .. } => Error::learn(
             path,
             format!("no such file or directory: {}", path.display()),
         ),

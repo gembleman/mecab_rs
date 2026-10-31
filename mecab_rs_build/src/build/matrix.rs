@@ -1,13 +1,14 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use super::text::{BUF_SIZE, Lines, atoi, cstr, failure, tokenize2};
+use super::text::{LINE_BUFFER_BYTES, Lines, atoi, cstr, tokenize2};
+use mecab_rs::__private::{
+    MATRIX_BIN_FILE, MATRIX_COST_BYTES, MATRIX_DEF_FILE, MATRIX_HEADER_BYTES, io_error, u16_at,
+};
 use mecab_rs::Error;
 
 const MATRIX_DEF_DEFAULT: &str = "1 1\n0 0 0\n";
 const FIELDS_PER_LINE: usize = 3;
-const HEADER_CELLS: usize = 2;
-const CELL_BYTES: usize = 2;
 const WRITE_CHUNK_CELLS: usize = 1 << 19;
 
 #[derive(Clone, Copy)]
@@ -23,7 +24,7 @@ fn size_of_first_line(lines: &mut Lines) -> Result<Option<MatrixSize>, Error> {
     let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
     let found = tokenize2(line, b"\t ", 2);
     if found.len() != 2 {
-        return Err(failure(lines.path(), format!("format error: {shown}")));
+        return Err(Error::build(lines.path(), format!("format error: {shown}")));
     }
     let size_of = |field: usize| {
         usize::try_from(atoi(cstr(line, field)))
@@ -32,7 +33,7 @@ fn size_of_first_line(lines: &mut Lines) -> Result<Option<MatrixSize>, Error> {
     };
     let (left, right) = (size_of(found[0]), size_of(found[1]));
     let (Some(left), Some(right)) = (left, right) else {
-        return Err(failure(
+        return Err(Error::build(
             lines.path(),
             format!("matrix size out of range: {shown}"),
         ));
@@ -41,20 +42,20 @@ fn size_of_first_line(lines: &mut Lines) -> Result<Option<MatrixSize>, Error> {
 }
 
 pub(super) fn sizes(dic_dir: &Path) -> Result<MatrixSize, Error> {
-    let text = dic_dir.join("matrix.def");
+    let text = dic_dir.join(MATRIX_DEF_FILE);
     if text.is_file() {
-        let mut lines = Lines::open(&text, Some(BUF_SIZE))?;
+        let mut lines = Lines::open(&text, Some(LINE_BUFFER_BYTES))?;
         return Ok(size_of_first_line(&mut lines)?.unwrap_or(MatrixSize { left: 0, right: 0 }));
     }
-    let binary = dic_dir.join("matrix.bin");
+    let binary = dic_dir.join(MATRIX_BIN_FILE);
     if let Ok(mut file) = std::fs::File::open(&binary)
         && let Ok(length) = file.metadata().map(|meta| meta.len())
     {
         let mut header = [0u8; 4];
         if io::Read::read_exact(&mut file, &mut header).is_ok() {
-            let left = usize::from(u16::from_le_bytes([header[0], header[1]]));
-            let right = usize::from(u16::from_le_bytes([header[2], header[3]]));
-            if ((left * right + HEADER_CELLS) * CELL_BYTES) as u64 == length {
+            let left = usize::from(u16_at(&header, 0));
+            let right = usize::from(u16_at(&header, 2));
+            if (MATRIX_HEADER_BYTES + left * right * MATRIX_COST_BYTES) as u64 == length {
                 return Ok(MatrixSize { left, right });
             }
         }
@@ -79,16 +80,16 @@ pub(super) fn compile(
     output: &mut impl Write,
 ) -> Result<(), Error> {
     let mut lines = if matrix_def.is_file() {
-        Lines::open(matrix_def, Some(BUF_SIZE))?
+        Lines::open(matrix_def, Some(LINE_BUFFER_BYTES))?
     } else {
         eprintln!(
             "{} is not found. minimum setting is used.",
             matrix_def.display()
         );
-        Lines::builtin(MATRIX_DEF_DEFAULT, matrix_def, Some(BUF_SIZE))
+        Lines::builtin(MATRIX_DEF_DEFAULT, matrix_def, Some(LINE_BUFFER_BYTES))
     };
-    let declared =
-        size_of_first_line(&mut lines)?.ok_or_else(|| failure(matrix_def, "format error: "))?;
+    let declared = size_of_first_line(&mut lines)?
+        .ok_or_else(|| Error::build(matrix_def, "format error: "))?;
     let left_size = declared.left;
     let right_size = declared.right;
     let mut matrix = vec![0i16; left_size * right_size];
@@ -106,21 +107,22 @@ pub(super) fn compile(
         }
         if count != FIELDS_PER_LINE {
             let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
-            return Err(failure(matrix_def, format!("format error: {shown}")));
+            return Err(Error::build(matrix_def, format!("format error: {shown}")));
         }
         let [left, right, cost] = numbers;
         if left < 0 || right < 0 || left as usize >= left_size || right as usize >= right_size {
-            return Err(failure(matrix_def, "index values are out of range"));
+            return Err(Error::build(matrix_def, "index values are out of range"));
         }
-        let cost = i16::try_from(cost)
-            .map_err(|_| failure(matrix_def, format!("cost out of the 16-bit range: {cost}")))?;
+        let cost = i16::try_from(cost).map_err(|_| {
+            Error::build(matrix_def, format!("cost out of the 16-bit range: {cost}"))
+        })?;
         matrix[left as usize + left_size * right as usize] = cost;
     }
 
     let write = |output: &mut dyn Write| -> io::Result<()> {
         output.write_all(&(left_size as u16).to_le_bytes())?;
         output.write_all(&(right_size as u16).to_le_bytes())?;
-        let mut bytes = Vec::with_capacity(WRITE_CHUNK_CELLS * CELL_BYTES);
+        let mut bytes = Vec::with_capacity(WRITE_CHUNK_CELLS * MATRIX_COST_BYTES);
         for chunk in matrix.chunks(WRITE_CHUNK_CELLS) {
             bytes.clear();
             for cell in chunk {
@@ -130,8 +132,5 @@ pub(super) fn compile(
         }
         Ok(())
     };
-    write(output).map_err(|source| Error::Io {
-        path: output_path.to_path_buf(),
-        source,
-    })
+    write(output).map_err(io_error(output_path))
 }

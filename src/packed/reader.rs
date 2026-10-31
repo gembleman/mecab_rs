@@ -8,37 +8,35 @@ use memmap2::Mmap;
 use super::bits::{MAX_RECORD_BITS, mask_of, section_bytes};
 use super::features::{FeatureView, Layout as FeatureLayout, NumSpec, check as feature_check};
 use super::{
-    BLOCK_CODES, BLOCK_COUNT, CELLS, CELLS_PADDING, CHAR_BLOCKS, CHAR_INDEX, CHAR_TABLE, DICRC,
-    FEATURES, FLAG_HOT_MATRIX, FLAG_INT_TEMPLATES, FLAGS_SHIFT, HEADER_BYTES, INLINE_COUNT_MASK,
-    INLINE_COUNT_SHIFT, INLINE_FLAG, MAGIC, MATRIX, MAX_UNITS, PARAMS, SECTIONS, TEMPLATES,
-    TERMINAL_FLAG, TOKENS, UNIT_BYTES, UNKNOWN_STARTS, UNKNOWN_TOKENS, UNUSED_LABEL, VALUE_MASK,
-    VERSION, label_of,
+    BLOCK_CODES, BLOCK_COUNT, CATEGORY_COUNT_AT, CELLS, CELLS_PADDING, CHAR_BLOCKS, CHAR_INDEX,
+    CHAR_TABLE, CODE_COUNT_AT, DICRC, FEATURE_BITS_AT, FEATURES, FLAG_HOT_MATRIX,
+    FLAG_INT_TEMPLATES, FLAGS_AT, FLAGS_SHIFT, HEADER_BYTES, INLINE_COUNT_MASK, INLINE_COUNT_SHIFT,
+    INLINE_FLAG, MAGIC, MAGIC_BYTES, MATRIX, MAX_UNITS, PARAM_BITS_AT, PARAM_COUNT_AT, PARAMS,
+    SECTION_ALIGNMENT, SECTION_ENTRY_BYTES, SECTION_LENGTH_IN_ENTRY, SECTION_OFFSET_IN_ENTRY,
+    SECTION_TABLE_AT, SECTIONS, TEMPLATES, TERMINAL_FLAG, TOKEN_COUNT_AT, TOKENS, UNIT_BYTES,
+    UNKNOWN_STARTS, UNKNOWN_TOKENS, UNUSED_LABEL, VALUE_MASK, VERSION, VERSION_AT, label_of,
 };
 use crate::char_property::SentenceChars;
-use crate::char_table::{HEADER_BYTES as CHAR_TABLE_HEADER, MAGIC as CHAR_TABLE_MAGIC};
+use crate::char_table::{CHAR_TABLE_HEADER_BYTES, MAGIC as CHAR_TABLE_MAGIC};
 use crate::dictionary::{map_open_file, open_unwritable};
 use crate::error::{Error, io_error};
 use crate::hot_shape::HotShape;
 use crate::int_runtime::is_runtime_form;
 use crate::mapped_bytes::MappedBytes;
+use crate::matrix::MATRIX_HEADER_BYTES;
 use crate::section::Section;
 use crate::system_dictionary::PrefixHit;
 pub use crate::system_dictionary::TokenRecord;
 use crate::templates::{TEMPLATE_HEADER_PEEK_BYTES, header_sizes};
-use crate::wire::{u16_at, u32_at, u64_at};
+use crate::utf8::is_continuation;
+use crate::wire::{u16_at, u16_values, u32_at, u32_values, u64_at};
 
 const CHUNK: usize = 1 << 20;
 const PARAM_BYTES: usize = 8;
-const MAGIC_BYTES: usize = 8;
-const SECTION_TABLE_AT: usize = 40;
-const SECTION_ENTRY_BYTES: usize = 16;
-const MATRIX_HEADER_BYTES: usize = 4;
 const HOT_ROWS_BYTES: usize = 4;
 const ROW_START_BYTES: usize = 4;
 
 mod validate;
-
-use validate::format_error;
 
 pub type Hit = PrefixHit;
 
@@ -68,10 +66,7 @@ pub(super) struct Source<'a> {
 
 impl Source<'_> {
     pub(super) fn broken(&self, reason: &'static str) -> Error {
-        Error::Format {
-            file: self.path.to_path_buf(),
-            reason,
-        }
+        Error::format(self.path, reason)
     }
 
     pub(super) fn section_length(&self, section: usize) -> usize {
@@ -80,10 +75,7 @@ impl Source<'_> {
 
     pub(super) fn read(&self, section: usize, from: usize, buffer: &mut [u8]) -> Result<(), Error> {
         let start = self.sections[section].start + from;
-        read_at(self.file, buffer, start as u64).map_err(|source| Error::Io {
-            path: self.path.to_path_buf(),
-            source,
-        })
+        read_at(self.file, buffer, start as u64).map_err(io_error(self.path))
     }
 
     fn read_all(&self, section: usize) -> Result<Vec<u8>, Error> {
@@ -141,7 +133,7 @@ impl PackedDictionary {
         let file_length = file.metadata().map_err(io_error(path))?.len();
         let mut header_bytes = [0u8; HEADER_BYTES];
         if file_length < HEADER_BYTES as u64 {
-            return Err(format_error(path, "the file is shorter than its header"));
+            return Err(Error::format(path, "the file is shorter than its header"));
         }
         read_at(&file, &mut header_bytes, 0).map_err(io_error(path))?;
         let header = validate::parse_header(&header_bytes, path)?;
@@ -153,7 +145,7 @@ impl PackedDictionary {
         };
         let map = Arc::new(map_open_file(&file, path)?);
         if map.len() as u64 != file_length {
-            return Err(format_error(path, "the file changed while it was opened"));
+            return Err(Error::format(path, "the file changed while it was opened"));
         }
         validate::check_section_sizes(&source, &header)?;
         let (left_size, right_size) = validate::check_matrix(&source, &header)?;
@@ -190,7 +182,7 @@ impl PackedDictionary {
             checked,
             dicrc,
         } = validated;
-        let view_error = || format_error(path, "a section is misaligned");
+        let view_error = || Error::format(path, "a section is misaligned");
         let char_index = Section::new(&map, sections[CHAR_INDEX].clone()).ok_or_else(view_error)?;
         let char_blocks =
             Section::new(&map, sections[CHAR_BLOCKS].clone()).ok_or_else(view_error)?;
@@ -328,11 +320,6 @@ impl PackedDictionary {
             .expect("the matrix section is inside the mapping")
     }
 
-    pub fn template_bytes(&self) -> Option<&[u8]> {
-        self.hot
-            .then(|| &self.map[self.sections[TEMPLATES].clone()])
-    }
-
     pub(crate) fn templates_mapped(&self) -> Option<MappedBytes> {
         self.hot.then(|| {
             MappedBytes::from_arc(Arc::clone(&self.map), self.sections[TEMPLATES].clone())
@@ -432,7 +419,7 @@ fn decode(bytes: &[u8]) -> Option<(char, usize)> {
     let tail = bytes.get(1..width)?;
     let mut scalar = u32::from(first) & (0x7F >> width);
     for &byte in tail {
-        if byte & 0xC0 != 0x80 {
+        if !is_continuation(byte) {
             return None;
         }
         scalar = scalar << 6 | u32::from(byte & 0x3F);

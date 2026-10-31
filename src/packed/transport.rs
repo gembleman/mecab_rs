@@ -12,19 +12,12 @@ use super::source::read_dictionary;
 use crate::Error;
 use crate::error::io_error;
 use crate::file_write::write_file;
-use crate::wire::fnv1a64;
+use crate::wire::{fnv1a64, u32_at, u64_at};
 
 const MAGIC: &[u8; 4] = b"MRDT";
 const VERSION: u32 = 3;
 
 pub use matrix::encode as matrix_part;
-
-fn bad(path: &Path, reason: &'static str) -> Error {
-    Error::Format {
-        file: path.to_path_buf(),
-        reason,
-    }
-}
 
 pub struct Part {
     pub name: &'static str,
@@ -43,7 +36,7 @@ impl<'a> Parts<'a> {
             .iter()
             .find(|part| part.0 == name)
             .map(|&(_, encoding, bytes)| (encoding, bytes))
-            .ok_or_else(|| bad(self.path, "a part is missing"))
+            .ok_or_else(|| Error::format(self.path, "a part is missing"))
     }
 
     fn plain(&self, name: &str, encoding: u32) -> Result<&'a [u8], Error> {
@@ -54,7 +47,7 @@ impl<'a> Parts<'a> {
     }
 
     fn corrupt(&self, reason: &'static str) -> Error {
-        bad(self.path, reason)
+        Error::format(self.path, reason)
     }
 }
 
@@ -105,27 +98,27 @@ pub(super) fn parse_container<'a>(payload: &'a [u8], path: &'a Path) -> Result<P
     let body_length = payload
         .len()
         .checked_sub(8)
-        .ok_or_else(|| bad(path, "the data is too short"))?;
+        .ok_or_else(|| Error::format(path, "the data is too short"))?;
     let (body, digest) = payload.split_at(body_length);
-    if fnv1a64(body) != u64::from_le_bytes(digest.try_into().expect("eight bytes")) {
-        return Err(bad(path, "the FNV digest does not match"));
+    if fnv1a64(body) != u64_at(digest, 0) {
+        return Err(Error::format(path, "the FNV digest does not match"));
     }
     let mut at = 0usize;
     let mut take = |length: usize| -> Result<&'a [u8], Error> {
         let end = at
             .checked_add(length)
             .filter(|&end| end <= body.len())
-            .ok_or_else(|| bad(path, "the data ends early"))?;
+            .ok_or_else(|| Error::format(path, "the data ends early"))?;
         let slice = &body[at..end];
         at = end;
         Ok(slice)
     };
-    let word = |bytes: &[u8]| u32::from_le_bytes(bytes.try_into().expect("four bytes"));
+    let word = |bytes: &[u8]| u32_at(bytes, 0);
     if take(4)? != MAGIC {
-        return Err(bad(path, "the magic is not valid"));
+        return Err(Error::format(path, "the magic is not valid"));
     }
     if word(take(4)?) != VERSION {
-        return Err(bad(
+        return Err(Error::format(
             path,
             "the transport format version is not supported; pack the dictionary again",
         ));
@@ -135,17 +128,18 @@ pub(super) fn parse_container<'a>(payload: &'a [u8], path: &'a Path) -> Result<P
     for _ in 0..count {
         let name_length = usize::from(take(1)?[0]);
         let name = str::from_utf8(take(name_length)?)
-            .map_err(|_| bad(path, "a part name is not valid UTF-8"))?;
+            .map_err(|_| Error::format(path, "a part name is not valid UTF-8"))?;
         let encoding = word(take(4)?);
-        let length = u64::from_le_bytes(take(8)?.try_into().expect("eight bytes"));
-        let length = usize::try_from(length).map_err(|_| bad(path, "a part is too long"))?;
+        let length = u64_at(take(8)?, 0);
+        let length =
+            usize::try_from(length).map_err(|_| Error::format(path, "a part is too long"))?;
         if parts.iter().any(|part| part.0 == name) {
-            return Err(bad(path, "a part is repeated"));
+            return Err(Error::format(path, "a part is repeated"));
         }
         parts.push((name, encoding, take(length)?));
     }
     if at != body.len() {
-        return Err(bad(path, "the data has trailing bytes"));
+        return Err(Error::format(path, "the data has trailing bytes"));
     }
     Ok(Parts { path, parts })
 }
@@ -158,8 +152,8 @@ fn lexicon_model(parts: &Parts) -> Result<Model, Error> {
     if dicrc.len() < 8 {
         return Err(corrupt("dicrc is too short"));
     }
-    let bos_length = u32::from_le_bytes(dicrc[..4].try_into().expect("four bytes")) as usize;
-    let unknown_length = u32::from_le_bytes(dicrc[4..8].try_into().expect("four bytes")) as usize;
+    let bos_length = u32_at(dicrc, 0) as usize;
+    let unknown_length = u32_at(dicrc, 4) as usize;
     if bos_length.checked_add(unknown_length).map(|sum| sum + 8) != Some(dicrc.len()) {
         return Err(corrupt("the lengths in dicrc do not match"));
     }
@@ -203,10 +197,7 @@ pub fn expand(xz_file: &Path, out_mrd: &Path) -> Result<(), Error> {
     let mut payload = Vec::new();
     XzReader::new(std::io::BufReader::new(file), false)
         .read_to_end(&mut payload)
-        .map_err(|error| Error::Rebuild {
-            path: xz_file.to_path_buf(),
-            reason: format!("xz: {error}"),
-        })?;
+        .map_err(|error| Error::rebuild(xz_file, format!("xz: {error}")))?;
     let (model, sections) = runtime_model(&parse_container(&payload, xz_file)?)?;
     drop(payload);
     let runtime = model.finish_runtime(sections)?;

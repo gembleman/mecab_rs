@@ -6,21 +6,14 @@ use crate::int_runtime::{RuntimeIntTemplates, is_runtime_form};
 use crate::mapped_bytes::MappedBytes;
 use crate::section::{Section, SectionSource};
 
-const HEADER_BYTES: usize = 4;
-const COST_BYTES: usize = 2;
-
-fn broken(path: &Path, reason: &'static str) -> Error {
-    Error::Format {
-        file: path.to_path_buf(),
-        reason,
-    }
-}
+pub const MATRIX_HEADER_BYTES: usize = 4;
+pub const MATRIX_COST_BYTES: usize = 2;
 
 fn header_sizes(map: &[u8], path: &Path, words: usize) -> Result<[usize; 4], Error> {
     let mut sizes = [0; 4];
     let header = map
         .get(..words * 2)
-        .ok_or_else(|| broken(path, "the file is shorter than its header"))?;
+        .ok_or_else(|| Error::format(path, "the file is shorter than its header"))?;
     for (size, &word) in sizes.iter_mut().zip(header.as_chunks::<2>().0) {
         *size = usize::from(u16::from_le_bytes(word));
     }
@@ -36,15 +29,20 @@ pub(crate) struct DenseMatrix<S = MappedBytes> {
 
 impl<S: SectionSource> DenseMatrix<S> {
     fn from_source(map: S, path: &Path) -> Result<Self, Error> {
-        let [left_size, right_size, _, _] = header_sizes(map.all_bytes(), path, HEADER_BYTES / 2)?;
+        let [left_size, right_size, _, _] =
+            header_sizes(map.all_bytes(), path, MATRIX_HEADER_BYTES / 2)?;
         if left_size == 0 || right_size == 0 {
-            return Err(broken(path, "the matrix has no context ids"));
+            return Err(Error::format(path, "the matrix has no context ids"));
         }
-        if HEADER_BYTES + left_size * right_size * COST_BYTES != map.all_bytes().len() {
-            return Err(broken(path, "the file size does not match the header"));
+        if MATRIX_HEADER_BYTES + left_size * right_size * MATRIX_COST_BYTES != map.all_bytes().len()
+        {
+            return Err(Error::format(
+                path,
+                "the file size does not match the header",
+            ));
         }
-        let costs = Section::new(map.all_bytes(), HEADER_BYTES..map.all_bytes().len())
-            .ok_or_else(|| broken(path, "the cost table is misaligned"))?;
+        let costs = Section::new(map.all_bytes(), MATRIX_HEADER_BYTES..map.all_bytes().len())
+            .ok_or_else(|| Error::format(path, "the cost table is misaligned"))?;
         Ok(Self {
             map,
             costs,
@@ -105,24 +103,24 @@ impl<'m, S: SectionSource> HotColumn<'m, S> {
 impl<S: SectionSource> HotMatrix<S> {
     fn from_source(map: S, templates: ColdPath<S>, path: &Path) -> Result<Self, Error> {
         let (left_size, right_size, shape) =
-            HotShape::parse(map.all_bytes()).map_err(|reason| broken(path, reason))?;
+            HotShape::parse(map.all_bytes()).map_err(|reason| Error::format(path, reason))?;
         if left_size != templates.left_size() || right_size != templates.right_size() {
-            return Err(broken(
+            return Err(Error::format(
                 path,
                 "the hot matrix size does not match the templates",
             ));
         }
         if !shape.contains_rectangle(templates.hot_left(), templates.hot_right()) {
-            return Err(broken(
+            return Err(Error::format(
                 path,
                 "the integer templates were made for another hot block",
             ));
         }
         let table_end = HotShape::header_bytes(shape.rows());
         let row_starts = Section::new(map.all_bytes(), HOT_HEADER_BYTES..table_end)
-            .ok_or_else(|| broken(path, "the row starts are misaligned"))?;
+            .ok_or_else(|| Error::format(path, "the row starts are misaligned"))?;
         let costs = Section::new(map.all_bytes(), table_end..map.all_bytes().len())
-            .ok_or_else(|| broken(path, "the cost table is misaligned"))?;
+            .ok_or_else(|| Error::format(path, "the cost table is misaligned"))?;
         Ok(Self {
             map,
             row_starts,
@@ -188,10 +186,10 @@ impl Matrix {
         path: &Path,
     ) -> Result<Self, Error> {
         if !is_runtime_form(&templates) {
-            return Err(Error::Format {
-                file: path.to_path_buf(),
-                reason: "the integer templates are not in the runtime form",
-            });
+            return Err(Error::format(
+                path,
+                "the integer templates are not in the runtime form",
+            ));
         }
         let templates = Box::new(RuntimeIntTemplates::from_mapped(templates, path)?);
         HotMatrix::from_source(map, templates, path).map(Self::PackedHot)

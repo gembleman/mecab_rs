@@ -10,12 +10,7 @@ pub fn write_file_with<E: From<Error>>(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<(), E>,
 ) -> Result<(), E> {
-    let io_error = |source| {
-        E::from(Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })
-    };
+    let io_error = |source| E::from(Error::io(path, source));
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let temporary = path.with_file_name(format!(".{name}.tmp"));
     let result = (|| {
@@ -36,9 +31,6 @@ pub fn write_file(
     write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
 ) -> Result<(), Error> {
     write_file_with(path, |writer| {
-        write(writer).map_err(|source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })
+        write(writer).map_err(|source| Error::io(path, source))
     })
 }

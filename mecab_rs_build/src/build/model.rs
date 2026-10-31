@@ -1,16 +1,16 @@
 use std::path::Path;
 
 use super::Charset;
-use super::text::{BUF_SIZE, Lines, atof, cstr, failure, tokenize_csv, tokenize2};
+use super::text::{LINE_BUFFER_BYTES, Lines, atof, cstr, tokenize_csv, tokenize2};
+use mecab_rs::__private::{CHARSET_BYTES, FEATURE_DEF_FILE, io_error, u32_at, u64_at};
 use mecab_rs::Error;
 
 const FEATURE_BUFFER_BYTES: usize = 2048;
 const MAX_FEATURE_COLUMNS: usize = 64;
-const CHARSET_BYTES: usize = 32;
-const COUNT_BYTES: usize = 4;
+const MODEL_COUNT_BYTES: usize = 4;
 const WEIGHT_BYTES: usize = 8;
 const FINGERPRINT_BYTES: usize = 8;
-const ENTRY_BYTES: usize = WEIGHT_BYTES + FINGERPRINT_BYTES;
+const MODEL_ENTRY_BYTES: usize = WEIGHT_BYTES + FINGERPRINT_BYTES;
 const FINGERPRINT_SEED: u32 = 0xfd14_deff;
 
 fn rotl(value: u32, shift: u32) -> u32 {
@@ -38,8 +38,7 @@ pub(crate) fn fingerprint(key: &[u8]) -> u64 {
     );
     let (blocks, tail) = key.as_chunks::<16>();
     for block in blocks {
-        let word =
-            |index: usize| u32::from_le_bytes(block[index * 4..index * 4 + 4].try_into().unwrap());
+        let word = |index: usize| u32_at(block, index * 4);
         let (mut k1, mut k2, mut k3, mut k4) = (word(0), word(1), word(2), word(3));
         k1 = rotl(k1.wrapping_mul(C1), 15).wrapping_mul(C2);
         h1 ^= k1;
@@ -121,7 +120,7 @@ fn read_model_charset(lines: &mut Lines, text_model: &Path) -> Result<Vec<u8>, E
         let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
         let found = tokenize2(line, b":", 2);
         if found.len() != 2 {
-            return Err(failure(text_model, format!("format error: {shown}")));
+            return Err(Error::build(text_model, format!("format error: {shown}")));
         }
         if cstr(line, found[0]) == b"charset" {
             model_charset = cstr(line, found[1]).get(1..).unwrap_or_default().to_vec();
@@ -139,11 +138,11 @@ fn require_same_charset(
         return Ok(());
     }
     let model = Charset::parse(&String::from_utf8_lossy(model_charset))
-        .map_err(|reason| failure(text_model, reason))?;
+        .map_err(|reason| Error::build(text_model, reason))?;
     let dictionary =
-        Charset::parse(dictionary_charset).map_err(|reason| failure(text_model, reason))?;
+        Charset::parse(dictionary_charset).map_err(|reason| Error::build(text_model, reason))?;
     if model != dictionary {
-        return Err(failure(
+        return Err(Error::build(
             text_model,
             format!(
                 "dictionary charset and model charset are different. dictionary_charset={dictionary_charset} model_charset={}",
@@ -160,7 +159,7 @@ fn read_entries(lines: &mut Lines, text_model: &Path) -> Result<Vec<ModelEntry>,
         let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
         let found = tokenize2(line, b"\t", 2);
         if found.len() != 2 {
-            return Err(failure(text_model, format!("format error: {shown}")));
+            return Err(Error::build(text_model, format!("format error: {shown}")));
         }
         entries.push(ModelEntry {
             fingerprint: fingerprint(cstr(line, found[1])),
@@ -175,7 +174,7 @@ pub(crate) fn convert(
     dictionary_charset: &str,
     charset: &str,
 ) -> Result<Vec<u8>, Error> {
-    let mut lines = Lines::open(text_model, Some(BUF_SIZE))?;
+    let mut lines = Lines::open(text_model, Some(LINE_BUFFER_BYTES))?;
     let model_charset = read_model_charset(&mut lines, text_model)?;
     require_same_charset(text_model, dictionary_charset, &model_charset)?;
     let mut entries = read_entries(&mut lines, text_model)?;
@@ -187,7 +186,8 @@ pub(crate) fn convert(
         })
     });
 
-    let mut bytes = Vec::with_capacity(COUNT_BYTES + CHARSET_BYTES + entries.len() * ENTRY_BYTES);
+    let mut bytes =
+        Vec::with_capacity(MODEL_COUNT_BYTES + CHARSET_BYTES + entries.len() * MODEL_ENTRY_BYTES);
     bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     bytes.extend_from_slice(&charset_field(charset));
     for entry in &entries {
@@ -206,7 +206,7 @@ pub(crate) struct Templates {
 
 impl Templates {
     pub(crate) fn open(feature_def: &Path) -> Result<Self, Error> {
-        let mut lines = Lines::open(feature_def, Some(BUF_SIZE))?;
+        let mut lines = Lines::open(feature_def, Some(LINE_BUFFER_BYTES))?;
         let mut templates = Self {
             unigram: Vec::new(),
             bigram: Vec::new(),
@@ -217,12 +217,12 @@ impl Templates {
             }
             let found = tokenize2(line, b"\t ", 2);
             if found.len() != 2 {
-                return Err(failure(feature_def, "format error"));
+                return Err(Error::build(feature_def, "format error"));
             }
             match cstr(line, found[0]) {
                 b"UNIGRAM" => templates.unigram.push(cstr(line, found[1]).to_vec()),
                 b"BIGRAM" => templates.bigram.push(cstr(line, found[1]).to_vec()),
-                _ => return Err(failure(feature_def, "format error")),
+                _ => return Err(Error::build(feature_def, "format error")),
             }
         }
         Ok(templates)
@@ -247,7 +247,7 @@ fn template_column<'a>(
         *cursor += 1;
     }
     if template.get(*cursor) != Some(&b'[') {
-        return Err(failure(path, "getIndex(): unmatched '['"));
+        return Err(Error::build(path, "getIndex(): unmatched '['"));
     }
     *cursor += 1;
     let mut number = 0usize;
@@ -268,7 +268,7 @@ fn template_column<'a>(
                 }
                 return Ok(Some(found));
             }
-            _ => return Err(failure(path, "unmatched '['")),
+            _ => return Err(Error::build(path, "unmatched '['")),
         }
         *cursor += 1;
     }
@@ -347,7 +347,7 @@ pub(crate) fn unigram_keys(
                         b'u' => key.extend_from_slice(ufeature),
                         b'w' => key.extend_from_slice(surface),
                         other => {
-                            return Err(failure(
+                            return Err(Error::build(
                                 feature_def,
                                 format!("unknown meta char: {}", char::from(other)),
                             ));
@@ -400,7 +400,7 @@ pub(crate) fn bigram_keys(
                         b'l' => key.extend_from_slice(lfeature),
                         b'r' => key.extend_from_slice(rfeature),
                         other => {
-                            return Err(failure(
+                            return Err(Error::build(
                                 feature_def,
                                 format!("unknown meta char: {}", char::from(other)),
                             ));
@@ -423,23 +423,22 @@ impl CostModel {
         dictionary_charset: &str,
         charset: &str,
     ) -> Result<Self, Error> {
-        let bytes = std::fs::read(model).map_err(|source| Error::Io {
-            path: model.to_path_buf(),
-            source,
-        })?;
-        let entry_count = bytes
-            .first_chunk::<4>()
-            .map(|count| u32::from_le_bytes(*count) as usize);
-        let is_binary = entry_count
-            .is_some_and(|count| count * ENTRY_BYTES + COUNT_BYTES + CHARSET_BYTES == bytes.len());
+        let bytes = std::fs::read(model).map_err(io_error(model))?;
+        let entry_count = (bytes.len() >= MODEL_COUNT_BYTES).then(|| u32_at(&bytes, 0) as usize);
+        let is_binary = entry_count.is_some_and(|count| {
+            count * MODEL_ENTRY_BYTES + MODEL_COUNT_BYTES + CHARSET_BYTES == bytes.len()
+        });
         let bytes = if is_binary {
-            let name = cstr(&bytes[COUNT_BYTES..COUNT_BYTES + CHARSET_BYTES], 0);
+            let name = cstr(
+                &bytes[MODEL_COUNT_BYTES..MODEL_COUNT_BYTES + CHARSET_BYTES],
+                0,
+            );
             let model_charset = Charset::parse(&String::from_utf8_lossy(name))
-                .map_err(|reason| failure(model, reason))?;
+                .map_err(|reason| Error::build(model, reason))?;
             let dictionary_charset =
-                Charset::parse(charset).map_err(|reason| failure(model, reason))?;
+                Charset::parse(charset).map_err(|reason| Error::build(model, reason))?;
             if model_charset != dictionary_charset {
-                return Err(failure(
+                return Err(Error::build(
                     model,
                     format!(
                         "model charset and dictionary charset are different. model_charset={} dictionary_charset={charset}",
@@ -451,8 +450,8 @@ impl CostModel {
         } else {
             convert(model, dictionary_charset, charset)?
         };
-        let count = u32::from_le_bytes(bytes[..COUNT_BYTES].try_into().unwrap()) as usize;
-        let body = &bytes[COUNT_BYTES + CHARSET_BYTES..];
+        let count = u32_at(&bytes, 0) as usize;
+        let body = &bytes[MODEL_COUNT_BYTES + CHARSET_BYTES..];
         let weights = body[..count * WEIGHT_BYTES]
             .as_chunks::<8>()
             .0
@@ -463,10 +462,10 @@ impl CostModel {
             .as_chunks::<8>()
             .0
             .iter()
-            .map(|word| u64::from_le_bytes(*word))
+            .map(|word| u64_at(word, 0))
             .collect();
 
-        let templates = Templates::open(&dic_dir.join("feature.def"))?;
+        let templates = Templates::open(&dic_dir.join(FEATURE_DEF_FILE))?;
         Ok(Self {
             weights,
             keys,

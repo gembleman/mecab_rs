@@ -4,8 +4,9 @@ use std::path::Path;
 use memmap2::{Mmap, MmapOptions};
 
 use crate::clusters::ClusterShape;
+use crate::dict_files::MATRIX_ITP_FILE;
 use crate::dictionary::map_file;
-use crate::error::Error;
+use crate::error::{Error, io_error};
 use crate::hot_shape::{CELL_SUM_BOUND, HotShape, MAX_KEYS};
 use crate::int_templates::{
     MAGIC, MAX_COST_FACTOR, MAX_SHIFT, MappedIntTemplates, RuntimeInputs, int_cost,
@@ -66,17 +67,13 @@ pub(crate) fn runtime_form_from(
 }
 
 pub fn runtime_form_of(bytes: &[u8], shape: &HotShape) -> Result<Vec<u8>, Error> {
-    let path = Path::new("matrix.itp");
-    let io_error = |source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    };
+    let path = Path::new(MATRIX_ITP_FILE);
     let mut map = MmapOptions::new()
         .len(bytes.len().max(1))
         .map_anon()
-        .map_err(io_error)?;
+        .map_err(io_error(path))?;
     map[..bytes.len()].copy_from_slice(bytes);
-    let map = map.make_read_only().map_err(io_error)?;
+    let map = map.make_read_only().map_err(io_error(path))?;
     MappedIntTemplates::from_source(map, path)?.runtime_form(shape)
 }
 

@@ -7,8 +7,9 @@ use std::thread;
 use memmap2::Mmap;
 
 use crate::dictionary::{map_open_file, open_unwritable};
-use crate::error::Error;
+use crate::error::{Error, io_error};
 use crate::section::{Plain, Section};
+use crate::utf8::is_continuation;
 use crate::wire::u32_at;
 
 pub const MAGIC_ID: u32 = 0xEF71_8F77;
@@ -25,7 +26,9 @@ const RIGHT_SIZE_AT: usize = 20;
 pub const ARRAY_BYTES_AT: usize = 24;
 pub const TOKEN_BYTES_AT: usize = 28;
 pub const FEATURE_BYTES_AT: usize = 32;
-const CHARSET: Range<usize> = 40..HEADER_SIZE;
+pub const CHARSET_AT: usize = 40;
+pub const CHARSET_BYTES: usize = HEADER_SIZE - CHARSET_AT;
+const CHARSET: Range<usize> = CHARSET_AT..HEADER_SIZE;
 const UTF8_NAMES: [&[u8]; 2] = [b"utf-8", b"utf8"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -126,16 +129,10 @@ impl SystemDictionary {
         kind: DictionaryKind,
         read_block_bytes: usize,
     ) -> Result<Self, Error> {
-        let io_error = |source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        };
-        let file = open_unwritable(path).map_err(io_error)?;
+        let io_error = io_error(path);
+        let file = open_unwritable(path).map_err(&io_error)?;
         let map = map_open_file(&file, path)?;
-        let broken = |reason| Error::Format {
-            file: path.to_path_buf(),
-            reason,
-        };
+        let broken = |reason| Error::format(path, reason);
         let bytes = &map[..];
         if bytes.len() < HEADER_SIZE
             || (u32_at(bytes, 0) ^ MAGIC_ID) as usize != bytes.len()
@@ -164,7 +161,7 @@ impl SystemDictionary {
         if features_end > tokens_end {
             let mut last_feature_byte = [0];
             read_exact_at(&file, &mut last_feature_byte, features_end as u64 - 1)
-                .map_err(io_error)?;
+                .map_err(&io_error)?;
             if last_feature_byte[0] != 0 {
                 return Err(broken("the features do not end with a NUL byte"));
             }
@@ -178,7 +175,7 @@ impl SystemDictionary {
             right_size,
             read_block_bytes,
         };
-        checked.run().map_err(io_error)?.map_err(broken)?;
+        checked.run().map_err(&io_error)?.map_err(broken)?;
         Ok(Self {
             map,
             left_size,
@@ -251,13 +248,6 @@ impl SystemDictionary {
             .expect("open checked that the features end with a NUL byte");
         unsafe { str::from_utf8_unchecked(&rest[..length]) }
     }
-}
-
-const CONTINUATION_MASK: u8 = 0xC0;
-const CONTINUATION_TAG: u8 = 0x80;
-
-fn is_continuation(byte: u8) -> bool {
-    byte & CONTINUATION_MASK == CONTINUATION_TAG
 }
 
 const PARALLEL_MIN_BYTES: usize = 1 << 22;
@@ -457,7 +447,7 @@ impl Checked<'_> {
             while let Some(&&offset) = next.peek()
                 && (offset as usize) < position
             {
-                boundaries &= buf[offset as usize - buf_start] & 0xC0 != 0x80;
+                boundaries &= !is_continuation(buf[offset as usize - buf_start]);
                 next.next();
             }
             let complete = buf

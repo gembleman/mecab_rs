@@ -5,7 +5,7 @@ use std::sync::Arc;
 use memmap2::Mmap;
 
 use crate::char_property::CharProperty;
-use crate::error::Error;
+use crate::error::{Error, io_error};
 use crate::expand_cache;
 use crate::matrix::Matrix;
 use crate::packed::PackedDictionary;
@@ -15,10 +15,7 @@ const MAX_USER_DICTIONARIES: usize = u8::MAX as usize;
 const DEFAULT_MAX_GROUPING_SIZE: usize = 24;
 
 pub(crate) fn map_open_file(file: &File, path: &Path) -> Result<Mmap, Error> {
-    unsafe { Mmap::map(file) }.map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })
+    unsafe { Mmap::map(file) }.map_err(io_error(path))
 }
 
 #[cfg(windows)]
@@ -33,10 +30,7 @@ pub(crate) fn open_unwritable(path: &Path) -> std::io::Result<File> {
 }
 
 pub(crate) fn map_file(path: &Path) -> Result<Mmap, Error> {
-    let file = open_unwritable(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let file = open_unwritable(path).map_err(io_error(path))?;
     map_open_file(&file, path)
 }
 
@@ -100,14 +94,9 @@ impl Dictionary {
         user_dictionaries: &[P],
     ) -> Result<Self, Error> {
         let packed = Arc::new(packed);
-        let matrix = if packed.template_bytes().is_some() {
-            Matrix::open_hot_bytes(
-                path,
-                packed.matrix_mapped(),
-                packed.templates_mapped().unwrap(),
-            )?
-        } else {
-            Matrix::open_dense_bytes(path, packed.matrix_mapped())?
+        let matrix = match packed.templates_mapped() {
+            Some(templates) => Matrix::open_hot_bytes(path, packed.matrix_mapped(), templates)?,
+            None => Matrix::open_dense_bytes(path, packed.matrix_mapped())?,
         };
         let chars = CharProperty::open_bytes(path, packed.char_table_mapped())?;
         let users = user_dictionaries
@@ -123,10 +112,10 @@ impl Dictionary {
                 user.left_size() == matrix.left_size() && user.right_size() == matrix.right_size()
             })
         {
-            return Err(Error::Format {
-                file: path.to_path_buf(),
-                reason: "the matrix size does not match the packed dictionary or a user dictionary",
-            });
+            return Err(Error::format(
+                path,
+                "the matrix size does not match the packed dictionary or a user dictionary",
+            ));
         }
         let unknown_tokens = (0..packed.category_count())
             .map(|category| {

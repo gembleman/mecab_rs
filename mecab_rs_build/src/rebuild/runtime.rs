@@ -5,7 +5,10 @@ use super::templates::compile_templates;
 use super::{
     ContextStats, Keep, Renumbering, SlimReport, collect_stats, copy_entries, prepare_output,
 };
-use mecab_rs::__private::HotShape;
+use mecab_rs::__private::{
+    CHAR_BIN_FILE, CHAR_DEF_FILE, CHAR_TABLE_FILE, DICRC_FILE, FEATURE_DEF_FILE, HotShape,
+    LEFT_ID_DEF_FILE, MATRIX_BIN_FILE, RIGHT_ID_DEF_FILE,
+};
 use mecab_rs::{CharTable, Error};
 
 pub enum StatsSource<'a> {
@@ -50,13 +53,13 @@ pub fn build_runtime(
     copy_entries(
         source,
         out,
-        Some(&["dicrc", "char.bin", "license", "feature.def"]),
+        Some(&[DICRC_FILE, CHAR_BIN_FILE, "license", FEATURE_DEF_FILE]),
     )?;
-    let char_def = source.join("char.def");
+    let char_def = source.join(CHAR_DEF_FILE);
     CharTable::convert(
-        &source.join("char.bin"),
+        &source.join(CHAR_BIN_FILE),
         char_def.is_file().then_some(char_def.as_path()),
-        &out.join("char.uni"),
+        &out.join(CHAR_TABLE_FILE),
     )?;
     stats.write_tsv(out)?;
     let slim = plan.write_dictionaries(source, out, options.keep.as_ref())?;
@@ -70,14 +73,14 @@ pub fn build_runtime(
             .map(|(_, text)| text.as_str())
             .expect("both id definitions are planned")
     };
-    let templates = compile_templates(source, id_def("left-id.def"), id_def("right-id.def"))?;
+    let templates = compile_templates(source, id_def(LEFT_ID_DEF_FILE), id_def(RIGHT_ID_DEF_FILE))?;
     progress("compile templates");
     let int = exact_int_templates(&templates, RUNTIME_SHIFT, options.threads, out)?;
     write_int_files(&int, out, options.hot.clone(), options.threads)?;
     progress("matrix.itp, matrix.hot");
     if options.matrix_bin {
         plan.write_matrix(source, out)?;
-        progress("matrix.bin");
+        progress(MATRIX_BIN_FILE);
     }
     Ok(RuntimeReport {
         left_size: plan.left_size,

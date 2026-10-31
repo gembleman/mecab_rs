@@ -1,8 +1,8 @@
 use std::io::Write;
 
 use super::features::{FeatureIndex, Features, ID_LIST_END};
+use super::surface_and_feature;
 use super::tokenizer::{BOS, EOS, Found, NORMAL, Tokenizer, UNKNOWN};
-use super::{failure, surface_and_feature};
 use crate::build::text::{Lines, cstr};
 use mecab_rs::Error;
 
@@ -253,26 +253,26 @@ impl Sentence {
                 if words.is_empty() {
                     return Ok(None);
                 }
-                return Err(failure(&path, "missing EOS at the end of the corpus"));
+                return Err(Error::learn(&path, "missing EOS at the end of the corpus"));
             };
             let text = cstr(line, 0);
             if text == b"EOS" || text.is_empty() {
                 break;
             }
             let Some((surface, feature)) = surface_and_feature(text) else {
-                return Err(failure(
+                return Err(Error::learn(
                     &path,
                     format!("format error: {}", String::from_utf8_lossy(text)),
                 ));
             };
             if surface.len() > usize::from(u16::MAX) {
-                return Err(failure(&path, "a surface is longer than 65535 bytes"));
+                return Err(Error::learn(&path, "a surface is longer than 65535 bytes"));
             }
             sentence.extend_from_slice(surface);
             words.push((surface.to_vec(), feature.to_vec()));
         }
         if sentence.is_empty() {
-            return Err(failure(&path, "empty sentence"));
+            return Err(Error::learn(&path, "empty sentence"));
         }
 
         let length = sentence.len();
@@ -342,7 +342,7 @@ impl Sentence {
                 node = this.nodes[node as usize].bnext;
             }
             if right == NIL {
-                return Err(failure(&path, "no node for a word of the answer"));
+                return Err(Error::learn(&path, "no node for a word of the answer"));
             }
             let mut left_path = NIL;
             let mut candidate = this.nodes[right as usize].lpath;
@@ -354,7 +354,7 @@ impl Sentence {
                 candidate = this.paths[candidate as usize].lnext;
             }
             if left_path == NIL {
-                return Err(failure(&path, "lpath is NULL"));
+                return Err(Error::learn(&path, "lpath is NULL"));
             }
 
             let pool = reader.index.pool();
@@ -468,11 +468,12 @@ impl Sentence {
                 let first = path;
                 while path != NIL {
                     let record = &self.paths[path as usize];
-                    value = logsumexp(
-                        value,
-                        record.cost + self.nodes[record.lnode as usize].alpha,
-                        path == first,
-                    );
+                    let term = record.cost + self.nodes[record.lnode as usize].alpha;
+                    value = if path == first {
+                        term
+                    } else {
+                        logsumexp(value, term)
+                    };
                     path = record.lnext;
                 }
                 self.nodes[node as usize].alpha = value;
@@ -490,11 +491,12 @@ impl Sentence {
                 let first = path;
                 while path != NIL {
                     let record = &self.paths[path as usize];
-                    value = logsumexp(
-                        value,
-                        record.cost + self.nodes[record.rnode as usize].beta,
-                        path == first,
-                    );
+                    let term = record.cost + self.nodes[record.rnode as usize].beta;
+                    value = if path == first {
+                        term
+                    } else {
+                        logsumexp(value, term)
+                    };
                     path = record.rnext;
                 }
                 self.nodes[node as usize].beta = value;
@@ -610,11 +612,8 @@ impl Sentence {
     }
 }
 
-fn logsumexp(x: f64, y: f64, init: bool) -> f64 {
+fn logsumexp(x: f64, y: f64) -> f64 {
     const MINUS_LOG_EPSILON: f64 = 50.0;
-    if init {
-        return y;
-    }
     let min = if y < x { y } else { x };
     let max = if x < y { y } else { x };
     if max > min + MINUS_LOG_EPSILON {

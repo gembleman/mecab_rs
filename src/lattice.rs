@@ -10,6 +10,7 @@ use crate::nbest::{Agenda, LinkSpan, PathLink};
 use crate::packed::{PackedDictionary, PackedView};
 use crate::system_dictionary::PrefixHit;
 use crate::system_dictionary::SystemDictionary;
+use crate::utf8::sequence_len;
 
 mod lookup;
 mod nbest;
@@ -213,16 +214,6 @@ fn best_left<const SELECT: bool>(
 const CONNECT_GROUP_SIZE: usize = 4;
 
 const END_SLOTS_PAST_TEXT: usize = 2;
-
-#[inline(always)]
-fn utf8_sequence_len(lead: u8) -> usize {
-    match lead {
-        ..0xc0 => 1,
-        0xc0..0xe0 => 2,
-        0xe0..0xf0 => 3,
-        _ => 4,
-    }
-}
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
@@ -480,7 +471,7 @@ impl Lattice {
                 debug_assert!(found.is_ok());
                 self.connect_best(dictionary, position, first);
             }
-            position += utf8_sequence_len(lead);
+            position += sequence_len(lead);
         }
         let last_filled_end = (0..=sentence_len)
             .rev()

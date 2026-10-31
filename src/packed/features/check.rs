@@ -12,6 +12,7 @@ use super::{
 };
 use crate::Error;
 use crate::packed::reader::Source;
+use crate::wire::u32_values;
 
 const READ_CHUNK: usize = 1 << 16;
 const RECORD_CHUNK: usize = 1 << 16;
@@ -120,12 +121,7 @@ fn fill_bits(
 }
 
 fn offsets_of(bytes: &[u8], blob_length: usize) -> Option<Vec<usize>> {
-    let offsets: Vec<usize> = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|&word| u32::from_le_bytes(word) as usize)
-        .collect();
+    let offsets: Vec<usize> = u32_values(bytes).map(|word| word as usize).collect();
     let valid = offsets.first() == Some(&0)
         && offsets.last() == Some(&blob_length)
         && offsets.windows(2).all(|pair| pair[0] <= pair[1]);
@@ -483,11 +479,8 @@ fn check_blob(
         return Ok(words);
     }
     let invalid = || source.broken("the lemma table of the features is not valid");
-    let sync: Vec<usize> = read_range(source, section, &layout.blob_sync)?
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|&word| u32::from_le_bytes(word) as usize)
+    let sync: Vec<usize> = u32_values(&read_range(source, section, &layout.blob_sync)?)
+        .map(|word| word as usize)
         .collect();
     if sync.len() != entry_count.div_ceil(BLOB_SYNC_EVERY)
         || sync.first() != Some(&0)
@@ -653,11 +646,8 @@ fn check_records(
     let records_length = counts.records as usize;
     let record_count = counts.record_count as usize;
     let invalid = |reason: &'static str| source.broken(reason);
-    let sync: Vec<usize> = read_range(source, section, &layout.sync)?
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|&word| u32::from_le_bytes(word) as usize)
+    let sync: Vec<usize> = u32_values(&read_range(source, section, &layout.sync)?)
+        .map(|word| word as usize)
         .collect();
     if sync.len() != record_count.div_ceil(SYNC_EVERY)
         || sync.first().is_some_and(|&first| first != 0)

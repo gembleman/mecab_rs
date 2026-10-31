@@ -2,18 +2,13 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 
+use mecab_rs::__private::io_error;
 use mecab_rs::Error;
 
-pub(crate) const BUF_SIZE: usize = 8192;
+pub(crate) const LINE_BUFFER_BYTES: usize = 8192;
+pub(crate) const MAX_DEF_COLUMNS: usize = 512;
 const READ_BUFFER_BYTES: usize = 1 << 20;
 const VERTICAL_TAB: u8 = 0x0b;
-
-pub(crate) fn failure(path: &Path, reason: impl Into<String>) -> Error {
-    Error::Build {
-        path: path.to_path_buf(),
-        reason: reason.into(),
-    }
-}
 
 pub(crate) fn key_value(line: &[u8]) -> Option<(&[u8], &[u8])> {
     let equals = line.iter().position(|&byte| byte == b'=')?;
@@ -207,10 +202,7 @@ pub(crate) struct Lines {
 
 impl Lines {
     pub(crate) fn open(path: &Path, c_buffer_size: Option<usize>) -> Result<Self, Error> {
-        let file = File::open(path).map_err(|source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let file = File::open(path).map_err(io_error(path))?;
         Ok(Self::new(
             Box::new(BufReader::with_capacity(READ_BUFFER_BYTES, file)),
             path,
@@ -244,10 +236,7 @@ impl Lines {
         let read = self
             .reader
             .read_until(b'\n', &mut self.buffer)
-            .map_err(|source| Error::Io {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(io_error(&self.path))?;
         if read == 0 {
             return Ok(None);
         }
@@ -260,7 +249,7 @@ impl Lines {
         if let Some(size) = self.c_buffer_size
             && self.buffer.len() > size - 2
         {
-            return Err(failure(
+            return Err(Error::build(
                 &self.path,
                 format!("a line is longer than {} bytes", size - 2),
             ));

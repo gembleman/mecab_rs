@@ -1,25 +1,15 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use super::text::{BUF_SIZE, Lines, atoi, cstr, failure, tokenize_csv, tokenize2};
+use super::text::{LINE_BUFFER_BYTES, Lines, MAX_DEF_COLUMNS, atoi, cstr, tokenize_csv, tokenize2};
+use mecab_rs::__private::{
+    CATEGORY_NAME_BYTES, CHAR_BIN_COUNT_BYTES, CHAR_BIN_ENTRIES, CHAR_BIN_ENTRY_BYTES,
+    DEFAULT_TYPE_SHIFT, MAX_CATEGORIES, TYPE_MASK, io_error, pack_char_info, u32_at, u32_values,
+};
 use mecab_rs::Error;
 
 const CHAR_PROPERTY_DEF_DEFAULT: &str = "DEFAULT 1 0 0\nSPACE   0 1 0\n0x0020 SPACE\n";
 pub(super) const UNK_DEF_DEFAULT: &str = "DEFAULT,0,0,0,*\nSPACE,0,0,0,*\n";
-const TABLE_ENTRIES: usize = 0xffff;
-const NAME_BYTES: usize = 32;
-const TYPE_MASK_BITS: u32 = 18;
-const TYPE_MASK: u32 = (1 << TYPE_MASK_BITS) - 1;
-const DEFAULT_TYPE_SHIFT: u32 = TYPE_MASK_BITS;
-const DEFAULT_TYPE_BITS: u32 = 0xff;
-const LENGTH_SHIFT: u32 = 26;
-const LENGTH_BITS: u32 = 0xf;
-const GROUP_SHIFT: u32 = 30;
-const INVOKE_SHIFT: u32 = 31;
-const MAX_CATEGORIES: usize = 18;
-const MAX_DEF_COLUMNS: usize = 512;
-const COUNT_BYTES: usize = 4;
-const ENTRY_BYTES: usize = 4;
 
 #[derive(Clone, Copy)]
 struct CharInfo {
@@ -32,11 +22,13 @@ struct CharInfo {
 
 impl CharInfo {
     fn pack(self) -> u32 {
-        (self.type_mask & TYPE_MASK)
-            | (self.default_type & DEFAULT_TYPE_BITS) << DEFAULT_TYPE_SHIFT
-            | (self.length & LENGTH_BITS) << LENGTH_SHIFT
-            | (self.group & 1) << GROUP_SHIFT
-            | (self.invoke & 1) << INVOKE_SHIFT
+        pack_char_info(
+            self.type_mask,
+            self.default_type,
+            self.length,
+            self.group,
+            self.invoke,
+        )
     }
 }
 
@@ -48,7 +40,7 @@ struct CodeRange {
 
 fn parse_hex_code(text: &[u8], path: &Path) -> Result<i32, Error> {
     let no_hex = || {
-        failure(
+        Error::build(
             path,
             format!("no hex value: {}", String::from_utf8_lossy(text)),
         )
@@ -66,7 +58,7 @@ fn parse_hex_code(text: &[u8], path: &Path) -> Result<i32, Error> {
             .checked_mul(16)
             .and_then(|value| value.checked_add(digit as i32))
             .ok_or_else(|| {
-                failure(
+                Error::build(
                     path,
                     format!("hex value overflows: {}", String::from_utf8_lossy(text)),
                 )
@@ -81,14 +73,14 @@ fn char_info_of_categories(
     path: &Path,
 ) -> Result<CharInfo, Error> {
     let undefined = |name: &[u8]| {
-        failure(
+        Error::build(
             path,
             format!("category [{}] is undefined", String::from_utf8_lossy(name)),
         )
     };
     let first = categories
         .first()
-        .ok_or_else(|| failure(path, "category size is empty"))?;
+        .ok_or_else(|| Error::build(path, "category size is empty"))?;
     let mut base = *table.get(first).ok_or_else(|| undefined(first))?;
     for name in categories {
         let info = table.get(name).ok_or_else(|| undefined(name))?;
@@ -119,9 +111,9 @@ fn parse_code_range(
     };
     let low = parse_hex_code(low, source)?;
     let high = parse_hex_code(high, source)?;
-    let in_table = |code: i32| (0..TABLE_ENTRIES as i32).contains(&code);
+    let in_table = |code: i32| (0..CHAR_BIN_ENTRIES as i32).contains(&code);
     if !(in_table(low) && in_table(high) && low <= high) {
-        return Err(failure(
+        return Err(Error::build(
             source,
             format!("range error: low={low} high={high}"),
         ));
@@ -133,7 +125,7 @@ fn parse_code_range(
             break;
         }
         if !categories.contains_key(name) {
-            return Err(failure(
+            return Err(Error::build(
                 source,
                 format!("category [{}] is undefined", String::from_utf8_lossy(name)),
             ));
@@ -162,13 +154,13 @@ fn parse_category(columns: &[usize], line: &[u8], definition_index: usize) -> Ch
 
 fn read_char_def(char_def: &Path) -> Result<CharDef, Error> {
     let mut lines = if char_def.is_file() {
-        Lines::open(char_def, Some(BUF_SIZE))?
+        Lines::open(char_def, Some(LINE_BUFFER_BYTES))?
     } else {
         eprintln!(
             "{} is not found. minimum setting is used",
             char_def.display()
         );
-        Lines::builtin(CHAR_PROPERTY_DEF_DEFAULT, char_def, Some(BUF_SIZE))
+        Lines::builtin(CHAR_PROPERTY_DEF_DEFAULT, char_def, Some(LINE_BUFFER_BYTES))
     };
     let source = lines.path().to_path_buf();
     let mut ranges: Vec<CodeRange> = Vec::new();
@@ -181,7 +173,7 @@ fn read_char_def(char_def: &Path) -> Result<CharDef, Error> {
         let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
         let columns = tokenize2(line, b"\t ", MAX_DEF_COLUMNS);
         if columns.len() < 2 {
-            return Err(failure(&source, format!("format error: {shown}")));
+            return Err(Error::build(&source, format!("format error: {shown}")));
         }
         let first = cstr(line, columns[0]);
         if first.starts_with(b"0x") {
@@ -194,20 +186,20 @@ fn read_char_def(char_def: &Path) -> Result<CharDef, Error> {
             )?);
         } else {
             if columns.len() < 4 {
-                return Err(failure(&source, format!("format error: {shown}")));
+                return Err(Error::build(&source, format!("format error: {shown}")));
             }
-            if first.len() >= NAME_BYTES {
-                return Err(failure(
+            if first.len() >= CATEGORY_NAME_BYTES {
+                return Err(Error::build(
                     &source,
                     format!(
                         "category name is longer than {} bytes: {}",
-                        NAME_BYTES - 1,
+                        CATEGORY_NAME_BYTES - 1,
                         String::from_utf8_lossy(first)
                     ),
                 ));
             }
             if categories.contains_key(first) {
-                return Err(failure(
+                return Err(Error::build(
                     &source,
                     format!(
                         "category {} is already defined",
@@ -233,14 +225,14 @@ fn require_categories_complete(
     unk_def: &Path,
 ) -> Result<(), Error> {
     if categories.len() >= MAX_CATEGORIES {
-        return Err(failure(
+        return Err(Error::build(
             char_def,
             format!("too many categories(>= {MAX_CATEGORIES})"),
         ));
     }
     for required in ["DEFAULT", "SPACE"] {
         if !categories.contains_key(required.as_bytes()) {
-            return Err(failure(
+            return Err(Error::build(
                 char_def,
                 format!("category [{required}] is undefined"),
             ));
@@ -248,13 +240,13 @@ fn require_categories_complete(
     }
 
     let mut lines = if unk_def.is_file() {
-        Lines::open(unk_def, Some(BUF_SIZE))?
+        Lines::open(unk_def, Some(LINE_BUFFER_BYTES))?
     } else {
         eprintln!(
             "{} is not found. minimum setting is used.",
             unk_def.display()
         );
-        Lines::builtin(UNK_DEF_DEFAULT, unk_def, Some(BUF_SIZE))
+        Lines::builtin(UNK_DEF_DEFAULT, unk_def, Some(LINE_BUFFER_BYTES))
     };
     let unk_source = lines.path().to_path_buf();
     let mut unknown: HashSet<Vec<u8>> = HashSet::new();
@@ -262,11 +254,11 @@ fn require_categories_complete(
         let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
         let columns = tokenize_csv(line, 2);
         if columns.is_empty() {
-            return Err(failure(&unk_source, format!("format error: {shown}")));
+            return Err(Error::build(&unk_source, format!("format error: {shown}")));
         }
         let key = cstr(line, columns[0]);
         if !categories.contains_key(key) {
-            return Err(failure(
+            return Err(Error::build(
                 &unk_source,
                 format!(
                     "category [{}] is undefined in {}",
@@ -279,7 +271,7 @@ fn require_categories_complete(
     }
     for name in categories.keys() {
         if !unknown.contains(name) {
-            return Err(failure(
+            return Err(Error::build(
                 &unk_source,
                 format!(
                     "category [{}] is undefined in {}",
@@ -301,18 +293,21 @@ pub(super) fn compile(char_def: &Path, unk_def: &Path) -> Result<Vec<u8>, Error>
     require_categories_complete(&categories, char_def, unk_def)?;
 
     let default = char_info_of_categories(&[b"DEFAULT".to_vec()], &categories, char_def)?;
-    let mut table = vec![default; TABLE_ENTRIES];
+    let mut table = vec![default; CHAR_BIN_ENTRIES];
     for range in &ranges {
         let info = char_info_of_categories(&range.categories, &categories, char_def)?;
         table[range.low as usize..=range.high as usize].fill(info);
     }
 
-    let mut bytes =
-        Vec::with_capacity(COUNT_BYTES + NAME_BYTES * order.len() + ENTRY_BYTES * TABLE_ENTRIES);
+    let mut bytes = Vec::with_capacity(
+        CHAR_BIN_COUNT_BYTES
+            + CATEGORY_NAME_BYTES * order.len()
+            + CHAR_BIN_ENTRY_BYTES * CHAR_BIN_ENTRIES,
+    );
     bytes.extend_from_slice(&(categories.len() as u32).to_le_bytes());
     for name in &order {
-        let mut padded = [0u8; NAME_BYTES];
-        debug_assert!(name.len() < NAME_BYTES);
+        let mut padded = [0u8; CATEGORY_NAME_BYTES];
+        debug_assert!(name.len() < CATEGORY_NAME_BYTES);
         padded[..name.len()].copy_from_slice(name);
         bytes.extend_from_slice(&padded);
     }
@@ -352,30 +347,21 @@ pub(crate) struct CharProperty {
 
 impl CharProperty {
     pub(crate) fn open(path: &Path) -> Result<Self, Error> {
-        let bytes = std::fs::read(path).map_err(|source| Error::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let categories = bytes
-            .first_chunk::<4>()
-            .map(|count| u32::from_le_bytes(*count) as usize)
-            .ok_or_else(|| failure(path, "invalid file size"))?;
-        let table_at = COUNT_BYTES + NAME_BYTES * categories;
-        if bytes.len() != table_at + ENTRY_BYTES * TABLE_ENTRIES {
-            return Err(failure(path, "invalid file size"));
+        let bytes = std::fs::read(path).map_err(io_error(path))?;
+        let categories = (bytes.len() >= CHAR_BIN_COUNT_BYTES)
+            .then(|| u32_at(&bytes, 0) as usize)
+            .ok_or_else(|| Error::build(path, "invalid file size"))?;
+        let table_at = CHAR_BIN_COUNT_BYTES + CATEGORY_NAME_BYTES * categories;
+        if bytes.len() != table_at + CHAR_BIN_ENTRY_BYTES * CHAR_BIN_ENTRIES {
+            return Err(Error::build(path, "invalid file size"));
         }
-        let names = bytes[COUNT_BYTES..table_at]
-            .as_chunks::<NAME_BYTES>()
+        let names = bytes[CHAR_BIN_COUNT_BYTES..table_at]
+            .as_chunks::<CATEGORY_NAME_BYTES>()
             .0
             .iter()
             .map(|name| cstr(name, 0).to_vec())
             .collect();
-        let table = bytes[table_at..]
-            .as_chunks::<ENTRY_BYTES>()
-            .0
-            .iter()
-            .map(|entry| u32::from_le_bytes(*entry))
-            .collect();
+        let table = u32_values(&bytes[table_at..]).collect();
         Ok(Self { names, table })
     }
 

@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 
-use mecab_rs::__private::io_error;
-use mecab_rs::__private::u32_at;
-use mecab_rs::__private::{HEADER_SIZE, MAGIC_ID, TOKEN_SIZE};
-use mecab_rs::__private::{write_file, write_file_with};
+use mecab_rs::__private::{
+    HEADER_SIZE, LEFT_ID_DEF_FILE, MAGIC_ID, MATRIX_BIN_FILE, RIGHT_ID_DEF_FILE, SYS_DIC_FILE,
+    TOKEN_SIZE, UNK_DIC_FILE, io_error, u16_at, u32_at, write_file, write_file_with,
+};
 use mecab_rs::{Dictionary, Error, Tagger};
 
 mod hot_pairs;
@@ -21,24 +21,16 @@ pub use mecab_rs::__private::default_threads;
 pub use runtime::{RuntimeOptions, RuntimeReport, StatsSource, build_runtime};
 pub use templates::{DEFAULT_HOT_CELLS, compile_templates};
 
-const CONTEXT_FILES: [&str; 2] = ["sys.dic", "unk.dic"];
-const ID_DEF_FILES: [&str; 2] = ["left-id.def", "right-id.def"];
+const CONTEXT_FILES: [&str; 2] = [SYS_DIC_FILE, UNK_DIC_FILE];
+const ID_DEF_FILES: [&str; 2] = [LEFT_ID_DEF_FILE, RIGHT_ID_DEF_FILE];
 pub const UNIDIC_FEATURE_COUNT: usize = 29;
 
-const MATRIX_FILE: &str = "matrix.bin";
 const RIGHT_STATS: &str = "right.tsv";
 const LEFT_STATS: &str = "left.tsv";
-fn bad(path: &Path, reason: impl Into<String>) -> Error {
-    Error::Rebuild {
-        path: path.to_path_buf(),
-        reason: reason.into(),
-    }
-}
+const HEADER_WORD_BYTES: usize = 4;
 
-const WORD_BYTES: usize = 4;
-
-fn word(bytes: &[u8], index: usize) -> u32 {
-    u32_at(bytes, index * WORD_BYTES)
+fn header_word(bytes: &[u8], index: usize) -> u32 {
+    u32_at(bytes, index * HEADER_WORD_BYTES)
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>, Error> {
@@ -69,7 +61,7 @@ fn prepare_output(dict_dir: &Path, out_dir: &Path) -> Result<(), Error> {
     let same = fs::canonicalize(dict_dir).map_err(io_error(dict_dir))?
         == fs::canonicalize(out_dir).map_err(io_error(out_dir))?;
     if same {
-        return Err(bad(
+        return Err(Error::rebuild(
             out_dir,
             "the output directory must differ from the source",
         ));
@@ -78,14 +70,14 @@ fn prepare_output(dict_dir: &Path, out_dir: &Path) -> Result<(), Error> {
 }
 
 fn matrix_shape(dict_dir: &Path) -> Result<(usize, usize), Error> {
-    let path = dict_dir.join(MATRIX_FILE);
+    let path = dict_dir.join(MATRIX_BIN_FILE);
     let mut header = [0u8; 4];
     File::open(&path)
         .and_then(|mut file| file.read_exact(&mut header))
         .map_err(io_error(&path))?;
     Ok((
-        usize::from(u16::from_le_bytes([header[0], header[1]])),
-        usize::from(u16::from_le_bytes([header[2], header[3]])),
+        usize::from(u16_at(&header, 0)),
+        usize::from(u16_at(&header, 2)),
     ))
 }
 
@@ -118,7 +110,8 @@ impl ContextStats {
 }
 
 fn read_counts(path: &Path) -> Result<Vec<u64>, Error> {
-    let text = String::from_utf8(read_file(path)?).map_err(|_| bad(path, "not UTF-8"))?;
+    let text =
+        String::from_utf8(read_file(path)?).map_err(|_| Error::rebuild(path, "not UTF-8"))?;
     let mut counts = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let parsed = line
@@ -127,7 +120,7 @@ fn read_counts(path: &Path) -> Result<Vec<u64>, Error> {
         match parsed {
             Some((id, count)) if id == counts.len() => counts.push(count),
             _ => {
-                return Err(bad(
+                return Err(Error::rebuild(
                     path,
                     format!("line {}: expected `{}<TAB>count`", index + 1, counts.len()),
                 ));
@@ -156,7 +149,8 @@ pub fn collect_stats(dict_dir: &Path, corpora: &[PathBuf]) -> Result<ContextStat
         };
         for corpus in corpora {
             let bytes = read_file(corpus)?;
-            let text = std::str::from_utf8(&bytes).map_err(|_| bad(corpus, "not UTF-8"))?;
+            let text =
+                std::str::from_utf8(&bytes).map_err(|_| Error::rebuild(corpus, "not UTF-8"))?;
             for line in text.split_terminator('\n') {
                 let sentence = line.strip_suffix('\r').unwrap_or(line);
                 let view = tagger.parse_lattice(sentence, &[])?;
@@ -206,12 +200,15 @@ fn patch_tokens(
     new_rc: &[usize],
 ) -> Result<(), Error> {
     if data.len() < HEADER_SIZE {
-        return Err(bad(path, "shorter than the 72-byte header"));
+        return Err(Error::rebuild(path, "shorter than the 72-byte header"));
     }
-    let (dsize, tsize) = (word(data, 6) as usize, word(data, 7) as usize);
+    let (dsize, tsize) = (header_word(data, 6) as usize, header_word(data, 7) as usize);
     let start = HEADER_SIZE + dsize;
     if tsize % TOKEN_SIZE != 0 || start.checked_add(tsize).is_none_or(|end| end > data.len()) {
-        return Err(bad(path, "the token section does not fit the file"));
+        return Err(Error::rebuild(
+            path,
+            "the token section does not fit the file",
+        ));
     }
     for token in data[start..start + tsize]
         .as_chunks_mut::<TOKEN_SIZE>()
@@ -219,10 +216,10 @@ fn patch_tokens(
         .iter_mut()
     {
         for (field, map) in [(0, new_lc), (2, new_rc)] {
-            let old = usize::from(u16::from_le_bytes([token[field], token[field + 1]]));
-            let new = map
-                .get(old)
-                .ok_or_else(|| bad(path, format!("a token uses id {old}, outside the matrix")))?;
+            let old = usize::from(u16_at(token, field));
+            let new = map.get(old).ok_or_else(|| {
+                Error::rebuild(path, format!("a token uses id {old}, outside the matrix"))
+            })?;
             token[field..field + 2].copy_from_slice(&(*new as u16).to_le_bytes());
         }
     }
@@ -235,7 +232,7 @@ fn renumber_id_def(text: &str, order: &[usize], path: &Path) -> Result<String, E
         rows.pop();
     }
     if rows.len() != order.len() {
-        return Err(bad(
+        return Err(Error::rebuild(
             path,
             format!(
                 "{} rows, but the matrix expects {}",
@@ -248,7 +245,7 @@ fn renumber_id_def(text: &str, order: &[usize], path: &Path) -> Result<String, E
     for (index, row) in rows.iter().enumerate() {
         let (_, rest) = row
             .split_once(' ')
-            .ok_or_else(|| bad(path, format!("row {} has no attributes", index + 1)))?;
+            .ok_or_else(|| Error::rebuild(path, format!("row {} has no attributes", index + 1)))?;
         attributes.push(rest);
     }
     let mut out = String::with_capacity(text.len() + 16);
@@ -267,7 +264,7 @@ fn write_permuted_matrix(
 ) -> Result<(), Error> {
     let (left_size, right_size) = (order_rc.len(), order_lc.len());
     if matrix.len() != 4 + 2 * left_size * right_size {
-        return Err(bad(
+        return Err(Error::rebuild(
             path,
             format!(
                 "{} bytes, but a {left_size} x {right_size} matrix takes {}",
@@ -276,18 +273,15 @@ fn write_permuted_matrix(
             ),
         ));
     }
-    let sink = |source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    };
-    writer.write_all(&matrix[..4]).map_err(sink)?;
+    let sink = io_error(path);
+    writer.write_all(&matrix[..4]).map_err(&sink)?;
     let mut row = vec![0u8; left_size * 2];
     for &old_row in order_lc {
         let from = &matrix[4 + old_row * left_size * 2..][..left_size * 2];
         for (cell, &old_column) in row.as_chunks_mut::<2>().0.iter_mut().zip(order_rc) {
             cell.copy_from_slice(&from[old_column * 2..][..2]);
         }
-        writer.write_all(&row).map_err(sink)?;
+        writer.write_all(&row).map_err(&sink)?;
     }
     Ok(())
 }
@@ -310,7 +304,7 @@ impl Renumbering {
     ) -> Result<Self, Error> {
         let (left_size, right_size) = matrix_shape(dict_dir)?;
         if stats.right.len() != left_size || stats.left.len() != right_size {
-            return Err(bad(
+            return Err(Error::rebuild(
                 stats_dir,
                 format!(
                     "right.tsv has {} ids and left.tsv {}, but the matrix is {left_size} x {right_size}",
@@ -325,8 +319,8 @@ impl Renumbering {
         let mut id_defs = Vec::new();
         for (name, order) in ID_DEF_FILES.iter().zip([&order_lc, &order_rc]) {
             let source = dict_dir.join(name);
-            let text =
-                String::from_utf8(read_file(&source)?).map_err(|_| bad(&source, "not UTF-8"))?;
+            let text = String::from_utf8(read_file(&source)?)
+                .map_err(|_| Error::rebuild(&source, "not UTF-8"))?;
             id_defs.push((*name, renumber_id_def(&text, order, &source)?));
         }
         Ok(Self {
@@ -351,7 +345,7 @@ impl Renumbering {
             let source = dict_dir.join(name);
             let mut data = read_file(&source)?;
             patch_tokens(&mut data, &source, &self.new_lc, &self.new_rc)?;
-            if let (Some(keep), "sys.dic") = (keep, name) {
+            if let (Some(keep), SYS_DIC_FILE) = (keep, name) {
                 let (slimmed, slim_report) = slim_dictionary(&data, &source, keep)?;
                 data = slimmed;
                 report = Some(slim_report);
@@ -371,10 +365,10 @@ impl Renumbering {
     }
 
     pub(crate) fn write_matrix(&self, dict_dir: &Path, out_dir: &Path) -> Result<(), Error> {
-        let matrix_path = dict_dir.join(MATRIX_FILE);
+        let matrix_path = dict_dir.join(MATRIX_BIN_FILE);
         let file = File::open(&matrix_path).map_err(io_error(&matrix_path))?;
         let matrix = unsafe { Mmap::map(&file) }.map_err(io_error(&matrix_path))?;
-        write_file_with(&out_dir.join(MATRIX_FILE), |writer| {
+        write_file_with(&out_dir.join(MATRIX_BIN_FILE), |writer| {
             write_permuted_matrix(
                 writer,
                 &matrix,
@@ -463,20 +457,23 @@ pub struct SlimReport {
 
 fn slim_dictionary(data: &[u8], path: &Path, keep: &Keep) -> Result<(Vec<u8>, SlimReport), Error> {
     if data.len() < HEADER_SIZE {
-        return Err(bad(path, "shorter than the 72-byte header"));
+        return Err(Error::rebuild(path, "shorter than the 72-byte header"));
     }
-    if word(data, 0) ^ MAGIC_ID != data.len() as u32 {
-        return Err(bad(path, "magic does not match the file size"));
+    if header_word(data, 0) ^ MAGIC_ID != data.len() as u32 {
+        return Err(Error::rebuild(path, "magic does not match the file size"));
     }
     let (dsize, tsize, fsize) = (
-        word(data, 6) as usize,
-        word(data, 7) as usize,
-        word(data, 8) as usize,
+        header_word(data, 6) as usize,
+        header_word(data, 7) as usize,
+        header_word(data, 8) as usize,
     );
     let token_start = HEADER_SIZE + dsize;
     let feature_start = token_start + tsize;
     if tsize % TOKEN_SIZE != 0 || feature_start + fsize != data.len() {
-        return Err(bad(path, "the sections do not add up to the file size"));
+        return Err(Error::rebuild(
+            path,
+            "the sections do not add up to the file size",
+        ));
     }
     let blob = &data[feature_start..];
     let mut tokens = data[token_start..feature_start].to_vec();
@@ -484,17 +481,17 @@ fn slim_dictionary(data: &[u8], path: &Path, keep: &Keep) -> Result<(Vec<u8>, Sl
     let mut by_text: HashMap<Vec<u8>, u32> = HashMap::new();
     let mut by_offset: HashMap<u32, u32> = HashMap::new();
     for token in tokens.as_chunks_mut::<TOKEN_SIZE>().0.iter_mut() {
-        let offset = u32::from_le_bytes(token[8..12].try_into().unwrap());
+        let offset = u32_at(token, 8);
         let place = match by_offset.get(&offset) {
             Some(&place) => place,
             None => {
-                let tail = blob
-                    .get(offset as usize..)
-                    .ok_or_else(|| bad(path, "a feature offset is past the feature section"))?;
+                let tail = blob.get(offset as usize..).ok_or_else(|| {
+                    Error::rebuild(path, "a feature offset is past the feature section")
+                })?;
                 let length = tail
                     .iter()
                     .position(|&byte| byte == 0)
-                    .ok_or_else(|| bad(path, "a feature is not NUL-terminated"))?;
+                    .ok_or_else(|| Error::rebuild(path, "a feature is not NUL-terminated"))?;
                 let text = keep.apply(&tail[..length]);
                 let place = match by_text.get(&text) {
                     Some(&place) => place,

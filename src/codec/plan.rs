@@ -51,7 +51,7 @@ fn trial(
     for (si, s) in srcs {
         m.set_srcs(*si, s.clone());
     }
-    let mut c = Coder::counter();
+    let mut coder = Coder::counter();
     let mut fields: Vec<&str> = Vec::with_capacity(lex.n_cols);
     for &(r, new_group) in sample {
         if new_group {
@@ -61,7 +61,7 @@ fn trial(
         for col in 0..lex.n_cols {
             fields.push(lex.field(r as usize, col));
         }
-        m.code_row(&mut c, &fields, "");
+        m.code_row(&mut coder, &fields, "");
     }
     m.step_bits.clone()
 }

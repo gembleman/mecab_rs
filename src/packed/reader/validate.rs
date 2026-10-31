@@ -1,20 +1,11 @@
 use super::*;
 
 const KNOWN_FLAGS: u32 = FLAG_HOT_MATRIX | FLAG_INT_TEMPLATES;
-const SECTION_ALIGNMENT: u64 = 8;
 const MAX_FORMAT_BITS: u32 = 32;
 pub(super) const DICRC_HEADER_BYTES: usize = 8;
 const UNKNOWN_START_BYTES: usize = 4;
 const BLOCK_ENTRY_BYTES: usize = 2;
 
-const FLAGS_AT: usize = 12;
-const CODE_COUNT_AT: usize = 16;
-const TOKEN_COUNT_AT: usize = 20;
-const PARAM_COUNT_AT: usize = 24;
-const CATEGORY_COUNT_AT: usize = 28;
-const PARAM_BITS_AT: usize = 32;
-const FEATURE_BITS_AT: usize = 36;
-const VERSION_AT: usize = 8;
 const CHAR_TABLE_CATEGORIES_AT: usize = 8;
 
 pub(super) struct Header {
@@ -32,19 +23,12 @@ impl Header {
     }
 }
 
-pub(super) fn format_error(path: &Path, reason: &'static str) -> Error {
-    Error::Format {
-        file: path.to_path_buf(),
-        reason,
-    }
-}
-
 fn check_flags(flags: u32, path: &Path) -> Result<(), Error> {
     if flags & !KNOWN_FLAGS != 0 {
-        return Err(format_error(path, "the flags are not valid"));
+        return Err(Error::format(path, "the flags are not valid"));
     }
     if (flags & FLAG_INT_TEMPLATES != 0) != (flags & FLAG_HOT_MATRIX != 0) {
-        return Err(format_error(
+        return Err(Error::format(
             path,
             "a hot matrix and integer templates come together",
         ));
@@ -53,7 +37,7 @@ fn check_flags(flags: u32, path: &Path) -> Result<(), Error> {
 }
 
 fn token_format(header: &[u8], path: &Path) -> Result<TokenFormat, Error> {
-    let broken = || format_error(path, "the widths of the token fields are not valid");
+    let broken = || Error::format(path, "the widths of the token fields are not valid");
     let (param_bits, feature_bits) = (
         u32_at(header, PARAM_BITS_AT),
         u32_at(header, FEATURE_BITS_AT),
@@ -71,10 +55,10 @@ fn token_format(header: &[u8], path: &Path) -> Result<TokenFormat, Error> {
 
 pub(super) fn parse_header(header: &[u8], path: &Path) -> Result<Header, Error> {
     if header[..MAGIC_BYTES] != *MAGIC {
-        return Err(format_error(path, "the magic number is not valid"));
+        return Err(Error::format(path, "the magic number is not valid"));
     }
     if u32_at(header, VERSION_AT) != VERSION {
-        return Err(format_error(
+        return Err(Error::format(
             path,
             "the file has another format version; pack the dictionary again",
         ));
@@ -100,13 +84,16 @@ pub(super) fn parse_sections(
     let mut end = HEADER_BYTES as u64;
     for (number, section) in sections.iter_mut().enumerate() {
         let at = SECTION_TABLE_AT + SECTION_ENTRY_BYTES * number;
-        let (offset, length) = (u64_at(header, at), u64_at(header, at + 8));
+        let (offset, length) = (
+            u64_at(header, at + SECTION_OFFSET_IN_ENTRY),
+            u64_at(header, at + SECTION_LENGTH_IN_ENTRY),
+        );
         let stop = offset.checked_add(length);
-        let misplaced = !offset.is_multiple_of(SECTION_ALIGNMENT)
+        let misplaced = !offset.is_multiple_of(SECTION_ALIGNMENT as u64)
             || offset < end
             || stop.is_none_or(|stop| stop > file_length);
         if misplaced {
-            return Err(format_error(
+            return Err(Error::format(
                 path,
                 "a section is misplaced or outside the file",
             ));
@@ -160,7 +147,7 @@ fn expected_matrix_length(
         HotShape::header_bytes(rows) - ROW_START_BYTES,
         &mut last_start,
     )?;
-    let cells = u32::from_le_bytes(last_start) as usize;
+    let cells = u32_at(&last_start, 0) as usize;
     Ok(HotShape::header_bytes(rows) + cells * 2)
 }
 
@@ -207,10 +194,10 @@ pub(super) fn check_matrix(source: &Source, header: &Header) -> Result<(usize, u
 }
 
 pub(super) fn check_char_table(source: &Source, category_count: usize) -> Result<(), Error> {
-    if source.section_length(CHAR_TABLE) < CHAR_TABLE_HEADER {
+    if source.section_length(CHAR_TABLE) < CHAR_TABLE_HEADER_BYTES {
         return Err(source.broken("the character table is shorter than its header"));
     }
-    let mut table_header = vec![0u8; CHAR_TABLE_HEADER];
+    let mut table_header = vec![0u8; CHAR_TABLE_HEADER_BYTES];
     source.read(CHAR_TABLE, 0, &mut table_header)?;
     if table_header[..4] != *CHAR_TABLE_MAGIC
         || u32_at(&table_header, CHAR_TABLE_CATEGORIES_AT) as usize != category_count
@@ -225,23 +212,13 @@ pub(super) fn check_char_table(source: &Source, category_count: usize) -> Result
 pub(super) fn check_char_codes(source: &Source, code_count: usize) -> Result<(), Error> {
     let index = source.read_all(CHAR_INDEX)?;
     let block_count = source.section_length(CHAR_BLOCKS) / (BLOCK_CODES * BLOCK_ENTRY_BYTES);
-    if index
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .any(|&pair| usize::from(u16::from_le_bytes(pair)) >= block_count)
-    {
+    if u16_values(&index).any(|block| usize::from(block) >= block_count) {
         return Err(source.broken("a character block does not exist"));
     }
     source.chunks(
         CHAR_BLOCKS,
         2,
-        |_, part| {
-            part.as_chunks::<2>()
-                .0
-                .iter()
-                .all(|&pair| usize::from(u16::from_le_bytes(pair)) < code_count)
-        },
+        |_, part| u16_values(part).all(|code| usize::from(code) < code_count),
         "a character code is out of range",
     )
 }
@@ -266,12 +243,7 @@ pub(super) fn check_params(
 
 pub(super) fn check_unknown_starts(source: &Source, header: &Header) -> Result<usize, Error> {
     let unknown_starts = source.read_all(UNKNOWN_STARTS)?;
-    let unknown_starts: Vec<u32> = unknown_starts
-        .as_chunks::<UNKNOWN_START_BYTES>()
-        .0
-        .iter()
-        .map(|&word| u32::from_le_bytes(word))
-        .collect();
+    let unknown_starts: Vec<u32> = u32_values(&unknown_starts).collect();
     let broken = || source.broken("the unknown tokens of the categories do not add up");
     if unknown_starts[0] != 0 || unknown_starts.windows(2).any(|pair| pair[0] > pair[1]) {
         return Err(broken());

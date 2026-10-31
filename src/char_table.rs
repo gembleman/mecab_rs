@@ -4,30 +4,22 @@ use std::io::{self, Write};
 use std::ops::RangeInclusive;
 use std::path::Path;
 
-use crate::error::Error;
+use crate::char_layout::{
+    CATEGORY_NAME_BYTES, CHAR_BIN_COUNT_BYTES, CHAR_BIN_ENTRIES, CHAR_BIN_ENTRY_BYTES,
+    MAX_CATEGORIES, pack_char_info,
+};
+use crate::dict_files::{CHAR_BIN_FILE, CHAR_DEF_FILE, CHAR_TABLE_FILE};
+use crate::error::{Error, io_error};
 use crate::file_write::write_file;
-
-pub(crate) const CHAR_TABLE_FILE: &str = "char.uni";
-const CHAR_BIN_FILE: &str = "char.bin";
-const CHAR_DEF_FILE: &str = "char.def";
 
 pub(crate) const MAGIC: &[u8; 4] = b"MXCU";
 pub(crate) const VERSION: u32 = 1;
-pub(crate) const HEADER_BYTES: usize = 16;
-pub(crate) const NAME_BYTES: usize = 32;
+pub(crate) const CHAR_TABLE_HEADER_BYTES: usize = 16;
 pub(crate) const PALETTE_ENTRY_BYTES: usize = 8;
 pub(crate) const MAX_PALETTE: usize = 256;
 pub(crate) const CODE_POINTS: usize = 0x11_0000;
 pub(crate) const BMP_LEN: usize = 0x1_0000;
 pub(crate) const EXTENDER_FLAG: u32 = 1;
-
-const BIN_TABLE_ENTRIES: usize = 0xffff;
-pub(crate) const TYPE_BITS: u32 = 18;
-pub(crate) const DEFAULT_TYPE_SHIFT: u32 = TYPE_BITS;
-pub(crate) const LENGTH_SHIFT: u32 = TYPE_BITS + 8;
-pub(crate) const GROUP_SHIFT: u32 = LENGTH_SHIFT + 4;
-pub(crate) const INVOKE_SHIFT: u32 = GROUP_SHIFT + 1;
-const MAX_CATEGORIES: usize = 18;
 
 const DEFAULT_CODE: usize = 0x0000;
 const IDEOGRAPH_CODE: usize = 0x3400;
@@ -61,21 +53,6 @@ pub struct CharTable {
     names: Vec<Vec<u8>>,
     palette: Vec<Entry>,
     table: Vec<u8>,
-}
-
-fn invalid(file: &Path, reason: &'static str) -> Error {
-    Error::Format {
-        file: file.to_path_buf(),
-        reason,
-    }
-}
-
-fn pack(type_mask: u32, default_type: u32, length: u32, group: u32, invoke: u32) -> u32 {
-    (type_mask & ((1 << TYPE_BITS) - 1))
-        | (default_type & 0xff) << DEFAULT_TYPE_SHIFT
-        | (length & 0xf) << LENGTH_SHIFT
-        | (group & 1) << GROUP_SHIFT
-        | (invoke & 1) << INVOKE_SHIFT
 }
 
 fn atoi(text: &[u8]) -> u32 {
@@ -187,7 +164,7 @@ fn parse_char_def(bytes: &[u8], file: &Path) -> Result<CharDef, Error> {
             ranges.push(DefRange {
                 low,
                 high,
-                info: pack(type_mask, id, length, group, invoke),
+                info: pack_char_info(type_mask, id, length, group, invoke),
             });
         } else {
             if columns.len() < 4 {
@@ -225,7 +202,7 @@ impl Interner {
             return Ok(index);
         }
         let index = u8::try_from(self.palette.len())
-            .map_err(|_| invalid(file, "more than 256 distinct character entries"))?;
+            .map_err(|_| Error::format(file, "more than 256 distinct character entries"))?;
         self.palette.push(entry);
         self.index.insert(entry, index);
         Ok(index)
@@ -234,31 +211,31 @@ impl Interner {
 
 impl CharTable {
     fn build(bin: &[u8], bin_path: &Path, def: Option<(&[u8], &Path)>) -> Result<Self, Error> {
-        let broken = |reason| invalid(bin_path, reason);
+        let broken = |reason| Error::format(bin_path, reason);
         let Some(&count) = bin.first_chunk() else {
             return Err(broken("the file is shorter than its header"));
         };
         let categories = u32::from_le_bytes(count) as usize;
         let table_start = categories
-            .checked_mul(NAME_BYTES)
-            .and_then(|names| names.checked_add(4))
+            .checked_mul(CATEGORY_NAME_BYTES)
+            .and_then(|names| names.checked_add(CHAR_BIN_COUNT_BYTES))
             .ok_or_else(|| broken("the file size does not match the header"))?;
-        if table_start.checked_add(4 * BIN_TABLE_ENTRIES) != Some(bin.len()) {
+        if table_start.checked_add(CHAR_BIN_ENTRY_BYTES * CHAR_BIN_ENTRIES) != Some(bin.len()) {
             return Err(broken("the file size does not match the header"));
         }
         if categories == 0 {
             return Err(broken("the file has no character categories"));
         }
-        let names: Vec<Vec<u8>> = bin[4..table_start]
-            .as_chunks::<NAME_BYTES>()
+        let names: Vec<Vec<u8>> = bin[CHAR_BIN_COUNT_BYTES..table_start]
+            .as_chunks::<CATEGORY_NAME_BYTES>()
             .0
             .iter()
             .map(|name| {
                 let length = name.iter().position(|&byte| byte == 0);
-                name[..length.unwrap_or(NAME_BYTES)].to_vec()
+                name[..length.unwrap_or(CATEGORY_NAME_BYTES)].to_vec()
             })
             .collect();
-        if names.iter().any(|name| name.len() >= NAME_BYTES) {
+        if names.iter().any(|name| name.len() >= CATEGORY_NAME_BYTES) {
             return Err(broken("a category name has no terminating NUL"));
         }
         let mut interner = Interner {
@@ -266,11 +243,16 @@ impl CharTable {
             index: HashMap::new(),
         };
         let mut table = vec![0u8; CODE_POINTS];
-        for (code, &entry) in bin[table_start..].as_chunks::<4>().0.iter().enumerate() {
+        for (code, &entry) in bin[table_start..]
+            .as_chunks::<CHAR_BIN_ENTRY_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let info = u32::from_le_bytes(entry);
             table[code] = interner.intern(Entry { info, flags: 0 }, bin_path)?;
         }
-        table[BIN_TABLE_ENTRIES] = interner.intern(Entry { info: 0, flags: 0 }, bin_path)?;
+        table[CHAR_BIN_ENTRIES] = interner.intern(Entry { info: 0, flags: 0 }, bin_path)?;
         let default = table[DEFAULT_CODE];
         table[BMP_LEN..].fill(default);
         let ideograph = table[IDEOGRAPH_CODE];
@@ -288,7 +270,7 @@ impl CharTable {
         if let Some((bytes, def_path)) = def {
             let def = parse_char_def(bytes, def_path)?;
             if def.names != names {
-                return Err(invalid(
+                return Err(Error::format(
                     def_path,
                     "the categories differ from those of char.bin",
                 ));
@@ -318,12 +300,7 @@ impl CharTable {
     }
 
     pub fn from_mecab(char_bin: &Path, char_def: Option<&Path>) -> Result<Self, Error> {
-        let read = |path: &Path| {
-            fs::read(path).map_err(|source| Error::Io {
-                path: path.to_path_buf(),
-                source,
-            })
-        };
+        let read = |path: &Path| fs::read(path).map_err(io_error(path));
         let bin = read(char_bin)?;
         let def = char_def
             .map(|path| read(path).map(|bytes| (bytes, path)))
@@ -338,8 +315,8 @@ impl CharTable {
         output.write_all(&(self.names.len() as u32).to_le_bytes())?;
         output.write_all(&(self.palette.len() as u32).to_le_bytes())?;
         for name in &self.names {
-            let mut padded = [0u8; NAME_BYTES];
-            debug_assert!(name.len() < NAME_BYTES);
+            let mut padded = [0u8; CATEGORY_NAME_BYTES];
+            debug_assert!(name.len() < CATEGORY_NAME_BYTES);
             padded[..name.len()].copy_from_slice(name);
             output.write_all(&padded)?;
         }

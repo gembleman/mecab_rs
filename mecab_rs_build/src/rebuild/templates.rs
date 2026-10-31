@@ -3,11 +3,12 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use super::{bad, read_file};
+use super::read_file;
 use crate::connection_templates::{ConnectionTemplates, TemplatePart};
-use mecab_rs::__private::HotShape;
-use mecab_rs::__private::io_error;
-use mecab_rs::__private::{id_rows, parse_side, project, read_bigrams, side_keys};
+use mecab_rs::__private::{
+    DICRC_FILE, FEATURE_DEF_FILE, HotShape, LEFT_ID_DEF_FILE, MODEL_DEF_FILE, RIGHT_ID_DEF_FILE,
+    id_rows, io_error, parse_side, project, read_bigrams, side_keys,
+};
 use mecab_rs::Error;
 
 pub(crate) const DEFAULT_HOT_LEFT: usize = 4480;
@@ -28,17 +29,18 @@ struct Source {
 }
 
 fn read_cost_factor(dicrc: &Path) -> Result<u32, Error> {
-    let text = String::from_utf8(read_file(dicrc)?).map_err(|_| bad(dicrc, "not UTF-8"))?;
+    let text =
+        String::from_utf8(read_file(dicrc)?).map_err(|_| Error::rebuild(dicrc, "not UTF-8"))?;
     for line in text.lines() {
         if line.starts_with("cost-factor") {
             return line
                 .split('=')
                 .nth(1)
                 .and_then(|value| value.trim().parse().ok())
-                .ok_or_else(|| bad(dicrc, "cost-factor is not an integer"));
+                .ok_or_else(|| Error::rebuild(dicrc, "cost-factor is not an integer"));
         }
     }
-    Err(bad(dicrc, "no cost-factor"))
+    Err(Error::rebuild(dicrc, "no cost-factor"))
 }
 
 fn read_weights(model_def: &Path, sources: &mut [Source]) -> Result<(), Error> {
@@ -70,7 +72,7 @@ fn read_weights(model_def: &Path, sources: &mut [Source]) -> Result<(), Error> {
             line.pop();
         }
         let malformed = || {
-            bad(
+            Error::rebuild(
                 model_def,
                 format!("line {number}: expected `weight<TAB>name:key`"),
             )
@@ -91,12 +93,12 @@ fn read_weights(model_def: &Path, sources: &mut [Source]) -> Result<(), Error> {
             continue;
         };
         let rest = std::str::from_utf8(&key[colon + 1..])
-            .map_err(|_| bad(model_def, format!("line {number}: not UTF-8")))?;
+            .map_err(|_| Error::rebuild(model_def, format!("line {number}: not UTF-8")))?;
         let weight: f64 = std::str::from_utf8(&line[..tab])
             .ok()
             .and_then(|text| text.parse().ok())
             .ok_or_else(|| {
-                bad(
+                Error::rebuild(
                     model_def,
                     format!("line {number}: the weight is not a number"),
                 )
@@ -136,7 +138,7 @@ fn compile(source: &Source, path: &Path) -> Result<TemplatePart, Error> {
         .into_iter()
         .collect();
     if left_relevant.len() > NO_FIRE_LIMIT || right_relevant.len() > NO_FIRE_LIMIT {
-        return Err(bad(
+        return Err(Error::rebuild(
             path,
             format!("template {} has more than 65535 distinct keys", source.name),
         ));
@@ -177,15 +179,15 @@ pub fn compile_templates(
     left_id_def: &str,
     right_id_def: &str,
 ) -> Result<ConnectionTemplates, Error> {
-    let cost_factor = read_cost_factor(&source_dir.join("dicrc"))?;
-    let feature_def = source_dir.join("feature.def");
-    let left_rows = id_rows(right_id_def, &source_dir.join("right-id.def"))?;
-    let right_rows = id_rows(left_id_def, &source_dir.join("left-id.def"))?;
+    let cost_factor = read_cost_factor(&source_dir.join(DICRC_FILE))?;
+    let feature_def = source_dir.join(FEATURE_DEF_FILE);
+    let left_rows = id_rows(right_id_def, &source_dir.join(RIGHT_ID_DEF_FILE))?;
+    let right_rows = id_rows(left_id_def, &source_dir.join(LEFT_ID_DEF_FILE))?;
     let mut sources = Vec::new();
     for (name, body) in read_bigrams(&feature_def)? {
         let (left_body, right_body) = body
             .split_once('/')
-            .ok_or_else(|| bad(&feature_def, format!("template {name} has no `/`")))?;
+            .ok_or_else(|| Error::rebuild(&feature_def, format!("template {name} has no `/`")))?;
         let left_keys = side_keys(&parse_side(left_body, true), &left_rows);
         let right_keys = side_keys(&parse_side(right_body, false), &right_rows);
         let set = |keys: &[Option<String>]| -> HashSet<String> {
@@ -200,7 +202,7 @@ pub fn compile_templates(
             weights: HashMap::new(),
         });
     }
-    let model_def = source_dir.join("model.def");
+    let model_def = source_dir.join(MODEL_DEF_FILE);
     read_weights(&model_def, &mut sources)?;
     let parts = sources
         .iter()

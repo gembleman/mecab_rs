@@ -25,16 +25,16 @@ pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<IdHasher>>;
 #[inline]
 pub fn mix(h: u64, x: u64) -> u64 {
     let mut z = h
-        .wrapping_mul(0xFF51_AFD7_ED55_8CCD)
-        .wrapping_add(x.wrapping_mul(0xC4CE_B9FE_1A85_EC53))
-        .wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        .wrapping_mul(MIX_HASH_MULTIPLIER)
+        .wrapping_add(x.wrapping_mul(MIX_VALUE_MULTIPLIER))
+        .wrapping_add(MIX_INCREMENT);
+    z = (z ^ (z >> 30)).wrapping_mul(MIX_FIRST_ROUND_MULTIPLIER);
+    z = (z ^ (z >> 27)).wrapping_mul(MIX_SECOND_ROUND_MULTIPLIER);
     z ^ (z >> 31)
 }
 
 pub fn hash_bytes(b: &[u8]) -> u64 {
-    let mut h = 0x243F_6A88_85A3_08D3 ^ b.len() as u64;
+    let mut h = HASH_BYTES_SEED ^ b.len() as u64;
     let (chunks, rest) = b.as_chunks::<8>();
     for &ch in chunks {
         h = mix(h, u64::from_le_bytes(ch));
@@ -83,6 +83,14 @@ impl Interner {
         self.map.insert(h, id);
         id
     }
+
+    #[inline]
+    pub fn find_or_add(&mut self, key: &[u8]) -> u32 {
+        match self.find(key) {
+            Some(id) => id,
+            None => self.add(key),
+        }
+    }
 }
 
 const TOTAL_LIMIT: u32 = 60000;
@@ -96,6 +104,14 @@ const HIT_INC: u32 = 2;
 const EXCLUSION_CAP: usize = 48;
 const EXCLUSION_SCAN_MAX: usize = 24;
 const BIG_INITIAL_CAP: usize = 64;
+const INLINE_ENTRY_COUNT: usize = 2;
+const FIRST_ARENA_CAP: u32 = 4;
+const MIX_HASH_MULTIPLIER: u64 = 0xFF51_AFD7_ED55_8CCD;
+const MIX_VALUE_MULTIPLIER: u64 = 0xC4CE_B9FE_1A85_EC53;
+const MIX_INCREMENT: u64 = 0x9E37_79B9_7F4A_7C15;
+const MIX_FIRST_ROUND_MULTIPLIER: u64 = 0xBF58_476D_1CE4_E5B9;
+const MIX_SECOND_ROUND_MULTIPLIER: u64 = 0x94D0_49BB_1331_11EB;
+const HASH_BYTES_SEED: u64 = 0x243F_6A88_85A3_08D3;
 const INITIAL_SLOTS: usize = 32;
 
 #[derive(Clone, Copy, Default)]
@@ -104,14 +120,14 @@ struct Table {
     len: u32,
     cap: u32,
     start: u32,
-    inl: [(u32, u32); 2],
+    inline_entries: [(u32, u32); INLINE_ENTRY_COUNT],
 }
 
 impl Table {
     #[inline]
     fn entries<'a>(&'a self, arena: &'a [(u32, u32)]) -> &'a [(u32, u32)] {
         if self.cap == 0 {
-            &self.inl[..self.len as usize]
+            &self.inline_entries[..self.len as usize]
         } else {
             &arena[self.start as usize..(self.start + self.len) as usize]
         }
@@ -120,7 +136,7 @@ impl Table {
     #[inline]
     fn entries_mut<'a>(&'a mut self, arena: &'a mut [(u32, u32)]) -> &'a mut [(u32, u32)] {
         if self.cap == 0 {
-            &mut self.inl[..self.len as usize]
+            &mut self.inline_entries[..self.len as usize]
         } else {
             &mut arena[self.start as usize..(self.start + self.len) as usize]
         }
@@ -128,14 +144,14 @@ impl Table {
 
     fn push(&mut self, arena: &mut Vec<(u32, u32)>, e: (u32, u32)) {
         if self.cap == 0 {
-            if self.len < 2 {
-                self.inl[self.len as usize] = e;
+            if (self.len as usize) < INLINE_ENTRY_COUNT {
+                self.inline_entries[self.len as usize] = e;
                 self.len += 1;
                 return;
             }
             self.start = arena.len() as u32;
-            self.cap = 4;
-            arena.extend_from_slice(&self.inl);
+            self.cap = FIRST_ARENA_CAP;
+            arena.extend_from_slice(&self.inline_entries);
             arena.extend_from_slice(&[(0, 0), (0, 0)]);
         } else if self.len == self.cap {
             let new_start = arena.len() as u32;
@@ -152,7 +168,7 @@ impl Table {
 
 struct Big {
     syms: Vec<u32>,
-    cnt: Vec<u32>,
+    counts: Vec<u32>,
     tree: Vec<u32>,
     pos_of: FastMap<u32, u32>,
     pos_ready: bool,
@@ -162,7 +178,7 @@ impl Big {
     fn from_sorted(entries: &[(u32, u32)]) -> Big {
         let mut b = Big {
             syms: entries.iter().map(|e| e.0).collect(),
-            cnt: entries.iter().map(|e| e.1).collect(),
+            counts: entries.iter().map(|e| e.1).collect(),
             tree: Vec::new(),
             pos_of: FastMap::default(),
             pos_ready: false,
@@ -174,8 +190,8 @@ impl Big {
     fn rebuild(&mut self, cap: usize) {
         self.tree.clear();
         self.tree.resize(cap + 1, 0);
-        for (i, &c) in self.cnt.iter().enumerate() {
-            self.tree[i + 1] = c;
+        for (i, &count) in self.counts.iter().enumerate() {
+            self.tree[i + 1] = count;
         }
         for i in 1..=cap {
             let j = i + i.isolate_lowest_one();
@@ -191,7 +207,7 @@ impl Big {
     }
 
     fn add(&mut self, pos: usize, delta: u32) {
-        self.cnt[pos] += delta;
+        self.counts[pos] += delta;
         let cap = self.cap();
         let mut i = pos + 1;
         while i <= cap {
@@ -206,7 +222,7 @@ impl Big {
             self.pos_of.insert(sym, pos as u32);
         }
         self.syms.push(sym);
-        self.cnt.push(0);
+        self.counts.push(0);
         if pos + 1 > self.cap() {
             let cap = self.cap() * 2;
             self.rebuild(cap);
@@ -252,9 +268,9 @@ impl Big {
 
     fn halve(&mut self) -> u32 {
         let mut total = 0;
-        for c in &mut self.cnt {
-            *c = c.div_ceil(2);
-            total += *c;
+        for count in &mut self.counts {
+            *count = count.div_ceil(2);
+            total += *count;
         }
         let cap = self.cap();
         self.rebuild(cap);
@@ -359,14 +375,14 @@ impl Ppm {
     }
 
     #[inline]
-    pub fn code(&mut self, c: &mut Coder, ctxs: &[u64], sym: u32) -> Option<u32> {
+    pub fn code(&mut self, coder: &mut Coder, ctxs: &[u64], sym: u32) -> Option<u32> {
         if (self.used + MAX_LEVELS) * 2 > self.slots.len() {
             self.grow();
         }
         self.nvisited = 0;
         self.hit = false;
-        let mut excl = [0u32; EXCLUSION_CAP];
-        let mut nex = 0usize;
+        let mut excluded = [0u32; EXCLUSION_CAP];
+        let mut excluded_count = 0usize;
         for &h in ctxs {
             let si = self.slot_for(h);
             self.visited[self.nvisited] = si;
@@ -375,83 +391,84 @@ impl Ppm {
             if t.total == 0 {
                 continue;
             }
-            let d = t.len;
-            let total = t.total + d;
+            let distinct = t.len;
+            let total = t.total + distinct;
             if t.cap == BIG {
                 let big = &mut self.bigs[t.start as usize];
-                if c.is_decoder() {
-                    let tg = c.target(total);
-                    if tg < t.total {
-                        let (pos, cum) = big.find(tg);
-                        c.consume(cum, big.cnt[pos]);
+                if coder.is_decoder() {
+                    let target = coder.target(total);
+                    if target < t.total {
+                        let (pos, cumulative) = big.find(target);
+                        coder.consume(cumulative, big.counts[pos]);
                         self.hit_pos = pos;
                         self.hit = true;
                         return Some(big.syms[pos]);
                     }
-                    c.consume(t.total, d);
+                    coder.consume(t.total, distinct);
                 } else if let Some(pos) = big.position(sym) {
-                    c.put(big.prefix(pos), big.cnt[pos], total);
+                    coder.put(big.prefix(pos), big.counts[pos], total);
                     self.hit_pos = pos;
                     self.hit = true;
                     return Some(sym);
                 } else {
-                    c.put(t.total, d, total);
+                    coder.put(t.total, distinct, total);
                 }
                 continue;
             }
             let entries = t.entries(&self.arena);
-            let (mut tot, mut dist) = (t.total, d);
-            if nex > 0 {
+            let (mut open_total, mut open_distinct) = (t.total, distinct);
+            if excluded_count > 0 {
                 for e in entries {
-                    if excl[..nex].contains(&e.0) {
-                        tot -= e.1;
-                        dist -= 1;
+                    if excluded[..excluded_count].contains(&e.0) {
+                        open_total -= e.1;
+                        open_distinct -= 1;
                     }
                 }
             }
-            if tot > 0 {
-                let total = tot + dist;
-                if c.is_decoder() {
-                    let tg = c.target(total);
-                    if tg < tot {
-                        let mut cum = 0;
+            if open_total > 0 {
+                let total = open_total + open_distinct;
+                if coder.is_decoder() {
+                    let target = coder.target(total);
+                    if target < open_total {
+                        let mut cumulative = 0;
                         for (i, &(s, n)) in entries.iter().enumerate() {
-                            if nex > 0 && excl[..nex].contains(&s) {
+                            if excluded_count > 0 && excluded[..excluded_count].contains(&s) {
                                 continue;
                             }
-                            if tg < cum + n {
-                                c.consume(cum, n);
+                            if target < cumulative + n {
+                                coder.consume(cumulative, n);
                                 self.hit_pos = i;
                                 self.hit = true;
                                 return Some(s);
                             }
-                            cum += n;
+                            cumulative += n;
                         }
                         unreachable!("frequency table out of sync");
                     }
-                    c.consume(tot, dist);
+                    coder.consume(open_total, open_distinct);
                 } else {
-                    let mut cum = 0;
+                    let mut cumulative = 0;
                     for (i, &(s, n)) in entries.iter().enumerate() {
-                        if nex > 0 && excl[..nex].contains(&s) {
+                        if excluded_count > 0 && excluded[..excluded_count].contains(&s) {
                             continue;
                         }
                         if s == sym {
-                            c.put(cum, n, total);
+                            coder.put(cumulative, n, total);
                             self.hit_pos = i;
                             self.hit = true;
                             return Some(sym);
                         }
-                        cum += n;
+                        cumulative += n;
                     }
-                    c.put(tot, dist, total);
+                    coder.put(open_total, open_distinct, total);
                 }
             }
             if entries.len() <= EXCLUSION_SCAN_MAX {
                 for e in entries {
-                    if nex < excl.len() && !excl[..nex].contains(&e.0) {
-                        excl[nex] = e.0;
-                        nex += 1;
+                    if excluded_count < excluded.len() && !excluded[..excluded_count].contains(&e.0)
+                    {
+                        excluded[excluded_count] = e.0;
+                        excluded_count += 1;
                     }
                 }
             }

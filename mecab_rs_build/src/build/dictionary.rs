@@ -7,15 +7,14 @@ use super::darts;
 use super::matrix::{self, MatrixSize};
 use super::model::CostModel;
 use super::rewrite::{ContextIds, PosIds, Rewriter};
-use super::text::{BUF_SIZE, Lines, atoi, cstr, escape_csv_element, failure, tokenize_csv};
+use super::text::{LINE_BUFFER_BYTES, Lines, atoi, cstr, escape_csv_element, tokenize_csv};
 use crate::connection_templates::to_cost;
-use mecab_rs::__private::write_file;
 use mecab_rs::__private::{
-    DIC_VERSION, DictionaryKind, HEADER_SIZE, MAGIC_ID, TOKEN_SIZE, VALUE_SIZE_BITS,
+    CHARSET_BYTES, DIC_VERSION, DictionaryKind, FEATURE_DEF_FILE, HEADER_SIZE, LEFT_ID_DEF_FILE,
+    MAGIC_ID, REWRITE_DEF_FILE, RIGHT_ID_DEF_FILE, TOKEN_SIZE, VALUE_SIZE_BITS, write_file,
 };
 use mecab_rs::Error;
 
-const CHARSET_BYTES: usize = 32;
 const CSV_COLUMNS: usize = 5;
 const SURFACE_COLUMN: usize = 0;
 const LEFT_ID_COLUMN: usize = 1;
@@ -61,7 +60,7 @@ impl<'a> Resources<'a> {
     }
 
     fn rewrite_def(&self) -> PathBuf {
-        self.settings.dic_dir.join("rewrite.def")
+        self.settings.dic_dir.join(REWRITE_DEF_FILE)
     }
 
     fn open_cost_model(&mut self) -> Result<(), Error> {
@@ -75,13 +74,16 @@ impl<'a> Resources<'a> {
     fn calc_cost(&mut self, word: &[u8], feature: &[u8]) -> Result<i32, Error> {
         let rewrite_def = self.rewrite_def();
         let (Some(rewriter), Some((model, property))) = (self.rewriter.as_mut(), &self.cost) else {
-            return Err(failure(&self.settings.dic_dir, "cannot open feature index"));
+            return Err(Error::build(
+                &self.settings.dic_dir,
+                "cannot open feature index",
+            ));
         };
         let (_, rewritten) = rewriter.rewrite_cached(feature, &rewrite_def)?;
         let weight = model.cost(
             &rewritten.unigram,
             property.default_type(word),
-            &self.settings.dic_dir.join("feature.def"),
+            &self.settings.dic_dir.join(FEATURE_DEF_FILE),
         )?;
         Ok(i32::from(to_cost(
             weight,
@@ -92,9 +94,9 @@ impl<'a> Resources<'a> {
     fn open_ids(&mut self) -> Result<(), Error> {
         if self.ids.is_none() {
             let dir = &self.settings.dic_dir;
-            let ids = ContextIds::open(&dir.join("left-id.def"), &dir.join("right-id.def"))?;
+            let ids = ContextIds::open(&dir.join(LEFT_ID_DEF_FILE), &dir.join(RIGHT_ID_DEF_FILE))?;
             if ids.left_size() != self.sizes.left || ids.right_size() != self.sizes.right {
-                return Err(failure(
+                return Err(Error::build(
                     dir,
                     format!(
                         "Context ID files(left-id.def or right-id.def may be broken: {} {} {} {}",
@@ -118,7 +120,7 @@ impl<'a> Resources<'a> {
         let rewriter = self.rewriter.as_ref().expect("opened above");
         let (matched, rewritten) = rewriter.rewrite(feature, &path)?;
         if !matched {
-            return Err(failure(
+            return Err(Error::build(
                 &path,
                 format!("rewrite failed: {}", String::from_utf8_lossy(feature)),
             ));
@@ -144,7 +146,7 @@ impl<'a> Resources<'a> {
 const NO_POS_ID: i32 = -1;
 
 fn invalid_ids_error(left: i32, right: i32, dir: &Path) -> Error {
-    failure(dir, format!("invalid ids are found lid={left} rid={right}"))
+    Error::build(dir, format!("invalid ids are found lid={left} rid={right}"))
 }
 
 struct ReadEntries {
@@ -167,16 +169,16 @@ fn read_entries(
     for input in inputs {
         let mut lines = if kind == DictionaryKind::Unknown && !input.is_file() {
             eprintln!("{} is not found. minimum setting is used.", input.display());
-            Lines::builtin(UNK_DEF_DEFAULT, input, Some(BUF_SIZE))
+            Lines::builtin(UNK_DEF_DEFAULT, input, Some(LINE_BUFFER_BYTES))
         } else {
-            Lines::open(input, Some(BUF_SIZE))?
+            Lines::open(input, Some(LINE_BUFFER_BYTES))?
         };
         let mut count = 0;
         while let Some(line) = lines.next_line()? {
             let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
             let columns = tokenize_csv(line, CSV_COLUMNS);
             if columns.len() != CSV_COLUMNS {
-                return Err(failure(input, format!("format error: {shown}")));
+                return Err(Error::build(input, format!("format error: {shown}")));
             }
             let word = cstr(line, columns[SURFACE_COLUMN]).to_vec();
             let mut left = to_int(cstr(line, columns[LEFT_ID_COLUMN]));
@@ -185,12 +187,15 @@ fn read_entries(
             let feature = cstr(line, columns[FEATURE_COLUMN]).to_vec();
             let pos_id = pos_ids.id(&feature)?;
             if pos_id < NO_POS_ID || pos_id > i32::from(u16::MAX) {
-                return Err(failure(input, format!("pos id out of range: {pos_id}")));
+                return Err(Error::build(
+                    input,
+                    format!("pos id out of range: {pos_id}"),
+                ));
             }
 
             if cost == NO_VALUE {
                 if kind != DictionaryKind::User {
-                    return Err(failure(
+                    return Err(Error::build(
                         input,
                         "cost field should not be empty in sys/unk dic.",
                     ));
@@ -205,7 +210,7 @@ fn read_entries(
                 return Err(invalid_ids_error(left, right, dir));
             }
             if i16::try_from(cost).is_err() {
-                return Err(failure(
+                return Err(Error::build(
                     input,
                     format!("cost out of the 16-bit range: {cost}: {shown}"),
                 ));
@@ -218,7 +223,7 @@ fn read_entries(
             let feature_offset = features.len();
             if !settings.options.wakati {
                 if str::from_utf8(&feature).is_err() {
-                    return Err(failure(
+                    return Err(Error::build(
                         input,
                         format!("the feature is not valid UTF-8: {shown}"),
                     ));
@@ -233,7 +238,7 @@ fn read_entries(
                 pos_id: pos_id as u16,
                 cost: cost as i16,
                 feature: u32::try_from(feature_offset)
-                    .map_err(|_| failure(input, "the features are longer than 4 GiB"))?,
+                    .map_err(|_| Error::build(input, "the features are longer than 4 GiB"))?,
             });
             count += 1;
         }
@@ -257,8 +262,9 @@ fn group_by_surface<'a>(entries: &'a [Entry], output: &Path) -> Result<SurfaceGr
     let mut push_group = |first_entry: usize, size: usize| -> Result<(), Error> {
         keys.push(&entries[first_entry].surface);
         values.push(
-            i32::try_from(size + (first_entry << VALUE_SIZE_BITS))
-                .map_err(|_| failure(output, "too many entries for the double array values"))?,
+            i32::try_from(size + (first_entry << VALUE_SIZE_BITS)).map_err(|_| {
+                Error::build(output, "too many entries for the double array values")
+            })?,
         );
         Ok(())
     };
@@ -305,7 +311,8 @@ fn encode_header(
     output: &Path,
 ) -> Result<Vec<u8>, Error> {
     let as_u32 = |value: usize, what: &str| {
-        u32::try_from(value).map_err(|_| failure(output, format!("{what} is longer than 4 GiB")))
+        u32::try_from(value)
+            .map_err(|_| Error::build(output, format!("{what} is longer than 4 GiB")))
     };
     let total = HEADER_SIZE + lengths.array + lengths.tokens + lengths.features;
     let mut header = Vec::with_capacity(HEADER_SIZE);
@@ -350,7 +357,7 @@ pub(super) fn compile(
         features.push(0);
     }
     if entries.is_empty() {
-        return Err(failure(output, "no entries to compile"));
+        return Err(Error::build(output, "no entries to compile"));
     }
 
     entries.sort_by(|a, b| a.surface.cmp(&b.surface));
@@ -392,13 +399,13 @@ pub(super) fn assign_costs(
     let mut text = Vec::new();
     let mut counts = Vec::new();
     for input in inputs {
-        let mut lines = Lines::open(input, Some(BUF_SIZE))?;
+        let mut lines = Lines::open(input, Some(LINE_BUFFER_BYTES))?;
         let mut count = 0;
         while let Some(line) = lines.next_line()? {
             let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
             let columns = tokenize_csv(line, CSV_COLUMNS);
             if columns.len() != CSV_COLUMNS {
-                return Err(failure(input, format!("format error: {shown}")));
+                return Err(Error::build(input, format!("format error: {shown}")));
             }
             let mut word = cstr(line, columns[SURFACE_COLUMN]).to_vec();
             let feature = cstr(line, columns[FEATURE_COLUMN]).to_vec();

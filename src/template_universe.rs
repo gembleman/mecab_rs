@@ -4,7 +4,9 @@ use std::fs;
 use std::path::Path;
 
 use crate::Error;
-use crate::error::{io_error, rebuild_error as bad};
+#[cfg(feature = "xz")]
+use crate::dict_files::{LEFT_ID_DEF_FILE, RIGHT_ID_DEF_FILE};
+use crate::error::io_error;
 
 #[cfg(feature = "xz")]
 const NO_FIRE_LIMIT: usize = 0xFFFF;
@@ -115,11 +117,11 @@ pub fn id_rows(text: &str, path: &Path) -> Result<Vec<Vec<String>>, Error> {
     let mut rows = Vec::new();
     for line in text.split_terminator('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
-        let (index, attributes) = line
-            .split_once(' ')
-            .ok_or_else(|| bad(path, format!("row {} has no attributes", rows.len() + 1)))?;
+        let (index, attributes) = line.split_once(' ').ok_or_else(|| {
+            Error::rebuild(path, format!("row {} has no attributes", rows.len() + 1))
+        })?;
         if index.parse::<usize>().ok() != Some(rows.len()) {
-            return Err(bad(
+            return Err(Error::rebuild(
                 path,
                 format!(
                     "row {} does not carry the id {}",
@@ -156,13 +158,13 @@ pub fn side_keys(pieces: &[Piece], rows: &[Vec<String>]) -> Vec<Option<String>> 
 
 pub fn read_bigrams(feature_def: &Path) -> Result<Vec<(String, String)>, Error> {
     let text = String::from_utf8(fs::read(feature_def).map_err(io_error(feature_def))?)
-        .map_err(|_| bad(feature_def, "not UTF-8"))?;
+        .map_err(|_| Error::rebuild(feature_def, "not UTF-8"))?;
     let mut bigrams = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("BIGRAM ") {
-            let (name, body) = rest
-                .split_once(':')
-                .ok_or_else(|| bad(feature_def, format!("BIGRAM line without `:`: {line}")))?;
+            let (name, body) = rest.split_once(':').ok_or_else(|| {
+                Error::rebuild(feature_def, format!("BIGRAM line without `:`: {line}"))
+            })?;
             bigrams.push((name.to_string(), body.to_string()));
         }
     }
@@ -194,12 +196,15 @@ pub fn universe_projections(
     right_id_def: &str,
     source: &Path,
 ) -> Result<Vec<(UniverseSide, UniverseSide)>, Error> {
-    let left_rows = id_rows(right_id_def, &source.join("right-id.def"))?;
-    let right_rows = id_rows(left_id_def, &source.join("left-id.def"))?;
+    let left_rows = id_rows(right_id_def, &source.join(RIGHT_ID_DEF_FILE))?;
+    let right_rows = id_rows(left_id_def, &source.join(LEFT_ID_DEF_FILE))?;
     let side = |keys: Vec<Option<String>>| -> Result<UniverseSide, Error> {
         let distinct: BTreeSet<&str> = keys.iter().flatten().map(String::as_str).collect();
         if distinct.len() > NO_FIRE_LIMIT {
-            return Err(bad(source, "a template has more than 65535 distinct keys"));
+            return Err(Error::rebuild(
+                source,
+                "a template has more than 65535 distinct keys",
+            ));
         }
         let distinct: Vec<&str> = distinct.into_iter().collect();
         Ok(UniverseSide {
@@ -212,7 +217,7 @@ pub fn universe_projections(
         .map(|(name, body)| {
             let (left_body, right_body) = body
                 .split_once('/')
-                .ok_or_else(|| bad(source, format!("template {name} has no `/`")))?;
+                .ok_or_else(|| Error::rebuild(source, format!("template {name} has no `/`")))?;
             Ok((
                 side(side_keys(&parse_side(left_body, true), &left_rows))?,
                 side(side_keys(&parse_side(right_body, false), &right_rows))?,

@@ -3,10 +3,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use super::bad;
 use crate::connection_templates::{ConnectionTemplates, ExactRows};
-use mecab_rs::__private::HotShape;
-use mecab_rs::__private::{IntPart, IntTemplates};
+use mecab_rs::__private::{HotShape, IntPart, IntTemplates, MATRIX_HOT_FILE, MATRIX_ITP_FILE};
 use mecab_rs::Error;
 
 pub const RUNTIME_SHIFT: u32 = 20;
@@ -19,7 +17,10 @@ fn integer_cost_factor(templates: &ConnectionTemplates, path: &Path) -> Result<u
             return Ok(integer);
         }
     }
-    Err(bad(path, "the cost-factor is not a usable integer"))
+    Err(Error::rebuild(
+        path,
+        "the cost-factor is not a usable integer",
+    ))
 }
 
 pub fn quantize(
@@ -37,7 +38,10 @@ pub fn quantize(
             for at in span[0] as usize..span[1] as usize {
                 let rounded = (part.weight[at] * scale).round();
                 if rounded.is_nan() || rounded.abs() > f64::from(i32::MAX) {
-                    return Err(bad(path, "a weight does not fit the integer grid"));
+                    return Err(Error::rebuild(
+                        path,
+                        "a weight does not fit the integer grid",
+                    ));
                 }
                 if rounded != 0.0 {
                     left_index.push(part.left_index[at]);
@@ -137,10 +141,10 @@ pub fn write_int_files(
     use mecab_rs::__private::write_file;
     let shape =
         super::templates::hot_shape_or_default(hot, templates.left_size(), templates.right_size());
-    write_file(&dict_dir.join("matrix.itp"), |writer| {
+    write_file(&dict_dir.join(MATRIX_ITP_FILE), |writer| {
         templates.write_templates(writer)
     })?;
-    write_file(&dict_dir.join("matrix.hot"), |writer| {
+    write_file(&dict_dir.join(MATRIX_HOT_FILE), |writer| {
         templates.write_hot_matrix(&shape, threads, writer)
     })
 }

@@ -1,8 +1,8 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use super::{failure, open_lines, surface_and_feature};
-use crate::build::text::{BUF_SIZE, Lines, atoi, cstr, tokenize_csv, tokenize2};
+use super::{open_lines, surface_and_feature};
+use crate::build::text::{LINE_BUFFER_BYTES, Lines, atoi, cstr, tokenize_csv, tokenize2};
 use mecab_rs::Error;
 
 struct Stream {
@@ -14,11 +14,10 @@ type Sentence = Vec<Vec<Vec<u8>>>;
 
 const LEVEL_TOKEN_LIMIT: usize = 512;
 
+const OUTPUT_PATH: &str = "output";
+
 fn output_error(source: io::Error) -> Error {
-    Error::Io {
-        path: PathBuf::from("output"),
-        source,
-    }
+    Error::io(Path::new(OUTPUT_PATH), source)
 }
 
 fn read_sentence(stream: &mut Stream, levels: &[i32]) -> Result<Option<Sentence>, Error> {
@@ -38,11 +37,11 @@ fn read_sentence(stream: &mut Stream, levels: &[i32]) -> Result<Option<Sentence>
         let text = cstr(line, 0);
         let Some((surface, feature)) = surface_and_feature(text) else {
             let shown = String::from_utf8_lossy(text);
-            return Err(failure(&path, format!("format error: {shown}")));
+            return Err(Error::learn(&path, format!("format error: {shown}")));
         };
         let mut buffer = feature.to_vec();
         buffer.push(0);
-        let starts = tokenize_csv(&mut buffer, BUF_SIZE - 1);
+        let starts = tokenize_csv(&mut buffer, LINE_BUFFER_BYTES - 1);
         let columns: Vec<&[u8]> = starts.iter().map(|&start| cstr(&buffer, start)).collect();
         let count = columns.len();
         let mut keys = Vec::with_capacity(levels.len());
@@ -53,7 +52,7 @@ fn read_sentence(stream: &mut Stream, levels: &[i32]) -> Result<Option<Sentence>
                 usize::try_from(level).unwrap_or(0)
             };
             if wanted > count {
-                return Err(failure(&path, format!(" out of range {level}")));
+                return Err(Error::learn(&path, format!(" out of range {level}")));
             }
             let mut key = surface.to_vec();
             for column in &columns[..wanted] {
@@ -110,7 +109,7 @@ pub fn evaluate(
     let mut first = open(system)?;
     let mut second = open(answer)?;
     if levels.is_empty() {
-        return Err(failure(system, "level_str is NULL"));
+        return Err(Error::learn(system, "level_str is NULL"));
     }
     let mut buffer = levels.as_bytes().to_vec();
     buffer.push(0);
@@ -119,7 +118,7 @@ pub fn evaluate(
         .map(|start| atoi(cstr(&buffer, start)))
         .collect();
     if levels.is_empty() {
-        return Err(failure(system, "level_str is empty"));
+        return Err(Error::learn(system, "level_str is empty"));
     }
     let mut correct = vec![0usize; levels.len()];
     let mut precision = 0usize;
@@ -175,7 +174,7 @@ pub fn test_sentences(inputs: &[PathBuf], out: &mut dyn Write) -> Result<(), Err
     let mut sentence: Vec<u8> = Vec::new();
     for input in inputs {
         let mut lines = if input.as_os_str() == "-" {
-            Lines::stdin(input, Some(BUF_SIZE))
+            Lines::stdin(input, Some(LINE_BUFFER_BYTES))
         } else {
             open_lines(input)?
         };

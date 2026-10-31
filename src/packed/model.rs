@@ -1,17 +1,22 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::path::Path;
 
 use super::bits::{BitWriter, MAX_RECORD_BITS, PADDING, width_of};
 use super::features;
 use super::order;
 use super::trie::{self, Entry};
 use super::{
-    BLOCK_CODES, BLOCK_COUNT, CELLS, CELLS_PADDING, CHAR_BLOCKS, CHAR_INDEX, CHAR_TABLE, DICRC,
-    FEATURES, FLAG_HOT_MATRIX, FLAG_INT_TEMPLATES, HEADER_BYTES, MAGIC, MATRIX, PARAMS, SECTIONS,
-    TEMPLATES, TOKENS, UNIT_BYTES, UNKNOWN_STARTS, UNKNOWN_TOKENS, VERSION,
+    BLOCK_CODES, BLOCK_COUNT, CATEGORY_COUNT_AT, CELLS, CELLS_PADDING, CHAR_BLOCKS, CHAR_INDEX,
+    CHAR_TABLE, CODE_COUNT_AT, DICRC, FEATURE_BITS_AT, FEATURES, FLAG_HOT_MATRIX,
+    FLAG_INT_TEMPLATES, FLAGS_AT, HEADER_BYTES, MAGIC, MAGIC_BYTES, MATRIX, PARAM_BITS_AT,
+    PARAM_COUNT_AT, PARAMS, SECTION_ALIGNMENT, SECTION_ENTRY_BYTES, SECTION_LENGTH_IN_ENTRY,
+    SECTION_OFFSET_IN_ENTRY, SECTION_TABLE_AT, SECTIONS, TEMPLATES, TOKEN_COUNT_AT, TOKENS,
+    UNIT_BYTES, UNKNOWN_STARTS, UNKNOWN_TOKENS, VERSION, VERSION_AT,
 };
 use crate::Error;
+use crate::dict_files::MATRIX_HOT_FILE;
 use crate::hot_shape::HotShape;
 use crate::int_runtime::{is_runtime_form, runtime_form_of};
 
@@ -58,8 +63,8 @@ impl Runtime<'_> {
         output.write_all(&self.header)?;
         for section in &self.sections {
             output.write_all(section)?;
-            let padding = section.len().next_multiple_of(8) - section.len();
-            output.write_all(&[0; 8][..padding])?;
+            let padding = section.len().next_multiple_of(SECTION_ALIGNMENT) - section.len();
+            output.write_all(&[0; SECTION_ALIGNMENT][..padding])?;
         }
         Ok(())
     }
@@ -210,10 +215,8 @@ impl Model {
         let mut sections: [Cow<'_, [u8]>; SECTIONS] = sections;
         sections[MATRIX] = Cow::Borrowed(&self.matrix);
         sections[TEMPLATES] = if !self.templates.is_empty() && !is_runtime_form(&self.templates) {
-            let (_, _, shape) = HotShape::parse(&self.matrix).map_err(|reason| Error::Format {
-                file: "matrix.hot".into(),
-                reason,
-            })?;
+            let (_, _, shape) = HotShape::parse(&self.matrix)
+                .map_err(|reason| Error::format(Path::new(MATRIX_HOT_FILE), reason))?;
             match runtime_form_of(&self.templates, &shape) {
                 Ok(bytes) => bytes.into(),
                 Err(Error::Unsupported(_)) => {
@@ -235,28 +238,33 @@ impl Model {
         dicrc.extend_from_slice(unknown.as_bytes());
         sections[DICRC] = dicrc.into();
 
-        let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&VERSION.to_le_bytes());
+        let mut out = vec![0u8; HEADER_BYTES];
+        out[..MAGIC_BYTES].copy_from_slice(MAGIC);
         let flags = u32::from(!self.templates.is_empty()) * (FLAG_HOT_MATRIX | FLAG_INT_TEMPLATES);
-        out.extend_from_slice(&flags.to_le_bytes());
-        for count in [
-            code_count,
-            self.token_params.len() as u32,
-            self.params.len() as u32,
-            self.unknown_starts.len().saturating_sub(1) as u32,
-            param_bits,
-            feature_bits,
+        for (at, value) in [
+            (VERSION_AT, VERSION),
+            (FLAGS_AT, flags),
+            (CODE_COUNT_AT, code_count),
+            (TOKEN_COUNT_AT, self.token_params.len() as u32),
+            (PARAM_COUNT_AT, self.params.len() as u32),
+            (
+                CATEGORY_COUNT_AT,
+                self.unknown_starts.len().saturating_sub(1) as u32,
+            ),
+            (PARAM_BITS_AT, param_bits),
+            (FEATURE_BITS_AT, feature_bits),
         ] {
-            out.extend_from_slice(&count.to_le_bytes());
+            out[at..at + 4].copy_from_slice(&value.to_le_bytes());
         }
         let mut offset = HEADER_BYTES;
-        for section in &sections {
-            out.extend_from_slice(&(offset as u64).to_le_bytes());
-            out.extend_from_slice(&(section.len() as u64).to_le_bytes());
-            offset += section.len().next_multiple_of(8);
+        for (number, section) in sections.iter().enumerate() {
+            let at = SECTION_TABLE_AT + SECTION_ENTRY_BYTES * number;
+            out[at + SECTION_OFFSET_IN_ENTRY..][..8]
+                .copy_from_slice(&(offset as u64).to_le_bytes());
+            out[at + SECTION_LENGTH_IN_ENTRY..][..8]
+                .copy_from_slice(&(section.len() as u64).to_le_bytes());
+            offset += section.len().next_multiple_of(SECTION_ALIGNMENT);
         }
-        debug_assert_eq!(out.len(), HEADER_BYTES);
         Ok(Runtime {
             header: out,
             sections: sections.into(),

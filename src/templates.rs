@@ -53,10 +53,7 @@ impl<'a> TemplateReader<'a> {
     }
 
     pub(crate) fn broken(&self, reason: &'static str) -> Error {
-        Error::Format {
-            file: self.path.to_path_buf(),
-            reason,
-        }
+        Error::format(self.path, reason)
     }
 
     pub(crate) fn bytes<const WIDTH: usize>(&mut self) -> Result<[u8; WIDTH], Error> {

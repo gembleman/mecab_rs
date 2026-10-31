@@ -5,7 +5,8 @@ use super::features::{FeatureIndex, Features, remap_weights};
 use super::lattice::{Reader, Sentence};
 use super::lbfgs::Lbfgs;
 use super::tokenizer::Tokenizer;
-use super::{Config, failure, format_g, open_lines};
+use super::{Config, Existing, LineEnding, format_g, open_lines};
+use mecab_rs::__private::DICRC_FILE;
 use mecab_rs::Error;
 
 const MAX_THREADS: usize = 512;
@@ -88,11 +89,11 @@ pub fn train(
 ) -> Result<TrainReport, Error> {
     let dic_dir = options.dic_dir.as_path();
     let mut config = Config::default();
-    config.set("cost", &options.cost.to_string(), true);
-    config.set("eta", &options.eta.to_string(), true);
-    config.set("freq", &options.freq.to_string(), true);
-    config.set("thread", &options.threads.to_string(), true);
-    config.load(&dic_dir.join("dicrc"))?;
+    config.set("cost", &options.cost.to_string(), Existing::Replace);
+    config.set("eta", &options.eta.to_string(), Existing::Replace);
+    config.set("freq", &options.freq.to_string(), Existing::Replace);
+    config.set("thread", &options.threads.to_string(), Existing::Replace);
+    config.load(&dic_dir.join(DICRC_FILE))?;
 
     let mut tokenizer = Tokenizer::open(dic_dir, &config)?;
     let mut features = Features::open(dic_dir)?;
@@ -105,7 +106,7 @@ pub fn train(
         let (alpha, settings) = index.reopen(old_model, &tokenizer.charset)?;
         old_alpha = alpha;
         for (key, value) in settings {
-            config.set(&key, &value, true);
+            config.set(&key, &value, Existing::Replace);
         }
     }
 
@@ -117,28 +118,34 @@ pub fn train(
     let freq: usize = config.number("freq");
 
     if cost.is_nan() || cost <= 0.0 {
-        return Err(failure(
+        return Err(Error::learn(
             dic_dir,
             format!("cost parameter is out of range: {}", format_g(cost)),
         ));
     }
     if eta.is_nan() || eta <= 0.0 {
-        return Err(failure(
+        return Err(Error::learn(
             dic_dir,
             format!("eta is out of range: {}", format_g(eta)),
         ));
     }
     if eval_size == 0 {
-        return Err(failure(dic_dir, "eval-size is out of range: 0"));
+        return Err(Error::learn(dic_dir, "eval-size is out of range: 0"));
     }
     if unk_eval_size == 0 {
-        return Err(failure(dic_dir, "unk-eval-size is out of range: 0"));
+        return Err(Error::learn(dic_dir, "unk-eval-size is out of range: 0"));
     }
     if freq == 0 {
-        return Err(failure(dic_dir, format!("freq is out of range: {freq}")));
+        return Err(Error::learn(
+            dic_dir,
+            format!("freq is out of range: {freq}"),
+        ));
     }
     if threads == 0 || threads > MAX_THREADS {
-        return Err(failure(dic_dir, format!("# thread is invalid: {threads}")));
+        return Err(Error::learn(
+            dic_dir,
+            format!("# thread is invalid: {threads}"),
+        ));
     }
 
     let _ = write!(log, "reading corpus ...");
@@ -280,7 +287,7 @@ pub fn train(
 
         let status = lbfgs.optimize(size, &mut alpha, objective, &expected);
         if status < 0 {
-            return Err(failure(dic_dir, "unexpected error in LBFGS routine"));
+            return Err(Error::learn(dic_dir, "unexpected error in LBFGS routine"));
         }
         if status == 0 {
             break;
@@ -294,7 +301,7 @@ pub fn train(
         format_g(cost),
         tokenizer.charset
     );
-    index.save(model, &header, &alpha, options.crlf)?;
+    index.save(model, &header, &alpha, LineEnding::from(options.crlf))?;
 
     Ok(TrainReport {
         sentences: sentence_count,

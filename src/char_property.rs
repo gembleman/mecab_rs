@@ -1,41 +1,46 @@
 use std::path::Path;
 
+use crate::char_layout::{
+    CATEGORY_NAME_BYTES, DEFAULT_TYPE_MASK, DEFAULT_TYPE_SHIFT, FLAG_MASK, GROUP_SHIFT,
+    INVOKE_SHIFT, LENGTH_MASK, LENGTH_SHIFT, TYPE_MASK,
+};
 use crate::char_table::{
-    BMP_LEN, CODE_POINTS, DEFAULT_TYPE_SHIFT, EXTENDER_FLAG, GROUP_SHIFT, HEADER_BYTES,
-    INVOKE_SHIFT, LENGTH_SHIFT, MAGIC, MAX_PALETTE, NAME_BYTES, PALETTE_ENTRY_BYTES, TYPE_BITS,
-    VERSION,
+    BMP_LEN, CHAR_TABLE_HEADER_BYTES, CODE_POINTS, EXTENDER_FLAG, MAGIC, MAX_PALETTE,
+    PALETTE_ENTRY_BYTES, VERSION,
 };
 use crate::dictionary::map_file;
 use crate::error::Error;
 use crate::mapped_bytes::MappedBytes;
+use crate::utf8::{
+    CONTINUATION_PAYLOAD, FOUR_BYTE_LEAD, FOUR_BYTE_PAYLOAD, THREE_BYTE_PAYLOAD, TWO_BYTE_PAYLOAD,
+    is_continuation, is_four_byte_lead, is_three_byte_lead, is_two_byte_lead,
+};
+use crate::wire::u32_at;
 
 const SPACE_CODE: u32 = 0x20;
-const FOUR_BYTE_LEAD: u8 = 0xf0;
-const CONTINUATION_MASK: u8 = 0xc0;
-const CONTINUATION_TAG: u8 = 0x80;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CharInfo(u32);
 
 impl CharInfo {
     fn type_mask(self) -> u32 {
-        self.0 & ((1 << TYPE_BITS) - 1)
+        self.0 & TYPE_MASK
     }
 
     pub(crate) fn default_type(self) -> usize {
-        ((self.0 >> DEFAULT_TYPE_SHIFT) & 0xff) as usize
+        ((self.0 >> DEFAULT_TYPE_SHIFT) & DEFAULT_TYPE_MASK) as usize
     }
 
     pub(crate) fn length(self) -> usize {
-        ((self.0 >> LENGTH_SHIFT) & 0xf) as usize
+        ((self.0 >> LENGTH_SHIFT) & LENGTH_MASK) as usize
     }
 
     pub(crate) fn group(self) -> bool {
-        (self.0 >> GROUP_SHIFT) & 1 == 1
+        (self.0 >> GROUP_SHIFT) & FLAG_MASK == FLAG_MASK
     }
 
     pub(crate) fn invoke(self) -> bool {
-        (self.0 >> INVOKE_SHIFT) & 1 == 1
+        (self.0 >> INVOKE_SHIFT) & FLAG_MASK == FLAG_MASK
     }
 
     pub(crate) fn is_kind_of(self, other: CharInfo) -> bool {
@@ -99,7 +104,7 @@ impl SentenceChars {
         };
         debug_assert!(std::str::from_utf8(text).is_ok());
         for position in (0..length).rev() {
-            if text[position] & CONTINUATION_MASK == CONTINUATION_TAG {
+            if is_continuation(text[position]) {
                 #[cfg(debug_assertions)]
                 {
                     self.entries[position] = Entry::default();
@@ -226,24 +231,20 @@ impl CharProperty {
     }
 
     pub(crate) fn from_mapped(map: MappedBytes, path: &Path) -> Result<Self, Error> {
-        let broken = |reason| Error::Format {
-            file: path.to_path_buf(),
-            reason,
-        };
-        let word = |at: usize| u32::from_le_bytes(*map[at..].first_chunk().expect("in range"));
-        if map.len() < HEADER_BYTES || map[..4] != *MAGIC || word(4) != VERSION {
+        let broken = |reason| Error::format(path, reason);
+        if map.len() < CHAR_TABLE_HEADER_BYTES || map[..4] != *MAGIC || u32_at(&map, 4) != VERSION {
             return Err(broken("the file is not a character table of this version"));
         }
-        let category_count = word(8) as usize;
-        let palette_len = word(12) as usize;
+        let category_count = u32_at(&map, 8) as usize;
+        let palette_len = u32_at(&map, 12) as usize;
         if category_count == 0
-            || category_count > 0xff
+            || category_count > DEFAULT_TYPE_MASK as usize
             || palette_len == 0
             || palette_len > MAX_PALETTE
         {
             return Err(broken("the category or palette count is out of range"));
         }
-        let palette_start = HEADER_BYTES + NAME_BYTES * category_count;
+        let palette_start = CHAR_TABLE_HEADER_BYTES + CATEGORY_NAME_BYTES * category_count;
         let table_start = palette_start + PALETTE_ENTRY_BYTES * palette_len;
         if table_start + CODE_POINTS != map.len() {
             return Err(broken("the file size does not match the header"));
@@ -251,7 +252,7 @@ impl CharProperty {
         let mut palette = Vec::with_capacity(palette_len);
         for index in 0..palette_len {
             let at = palette_start + PALETTE_ENTRY_BYTES * index;
-            let (info, flags) = (word(at), word(at + 4));
+            let (info, flags) = (u32_at(&map, at), u32_at(&map, at + 4));
             let info = CharInfo(info);
             if info.default_type() >= category_count || flags & !EXTENDER_FLAG != 0 {
                 return Err(broken("a palette entry is not valid"));
@@ -292,15 +293,15 @@ impl CharProperty {
     }
 
     pub fn name(&self, index: usize) -> &[u8] {
-        let start = HEADER_BYTES + NAME_BYTES * index;
+        let start = CHAR_TABLE_HEADER_BYTES + CATEGORY_NAME_BYTES * index;
         let bytes = self
             .map
-            .slice(start..start + NAME_BYTES)
+            .slice(start..start + CATEGORY_NAME_BYTES)
             .expect("the category name is inside the validated table");
         let length = bytes
             .iter()
             .position(|&byte| byte == 0)
-            .unwrap_or(NAME_BYTES);
+            .unwrap_or(CATEGORY_NAME_BYTES);
         &bytes[..length]
     }
 
@@ -405,18 +406,21 @@ fn decode_utf8(text: &[u8], begin: usize, available: usize) -> (u32, usize) {
     let first = byte(0);
     if first < 0x80 {
         (u32::from(first), 1)
-    } else if available >= 2 && first & 0xe0 == 0xc0 {
-        (u32::from(first & 0x1f) << 6 | u32::from(byte(1) & 0x3f), 2)
-    } else if available >= 3 && first & 0xf0 == 0xe0 {
-        let code = u32::from(first & 0x0f) << 12
-            | u32::from(byte(1) & 0x3f) << 6
-            | u32::from(byte(2) & 0x3f);
+    } else if available >= 2 && is_two_byte_lead(first) {
+        (
+            u32::from(first & TWO_BYTE_PAYLOAD) << 6 | u32::from(byte(1) & CONTINUATION_PAYLOAD),
+            2,
+        )
+    } else if available >= 3 && is_three_byte_lead(first) {
+        let code = u32::from(first & THREE_BYTE_PAYLOAD) << 12
+            | u32::from(byte(1) & CONTINUATION_PAYLOAD) << 6
+            | u32::from(byte(2) & CONTINUATION_PAYLOAD);
         (code, 3)
-    } else if available >= 4 && first & 0xf8 == 0xf0 {
-        let code = u32::from(first & 0x07) << 18
-            | u32::from(byte(1) & 0x3f) << 12
-            | u32::from(byte(2) & 0x3f) << 6
-            | u32::from(byte(3) & 0x3f);
+    } else if available >= 4 && is_four_byte_lead(first) {
+        let code = u32::from(first & FOUR_BYTE_PAYLOAD) << 18
+            | u32::from(byte(1) & CONTINUATION_PAYLOAD) << 12
+            | u32::from(byte(2) & CONTINUATION_PAYLOAD) << 6
+            | u32::from(byte(3) & CONTINUATION_PAYLOAD);
         (code, 4)
     } else {
         (0, 1)

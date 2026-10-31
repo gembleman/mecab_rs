@@ -2,8 +2,30 @@ use super::coder::{Coder, Flag, UintModel};
 use super::ppm::{FastMap, Interner, NOVEL, Ppm, hash_bytes, mix};
 use super::text::{CharModel, is_kana, kata};
 use crate::wire::{get_varint, put_varint, unzigzag, zigzag};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Bound;
+
+const TAG_CAT: u8 = 0;
+const TAG_STR: u8 = 1;
+const TAG_STR_ALIGNED: u8 = 2;
+const TAG_NUM: u8 = 3;
+const TAG_LID: u8 = 4;
+const MAX_COLS: usize = 1 << 20;
+const CANONICAL_I64_LIMIT: u64 = 1 << 61;
+const CANONICAL_U64_LIMIT: u64 = 1 << 62;
+pub const LID_MODE_COUNT: usize = 5;
+const KNOWN_SEGMENT_COST: f64 = 2.0;
+const NEW_SEGMENT_BASE_COST: f64 = 5.0;
+const NEW_SEGMENT_COST_PER_CHAR: f64 = 6.0;
+const MAX_SEGMENT_LEN: usize = 8;
+const EX_ALIGNED: u32 = 1000;
+const EX_DOMAIN: u64 = 1001;
+const MAX_RECENT: usize = 8;
+pub const FIXED_COLS: usize = 4;
+const IRREGULAR_FLAG_LIMIT: u32 = 30000;
+const LO_BITS_MAX: u8 = 24;
+pub const MAX_STR_STEPS: usize = 200;
+pub const MAX_LID_SHIFT: u8 = 54;
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct LidSpec {
@@ -40,9 +62,19 @@ fn put_opt(out: &mut Vec<u8>, v: Option<usize>) {
     put_varint(out, v.map_or(0, |x| x as u64 + 1));
 }
 
-fn get_opt(b: &[u8], pos: &mut usize) -> Option<Option<usize>> {
-    let v = get_varint(b, pos)?;
+fn get_opt(bytes: &[u8], pos: &mut usize) -> Option<Option<usize>> {
+    let v = get_varint(bytes, pos)?;
     Some(if v == 0 { None } else { Some(v as usize - 1) })
+}
+
+fn read_u8(bytes: &[u8], pos: &mut usize) -> Option<u8> {
+    let value = *bytes.get(*pos)?;
+    *pos += 1;
+    Some(value)
+}
+
+fn read_usize(bytes: &[u8], pos: &mut usize) -> Option<usize> {
+    Some(get_varint(bytes, pos)? as usize)
 }
 
 impl Plan {
@@ -51,77 +83,74 @@ impl Plan {
         put_varint(out, self.pos_cols as u64);
         put_opt(out, self.cat_ctx);
         put_varint(out, self.steps.len() as u64);
-        for s in &self.steps {
-            put_varint(out, s.col as u64);
-            match &s.kind {
-                Kind::Cat => out.push(0),
+        for step in &self.steps {
+            put_varint(out, step.col as u64);
+            match &step.kind {
+                Kind::Cat => out.push(TAG_CAT),
                 Kind::Str { align, recent } => {
-                    out.push(1 + *align as u8);
+                    out.push(TAG_STR + *align as u8);
                     out.push(*recent);
                 }
                 Kind::Num { mode } => {
-                    out.push(3);
+                    out.push(TAG_NUM);
                     out.push(*mode);
                 }
-                Kind::Lid(l) => {
-                    out.push(4);
-                    out.push(l.shift);
-                    put_opt(out, l.partner);
-                    put_opt(out, l.order);
-                    put_opt(out, l.low_col);
-                    put_varint(out, l.key.len() as u64);
-                    for &k in &l.key {
-                        put_varint(out, k as u64);
+                Kind::Lid(spec) => {
+                    out.push(TAG_LID);
+                    out.push(spec.shift);
+                    put_opt(out, spec.partner);
+                    put_opt(out, spec.order);
+                    put_opt(out, spec.low_col);
+                    put_varint(out, spec.key.len() as u64);
+                    for &key_col in &spec.key {
+                        put_varint(out, key_col as u64);
                     }
                 }
             }
         }
     }
 
-    pub fn read(b: &[u8], pos: &mut usize) -> Option<Plan> {
-        let n_cols = get_varint(b, pos)? as usize;
-        let pos_cols = get_varint(b, pos)? as usize;
-        let cat_ctx = get_opt(b, pos)?;
-        let n = get_varint(b, pos)? as usize;
-        if n_cols > 1 << 20 || n > n_cols || pos_cols > n_cols.saturating_sub(FIXED_COLS) {
+    pub fn read(bytes: &[u8], pos: &mut usize) -> Option<Plan> {
+        let n_cols = read_usize(bytes, pos)?;
+        let pos_cols = read_usize(bytes, pos)?;
+        let cat_ctx = get_opt(bytes, pos)?;
+        let step_count = read_usize(bytes, pos)?;
+        if n_cols > MAX_COLS || step_count > n_cols || pos_cols > n_cols.saturating_sub(FIXED_COLS)
+        {
             return None;
         }
         let mut steps = Vec::new();
-        for _ in 0..n {
-            let col = get_varint(b, pos)? as usize;
-            let tag = *b.get(*pos)?;
-            *pos += 1;
+        for _ in 0..step_count {
+            let col = read_usize(bytes, pos)?;
+            let tag = read_u8(bytes, pos)?;
             let kind = match tag {
-                0 => Kind::Cat,
-                1 | 2 => {
-                    let recent = *b.get(*pos)?;
-                    *pos += 1;
+                TAG_CAT => Kind::Cat,
+                TAG_STR | TAG_STR_ALIGNED => {
+                    let recent = read_u8(bytes, pos)?;
                     if recent as usize > MAX_RECENT {
                         return None;
                     }
                     Kind::Str {
-                        align: tag == 2,
+                        align: tag == TAG_STR_ALIGNED,
                         recent,
                     }
                 }
-                3 => {
-                    let mode = *b.get(*pos)?;
-                    *pos += 1;
+                TAG_NUM => {
+                    let mode = read_u8(bytes, pos)?;
                     Kind::Num { mode }
                 }
-                4 => {
-                    let shift = *b.get(*pos)?;
-                    *pos += 1;
-                    let partner = get_opt(b, pos)?;
-                    let order = get_opt(b, pos)?;
-                    let low_col = get_opt(b, pos)?;
-                    let kn = get_varint(b, pos)? as usize;
-                    if kn > n_cols {
+                TAG_LID => {
+                    let shift = read_u8(bytes, pos)?;
+                    let partner = get_opt(bytes, pos)?;
+                    let order = get_opt(bytes, pos)?;
+                    let low_col = get_opt(bytes, pos)?;
+                    let key_len = read_usize(bytes, pos)?;
+                    if key_len > n_cols {
                         return None;
                     }
                     let mut key = Vec::new();
-                    for _ in 0..kn {
-                        key.push(get_varint(b, pos)? as usize);
+                    for _ in 0..key_len {
+                        key.push(read_usize(bytes, pos)?);
                     }
                     Kind::Lid(LidSpec {
                         shift,
@@ -222,7 +251,7 @@ struct StrState {
     chars: CharModel,
     ex_ppm: Ppm,
     run_ppm: Ppm,
-    runs: Interner,
+    run_readings: Interner,
     read_chars: CharModel,
     recent: Vec<String>,
     limit: usize,
@@ -231,7 +260,7 @@ struct StrState {
     align_stats: [f64; 4],
     seg_ppm: Ppm,
     segs: Interner,
-    known: std::collections::HashSet<u64>,
+    known: HashSet<u64>,
 }
 
 struct LidState {
@@ -247,7 +276,7 @@ struct LidState {
     partner_bad: Flag,
     last_new: u64,
     stats: [f64; 6],
-    mode_count: [u64; 5],
+    mode_count: [u64; LID_MODE_COUNT],
 }
 
 struct NumState {
@@ -269,46 +298,46 @@ enum StepState {
     Num(Box<NumState>),
 }
 
-struct Shared {
-    cur: Vec<String>,
-    tmp: String,
-    scratch: Vec<u8>,
+struct RowState {
+    fields: Vec<String>,
+    coded_text: String,
+    key_buf: Vec<u8>,
     raw_chars: CharModel,
     cat_chars: CharModel,
     pos_hash: u64,
-    p0: u64,
-    p01: u64,
+    pos_first_hash: u64,
+    pos_first_two_hash: u64,
     pos_sym: u32,
     prev_pos: u32,
     last_char: u32,
     first_in_group: bool,
     prev_num: i64,
     num_seen: bool,
-    lid_key: u64,
-    cat_id: u32,
+    lid_ref_key: u64,
+    cat_group_id: u32,
     surf_hash: u64,
-    shape: u64,
-    sgroup: u32,
-    prev_sgroup: u32,
-    prev_cat_id: u32,
-    row_irr: bool,
-    out: String,
-    runs: Vec<(bool, usize, usize)>,
-    groups: Vec<(usize, usize)>,
+    str_shape: u64,
+    str_group_id: u32,
+    prev_str_group_id: u32,
+    prev_cat_group_id: u32,
+    row_irregular: bool,
+    rebuilt: String,
+    script_runs: Vec<(bool, usize, usize)>,
+    reading_spans: Vec<(usize, usize)>,
 }
 
 pub struct Model {
     plan: Plan,
     steps: Vec<StepState>,
-    sh: Shared,
+    row_state: RowState,
     pos_ppm: Ppm,
     pos_intern: Interner,
     comp_ppm: Vec<Ppm>,
     comp_intern: Vec<Interner>,
     comp_chars: CharModel,
     pos_hashes: Vec<(u64, u64, u64)>,
-    group: CatGroup,
-    sgroup: StrGroup,
+    cat_group: CatGroup,
+    str_group: StrGroup,
     row_flag: Flag,
     bundle_cats: bool,
     active: Option<Vec<bool>>,
@@ -318,7 +347,7 @@ pub struct Model {
 
 pub(super) fn canonical_i64(s: &str) -> Option<i64> {
     let v: i64 = s.parse().ok()?;
-    if v.unsigned_abs() < (1 << 61) && v.to_string() == s {
+    if v.unsigned_abs() < CANONICAL_I64_LIMIT && v.to_string() == s {
         Some(v)
     } else {
         None
@@ -327,11 +356,20 @@ pub(super) fn canonical_i64(s: &str) -> Option<i64> {
 
 pub(super) fn canonical_u64(s: &str) -> Option<u64> {
     let v: u64 = s.parse().ok()?;
-    if v < (1 << 62) && v.to_string() == s {
+    if v < CANONICAL_U64_LIMIT && v.to_string() == s {
         Some(v)
     } else {
         None
     }
+}
+
+#[inline]
+fn read_str(bytes: &[u8], pos: &mut usize, dest: &mut String) {
+    let len = get_varint(bytes, pos).unwrap_or(0) as usize;
+    let end = pos.saturating_add(len).min(bytes.len());
+    dest.clear();
+    dest.push_str(std::str::from_utf8(&bytes[*pos..end]).unwrap_or(""));
+    *pos = end;
 }
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
@@ -360,7 +398,7 @@ impl Model {
                         chars: CharModel::new(2),
                         ex_ppm: Ppm::default(),
                         run_ppm: Ppm::default(),
-                        runs: Interner::default(),
+                        run_readings: Interner::default(),
                         read_chars: CharModel::new(2),
                         recent: Vec::new(),
                         group_plan: None,
@@ -386,7 +424,7 @@ impl Model {
                     partner_bad: Flag::default(),
                     last_new: 0,
                     stats: [0.0; 6],
-                    mode_count: [0; 5],
+                    mode_count: [0; LID_MODE_COUNT],
                 })),
                 Kind::Num { .. } => StepState::Num(Box::new(NumState {
                     ppm: Ppm::default(),
@@ -403,43 +441,43 @@ impl Model {
         }
         let p = plan.pos_cols;
         let n_steps = plan.steps.len();
-        let sh = Shared {
-            cur: vec![String::new(); plan.n_cols],
-            tmp: String::new(),
-            scratch: Vec::new(),
+        let row = RowState {
+            fields: vec![String::new(); plan.n_cols],
+            coded_text: String::new(),
+            key_buf: Vec::new(),
             raw_chars: CharModel::new(2),
             cat_chars: CharModel::new(1),
             pos_hash: 0,
-            p0: 0,
-            p01: 0,
+            pos_first_hash: 0,
+            pos_first_two_hash: 0,
             pos_sym: NOVEL,
             prev_pos: NOVEL,
             last_char: 0,
             first_in_group: true,
             prev_num: 0,
             num_seen: false,
-            lid_key: 0,
-            cat_id: 0,
+            lid_ref_key: 0,
+            cat_group_id: 0,
             surf_hash: 0,
-            shape: 0,
-            sgroup: 0,
-            prev_sgroup: 0,
-            prev_cat_id: 0,
-            row_irr: true,
-            out: String::new(),
-            runs: Vec::new(),
-            groups: Vec::new(),
+            str_shape: 0,
+            str_group_id: 0,
+            prev_str_group_id: 0,
+            prev_cat_group_id: 0,
+            row_irregular: true,
+            rebuilt: String::new(),
+            script_runs: Vec::new(),
+            reading_spans: Vec::new(),
         };
         Model {
             steps,
-            sh,
+            row_state: row,
             pos_ppm: Ppm::default(),
             pos_intern: Interner::default(),
             comp_ppm: (0..p).map(|_| Ppm::default()).collect(),
             comp_intern: (0..p).map(|_| Interner::default()).collect(),
             comp_chars: CharModel::new(1),
             pos_hashes: Vec::new(),
-            group: CatGroup {
+            cat_group: CatGroup {
                 ppm: Ppm::default(),
                 tuples: Interner::default(),
                 ctx_col: plan.cat_ctx,
@@ -451,7 +489,7 @@ impl Model {
                     .map(|(i, _)| i)
                     .collect(),
             },
-            sgroup: StrGroup {
+            str_group: StrGroup {
                 ppm: Ppm::default(),
                 vecs: Interner::default(),
                 steps: plan
@@ -486,7 +524,7 @@ impl Model {
         }
     }
 
-    pub fn lid_stats(&self) -> Option<([f64; 6], [u64; 5])> {
+    pub fn lid_stats(&self) -> Option<([f64; 6], [u64; LID_MODE_COUNT])> {
         self.steps.iter().find_map(|s| match s {
             StepState::Lid(l) => Some((l.stats, l.mode_count)),
             _ => None,
@@ -517,29 +555,29 @@ impl Model {
     }
 
     pub fn row(&self) -> &[String] {
-        &self.sh.cur
+        &self.row_state.fields
     }
 
     pub fn start_group(&mut self) {
-        self.sh.first_in_group = true;
+        self.row_state.first_in_group = true;
     }
 
-    pub fn code_row(&mut self, c: &mut Coder, fields: &[&str], surface: &str) {
-        let sh = &mut self.sh;
-        if !c.is_decoder() {
+    pub fn code_row(&mut self, coder: &mut Coder, fields: &[&str], surface: &str) {
+        let row = &mut self.row_state;
+        if !coder.is_decoder() {
             for (i, f) in fields.iter().enumerate() {
-                sh.cur[i].clear();
-                sh.cur[i].push_str(f);
+                row.fields[i].clear();
+                row.fields[i].push_str(f);
             }
         } else {
-            sh.cur[0].clear();
-            sh.cur[0].push_str(surface);
+            row.fields[0].clear();
+            row.fields[0].push_str(surface);
         }
-        sh.last_char = sh.cur[0].chars().next_back().map_or(0, |ch| ch as u32);
-        sh.prev_num = 0;
-        sh.num_seen = false;
-        sh.lid_key = 0;
-        let before = c.bits;
+        row.last_char = row.fields[0].chars().next_back().map_or(0, |ch| ch as u32);
+        row.prev_num = 0;
+        row.num_seen = false;
+        row.lid_ref_key = 0;
+        let before = coder.bits;
         if self.plan.pos_cols > 0 {
             code_pos(
                 &mut self.pos_ppm,
@@ -548,37 +586,37 @@ impl Model {
                 &mut self.comp_intern,
                 &mut self.comp_chars,
                 &mut self.pos_hashes,
-                sh,
-                c,
+                row,
+                coder,
                 self.plan.pos_cols,
                 self.active.is_some(),
             );
         }
-        self.pos_bits += c.bits - before;
-        sh.cat_id = 0;
-        sh.shape = 0;
-        sh.sgroup = 0;
-        sh.surf_hash = hash_bytes(sh.cur[0].as_bytes());
-        let bundle = self.bundle_cats && !self.group.steps.is_empty();
+        self.pos_bits += coder.bits - before;
+        row.cat_group_id = 0;
+        row.str_shape = 0;
+        row.str_group_id = 0;
+        row.surf_hash = hash_bytes(row.fields[0].as_bytes());
+        let bundle = self.bundle_cats && !self.cat_group.steps.is_empty();
         if bundle {
-            self.group.ppm.prefetch(mix(
-                mix(9 + sh.first_in_group as u64, sh.pos_hash),
-                sh.prev_cat_id as u64,
+            self.cat_group.ppm.prefetch(mix(
+                mix(9 + row.first_in_group as u64, row.pos_hash),
+                row.prev_cat_group_id as u64,
             ));
-            self.group.ppm.prefetch(mix(5, sh.pos_hash));
+            self.cat_group.ppm.prefetch(mix(5, row.pos_hash));
         }
-        sh.row_irr = true;
+        row.row_irregular = true;
         if self.active.is_none() {
             let mut irr = false;
-            if !c.is_decoder() {
+            if !coder.is_decoder() {
                 for step in &self.plan.steps {
                     irr |= match &step.kind {
-                        Kind::Num { .. } => canonical_i64(&sh.cur[step.col]).is_none(),
-                        Kind::Lid(l) => match canonical_u64(&sh.cur[step.col]) {
+                        Kind::Num { .. } => canonical_i64(&row.fields[step.col]).is_none(),
+                        Kind::Lid(l) => match canonical_u64(&row.fields[step.col]) {
                             None => true,
-                            Some(v) => l
-                                .partner
-                                .is_some_and(|p| canonical_u64(&sh.cur[p]) != Some(v >> l.shift)),
+                            Some(v) => l.partner.is_some_and(|p| {
+                                canonical_u64(&row.fields[p]) != Some(v >> l.shift)
+                            }),
                         },
                         _ => false,
                     };
@@ -589,58 +627,81 @@ impl Model {
                 .steps
                 .iter()
                 .any(|s| matches!(s.kind, Kind::Num { .. } | Kind::Lid(_)));
-            sh.row_irr = has_numbers && self.row_flag.code(c, irr, IRREGULAR_FLAG_LIMIT);
+            row.row_irregular = has_numbers && self.row_flag.code(coder, irr, IRREGULAR_FLAG_LIMIT);
         }
-        let sbundle = self.active.is_none() && !self.sgroup.steps.is_empty();
+        let sbundle = self.active.is_none() && !self.str_group.steps.is_empty();
         if sbundle {
-            self.sgroup.ppm.prefetch(mix(
-                mix(66 + sh.first_in_group as u64, sh.pos_hash),
-                sh.prev_sgroup as u64,
+            self.str_group.ppm.prefetch(mix(
+                mix(66 + row.first_in_group as u64, row.pos_hash),
+                row.prev_str_group_id as u64,
             ));
         }
         for (si, step) in self.plan.steps.iter().enumerate() {
             if self.active.as_ref().is_some_and(|m| !m[si]) {
                 if let Kind::Num { .. } = step.kind
-                    && let Some(v) = canonical_i64(&sh.cur[step.col])
+                    && let Some(v) = canonical_i64(&row.fields[step.col])
                 {
-                    note_num(sh, v);
+                    note_num(row, v);
                 }
                 continue;
             }
-            let before = c.bits;
+            let before = coder.bits;
             match (&mut self.steps[si], &step.kind) {
                 (StepState::Cat(st), Kind::Cat) => {
                     if !bundle {
-                        code_cat(st, sh, c, step.col, 0);
-                    } else if si == self.group.steps[0] {
-                        code_cat_group(&mut self.group, &mut self.steps, &self.plan.steps, sh, c);
+                        code_cat(st, row, coder, step.col, 0);
+                    } else if si == self.cat_group.steps[0] {
+                        code_cat_group(
+                            &mut self.cat_group,
+                            &mut self.steps,
+                            &self.plan.steps,
+                            row,
+                            coder,
+                        );
                     }
                 }
                 (StepState::Str(_), Kind::Str { align, .. }) => {
-                    if sbundle && si == self.sgroup.steps[0] {
-                        code_str_group(&mut self.sgroup, &mut self.steps, &self.plan.steps, sh, c);
+                    if sbundle && si == self.str_group.steps[0] {
+                        code_str_group(
+                            &mut self.str_group,
+                            &mut self.steps,
+                            &self.plan.steps,
+                            row,
+                            coder,
+                        );
                     }
                     if let StepState::Str(st) = &mut self.steps[si] {
-                        code_str(st, sh, c, step.col, *align, sbundle);
+                        code_str(
+                            st,
+                            row,
+                            coder,
+                            step.col,
+                            StrOptions {
+                                align: *align,
+                                grouped: sbundle,
+                            },
+                        );
                     }
                 }
-                (StepState::Lid(st), Kind::Lid(spec)) => code_lid(st, sh, c, step.col, spec),
-                (StepState::Num(st), Kind::Num { mode }) => code_num(st, sh, c, step.col, *mode),
+                (StepState::Lid(st), Kind::Lid(spec)) => code_lid(st, row, coder, step.col, spec),
+                (StepState::Num(st), Kind::Num { mode }) => {
+                    code_num(st, row, coder, step.col, *mode)
+                }
                 _ => unreachable!(),
             }
-            self.step_bits[si] += c.bits - before;
+            self.step_bits[si] += coder.bits - before;
         }
-        sh.prev_pos = sh.pos_sym;
-        sh.first_in_group = false;
-        sh.prev_sgroup = sh.sgroup;
-        sh.prev_cat_id = sh.cat_id;
+        row.prev_pos = row.pos_sym;
+        row.first_in_group = false;
+        row.prev_str_group_id = row.str_group_id;
+        row.prev_cat_group_id = row.cat_group_id;
     }
 }
 
-fn note_num(sh: &mut Shared, v: i64) {
-    if !sh.num_seen {
-        sh.num_seen = true;
-        sh.prev_num = v;
+fn note_num(row: &mut RowState, v: i64) {
+    if !row.num_seen {
+        row.num_seen = true;
+        row.prev_num = v;
     }
 }
 
@@ -652,59 +713,58 @@ fn code_pos(
     comp_intern: &mut [Interner],
     comp_chars: &mut CharModel,
     hashes: &mut Vec<(u64, u64, u64)>,
-    sh: &mut Shared,
-    c: &mut Coder,
-    p: usize,
+    row: &mut RowState,
+    coder: &mut Coder,
+    pos_cols: usize,
     trial: bool,
 ) {
-    let dec = c.is_decoder();
-    sh.scratch.clear();
+    let dec = coder.is_decoder();
+    row.key_buf.clear();
     if !dec {
-        for i in 0..p {
-            put_str(&mut sh.scratch, &sh.cur[FIXED_COLS + i]);
+        for i in 0..pos_cols {
+            put_str(&mut row.key_buf, &row.fields[FIXED_COLS + i]);
         }
     }
     let sym = if dec {
         NOVEL
     } else {
-        intern.find(&sh.scratch).unwrap_or(NOVEL)
+        intern.find(&row.key_buf).unwrap_or(NOVEL)
     };
     let id = if trial {
-        match intern.find(&sh.scratch) {
-            Some(i) => i,
-            None => intern.add(&sh.scratch),
-        }
+        intern.find_or_add(&row.key_buf)
     } else {
         let ctxs = [
             mix(
-                mix(100 + sh.first_in_group as u64, sh.prev_pos as u64),
-                sh.last_char as u64,
+                mix(100 + row.first_in_group as u64, row.prev_pos as u64),
+                row.last_char as u64,
             ),
-            mix(101, sh.last_char as u64),
+            mix(101, row.last_char as u64),
             102,
         ];
-        let id = match ppm.code(c, &ctxs, sym) {
+        let id = match ppm.code(coder, &ctxs, sym) {
             Some(id) => id,
             None => {
                 let mut h = 0u64;
-                sh.scratch.clear();
-                for i in 0..p {
+                row.key_buf.clear();
+                for i in 0..pos_cols {
                     let ctxs = [mix(110 + i as u64, h), 120 + i as u64];
                     let fsym = if dec {
                         NOVEL
                     } else {
                         comp_intern[i]
-                            .find(sh.cur[FIXED_COLS + i].as_bytes())
+                            .find(row.fields[FIXED_COLS + i].as_bytes())
                             .unwrap_or(NOVEL)
                     };
-                    let fid = match comp_ppm[i].code(c, &ctxs, fsym) {
+                    let fid = match comp_ppm[i].code(coder, &ctxs, fsym) {
                         Some(f) => f,
                         None => {
-                            comp_chars.code_str(c, &[], &sh.cur[FIXED_COLS + i], &mut sh.tmp);
-                            match comp_intern[i].find(sh.tmp.as_bytes()) {
-                                Some(f) => f,
-                                None => comp_intern[i].add(sh.tmp.as_bytes()),
-                            }
+                            comp_chars.code_str(
+                                coder,
+                                &[],
+                                &row.fields[FIXED_COLS + i],
+                                &mut row.coded_text,
+                            );
+                            comp_intern[i].find_or_add(row.coded_text.as_bytes())
                         }
                     };
                     comp_ppm[i].update(fid);
@@ -712,85 +772,79 @@ fn code_pos(
                         .unwrap_or("")
                         .to_string();
                     h = mix(h, hash_bytes(f.as_bytes()));
-                    put_str(&mut sh.scratch, &f);
-                    sh.cur[FIXED_COLS + i] = f;
+                    put_str(&mut row.key_buf, &f);
+                    row.fields[FIXED_COLS + i] = f;
                 }
-                match intern.find(&sh.scratch) {
-                    Some(i) => i,
-                    None => intern.add(&sh.scratch),
-                }
+                intern.find_or_add(&row.key_buf)
             }
         };
         ppm.update(id);
         id
     };
-    sh.pos_sym = id;
+    row.pos_sym = id;
     if dec {
-        let b = intern.get(id);
+        let tuple = intern.get(id);
         let mut pos = 0;
-        for i in 0..p {
-            let n = get_varint(b, &mut pos).unwrap_or(0) as usize;
-            let end = pos.saturating_add(n).min(b.len());
-            sh.cur[FIXED_COLS + i].clear();
-            sh.cur[FIXED_COLS + i].push_str(std::str::from_utf8(&b[pos..end]).unwrap_or(""));
-            pos = end;
+        for i in 0..pos_cols {
+            read_str(tuple, &mut pos, &mut row.fields[FIXED_COLS + i]);
         }
     }
-    if let Some(&(p0, p01, all)) = hashes.get(id as usize).filter(|x| x.2 != 0) {
-        (sh.p0, sh.p01, sh.pos_hash) = (p0, p01, all);
+    if let Some(&(pos_first_hash, pos_first_two_hash, all)) =
+        hashes.get(id as usize).filter(|x| x.2 != 0)
+    {
+        (row.pos_first_hash, row.pos_first_two_hash, row.pos_hash) =
+            (pos_first_hash, pos_first_two_hash, all);
         return;
     }
     let mut h = 0u64;
-    for i in 0..p {
-        h = mix(h, hash_bytes(sh.cur[FIXED_COLS + i].as_bytes()));
+    for i in 0..pos_cols {
+        h = mix(h, hash_bytes(row.fields[FIXED_COLS + i].as_bytes()));
         if i == 0 {
-            sh.p0 = h;
+            row.pos_first_hash = h;
         }
         if i == 1 {
-            sh.p01 = h;
+            row.pos_first_two_hash = h;
         }
     }
-    if p == 1 {
-        sh.p01 = sh.p0;
+    if pos_cols == 1 {
+        row.pos_first_two_hash = row.pos_first_hash;
     }
-    sh.pos_hash = h | 1;
+    row.pos_hash = h | 1;
     if hashes.len() <= id as usize {
         hashes.resize(id as usize + 1, (0, 0, 0));
     }
-    hashes[id as usize] = (sh.p0, sh.p01, sh.pos_hash);
+    hashes[id as usize] = (row.pos_first_hash, row.pos_first_two_hash, row.pos_hash);
 }
 
-fn code_cat(st: &mut CatState, sh: &mut Shared, c: &mut Coder, col: usize, prev: u64) {
-    let dec = c.is_decoder();
+fn code_cat(st: &mut CatState, row: &mut RowState, coder: &mut Coder, col: usize, prev: u64) {
+    let dec = coder.is_decoder();
     let mut ctxs = [0u64; 4];
-    let mut n = 0;
+    let mut ctx_count = 0;
     if prev != 0 {
-        ctxs[n] = mix(mix(1, sh.pos_hash), prev);
-        n += 1;
+        ctxs[ctx_count] = mix(mix(1, row.pos_hash), prev);
+        ctx_count += 1;
     }
-    ctxs[n] = mix(2, sh.pos_hash);
-    ctxs[n + 1] = mix(3, sh.p0);
-    ctxs[n + 2] = 4;
-    n += 3;
+    ctxs[ctx_count] = mix(2, row.pos_hash);
+    ctxs[ctx_count + 1] = mix(3, row.pos_first_hash);
+    ctxs[ctx_count + 2] = 4;
+    ctx_count += 3;
     let sym = if dec {
         NOVEL
     } else {
-        st.intern.find(sh.cur[col].as_bytes()).unwrap_or(NOVEL)
+        st.intern.find(row.fields[col].as_bytes()).unwrap_or(NOVEL)
     };
-    let id = match st.ppm.code(c, &ctxs[..n], sym) {
+    let id = match st.ppm.code(coder, &ctxs[..ctx_count], sym) {
         Some(id) => id,
         None => {
-            sh.cat_chars.code_str(c, &[], &sh.cur[col], &mut sh.tmp);
-            match st.intern.find(sh.tmp.as_bytes()) {
-                Some(i) => i,
-                None => st.intern.add(sh.tmp.as_bytes()),
-            }
+            row.cat_chars
+                .code_str(coder, &[], &row.fields[col], &mut row.coded_text);
+            st.intern.find_or_add(row.coded_text.as_bytes())
         }
     };
     st.ppm.update(id);
     if dec {
-        sh.cur[col].clear();
-        sh.cur[col].push_str(std::str::from_utf8(st.intern.get(id)).unwrap_or(""));
+        row.fields[col].clear();
+        row.fields[col].push_str(std::str::from_utf8(st.intern.get(id)).unwrap_or(""));
     }
 }
 
@@ -798,31 +852,33 @@ fn code_cat_group(
     g: &mut CatGroup,
     steps: &mut [StepState],
     plan_steps: &[Step],
-    sh: &mut Shared,
-    c: &mut Coder,
+    row: &mut RowState,
+    coder: &mut Coder,
 ) {
-    let dec = c.is_decoder();
-    sh.scratch.clear();
+    let dec = coder.is_decoder();
+    row.key_buf.clear();
     if !dec {
         for &si in &g.steps {
             let col = plan_steps[si].col;
-            put_str(&mut sh.scratch, &sh.cur[col]);
+            put_str(&mut row.key_buf, &row.fields[col]);
         }
     }
     let sym = if dec {
         NOVEL
     } else {
-        g.tuples.find(&sh.scratch).unwrap_or(NOVEL)
+        g.tuples.find(&row.key_buf).unwrap_or(NOVEL)
     };
-    let colh = g.ctx_col.map_or(0, |k| hash_bytes(sh.cur[k].as_bytes()));
+    let colh = g
+        .ctx_col
+        .map_or(0, |k| hash_bytes(row.fields[k].as_bytes()));
     let ctxs = [
-        mix(mix(8, sh.pos_hash), colh),
+        mix(mix(8, row.pos_hash), colh),
         mix(
-            mix(9 + sh.first_in_group as u64, sh.pos_hash),
-            sh.prev_cat_id as u64,
+            mix(9 + row.first_in_group as u64, row.pos_hash),
+            row.prev_cat_group_id as u64,
         ),
-        mix(5, sh.pos_hash),
-        mix(6, sh.p0),
+        mix(5, row.pos_hash),
+        mix(6, row.pos_first_hash),
         7,
     ];
     let ctxs = if g.ctx_col.is_some() {
@@ -830,99 +886,103 @@ fn code_cat_group(
     } else {
         &ctxs[1..]
     };
-    let id = match g.ppm.code(c, ctxs, sym) {
+    let id = match g.ppm.code(coder, ctxs, sym) {
         Some(id) => id,
         None => {
             let mut prev = 0u64;
             for &si in &g.steps {
                 let col = plan_steps[si].col;
                 if let StepState::Cat(st) = &mut steps[si] {
-                    code_cat(st, sh, c, col, prev);
+                    code_cat(st, row, coder, col, prev);
                 }
-                prev = mix(prev | 1, hash_bytes(sh.cur[col].as_bytes()));
+                prev = mix(prev | 1, hash_bytes(row.fields[col].as_bytes()));
             }
-            sh.scratch.clear();
+            row.key_buf.clear();
             for &si in &g.steps {
                 let col = plan_steps[si].col;
-                put_str(&mut sh.scratch, &sh.cur[col]);
+                put_str(&mut row.key_buf, &row.fields[col]);
             }
-            match g.tuples.find(&sh.scratch) {
-                Some(i) => i,
-                None => g.tuples.add(&sh.scratch),
-            }
+            g.tuples.find_or_add(&row.key_buf)
         }
     };
     g.ppm.update(id);
-    sh.cat_id = id + 1;
+    row.cat_group_id = id + 1;
     if dec {
-        let b = g.tuples.get(id);
+        let tuple = g.tuples.get(id);
         let mut pos = 0;
         for &si in &g.steps {
-            let n = get_varint(b, &mut pos).unwrap_or(0) as usize;
-            let end = pos.saturating_add(n).min(b.len());
-            let f = &mut sh.cur[plan_steps[si].col];
-            f.clear();
-            f.push_str(std::str::from_utf8(&b[pos..end]).unwrap_or(""));
-            pos = end;
+            read_str(tuple, &mut pos, &mut row.fields[plan_steps[si].col]);
         }
     }
 }
 
-fn runs_of(s: &str, out: &mut Vec<(bool, usize, usize)>) {
+fn split_script_runs(s: &str, out: &mut Vec<(bool, usize, usize)>) {
     out.clear();
     for (i, ch) in s.char_indices() {
-        let k = is_kana(ch);
+        let kana = is_kana(ch);
         match out.last_mut() {
-            Some(last) if last.0 == k => last.2 = i + ch.len_utf8(),
-            _ => out.push((k, i, i + ch.len_utf8())),
+            Some(last) if last.0 == kana => last.2 = i + ch.len_utf8(),
+            _ => out.push((kana, i, i + ch.len_utf8())),
         }
     }
 }
 
 fn match_reading(
     surface: &str,
-    runs: &[(bool, usize, usize)],
+    script_runs: &[(bool, usize, usize)],
     target: &str,
-    groups: &mut Vec<(usize, usize)>,
+    reading_spans: &mut Vec<(usize, usize)>,
 ) -> bool {
     fn rec(
         surface: &str,
-        runs: &[(bool, usize, usize)],
+        script_runs: &[(bool, usize, usize)],
         target: &str,
         pos: usize,
-        groups: &mut Vec<(usize, usize)>,
+        reading_spans: &mut Vec<(usize, usize)>,
     ) -> bool {
-        let Some(&(is_k, a, b)) = runs.first() else {
+        let Some(&(is_kana_run, run_start, run_end)) = script_runs.first() else {
             return pos == target.len();
         };
-        if is_k {
+        if is_kana_run {
             let mut p = pos;
             let mut t = target[pos..].chars();
-            for ch in surface[a..b].chars() {
+            for ch in surface[run_start..run_end].chars() {
                 match t.next() {
                     Some(x) if x == kata(ch) => p += x.len_utf8(),
                     _ => return false,
                 }
             }
-            return rec(surface, &runs[1..], target, p, groups);
+            return rec(surface, &script_runs[1..], target, p, reading_spans);
         }
         let mut end = pos;
         for ch in target[pos..].chars() {
             end += ch.len_utf8();
-            groups.push((pos, end));
-            if rec(surface, &runs[1..], target, end, groups) {
+            reading_spans.push((pos, end));
+            if rec(surface, &script_runs[1..], target, end, reading_spans) {
                 return true;
             }
-            groups.pop();
+            reading_spans.pop();
         }
         false
     }
-    groups.clear();
-    rec(surface, runs, target, 0, groups)
+    reading_spans.clear();
+    rec(surface, script_runs, target, 0, reading_spans)
 }
 
 fn common_prefix_len(a: impl Iterator<Item = char>, b: impl Iterator<Item = char>) -> usize {
     a.zip(b).take_while(|(x, y)| x == y).count()
+}
+
+#[inline]
+fn resolve_source<'a>(st: &'a StrState, fields: &'a [String], index: usize) -> &'a str {
+    let source_count = st.srcs.len();
+    if index < source_count {
+        fields[st.srcs[index]].as_str()
+    } else {
+        st.recent
+            .get(index - source_count)
+            .map_or("", |x| x.as_str())
+    }
 }
 
 fn apply_ref(src: &str, to_kata: bool, trim: usize, append: &str, out: &mut String) {
@@ -941,20 +1001,22 @@ fn apply_ref(src: &str, to_kata: bool, trim: usize, append: &str, out: &mut Stri
     out.push_str(append);
 }
 
-const EX_ALIGNED: u32 = 1000;
-const EX_DOMAIN: u64 = 1001;
-
 type Cand = (usize, usize, usize, usize);
 
-fn plan_str(st: &StrState, sh: &mut Shared, col: usize, align: bool) -> (u32, Cand) {
+fn plan_str(st: &StrState, row: &mut RowState, col: usize, align: bool) -> (u32, Cand) {
     if align {
-        runs_of(&sh.cur[0], &mut sh.runs);
-        if match_reading(&sh.cur[0], &sh.runs, &sh.cur[col], &mut sh.groups) {
+        split_script_runs(&row.fields[0], &mut row.script_runs);
+        if match_reading(
+            &row.fields[0],
+            &row.script_runs,
+            &row.fields[col],
+            &mut row.reading_spans,
+        ) {
             return (EX_ALIGNED, (0, 0, 0, 0));
         }
     }
     let nsrc = st.srcs.len();
-    let target = &sh.cur[col];
+    let target = &row.fields[col];
     let tlen = target.chars().count();
     let mut best: Option<(usize, usize, usize, usize, usize)> = None;
     let mut consider = |cand: (usize, usize, usize, usize, usize)| {
@@ -963,7 +1025,7 @@ fn plan_str(st: &StrState, sh: &mut Shared, col: usize, align: bool) -> (u32, Ca
         }
     };
     for (j, &sc) in st.srcs.iter().enumerate() {
-        let src = &sh.cur[sc];
+        let src = &row.fields[sc];
         let has_hira = src.chars().any(|ch| kata(ch) != ch);
         let slen = src.chars().count();
         for t in 0..=(has_hira as usize) {
@@ -1006,57 +1068,54 @@ fn code_str_group(
     g: &mut StrGroup,
     steps: &mut [StepState],
     plan_steps: &[Step],
-    sh: &mut Shared,
-    c: &mut Coder,
+    row: &mut RowState,
+    coder: &mut Coder,
 ) {
-    let dec = c.is_decoder();
-    sh.scratch.clear();
+    let dec = coder.is_decoder();
+    row.key_buf.clear();
     if !dec {
         for &si in &g.steps {
             if let (StepState::Str(st), Kind::Str { align, .. }) =
                 (&mut steps[si], &plan_steps[si].kind)
             {
-                let (ex, cand) = plan_str(st, sh, plan_steps[si].col, *align);
+                let (ex, cand) = plan_str(st, row, plan_steps[si].col, *align);
                 st.group_plan = Some((ex, cand));
-                sh.scratch.extend_from_slice(&(ex as u16).to_le_bytes());
+                row.key_buf.extend_from_slice(&(ex as u16).to_le_bytes());
             }
         }
     }
     let sym = if dec {
         NOVEL
     } else {
-        g.vecs.find(&sh.scratch).unwrap_or(NOVEL)
+        g.vecs.find(&row.key_buf).unwrap_or(NOVEL)
     };
     let ctxs = [
         mix(
-            mix(66 + sh.first_in_group as u64, sh.pos_hash),
-            sh.prev_sgroup as u64,
+            mix(66 + row.first_in_group as u64, row.pos_hash),
+            row.prev_str_group_id as u64,
         ),
-        mix(60, sh.pos_hash),
-        mix(61, sh.p0),
+        mix(60, row.pos_hash),
+        mix(61, row.pos_first_hash),
         62,
     ];
-    let id = match g.ppm.code(c, &ctxs, sym) {
+    let id = match g.ppm.code(coder, &ctxs, sym) {
         Some(id) => id,
         None => {
-            sh.scratch.clear();
+            row.key_buf.clear();
             for &si in &g.steps {
                 if let StepState::Str(st) = &mut steps[si] {
                     let want = st.group_plan.map_or(0, |p| p.0);
-                    let ex = code_ex(st, sh, c, want);
+                    let ex = code_ex(st, row, coder, want);
                     st.group_plan = st.group_plan.map(|p| (ex, p.1));
                     st.group_exact = ex;
-                    sh.scratch.extend_from_slice(&(ex as u16).to_le_bytes());
+                    row.key_buf.extend_from_slice(&(ex as u16).to_le_bytes());
                 }
             }
-            match g.vecs.find(&sh.scratch) {
-                Some(i) => i,
-                None => g.vecs.add(&sh.scratch),
-            }
+            g.vecs.find_or_add(&row.key_buf)
         }
     };
     g.ppm.update(id);
-    sh.sgroup = id + 1;
+    row.str_group_id = id + 1;
     let b = g.vecs.get(id);
     for (k, &si) in g.steps.iter().enumerate() {
         if let StepState::Str(st) = &mut steps[si] {
@@ -1065,29 +1124,22 @@ fn code_str_group(
                 .map_or(0, |x| u16::from_le_bytes([x[0], x[1]]) as u32);
             if st.group_exact == 0 {
                 st.tuple_ppm
-                    .prefetch(mix(mix(24, sh.pos_hash), sh.sgroup as u64));
-                st.tuple_ppm.prefetch(mix(20, sh.pos_hash));
+                    .prefetch(mix(mix(24, row.pos_hash), row.str_group_id as u64));
+                st.tuple_ppm.prefetch(mix(20, row.pos_hash));
             }
         }
     }
 }
 
-fn code_ex(st: &mut StrState, sh: &mut Shared, c: &mut Coder, want: u32) -> u32 {
-    let ctxs = [mix(63, sh.pos_hash), mix(64, sh.p0), 65];
-    let ex = match st.ex_ppm.code(c, &ctxs, want) {
+fn code_ex(st: &mut StrState, row: &mut RowState, coder: &mut Coder, want: u32) -> u32 {
+    let ctxs = [mix(63, row.pos_hash), mix(64, row.pos_first_hash), 65];
+    let ex = match st.ex_ppm.code(coder, &ctxs, want) {
         Some(e) => e,
-        None => c.uniform(want as u64, EX_DOMAIN) as u32,
+        None => coder.uniform(want as u64, EX_DOMAIN) as u32,
     };
     st.ex_ppm.update(ex);
     ex
 }
-
-const MAX_RECENT: usize = 8;
-pub const FIXED_COLS: usize = 4;
-const IRREGULAR_FLAG_LIMIT: u32 = 30000;
-const LO_BITS_MAX: u8 = 24;
-pub const MAX_STR_STEPS: usize = 200;
-pub const MAX_LID_SHIFT: u8 = 54;
 
 fn remember(recent: &mut Vec<String>, limit: usize, v: &str) {
     if limit == 0 {
@@ -1107,45 +1159,45 @@ fn remember(recent: &mut Vec<String>, limit: usize, v: &str) {
     recent.insert(0, buf);
 }
 
-fn code_str(
-    st: &mut StrState,
-    sh: &mut Shared,
-    c: &mut Coder,
-    col: usize,
+#[derive(Clone, Copy)]
+struct StrOptions {
     align: bool,
     grouped: bool,
+}
+
+fn code_str(
+    st: &mut StrState,
+    row: &mut RowState,
+    coder: &mut Coder,
+    col: usize,
+    options: StrOptions,
 ) {
-    let dec = c.is_decoder();
-    let nsrc = st.srcs.len();
+    let dec = coder.is_decoder();
     let pending = st.group_plan.take();
-    let (ex, cand) = if grouped {
+    let (ex, cand) = if options.grouped {
         (st.group_exact, pending.map_or((0, 0, 0, 0), |p| p.1))
     } else {
         let (want, cand) = if dec {
             (0, (0, 0, 0, 0))
         } else {
-            plan_str(st, sh, col, align)
+            plan_str(st, row, col, options.align)
         };
-        (code_ex(st, sh, c, want), cand)
+        (code_ex(st, row, coder, want), cand)
     };
-    sh.shape = mix(sh.shape, ex as u64);
-    if ex == EX_ALIGNED && align {
-        code_aligned(st, sh, c, col);
+    row.str_shape = mix(row.str_shape, ex as u64);
+    if ex == EX_ALIGNED && options.align {
+        code_aligned(st, row, coder, col);
     } else if ex != 0 && ex != EX_ALIGNED {
         if dec {
             let (j, t) = (((ex - 1) / 2) as usize, ((ex - 1) % 2) as usize);
-            let src = if j < nsrc {
-                sh.cur[st.srcs[j]].as_str()
-            } else {
-                st.recent.get(j - nsrc).map_or("", |x| x.as_str())
-            };
-            apply_ref(src, t == 1, 0, "", &mut sh.out);
-            std::mem::swap(&mut sh.cur[col], &mut sh.out);
+            let src = resolve_source(st, &row.fields, j);
+            apply_ref(src, t == 1, 0, "", &mut row.rebuilt);
+            std::mem::swap(&mut row.fields[col], &mut row.rebuilt);
         }
     } else {
-        code_ref(st, sh, c, col, cand);
+        code_ref(st, row, coder, col, cand);
     }
-    remember_value(st, &sh.cur[col]);
+    remember_value(st, &row.fields[col]);
 }
 
 fn pair_hash(ch: char, seg: &[char]) -> u64 {
@@ -1157,49 +1209,53 @@ fn pair_hash(ch: char, seg: &[char]) -> u64 {
 }
 
 fn segment_reading(st: &StrState, chars: &[char], reading: &[char]) -> Vec<(usize, usize)> {
-    const MAX_SEG: usize = 8;
-    let (n, m) = (chars.len(), reading.len());
-    let w = m + 1;
-    let inf = f64::MAX / 4.0;
-    let mut cost = vec![inf; (n + 1) * w];
-    let mut take = vec![0usize; (n + 1) * w];
+    let (char_count, reading_len) = (chars.len(), reading.len());
+    let stride = reading_len + 1;
+    let unreachable_cost = f64::MAX / 4.0;
+    let mut cost = vec![unreachable_cost; (char_count + 1) * stride];
+    let mut segment_len_at = vec![0usize; (char_count + 1) * stride];
     cost[0] = 0.0;
-    for i in 0..n {
-        for k in 0..=m {
-            let base = cost[i * w + k];
-            if base >= inf {
+    for i in 0..char_count {
+        for reading_pos in 0..=reading_len {
+            let base = cost[i * stride + reading_pos];
+            if base >= unreachable_cost {
                 continue;
             }
-            let longest = if i + 1 == n {
-                m - k
+            let longest = if i + 1 == char_count {
+                reading_len - reading_pos
             } else {
-                MAX_SEG.min(m - k)
+                MAX_SEGMENT_LEN.min(reading_len - reading_pos)
             };
             for len in 0..=longest {
-                let known = st
-                    .known
-                    .contains(&pair_hash(chars[i], &reading[k..k + len]));
-                let step = if known { 2.0 } else { 5.0 + 6.0 * len as f64 };
-                let idx = (i + 1) * w + k + len;
-                if base + step < cost[idx] {
-                    cost[idx] = base + step;
-                    take[idx] = len;
+                let known = st.known.contains(&pair_hash(
+                    chars[i],
+                    &reading[reading_pos..reading_pos + len],
+                ));
+                let segment_cost = if known {
+                    KNOWN_SEGMENT_COST
+                } else {
+                    NEW_SEGMENT_BASE_COST + NEW_SEGMENT_COST_PER_CHAR * len as f64
+                };
+                let idx = (i + 1) * stride + reading_pos + len;
+                if base + segment_cost < cost[idx] {
+                    cost[idx] = base + segment_cost;
+                    segment_len_at[idx] = len;
                 }
             }
         }
     }
-    let mut out = vec![(0, 0); n];
-    let mut k = m;
-    for i in (0..n).rev() {
-        let len = take[(i + 1) * w + k];
-        out[i] = (k - len, k);
-        k -= len;
+    let mut out = vec![(0, 0); char_count];
+    let mut reading_pos = reading_len;
+    for i in (0..char_count).rev() {
+        let len = segment_len_at[(i + 1) * stride + reading_pos];
+        out[i] = (reading_pos - len, reading_pos);
+        reading_pos -= len;
     }
     out
 }
 
-fn code_segments(st: &mut StrState, c: &mut Coder, run: &str, reading: &str, out: &mut String) {
-    let dec = c.is_decoder();
+fn code_segments(st: &mut StrState, coder: &mut Coder, run: &str, reading: &str, out: &mut String) {
+    let dec = coder.is_decoder();
     let chars: Vec<char> = run.chars().collect();
     let rchars: Vec<char> = reading.chars().collect();
     let ranges = if dec {
@@ -1219,15 +1275,12 @@ fn code_segments(st: &mut StrState, c: &mut Coder, run: &str, reading: &str, out
             (seg, st.segs.find(piece.as_bytes()).unwrap_or(NOVEL))
         };
         let ctxs = [mix(80, ch as u64), 81];
-        let id = match st.seg_ppm.code(c, &ctxs, sym) {
+        let id = match st.seg_ppm.code(coder, &ctxs, sym) {
             Some(id) => id,
             None => {
                 let want = piece.clone();
-                st.read_chars.code_str(c, &[], &want, &mut piece);
-                match st.segs.find(piece.as_bytes()) {
-                    Some(i) => i,
-                    None => st.segs.add(piece.as_bytes()),
-                }
+                st.read_chars.code_str(coder, &[], &want, &mut piece);
+                st.segs.find_or_add(piece.as_bytes())
             }
         };
         st.seg_ppm.update(id);
@@ -1239,36 +1292,42 @@ fn code_segments(st: &mut StrState, c: &mut Coder, run: &str, reading: &str, out
     }
 }
 
-fn code_aligned(st: &mut StrState, sh: &mut Shared, c: &mut Coder, col: usize) {
-    let dec = c.is_decoder();
-    runs_of(&sh.cur[0], &mut sh.runs);
+fn code_aligned(st: &mut StrState, row: &mut RowState, coder: &mut Coder, col: usize) {
+    let dec = coder.is_decoder();
+    split_script_runs(&row.fields[0], &mut row.script_runs);
     if !dec {
-        match_reading(&sh.cur[0], &sh.runs, &sh.cur[col], &mut sh.groups);
+        match_reading(
+            &row.fields[0],
+            &row.script_runs,
+            &row.fields[col],
+            &mut row.reading_spans,
+        );
     }
-    sh.out.clear();
+    row.rebuilt.clear();
     let mut gi = 0;
-    for &(is_k, a, b) in &sh.runs {
-        if is_k {
-            sh.out.extend(sh.cur[0][a..b].chars().map(kata));
+    for &(is_kana_run, run_start, run_end) in &row.script_runs {
+        if is_kana_run {
+            row.rebuilt
+                .extend(row.fields[0][run_start..run_end].chars().map(kata));
             continue;
         }
-        let run = &sh.cur[0][a..b];
+        let run = &row.fields[0][run_start..run_end];
         let reading = if dec {
             ""
         } else {
-            &sh.cur[col][sh.groups[gi].0..sh.groups[gi].1]
+            &row.fields[col][row.reading_spans[gi].0..row.reading_spans[gi].1]
         };
         gi += 1;
         let sym = if dec {
             NOVEL
         } else {
-            st.runs.find(reading.as_bytes()).unwrap_or(NOVEL)
+            st.run_readings.find(reading.as_bytes()).unwrap_or(NOVEL)
         };
-        let b0 = c.bits;
+        let b0 = coder.bits;
         let hit = st
             .run_ppm
-            .code(c, &[mix(12, hash_bytes(run.as_bytes()))], sym);
-        let b1 = c.bits;
+            .code(coder, &[mix(12, hash_bytes(run.as_bytes()))], sym);
+        let b1 = coder.bits;
         if hit.is_some() {
             st.align_stats[0] += b1 - b0;
             st.align_stats[1] += 1.0;
@@ -1276,121 +1335,115 @@ fn code_aligned(st: &mut StrState, sh: &mut Shared, c: &mut Coder, col: usize) {
         let id = match hit {
             Some(id) => id,
             None => {
-                code_segments(st, c, run, reading, &mut sh.tmp);
-                st.align_stats[2] += c.bits - b0;
+                code_segments(st, coder, run, reading, &mut row.coded_text);
+                st.align_stats[2] += coder.bits - b0;
                 st.align_stats[3] += 1.0;
-                match st.runs.find(sh.tmp.as_bytes()) {
-                    Some(i) => i,
-                    None => st.runs.add(sh.tmp.as_bytes()),
-                }
+                st.run_readings.find_or_add(row.coded_text.as_bytes())
             }
         };
         st.run_ppm.update(id);
-        sh.out
-            .push_str(std::str::from_utf8(st.runs.get(id)).unwrap_or(""));
+        row.rebuilt
+            .push_str(std::str::from_utf8(st.run_readings.get(id)).unwrap_or(""));
     }
     if dec {
-        std::mem::swap(&mut sh.cur[col], &mut sh.out);
+        std::mem::swap(&mut row.fields[col], &mut row.rebuilt);
     }
 }
 
-fn code_ref(st: &mut StrState, sh: &mut Shared, c: &mut Coder, col: usize, cand: Cand) {
-    let dec = c.is_decoder();
+fn code_ref(st: &mut StrState, row: &mut RowState, coder: &mut Coder, col: usize, cand: Cand) {
+    let dec = coder.is_decoder();
     let nsrc = st.srcs.len();
     let (bj, bt, btrim, bapp) = cand;
-    let make_key = |scratch: &mut Vec<u8>, j: usize, t: usize, trim: usize, app: &str| {
-        scratch.clear();
-        scratch.push(j as u8);
-        scratch.push(t as u8);
-        put_varint(scratch, trim as u64);
-        scratch.extend_from_slice(app.as_bytes());
+    let make_key = |key: &mut Vec<u8>, j: usize, t: usize, trim: usize, app: &str| {
+        key.clear();
+        key.push(j as u8);
+        key.push(t as u8);
+        put_varint(key, trim as u64);
+        key.extend_from_slice(app.as_bytes());
     };
     let sym = if dec {
         NOVEL
     } else {
-        let app = &sh.cur[col][bapp..];
-        make_key(&mut sh.scratch, bj, bt, btrim, app);
-        st.tuples.find(&sh.scratch).unwrap_or(NOVEL)
+        let app = &row.fields[col][bapp..];
+        make_key(&mut row.key_buf, bj, bt, btrim, app);
+        st.tuples.find(&row.key_buf).unwrap_or(NOVEL)
     };
     let ctxs = [
-        mix(mix(24, sh.pos_hash), sh.sgroup as u64),
-        mix(20, sh.pos_hash),
-        mix(21, sh.p0),
+        mix(mix(24, row.pos_hash), row.str_group_id as u64),
+        mix(20, row.pos_hash),
+        mix(21, row.pos_first_hash),
         22,
     ];
-    let ctxs = if sh.sgroup == 0 {
+    let ctxs = if row.str_group_id == 0 {
         &ctxs[1..]
     } else {
         &ctxs[..]
     };
-    let id = match st.tuple_ppm.code(c, ctxs, sym) {
+    let id = match st.tuple_ppm.code(coder, ctxs, sym) {
         Some(id) => id,
         None => {
             let rsym = (bj * 2 + bt) as u32;
-            let r = match st.ref_ppm.code(c, &[mix(23, sh.p0), 24], rsym) {
+            let r = match st
+                .ref_ppm
+                .code(coder, &[mix(23, row.pos_first_hash), 24], rsym)
+            {
                 Some(r) => r,
-                None => c.uniform(rsym as u64, 2 * (nsrc + MAX_RECENT) as u64) as u32,
+                None => coder.uniform(rsym as u64, 2 * (nsrc + MAX_RECENT) as u64) as u32,
             };
             st.ref_ppm.update(r);
-            let trim = st.trim.code(c, btrim as u64) as usize;
-            let app = if dec { "" } else { &sh.cur[col][bapp..] };
-            st.chars.code_str(c, &[], app, &mut sh.tmp);
+            let trim = st.trim.code(coder, btrim as u64) as usize;
+            let app = if dec { "" } else { &row.fields[col][bapp..] };
+            st.chars.code_str(coder, &[], app, &mut row.coded_text);
             let (j, t) = ((r / 2) as usize, (r % 2) as usize);
-            let tmp = std::mem::take(&mut sh.tmp);
-            make_key(&mut sh.scratch, j, t, trim, &tmp);
-            sh.tmp = tmp;
-            match st.tuples.find(&sh.scratch) {
-                Some(i) => i,
-                None => st.tuples.add(&sh.scratch),
-            }
+            let tmp = std::mem::take(&mut row.coded_text);
+            make_key(&mut row.key_buf, j, t, trim, &tmp);
+            row.coded_text = tmp;
+            st.tuples.find_or_add(&row.key_buf)
         }
     };
     st.tuple_ppm.update(id);
     if !dec {
         return;
     }
-    let b = st.tuples.get(id);
-    let (j, t) = (b[0] as usize, b[1] as usize);
+    let key = st.tuples.get(id);
+    let (j, t) = (key[0] as usize, key[1] as usize);
     let mut pos = 2;
-    let trim = get_varint(b, &mut pos).unwrap_or(0) as usize;
-    let app = std::str::from_utf8(&b[pos..]).unwrap_or("");
-    let src = if j < nsrc {
-        sh.cur[st.srcs[j]].as_str()
-    } else {
-        st.recent.get(j - nsrc).map_or("", |x| x.as_str())
-    };
-    apply_ref(src, t == 1, trim, app, &mut sh.out);
-    std::mem::swap(&mut sh.cur[col], &mut sh.out);
+    let trim = get_varint(key, &mut pos).unwrap_or(0) as usize;
+    let app = std::str::from_utf8(&key[pos..]).unwrap_or("");
+    let src = resolve_source(st, &row.fields, j);
+    apply_ref(src, t == 1, trim, app, &mut row.rebuilt);
+    std::mem::swap(&mut row.fields[col], &mut row.rebuilt);
 }
 
-fn code_num(st: &mut NumState, sh: &mut Shared, c: &mut Coder, col: usize, mode: u8) {
-    let dec = c.is_decoder();
+fn code_num(st: &mut NumState, row: &mut RowState, coder: &mut Coder, col: usize, mode: u8) {
+    let dec = coder.is_decoder();
     let parsed = if dec {
         None
     } else {
-        canonical_i64(&sh.cur[col])
+        canonical_i64(&row.fields[col])
     };
-    if sh.row_irr
+    if row.row_irregular
         && st
             .irregular
-            .code(c, !dec && parsed.is_none(), IRREGULAR_FLAG_LIMIT)
+            .code(coder, !dec && parsed.is_none(), IRREGULAR_FLAG_LIMIT)
     {
-        sh.raw_chars.code_str(c, &[], &sh.cur[col], &mut sh.tmp);
+        row.raw_chars
+            .code_str(coder, &[], &row.fields[col], &mut row.coded_text);
         if dec {
-            sh.cur[col] = sh.tmp.clone();
+            row.fields[col] = row.coded_text.clone();
         }
         return;
     }
-    let reference = if mode == 2 && sh.lid_key != 0 {
-        st.refs.get(&sh.lid_key).copied()
+    let reference = if mode == 2 && row.lid_ref_key != 0 {
+        st.refs.get(&row.lid_ref_key).copied()
     } else {
         None
     };
     if let Some((rcost, rlc)) = reference {
         let ctxs = [
-            mix(mix(90, sh.prev_num as u64), rlc as u64),
-            mix(mix(91, sh.prev_num as u64), sh.pos_hash),
-            mix(92, sh.pos_hash),
+            mix(mix(90, row.prev_num as u64), rlc as u64),
+            mix(mix(91, row.prev_num as u64), row.pos_hash),
+            mix(92, row.pos_hash),
             93,
         ];
         let want = parsed.map_or(0, |v| v.wrapping_sub(rcost));
@@ -1398,26 +1451,23 @@ fn code_num(st: &mut NumState, sh: &mut Shared, c: &mut Coder, col: usize, mode:
             Some(_) => st.d_intern.find(&want.to_le_bytes()).unwrap_or(NOVEL),
             None => NOVEL,
         };
-        let id = match st.d_ppm.code(c, &ctxs, sym) {
+        let id = match st.d_ppm.code(coder, &ctxs, sym) {
             Some(id) => id,
             None => {
-                let b0 = c.bits;
-                let d = unzigzag(st.d_uint.code(c, zigzag(want)));
-                st.novel.0 += c.bits - b0;
+                let b0 = coder.bits;
+                let d = unzigzag(st.d_uint.code(coder, zigzag(want)));
+                st.novel.0 += coder.bits - b0;
                 st.novel.1 += 1;
-                match st.d_intern.find(&d.to_le_bytes()) {
-                    Some(i) => i,
-                    None => st.d_intern.add(&d.to_le_bytes()),
-                }
+                st.d_intern.find_or_add(&d.to_le_bytes())
             }
         };
         st.d_ppm.update(id);
         let d = i64::from_le_bytes(st.d_intern.get(id).try_into().unwrap_or([0; 8]));
         let v = rcost.wrapping_add(d);
-        st.refs.insert(sh.lid_key, (v, sh.prev_num));
-        note_num(sh, v);
+        st.refs.insert(row.lid_ref_key, (v, row.prev_num));
+        note_num(row, v);
         if dec {
-            set_i64(&mut sh.cur[col], v);
+            set_i64(&mut row.fields[col], v);
         }
         return;
     }
@@ -1425,13 +1475,13 @@ fn code_num(st: &mut NumState, sh: &mut Shared, c: &mut Coder, col: usize, mode:
     let n;
     match mode {
         0 => {
-            ctxs = [mix(50, sh.p0), 51, 0, 0, 0, 0];
+            ctxs = [mix(50, row.pos_first_hash), 51, 0, 0, 0, 0];
             n = 2;
         }
         2 => {
             ctxs = [
-                mix(mix(60, sh.prev_num as u64), sh.pos_hash),
-                mix(61, sh.p01),
+                mix(mix(60, row.prev_num as u64), row.pos_hash),
+                mix(61, row.pos_first_two_hash),
                 62,
                 0,
                 0,
@@ -1440,25 +1490,28 @@ fn code_num(st: &mut NumState, sh: &mut Shared, c: &mut Coder, col: usize, mode:
             n = 3;
         }
         1 => {
-            let base = mix(sh.pos_sym as u64, sh.cat_id as u64);
+            let base = mix(row.pos_sym as u64, row.cat_group_id as u64);
             ctxs = [
-                mix(mix(70, base), sh.surf_hash),
+                mix(mix(70, base), row.surf_hash),
                 mix(71, base),
-                mix(72, sh.pos_sym as u64),
-                mix(73, sh.p01),
+                mix(72, row.pos_sym as u64),
+                mix(73, row.pos_first_two_hash),
                 74,
                 0,
             ];
             n = 5;
         }
         _ => {
-            let base = mix(mix(sh.pos_sym as u64, sh.cat_id as u64), sh.prev_num as u64);
+            let base = mix(
+                mix(row.pos_sym as u64, row.cat_group_id as u64),
+                row.prev_num as u64,
+            );
             ctxs = [
-                mix(mix(80, base), sh.surf_hash),
+                mix(mix(80, base), row.surf_hash),
                 mix(81, base),
-                mix(82, mix(sh.pos_sym as u64, sh.cat_id as u64)),
-                mix(83, sh.pos_sym as u64),
-                mix(84, sh.p01),
+                mix(82, mix(row.pos_sym as u64, row.cat_group_id as u64)),
+                mix(83, row.pos_sym as u64),
+                mix(84, row.pos_first_two_hash),
                 85,
             ];
             n = 6;
@@ -1470,27 +1523,24 @@ fn code_num(st: &mut NumState, sh: &mut Shared, c: &mut Coder, col: usize, mode:
         Some(v) => st.intern.find(&v.to_le_bytes()).unwrap_or(NOVEL),
         None => NOVEL,
     };
-    let id = match st.ppm.code(c, ctxs, sym) {
+    let id = match st.ppm.code(coder, ctxs, sym) {
         Some(id) => id,
         None => {
-            let b0 = c.bits;
-            let v = unzigzag(st.uint.code(c, zigzag(parsed.unwrap_or(0))));
-            st.novel.0 += c.bits - b0;
+            let b0 = coder.bits;
+            let v = unzigzag(st.uint.code(coder, zigzag(parsed.unwrap_or(0))));
+            st.novel.0 += coder.bits - b0;
             st.novel.1 += 1;
-            match st.intern.find(&v.to_le_bytes()) {
-                Some(i) => i,
-                None => st.intern.add(&v.to_le_bytes()),
-            }
+            st.intern.find_or_add(&v.to_le_bytes())
         }
     };
     st.ppm.update(id);
     let v = i64::from_le_bytes(st.intern.get(id).try_into().unwrap_or([0; 8]));
-    if mode == 2 && sh.lid_key != 0 {
-        st.refs.insert(sh.lid_key, (v, sh.prev_num));
+    if mode == 2 && row.lid_ref_key != 0 {
+        st.refs.insert(row.lid_ref_key, (v, row.prev_num));
     }
-    note_num(sh, v);
+    note_num(row, v);
     if dec {
-        set_i64(&mut sh.cur[col], v);
+        set_i64(&mut row.fields[col], v);
     }
 }
 
@@ -1559,29 +1609,30 @@ fn set_i64(s: &mut String, v: i64) {
     }
 }
 
-fn code_lid(st: &mut LidState, sh: &mut Shared, c: &mut Coder, col: usize, spec: &LidSpec) {
-    let dec = c.is_decoder();
+fn code_lid(st: &mut LidState, row: &mut RowState, coder: &mut Coder, col: usize, spec: &LidSpec) {
+    let dec = coder.is_decoder();
     let (shift, partner, order) = (spec.shift, spec.partner, spec.order);
     let parsed = if dec {
         None
     } else {
-        canonical_u64(&sh.cur[col])
+        canonical_u64(&row.fields[col])
     };
-    let irregular = sh.row_irr
+    let irregular = row.row_irregular
         && st
             .irregular
-            .code(c, !dec && parsed.is_none(), IRREGULAR_FLAG_LIMIT);
+            .code(coder, !dec && parsed.is_none(), IRREGULAR_FLAG_LIMIT);
     if irregular {
-        sh.raw_chars.code_str(c, &[], &sh.cur[col], &mut sh.tmp);
+        row.raw_chars
+            .code_str(coder, &[], &row.fields[col], &mut row.coded_text);
         if dec {
-            sh.cur[col].clone_from(&sh.tmp);
+            row.fields[col].clone_from(&row.coded_text);
         }
     } else {
         let v = parsed.unwrap_or(0);
         let (id, low) = (v >> shift, v & ((1u64 << shift) - 1));
-        let mut kh = mix(7, sh.p0);
+        let mut kh = mix(7, row.pos_first_hash);
         for &k in &spec.key {
-            kh = mix(kh, hash_bytes(sh.cur[k].as_bytes()));
+            kh = mix(kh, hash_bytes(row.fields[k].as_bytes()));
         }
         let seen = st.seen.get(&kh).copied();
         let mut near = (None, None);
@@ -1589,7 +1640,7 @@ fn code_lid(st: &mut LidState, sh: &mut Shared, c: &mut Coder, col: usize, spec:
             0
         } else {
             if !dec && let Some(o) = order {
-                near = neighbours(&st.order, sh.cur[o].as_bytes());
+                near = neighbours(&st.order, row.fields[o].as_bytes());
             }
             let bits = |x: u64| 64 - x.leading_zeros() as u64;
             if near.0.is_some() {
@@ -1602,50 +1653,55 @@ fn code_lid(st: &mut LidState, sh: &mut Shared, c: &mut Coder, col: usize, spec:
                 3
             }
         };
-        let b0 = c.bits;
-        let ctxs = [mix(mix(32, sh.p0), sh.shape), mix(30, sh.p0), 31];
-        let mode = match st.mode_ppm.code(c, &ctxs, want_mode) {
+        let b0 = coder.bits;
+        let ctxs = [
+            mix(mix(32, row.pos_first_hash), row.str_shape),
+            mix(30, row.pos_first_hash),
+            31,
+        ];
+        let mode = match st.mode_ppm.code(coder, &ctxs, want_mode) {
             Some(m) => m,
-            None => c.uniform(want_mode as u64, 5) as u32,
+            None => coder.uniform(want_mode as u64, LID_MODE_COUNT as u64) as u32,
         };
         st.mode_ppm.update(mode);
-        let b1 = c.bits;
+        let b1 = coder.bits;
         st.stats[0] += b1 - b0;
-        st.mode_count[mode as usize % 5] += 1;
+        st.mode_count[mode as usize % LID_MODE_COUNT] += 1;
         if dec
             && (mode == 1 || mode == 2)
             && let Some(o) = order
         {
-            near = neighbours(&st.order, sh.cur[o].as_bytes());
+            near = neighbours(&st.order, row.fields[o].as_bytes());
         }
         let new_id = match mode {
             0 => seen.unwrap_or(0),
             1 => {
                 let (lo, hi) = near.1.unwrap_or((0, 1));
-                lo + c.uniform(id.wrapping_sub(lo), hi - lo)
+                lo + coder.uniform(id.wrapping_sub(lo), hi - lo)
             }
             2 => {
                 let a = near.0.unwrap_or(0) as i64;
                 a.wrapping_add(unzigzag(
-                    st.delta.code(c, zigzag((id as i64).wrapping_sub(a))),
+                    st.delta.code(coder, zigzag((id as i64).wrapping_sub(a))),
                 )) as u64
             }
             4 => {
                 let a = st.last_new as i64;
                 a.wrapping_add(unzigzag(
-                    st.from_last.code(c, zigzag((id as i64).wrapping_sub(a))),
+                    st.from_last
+                        .code(coder, zigzag((id as i64).wrapping_sub(a))),
                 )) as u64
             }
-            _ => st.direct.code(c, id),
+            _ => st.direct.code(coder, id),
         };
-        st.stats[1 + (mode as usize % 5).min(3)] += c.bits - b1;
-        let b2 = c.bits;
+        st.stats[1 + (mode as usize % LID_MODE_COUNT).min(3)] += coder.bits - b1;
+        let b2 = coder.bits;
         if mode != 0 {
             st.last_new = new_id;
         }
         st.seen.insert(kh, new_id);
         if let Some(o) = order {
-            let k = sh.cur[o].as_bytes();
+            let k = row.fields[o].as_bytes();
             match st.order.get_mut(k) {
                 Some(e) => {
                     e.0 = e.0.min(new_id);
@@ -1658,63 +1714,67 @@ fn code_lid(st: &mut LidState, sh: &mut Shared, c: &mut Coder, col: usize, spec:
         }
         let split = shift.min(LO_BITS_MAX) as u32;
         let ctxs = [
-            mix(mix(41, sh.pos_hash), sh.shape),
-            mix(42, sh.pos_hash),
-            mix(43, sh.p0),
+            mix(mix(41, row.pos_hash), row.str_shape),
+            mix(42, row.pos_hash),
+            mix(43, row.pos_first_hash),
             44,
         ];
         let lo = low & ((1u64 << split) - 1);
-        let lo = match st.lo_ppm.code(c, &ctxs, lo as u32) {
+        let lo = match st.lo_ppm.code(coder, &ctxs, lo as u32) {
             Some(x) => x,
-            None => c.raw_bits(lo, split) as u32,
+            None => coder.raw_bits(lo, split) as u32,
         };
         st.lo_ppm.update(lo);
         let mut low = lo as u64;
         if shift as u32 > split {
             let hi_bits = shift as u32 - split;
             let hi = (v & ((1u64 << shift) - 1)) >> split;
-            let colh = spec.low_col.map_or(0, |k| hash_bytes(sh.cur[k].as_bytes()));
+            let colh = spec
+                .low_col
+                .map_or(0, |k| hash_bytes(row.fields[k].as_bytes()));
             let ctxs = [
                 mix(mix(50, new_id), colh),
-                mix(mix(51, sh.pos_hash), sh.shape),
-                mix(52, sh.pos_hash),
-                mix(53, sh.p0),
+                mix(mix(51, row.pos_hash), row.str_shape),
+                mix(52, row.pos_hash),
+                mix(53, row.pos_first_hash),
                 54,
             ];
-            let hi = match st.hi_ppm.code(c, &ctxs, hi as u32) {
+            let hi = match st.hi_ppm.code(coder, &ctxs, hi as u32) {
                 Some(x) => x,
-                None => c.raw_bits(hi, hi_bits) as u32,
+                None => coder.raw_bits(hi, hi_bits) as u32,
             };
             st.hi_ppm.update(hi);
             low |= (hi as u64) << split;
         }
-        sh.lid_key = mix(mix(77, new_id), low >> 24) | 1;
-        st.stats[5] += c.bits - b2;
+        row.lid_ref_key = mix(mix(77, new_id), low >> LO_BITS_MAX) | 1;
+        st.stats[5] += coder.bits - b2;
         if dec {
-            set_u64(&mut sh.cur[col], (new_id << shift) | low);
+            set_u64(&mut row.fields[col], (new_id << shift) | low);
         }
         if let Some(p) = partner {
-            let bad = sh.row_irr
+            let bad = row.row_irregular
                 && st.partner_bad.code(
-                    c,
-                    !dec && canonical_u64(&sh.cur[p]) != Some(new_id),
+                    coder,
+                    !dec && canonical_u64(&row.fields[p]) != Some(new_id),
                     IRREGULAR_FLAG_LIMIT,
                 );
             if bad {
-                sh.raw_chars.code_str(c, &[], &sh.cur[p], &mut sh.tmp);
+                row.raw_chars
+                    .code_str(coder, &[], &row.fields[p], &mut row.coded_text);
                 if dec {
-                    sh.cur[p].clone_from(&sh.tmp);
+                    row.fields[p].clone_from(&row.coded_text);
                 }
             } else if dec {
-                set_u64(&mut sh.cur[p], new_id);
+                set_u64(&mut row.fields[p], new_id);
             }
         }
         return;
     }
     if let Some(p) = partner {
-        sh.raw_chars.code_str(c, &[], &sh.cur[p], &mut sh.tmp);
+        row.raw_chars
+            .code_str(coder, &[], &row.fields[p], &mut row.coded_text);
         if dec {
-            sh.cur[p].clone_from(&sh.tmp);
+            row.fields[p].clone_from(&row.coded_text);
         }
     }
 }

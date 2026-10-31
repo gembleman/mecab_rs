@@ -3,13 +3,12 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use super::{LineEnds, failure};
+use super::{LineEnding, LineEnds};
 use crate::build::Charset;
 use crate::build::model::{Templates, bigram_keys, unigram_keys};
 use crate::build::rewrite::{Rewriter, Rewritten};
-use crate::build::text::{BUF_SIZE, Lines, atof, cstr, tokenize2};
-use mecab_rs::__private::write_file;
-use mecab_rs::__private::{FNV_OFFSET, FNV_PRIME};
+use crate::build::text::{LINE_BUFFER_BYTES, Lines, atof, cstr, tokenize2};
+use mecab_rs::__private::{FEATURE_DEF_FILE, FNV_OFFSET, FNV_PRIME, REWRITE_DEF_FILE, write_file};
 use mecab_rs::Error;
 
 pub(super) struct Fnv(u64);
@@ -46,7 +45,7 @@ pub(super) struct Features {
 
 impl Features {
     pub(super) fn open(dic_dir: &Path) -> Result<Self, Error> {
-        let rewrite_def = dic_dir.join("rewrite.def");
+        let rewrite_def = dic_dir.join(REWRITE_DEF_FILE);
         Ok(Self {
             ids: Map::default(),
             list: Vec::new(),
@@ -77,7 +76,7 @@ impl Features {
             let feature = &self.list[id as usize];
             let (matched, rewritten) = self.rewriter.rewrite(feature, &self.rewrite_def)?;
             if !matched {
-                return Err(failure(
+                return Err(Error::learn(
                     &self.rewrite_def,
                     format!(
                         " cannot rewrite pattern: {}",
@@ -168,7 +167,7 @@ pub(super) fn remap_weights(old: &[f64], renumbered: &[i32], size: usize) -> Vec
 
 impl FeatureIndex {
     pub(super) fn open(dic_dir: &Path) -> Result<Self, Error> {
-        let feature_def = dic_dir.join("feature.def");
+        let feature_def = dic_dir.join(FEATURE_DEF_FILE);
         Ok(Self {
             templates: Templates::open(&feature_def)?,
             feature_def,
@@ -304,8 +303,8 @@ impl FeatureIndex {
         self.dic.clear();
         self.cache.clear();
         self.maxid = 0;
-        let mut lines = Lines::open(path, Some(BUF_SIZE)).map_err(|_| {
-            failure(
+        let mut lines = Lines::open(path, Some(LINE_BUFFER_BYTES)).map_err(|_| {
+            Error::learn(
                 path,
                 format!("cannot open the old model {}", path.display()),
             )
@@ -319,7 +318,7 @@ impl FeatureIndex {
             let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
             let found = tokenize2(line, b":", 2);
             if found.len() != 2 {
-                return Err(failure(path, format!("format error: {shown}")));
+                return Err(Error::learn(path, format!("format error: {shown}")));
             }
             let key = String::from_utf8_lossy(cstr(line, found[0])).into_owned();
             let value = String::from_utf8_lossy(cstr(line, found[1]).get(1..).unwrap_or_default())
@@ -331,13 +330,14 @@ impl FeatureIndex {
             }
         }
         if model_charset.is_empty() {
-            return Err(failure(path, "charset is empty"));
+            return Err(Error::learn(path, "charset is empty"));
         }
-        let old_charset = Charset::parse(&model_charset).map_err(|reason| failure(path, reason))?;
+        let old_charset =
+            Charset::parse(&model_charset).map_err(|reason| Error::learn(path, reason))?;
         let new_charset =
-            Charset::parse(dictionary_charset).map_err(|reason| failure(path, reason))?;
+            Charset::parse(dictionary_charset).map_err(|reason| Error::learn(path, reason))?;
         if old_charset != new_charset {
-            return Err(failure(
+            return Err(Error::learn(
                 path,
                 format!("cannot create model from={model_charset} to={dictionary_charset}"),
             ));
@@ -347,7 +347,7 @@ impl FeatureIndex {
             let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
             let found = tokenize2(line, b"\t", 2);
             if found.len() != 2 {
-                return Err(failure(path, format!("format error: {shown}")));
+                return Err(Error::learn(path, format!("format error: {shown}")));
             }
             let id = i32::try_from(self.maxid).expect("fewer than 2^31 features");
             self.dic.entry(cstr(line, found[1]).to_vec()).or_insert(id);
@@ -362,13 +362,13 @@ impl FeatureIndex {
         path: &Path,
         header: &str,
         alpha: &[f64],
-        crlf: bool,
+        ending: LineEnding,
     ) -> Result<(), Error> {
         let mut entries: Vec<(&Vec<u8>, i32)> =
             self.dic.iter().map(|(key, &id)| (key, id)).collect();
         entries.sort_unstable();
         write_file(path, |file| {
-            let mut file = LineEnds::new(file, crlf);
+            let mut file = LineEnds::new(file, ending);
             file.write_all(header.as_bytes())?;
             file.write_all(b"\n")?;
             let mut line = Vec::new();

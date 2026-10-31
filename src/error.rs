@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -40,11 +40,45 @@ pub enum Error {
     Corrupt(&'static str),
 }
 
-pub fn io_error(path: &std::path::Path) -> impl Fn(io::Error) -> Error + '_ {
-    |source| Error::Io {
-        path: path.to_path_buf(),
-        source,
+impl Error {
+    pub fn io(path: &Path, source: io::Error) -> Self {
+        Self::Io {
+            path: path.to_path_buf(),
+            source,
+        }
     }
+
+    pub fn format(file: &Path, reason: &'static str) -> Self {
+        Self::Format {
+            file: file.to_path_buf(),
+            reason,
+        }
+    }
+
+    pub fn rebuild(path: &Path, reason: impl Into<String>) -> Self {
+        Self::Rebuild {
+            path: path.to_path_buf(),
+            reason: reason.into(),
+        }
+    }
+
+    pub fn build(path: &Path, reason: impl Into<String>) -> Self {
+        Self::Build {
+            path: path.to_path_buf(),
+            reason: reason.into(),
+        }
+    }
+
+    pub fn learn(path: &Path, reason: impl Into<String>) -> Self {
+        Self::Learn {
+            path: path.to_path_buf(),
+            reason: reason.into(),
+        }
+    }
+}
+
+pub fn io_error(path: &Path) -> impl Fn(io::Error) -> Error + '_ {
+    |source| Error::io(path, source)
 }
 
 impl fmt::Display for Error {
@@ -111,12 +145,5 @@ impl std::error::Error for Error {
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
-    }
-}
-
-pub(crate) fn rebuild_error(path: &std::path::Path, reason: impl Into<String>) -> Error {
-    Error::Rebuild {
-        path: path.to_path_buf(),
-        reason: reason.into(),
     }
 }

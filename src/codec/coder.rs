@@ -2,7 +2,11 @@ const TOP: u32 = 1 << 24;
 const UINT_FLAG_LIMIT: u32 = 1024;
 const UINT_MAX_BITS: usize = 63;
 const UINT_SLOTS: usize = UINT_MAX_BITS + 2;
-pub const MAX_TOTAL: u32 = 1 << 16;
+const UNIFORM_BITS: u32 = 16;
+pub const MAX_TOTAL: u32 = 1 << UNIFORM_BITS;
+const STATE_BYTES: usize = 5;
+const CARRY_BOUNDARY: u32 = 0xFF00_0000;
+const LOW_MASK: u64 = 0x00FF_FFFF;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -45,24 +49,24 @@ impl<'a> Coder<'a> {
     }
 
     pub fn encoder(track_bits: bool) -> Coder<'static> {
-        let mut c = Coder::new(Mode::Encode);
-        c.track = track_bits;
-        c
+        let mut coder = Coder::new(Mode::Encode);
+        coder.track = track_bits;
+        coder
     }
 
     pub fn counter() -> Coder<'static> {
-        let mut c = Coder::new(Mode::Count);
-        c.track = true;
-        c
+        let mut coder = Coder::new(Mode::Count);
+        coder.track = true;
+        coder
     }
 
     pub fn decoder(input: &'a [u8]) -> Coder<'a> {
-        let mut c = Coder::new(Mode::Decode);
-        c.input = input;
-        for _ in 0..5 {
-            c.code = (c.code << 8) | c.next_byte() as u32;
+        let mut coder = Coder::new(Mode::Decode);
+        coder.input = input;
+        for _ in 0..STATE_BYTES {
+            coder.code = (coder.code << 8) | coder.next_byte() as u32;
         }
-        c
+        coder
     }
 
     #[inline]
@@ -82,7 +86,7 @@ impl<'a> Coder<'a> {
     }
 
     fn shift_low(&mut self) {
-        if (self.low as u32) < 0xFF00_0000 || (self.low >> 32) != 0 {
+        if (self.low as u32) < CARRY_BOUNDARY || (self.low >> 32) != 0 {
             let carry = (self.low >> 32) as u8;
             let mut temp = self.cache;
             loop {
@@ -96,12 +100,12 @@ impl<'a> Coder<'a> {
             self.cache = (self.low >> 24) as u8;
         }
         self.cache_size += 1;
-        self.low = (self.low & 0x00FF_FFFF) << 8;
+        self.low = (self.low & LOW_MASK) << 8;
     }
 
     pub fn finish(mut self) -> Vec<u8> {
         if self.mode == Mode::Encode {
-            for _ in 0..5 {
+            for _ in 0..STATE_BYTES {
                 self.shift_low();
             }
         }
@@ -160,21 +164,22 @@ impl<'a> Coder<'a> {
         if n <= MAX_TOTAL as u64 {
             return self.uniform16(v as u32, n as u32) as u64;
         }
-        let high_n = ((n - 1) >> 16) + 1;
-        let high = self.uniform(v >> 16, high_n);
+        let high_n = ((n - 1) >> UNIFORM_BITS) + 1;
+        let high = self.uniform(v >> UNIFORM_BITS, high_n);
         let low_n = if high == high_n - 1 {
-            n - (high << 16)
+            n - (high << UNIFORM_BITS)
         } else {
-            1 << 16
+            MAX_TOTAL as u64
         };
-        (high << 16) | self.uniform16((v & 0xFFFF) as u32, low_n as u32) as u64
+        (high << UNIFORM_BITS)
+            | self.uniform16((v & (MAX_TOTAL as u64 - 1)) as u32, low_n as u32) as u64
     }
 
     pub fn raw_bits(&mut self, v: u64, nbits: u32) -> u64 {
         let mut out = 0u64;
         let mut left = nbits;
         while left > 0 {
-            let k = left.min(16);
+            let k = left.min(UNIFORM_BITS);
             left -= k;
             let part = self.uniform16(((v >> left) & ((1 << k) - 1)) as u32, 1 << k) as u64;
             out = (out << k) | part;
@@ -191,24 +196,24 @@ pub struct Flag {
 
 impl Flag {
     #[inline]
-    pub fn code(&mut self, c: &mut Coder, bit: bool, limit: u32) -> bool {
+    pub fn code(&mut self, coder: &mut Coder, bit: bool, limit: u32) -> bool {
         let f0 = 2 * self.n0 + 1;
         let f1 = 2 * self.n1 + 1;
         let total = f0 + f1;
-        let bit = if c.is_decoder() {
-            let t = c.target(total);
-            let b = t >= f0;
-            if b {
-                c.consume(f0, f1);
+        let bit = if coder.is_decoder() {
+            let slot = coder.target(total);
+            let is_one = slot >= f0;
+            if is_one {
+                coder.consume(f0, f1);
             } else {
-                c.consume(0, f0);
+                coder.consume(0, f0);
             }
-            b
+            is_one
         } else {
             if bit {
-                c.put(f0, f1, total);
+                coder.put(f0, f1, total);
             } else {
-                c.put(0, f0, total);
+                coder.put(0, f0, total);
             }
             bit
         };
@@ -241,32 +246,40 @@ impl Default for UintModel {
 }
 
 impl UintModel {
-    pub fn code(&mut self, c: &mut Coder, v: u64) -> u64 {
-        let w = v.wrapping_add(1);
-        let n = if c.is_decoder() {
+    pub fn code(&mut self, coder: &mut Coder, v: u64) -> u64 {
+        let value_plus_one = v.wrapping_add(1);
+        let bit_len = if coder.is_decoder() {
             0
         } else {
-            UINT_MAX_BITS - w.leading_zeros() as usize
+            UINT_MAX_BITS - value_plus_one.leading_zeros() as usize
         };
         let mut len = 0usize;
-        while len < UINT_MAX_BITS && self.len[len].code(c, n > len, UINT_FLAG_LIMIT) {
+        while len < UINT_MAX_BITS && self.len[len].code(coder, bit_len > len, UINT_FLAG_LIMIT) {
             len += 1;
         }
         if len == 0 {
             return 0;
         }
-        let mut x = 1u64;
-        let b1 = self.top[len][0].code(c, (w >> (len - 1)) & 1 == 1, UINT_FLAG_LIMIT) as u64;
-        x = (x << 1) | b1;
+        let mut decoded = 1u64;
+        let first_bit = self.top[len][0].code(
+            coder,
+            (value_plus_one >> (len - 1)) & 1 == 1,
+            UINT_FLAG_LIMIT,
+        ) as u64;
+        decoded = (decoded << 1) | first_bit;
         if len >= 2 {
-            let b2 = self.top[len][1].code(c, (w >> (len - 2)) & 1 == 1, UINT_FLAG_LIMIT) as u64;
-            x = (x << 1) | b2;
+            let second_bit = self.top[len][1].code(
+                coder,
+                (value_plus_one >> (len - 2)) & 1 == 1,
+                UINT_FLAG_LIMIT,
+            ) as u64;
+            decoded = (decoded << 1) | second_bit;
             if len >= 3 {
                 let rest = len as u32 - 2;
-                let r = c.raw_bits(w & ((1u64 << rest) - 1), rest);
-                x = (x << rest) | r;
+                let low_bits = coder.raw_bits(value_plus_one & ((1u64 << rest) - 1), rest);
+                decoded = (decoded << rest) | low_bits;
             }
         }
-        x - 1
+        decoded - 1
     }
 }

@@ -6,6 +6,8 @@ pub(super) mod pieces;
 use std::fmt;
 use std::ops::Range;
 
+use crate::wire::{u32_at, u64_at};
+
 pub(super) const OP_REF: u8 = 0x00;
 pub(super) const OP_EMPTY: u8 = 0x01;
 pub(super) const OP_STAR: u8 = 0x02;
@@ -39,6 +41,33 @@ pub(super) const OP_COPY_MAX: u8 = OP_NUM - 1;
 pub(super) const OP_NUM_MAX: u8 = OP_NUM + MAX_NUMERIC as u8 - 1;
 pub(super) const OP_HIGH_MAX: u8 = OP_HIGH + MAX_NUMERIC as u8 - 1;
 pub(super) const OP_NUMB_MAX: u8 = OP_NUMB + MAX_NUMERIC as u8 - 1;
+const TEMPLATES_AT: usize = 0;
+const SHAPES_AT: usize = 4;
+const NUMERICS_AT: usize = 8;
+const LO_TOTAL_AT: usize = 12;
+const POOL_BYTES_AT: usize = 16;
+const SHAPE_BYTES_AT: usize = 24;
+const STRINGS_AT: usize = 32;
+const RECORDS_AT: usize = 40;
+const RECORD_COUNT_AT: usize = 48;
+const CHARS_AT: usize = 56;
+const PIECES_AT: usize = 60;
+const POSITIONS_AT: usize = 64;
+const ENTRY_BITS_AT: usize = 68;
+const BLOB_BYTES_AT: usize = 72;
+const BLOB_ENTRIES_AT: usize = 84;
+const RULE_GROUPS_AT: usize = 88;
+const RULE_ENTRIES_AT: usize = 92;
+const RULE_COUNT_AT: usize = 96;
+const TEMPLATE_BITS_AT: usize = 52;
+const SHAPE_BITS_AT: usize = 53;
+const REF_BITS_AT: usize = 54;
+const HEADER_ZERO_AT: usize = 55;
+const BLOB_FIELDS_AT: usize = 80;
+const BLOB_NUMBER_AT: usize = 81;
+const ID_BYTES_AT: usize = 82;
+const BLOB_BITS_AT: usize = 83;
+const HEADER_TAIL_AT: usize = 100;
 const LENGTH_LIMIT: u64 = 1 << 40;
 const MAX_DIGITS: usize = 20;
 
@@ -194,60 +223,58 @@ impl Layout {
     pub(super) fn header(&self) -> [u8; HEADER_BYTES] {
         let counts = &self.counts;
         let mut header = [0u8; HEADER_BYTES];
-        header[0..4].copy_from_slice(&counts.templates.to_le_bytes());
-        header[4..8].copy_from_slice(&counts.shapes.to_le_bytes());
-        header[8..12].copy_from_slice(&counts.numerics.to_le_bytes());
-        header[12..16].copy_from_slice(&counts.lo_total.to_le_bytes());
-        header[16..24].copy_from_slice(&counts.pool_bytes.to_le_bytes());
-        header[24..32].copy_from_slice(&counts.shape_bytes.to_le_bytes());
-        header[32..40].copy_from_slice(&counts.strings.to_le_bytes());
-        header[40..48].copy_from_slice(&counts.records.to_le_bytes());
-        header[48..52].copy_from_slice(&counts.record_count.to_le_bytes());
-        header[56..60].copy_from_slice(&counts.chars.to_le_bytes());
-        header[60..64].copy_from_slice(&counts.pieces.to_le_bytes());
-        header[64..68].copy_from_slice(&counts.positions.to_le_bytes());
-        header[68..72].copy_from_slice(&counts.entry_bits.to_le_bytes());
-        header[52] = self.template_bits as u8;
-        header[53] = self.shape_bits as u8;
-        header[54] = self.ref_bits as u8;
-        header[72..80].copy_from_slice(&counts.blob_bytes.to_le_bytes());
-        header[80] = counts.blob_fields as u8;
-        header[81] = counts.blob_number as u8;
-        header[82] = counts.id_bytes as u8;
-        header[83] = self.blob_bits as u8;
-        header[84..88].copy_from_slice(&counts.blob_entries.to_le_bytes());
-        header[88..92].copy_from_slice(&counts.rule_groups.to_le_bytes());
-        header[92..96].copy_from_slice(&counts.rule_entries.to_le_bytes());
-        header[96..100].copy_from_slice(&counts.rule_count.to_le_bytes());
+        header[TEMPLATES_AT..][..4].copy_from_slice(&counts.templates.to_le_bytes());
+        header[SHAPES_AT..][..4].copy_from_slice(&counts.shapes.to_le_bytes());
+        header[NUMERICS_AT..][..4].copy_from_slice(&counts.numerics.to_le_bytes());
+        header[LO_TOTAL_AT..][..4].copy_from_slice(&counts.lo_total.to_le_bytes());
+        header[POOL_BYTES_AT..][..8].copy_from_slice(&counts.pool_bytes.to_le_bytes());
+        header[SHAPE_BYTES_AT..][..8].copy_from_slice(&counts.shape_bytes.to_le_bytes());
+        header[STRINGS_AT..][..8].copy_from_slice(&counts.strings.to_le_bytes());
+        header[RECORDS_AT..][..8].copy_from_slice(&counts.records.to_le_bytes());
+        header[RECORD_COUNT_AT..][..4].copy_from_slice(&counts.record_count.to_le_bytes());
+        header[TEMPLATE_BITS_AT] = self.template_bits as u8;
+        header[SHAPE_BITS_AT] = self.shape_bits as u8;
+        header[REF_BITS_AT] = self.ref_bits as u8;
+        header[CHARS_AT..][..4].copy_from_slice(&counts.chars.to_le_bytes());
+        header[PIECES_AT..][..4].copy_from_slice(&counts.pieces.to_le_bytes());
+        header[POSITIONS_AT..][..4].copy_from_slice(&counts.positions.to_le_bytes());
+        header[ENTRY_BITS_AT..][..4].copy_from_slice(&counts.entry_bits.to_le_bytes());
+        header[BLOB_BYTES_AT..][..8].copy_from_slice(&counts.blob_bytes.to_le_bytes());
+        header[BLOB_FIELDS_AT] = counts.blob_fields as u8;
+        header[BLOB_NUMBER_AT] = counts.blob_number as u8;
+        header[ID_BYTES_AT] = counts.id_bytes as u8;
+        header[BLOB_BITS_AT] = self.blob_bits as u8;
+        header[BLOB_ENTRIES_AT..][..4].copy_from_slice(&counts.blob_entries.to_le_bytes());
+        header[RULE_GROUPS_AT..][..4].copy_from_slice(&counts.rule_groups.to_le_bytes());
+        header[RULE_ENTRIES_AT..][..4].copy_from_slice(&counts.rule_entries.to_le_bytes());
+        header[RULE_COUNT_AT..][..4].copy_from_slice(&counts.rule_count.to_le_bytes());
         header
     }
 
     pub(super) fn parse(header: &[u8], length: usize) -> Option<Self> {
         let header: &[u8; HEADER_BYTES] = header.get(..HEADER_BYTES)?.try_into().ok()?;
-        let u32_at = |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().expect("four"));
-        let u64_at = |at: usize| u64::from_le_bytes(header[at..at + 8].try_into().expect("eight"));
         let counts = Counts {
-            templates: u32_at(0),
-            shapes: u32_at(4),
-            numerics: u32_at(8),
-            lo_total: u32_at(12),
-            chars: u32_at(56),
-            pieces: u32_at(60),
-            positions: u32_at(64),
-            entry_bits: u32_at(68),
-            pool_bytes: u64_at(16),
-            shape_bytes: u64_at(24),
-            strings: u64_at(32),
-            records: u64_at(40),
-            record_count: u32_at(48),
-            blob_bytes: u64_at(72),
-            blob_entries: u32_at(84),
-            rule_groups: u32_at(88),
-            rule_entries: u32_at(92),
-            rule_count: u32_at(96),
-            blob_fields: u32::from(header[80]),
-            blob_number: u32::from(header[81]),
-            id_bytes: u32::from(header[82]),
+            templates: u32_at(header, TEMPLATES_AT),
+            shapes: u32_at(header, SHAPES_AT),
+            numerics: u32_at(header, NUMERICS_AT),
+            lo_total: u32_at(header, LO_TOTAL_AT),
+            chars: u32_at(header, CHARS_AT),
+            pieces: u32_at(header, PIECES_AT),
+            positions: u32_at(header, POSITIONS_AT),
+            entry_bits: u32_at(header, ENTRY_BITS_AT),
+            pool_bytes: u64_at(header, POOL_BYTES_AT),
+            shape_bytes: u64_at(header, SHAPE_BYTES_AT),
+            strings: u64_at(header, STRINGS_AT),
+            records: u64_at(header, RECORDS_AT),
+            record_count: u32_at(header, RECORD_COUNT_AT),
+            blob_bytes: u64_at(header, BLOB_BYTES_AT),
+            blob_entries: u32_at(header, BLOB_ENTRIES_AT),
+            rule_groups: u32_at(header, RULE_GROUPS_AT),
+            rule_entries: u32_at(header, RULE_ENTRIES_AT),
+            rule_count: u32_at(header, RULE_COUNT_AT),
+            blob_fields: u32::from(header[BLOB_FIELDS_AT]),
+            blob_number: u32::from(header[BLOB_NUMBER_AT]),
+            id_bytes: u32::from(header[ID_BYTES_AT]),
         };
         if counts.numerics as usize > MAX_NUMERIC
             || counts.strings >= LENGTH_LIMIT
@@ -257,15 +284,20 @@ impl Layout {
             || counts.records >= LENGTH_LIMIT
             || counts.chars as usize > chars::MAX_CHARS
             || counts.blob_bytes >= LENGTH_LIMIT
-            || header[55] != 0
-            || header[100..HEADER_BYTES] != [0; HEADER_BYTES - 100]
+            || header[HEADER_ZERO_AT] != 0
+            || header[HEADER_TAIL_AT..HEADER_BYTES] != [0; HEADER_BYTES - HEADER_TAIL_AT]
             || !counts.blob_is_consistent()
             || !counts.rules_are_consistent()
         {
             return None;
         }
         let layout = Self::new(counts)?;
-        let widths = [header[52], header[53], header[54], header[83]];
+        let widths = [
+            header[TEMPLATE_BITS_AT],
+            header[SHAPE_BITS_AT],
+            header[REF_BITS_AT],
+            header[BLOB_BITS_AT],
+        ];
         let expected = [
             layout.template_bits,
             layout.shape_bits,

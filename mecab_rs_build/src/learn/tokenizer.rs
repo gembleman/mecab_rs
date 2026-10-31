@@ -1,22 +1,17 @@
 use std::path::Path;
 
-use super::{Config, failure};
+use super::Config;
 use crate::build::char_def::CharProperty;
-use mecab_rs::__private::{DictionaryKind, PrefixHit, SystemDictionary};
+use mecab_rs::__private::{
+    CHAR_BIN_FILE, DEFAULT_TYPE_MASK, DEFAULT_TYPE_SHIFT, DICRC_FILE, DictionaryKind, FLAG_MASK,
+    GROUP_SHIFT, INVOKE_SHIFT, LENGTH_MASK, LENGTH_SHIFT, PrefixHit, SYS_DIC_FILE,
+    SystemDictionary, TYPE_MASK, UNK_DIC_FILE,
+};
 use mecab_rs::Error;
 
 const DEFAULT_MAX_GROUPING_SIZE: usize = 24;
 const MAX_LOOKUP_BYTES: usize = 65535;
 const U16_MASK: usize = 0xffff;
-
-const TYPE_BITS: u32 = 18;
-const TYPE_MASK: u32 = (1 << TYPE_BITS) - 1;
-const DEFAULT_TYPE_SHIFT: u32 = TYPE_BITS;
-const DEFAULT_TYPE_MASK: u32 = 0xff;
-const LENGTH_SHIFT: u32 = 26;
-const LENGTH_MASK: u32 = 0xf;
-const GROUP_BIT: u32 = 30;
-const INVOKE_BIT: u32 = 31;
 
 fn default_type(info: u32) -> usize {
     ((info >> DEFAULT_TYPE_SHIFT) & DEFAULT_TYPE_MASK) as usize
@@ -27,11 +22,11 @@ fn length(info: u32) -> usize {
 }
 
 fn group(info: u32) -> bool {
-    (info >> GROUP_BIT) & 1 == 1
+    (info >> GROUP_SHIFT) & FLAG_MASK == FLAG_MASK
 }
 
 fn invoke(info: u32) -> bool {
-    (info >> INVOKE_BIT) & 1 == 1
+    (info >> INVOKE_SHIFT) & FLAG_MASK == FLAG_MASK
 }
 
 fn is_kind_of(info: u32, other: u32) -> bool {
@@ -82,15 +77,15 @@ pub(super) struct Tokenizer {
 
 impl Tokenizer {
     pub(super) fn open(dic_dir: &Path, config: &Config) -> Result<Self, Error> {
-        let unknown_path = dic_dir.join("unk.dic");
+        let unknown_path = dic_dir.join(UNK_DIC_FILE);
         let unknown = SystemDictionary::open(&unknown_path, DictionaryKind::Unknown)?;
-        let chars = CharProperty::open(&dic_dir.join("char.bin"))?;
-        let system = SystemDictionary::open(&dic_dir.join("sys.dic"), DictionaryKind::System)?;
+        let chars = CharProperty::open(&dic_dir.join(CHAR_BIN_FILE))?;
+        let system = SystemDictionary::open(&dic_dir.join(SYS_DIC_FILE), DictionaryKind::System)?;
         let mut unknown_tokens = Vec::with_capacity(chars.category_count());
         for category in 0..chars.category_count() {
             let name = chars.name(category);
             let run = unknown.exact_match(name).ok_or_else(|| {
-                failure(
+                Error::learn(
                     &unknown_path,
                     format!(
                         "cannot find UNK category: {}",
@@ -102,8 +97,8 @@ impl Tokenizer {
         }
         let bos_feature = config.text("bos-feature").as_bytes().to_vec();
         if bos_feature.is_empty() {
-            return Err(failure(
-                &dic_dir.join("dicrc"),
+            return Err(Error::learn(
+                &dic_dir.join(DICRC_FILE),
                 "bos-feature is undefined in dicrc",
             ));
         }

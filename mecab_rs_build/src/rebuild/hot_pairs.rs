@@ -1,4 +1,4 @@
-use mecab_rs::__private::HotShape;
+use mecab_rs::__private::{HotShape, u16_at, u32_at};
 
 const BISECTION_ROUNDS: usize = 64;
 const LARGEST_PENALTY: f64 = 1e15;
@@ -20,11 +20,11 @@ impl PairCount {
         [a, b, c, d, e, f, g, h]
     }
 
-    pub fn from_bytes([a, b, c, d, e, f, g, h]: [u8; PAIR_COUNT_BYTES]) -> Self {
+    pub fn from_bytes(bytes: [u8; PAIR_COUNT_BYTES]) -> Self {
         Self {
-            row: u16::from_le_bytes([a, b]),
-            column: u16::from_le_bytes([c, d]),
-            count: u32::from_le_bytes([e, f, g, h]),
+            row: u16_at(&bytes, 0),
+            column: u16_at(&bytes, 2),
+            count: u32_at(&bytes, 4),
         }
     }
 }

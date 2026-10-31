@@ -1,11 +1,13 @@
 #[doc(hidden)]
 pub mod __private;
+mod char_layout;
 mod char_property;
 pub mod char_table;
 mod clusters;
 #[cfg(feature = "xz")]
 mod codec;
 mod constraint;
+mod dict_files;
 mod dictionary;
 mod error;
 mod expand_cache;
@@ -31,6 +33,7 @@ mod tagger;
 mod template_universe;
 mod templates;
 mod threads;
+mod utf8;
 mod wire;
 
 pub use char_table::{CharTable, migrate_char_table};

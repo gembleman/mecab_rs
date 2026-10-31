@@ -8,7 +8,7 @@ mod text;
 use crate::Error;
 use crate::wire::{FNV_OFFSET, fnv1a, get_varint, put_varint};
 use coder::{Coder, UintModel};
-use model::Model;
+use model::{LID_MODE_COUNT, Model};
 use ppm::{NOVEL, Ppm, mix};
 use std::time::Instant;
 use table::{Parsed, parse_text};
@@ -19,10 +19,16 @@ pub use table::Lexicon;
 
 const MAGIC: &[u8; 4] = b"MLX1";
 const FLAG_NO_FINAL_NEWLINE: u8 = 1;
+const FLAG_GROUPED: u8 = 2;
 const FLAG_STORED: u8 = 4;
 const FLAGS_KNOWN: u8 = 7;
 const MAX_KEY_COUNT: usize = 1 << 31;
 const PREALLOC_KEY_LIMIT: usize = 1 << 24;
+const FLAGS_OFFSET: usize = 4;
+const HEADER_PREFIX_LEN: usize = FLAGS_OFFSET + 1;
+const DIGEST_BYTES: usize = 8;
+const STORED_HEADER_SLACK: usize = 32;
+const OVERRUN_MESSAGE: &str = "truncated data";
 
 #[derive(Clone, Default)]
 pub struct EncodeOptions {
@@ -38,7 +44,7 @@ pub struct Report {
     pub counts_bits: f64,
     pub steps: Vec<(usize, String, f64)>,
     pub irregular_bits: f64,
-    pub lid: Option<([f64; 6], [u64; 5])>,
+    pub lid: Option<([f64; 6], [u64; LID_MODE_COUNT])>,
     pub num_novel: Vec<(f64, u64)>,
     pub align: Vec<(usize, [f64; 4])>,
     pub plan_seconds: f64,
@@ -46,41 +52,41 @@ pub struct Report {
 }
 
 struct KeyModel {
-    lcp: Ppm,
-    lcp_uint: UintModel,
-    first: Ppm,
-    first_uint: UintModel,
+    prefix_len: Ppm,
+    prefix_len_escape: UintModel,
+    first_char_delta: Ppm,
+    first_char_delta_escape: UintModel,
     chars: CharModel,
-    cnt: Ppm,
-    cnt_uint: UintModel,
+    group_size: Ppm,
+    group_size_escape: UintModel,
     prev: Vec<char>,
     cur: Vec<char>,
-    last_l: u32,
+    last_prefix_len: u32,
 }
 
 impl KeyModel {
     fn new() -> Self {
         KeyModel {
-            lcp: Ppm::default(),
-            lcp_uint: UintModel::default(),
-            first: Ppm::default(),
-            first_uint: UintModel::default(),
+            prefix_len: Ppm::default(),
+            prefix_len_escape: UintModel::default(),
+            first_char_delta: Ppm::default(),
+            first_char_delta_escape: UintModel::default(),
             chars: CharModel::new(2),
-            cnt: Ppm::default(),
-            cnt_uint: UintModel::default(),
+            group_size: Ppm::default(),
+            group_size_escape: UintModel::default(),
             prev: Vec::new(),
             cur: Vec::new(),
-            last_l: 0,
+            last_prefix_len: 0,
         }
     }
 
-    fn code_key(&mut self, c: &mut Coder, key: &str, out: &mut String) {
-        let dec = c.is_decoder();
+    fn code_key(&mut self, coder: &mut Coder, key: &str, out: &mut String) {
+        let dec = coder.is_decoder();
         self.cur.clear();
-        let mut l = 0;
+        let mut shared_len = 0;
         if !dec {
             self.cur.extend(key.chars());
-            l = self
+            shared_len = self
                 .prev
                 .iter()
                 .zip(&self.cur)
@@ -89,39 +95,51 @@ impl KeyModel {
         }
         let prev_len = self.prev.len();
         let ctxs = [
-            mix(mix(1, prev_len as u64), self.last_l as u64),
+            mix(mix(1, prev_len as u64), self.last_prefix_len as u64),
             mix(1, prev_len as u64),
             2,
         ];
-        let l = match self.lcp.code(c, &ctxs, if dec { NOVEL } else { l as u32 }) {
-            Some(l) => l,
-            None => saturate_u32(self.lcp_uint.code(c, l as u64)),
-        };
-        self.lcp.update(l);
-        let l = (l as usize).min(prev_len);
-        self.last_l = l as u32;
+        let shared_len =
+            match self
+                .prefix_len
+                .code(coder, &ctxs, if dec { NOVEL } else { shared_len as u32 })
+            {
+                Some(shared_len) => shared_len,
+                None => saturate_u32(self.prefix_len_escape.code(coder, shared_len as u64)),
+            };
+        self.prefix_len.update(shared_len);
+        let shared_len = (shared_len as usize).min(prev_len);
+        self.last_prefix_len = shared_len as u32;
         out.clear();
-        out.extend(&self.prev[..l]);
-        let mut rest_from = l;
-        if l < prev_len {
-            let pc = self.prev[l] as u32;
-            let before = if l > 0 { self.prev[l - 1] as u64 } else { 0 };
-            let d = if dec {
+        out.extend(&self.prev[..shared_len]);
+        let mut rest_from = shared_len;
+        if shared_len < prev_len {
+            let prev_char = self.prev[shared_len] as u32;
+            let char_before = if shared_len > 0 {
+                self.prev[shared_len - 1] as u64
+            } else {
+                0
+            };
+            let delta = if dec {
                 0
             } else {
-                (self.cur[l] as u32).wrapping_sub(pc + 1)
+                (self.cur[shared_len] as u32).wrapping_sub(prev_char + 1)
             };
-            let ctxs = [mix(mix(5, before), pc as u64), mix(6, pc as u64), 7];
-            let d = match self.first.code(c, &ctxs, d) {
-                Some(d) => d,
-                None => saturate_u32(self.first_uint.code(c, d as u64)),
+            let ctxs = [
+                mix(mix(5, char_before), prev_char as u64),
+                mix(6, prev_char as u64),
+                7,
+            ];
+            let delta = match self.first_char_delta.code(coder, &ctxs, delta) {
+                Some(delta) => delta,
+                None => saturate_u32(self.first_char_delta_escape.code(coder, delta as u64)),
             };
-            self.first.update(d);
+            self.first_char_delta.update(delta);
             out.push(
-                char::from_u32(pc.wrapping_add(1).wrapping_add(d))
+                char::from_u32(prev_char.wrapping_add(1).wrapping_add(delta))
                     .unwrap_or(char::REPLACEMENT_CHARACTER),
             );
-            rest_from = l + 1;
+            rest_from = shared_len + 1;
         }
         let mut tail: Vec<u32> = out.chars().rev().take(2).map(|ch| ch as u32).collect();
         tail.reverse();
@@ -131,22 +149,25 @@ impl KeyModel {
             self.cur[rest_from..].iter().collect()
         };
         let mut suffix = String::new();
-        self.chars.code_str(c, &tail, &rest, &mut suffix);
+        self.chars.code_str(coder, &tail, &rest, &mut suffix);
         out.push_str(&suffix);
         self.prev.clear();
         self.prev.extend(out.chars());
     }
 
-    fn code_count(&mut self, c: &mut Coder, key: &str, count: usize) -> usize {
+    fn code_count(&mut self, coder: &mut Coder, key: &str, count: usize) -> usize {
         let last = key.chars().next_back().map_or(0, |ch| ch as u64);
         let ctxs = [mix(3, last), 4];
-        let n = match self.cnt.code(c, &ctxs, count as u32) {
-            Some(n) => n,
-            None => saturate_u32(self.cnt_uint.code(c, (count as u64).wrapping_sub(1)))
-                .saturating_add(1),
+        let size = match self.group_size.code(coder, &ctxs, count as u32) {
+            Some(size) => size,
+            None => saturate_u32(
+                self.group_size_escape
+                    .code(coder, (count as u64).wrapping_sub(1)),
+            )
+            .saturating_add(1),
         };
-        self.cnt.update(n);
-        n as usize
+        self.group_size.update(size);
+        size as usize
     }
 }
 
@@ -193,41 +214,39 @@ pub fn encode_with(csv: &[u8], opts: &EncodeOptions) -> (Vec<u8>, Report) {
 
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
-    out.push(lex.no_final_newline as u8 | (parsed.already_grouped as u8) << 1);
+    out.push(header_flags(lex.no_final_newline, parsed.already_grouped));
     put_varint(&mut out, text_len);
     out.extend_from_slice(&digest.to_le_bytes());
     put_varint(&mut out, groups.len() as u64);
     put_varint(&mut out, lex.irregular.len() as u64);
     plan.write(&mut out);
 
-    let mut c = Coder::encoder(opts.report);
-    let mut km = KeyModel::new();
-    let mut report = Report {
-        ..Default::default()
-    };
-    let mut buf = String::new();
-    for &(a, _) in &groups {
-        let key = lex.field(parsed.order[a] as usize, 0);
-        km.code_key(&mut c, key, &mut buf);
+    let mut coder = Coder::encoder(opts.report);
+    let mut key_model = KeyModel::new();
+    let mut report = Report::default();
+    let mut key_buf = String::new();
+    for &(group_start, _) in &groups {
+        let key = lex.field(parsed.order[group_start] as usize, 0);
+        key_model.code_key(&mut coder, key, &mut key_buf);
     }
-    report.keys_bits = c.bits;
-    let before = c.bits;
-    for &(a, b) in &groups {
-        let key = lex.field(parsed.order[a] as usize, 0);
-        km.code_count(&mut c, key, b - a);
+    report.keys_bits = coder.bits;
+    let bits_before = coder.bits;
+    for &(group_start, group_end) in &groups {
+        let key = lex.field(parsed.order[group_start] as usize, 0);
+        key_model.code_count(&mut coder, key, group_end - group_start);
     }
-    report.counts_bits = c.bits - before;
+    report.counts_bits = coder.bits - bits_before;
     if lex.n_cols > 0 {
         let mut model = Model::new(plan);
         let mut fields: Vec<&str> = Vec::with_capacity(lex.n_cols);
-        for &(a, b) in &groups {
+        for &(group_start, group_end) in &groups {
             model.start_group();
-            for &r in &parsed.order[a..b] {
+            for &row in &parsed.order[group_start..group_end] {
                 fields.clear();
                 for col in 0..lex.n_cols {
-                    fields.push(lex.field(r as usize, col));
+                    fields.push(lex.field(row as usize, col));
                 }
-                model.code_row(&mut c, &fields, "");
+                model.code_row(&mut coder, &fields, "");
             }
         }
         report.pos_bits = model.pos_bits;
@@ -240,18 +259,18 @@ pub fn encode_with(csv: &[u8], opts: &EncodeOptions) -> (Vec<u8>, Report) {
                 .push((s.col, format!("{:?}", s.kind), model.step_bits[si]));
         }
     }
-    let before = c.bits;
-    let mut irr = CharModel::new(2);
+    let bits_before = coder.bits;
+    let mut irregular_model = CharModel::new(2);
     let mut gaps = UintModel::default();
-    let mut tmp = Vec::new();
+    let mut line_buf = Vec::new();
     let mut previous_at = 0;
-    for (l, &at) in lex.irregular.iter().zip(&lex.irregular_at) {
-        gaps.code(&mut c, u64::from(at - previous_at));
+    for (line, &at) in lex.irregular.iter().zip(&lex.irregular_at) {
+        gaps.code(&mut coder, u64::from(at - previous_at));
         previous_at = at;
-        irr.code_bytes(&mut c, l, &mut tmp);
+        irregular_model.code_bytes(&mut coder, line, &mut line_buf);
     }
-    report.irregular_bits = c.bits - before;
-    out.extend_from_slice(&c.finish());
+    report.irregular_bits = coder.bits - bits_before;
+    out.extend_from_slice(&coder.finish());
     report.plan_seconds = plan_seconds;
     report.code_seconds = t1.elapsed().as_secs_f64();
     if opts.verify && decode_lexicon(&out).is_err() {
@@ -263,13 +282,32 @@ pub fn encode_with(csv: &[u8], opts: &EncodeOptions) -> (Vec<u8>, Report) {
 }
 
 fn stored(text: &[u8], no_final_newline: bool, grouped: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len() + 32);
+    let mut out = Vec::with_capacity(text.len() + STORED_HEADER_SLACK);
     out.extend_from_slice(MAGIC);
-    out.push(no_final_newline as u8 | (grouped as u8) << 1 | FLAG_STORED);
+    out.push(header_flags(no_final_newline, grouped) | FLAG_STORED);
     put_varint(&mut out, text.len() as u64);
     out.extend_from_slice(&fnv1a(FNV_OFFSET, text).to_le_bytes());
     out.extend_from_slice(text);
     out
+}
+
+fn header_flags(no_final_newline: bool, grouped: bool) -> u8 {
+    let mut flags = 0;
+    if no_final_newline {
+        flags |= FLAG_NO_FINAL_NEWLINE;
+    }
+    if grouped {
+        flags |= FLAG_GROUPED;
+    }
+    flags
+}
+
+#[inline]
+fn ensure_not_overrun(coder: &Coder) -> Result<(), Error> {
+    if coder.overrun() {
+        return corrupt(OVERRUN_MESSAGE);
+    }
+    Ok(())
 }
 
 fn corrupt<T>(why: &'static str) -> Result<T, Error> {
@@ -288,24 +326,24 @@ struct Header {
 }
 
 fn read_header(data: &[u8]) -> Result<Header, Error> {
-    if data.len() < 5 || &data[..4] != MAGIC {
+    if data.len() < HEADER_PREFIX_LEN || &data[..MAGIC.len()] != MAGIC {
         return corrupt("not a lexicon stream");
     }
-    let flags = data[4];
+    let flags = data[FLAGS_OFFSET];
     if flags & !FLAGS_KNOWN != 0 {
         return corrupt("unknown flags");
     }
-    let mut pos = 5;
+    let mut pos = HEADER_PREFIX_LEN;
     let Some(text_len) = get_varint(data, &mut pos) else {
         return corrupt("truncated header");
     };
     let Some(digest) = data
-        .get(pos..pos + 8)
+        .get(pos..pos + DIGEST_BYTES)
         .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
     else {
         return corrupt("truncated header");
     };
-    pos += 8;
+    pos += DIGEST_BYTES;
     if flags & FLAG_STORED != 0 {
         return Ok(Header {
             no_final_newline: flags & FLAG_NO_FINAL_NEWLINE != 0,
@@ -352,31 +390,27 @@ fn decode_unchecked(data: &[u8]) -> Result<(Lexicon, Header), Error> {
         lex.no_final_newline = h.no_final_newline;
         return Ok((lex, h));
     }
-    let mut c = Coder::decoder(&data[h.payload..]);
+    let mut coder = Coder::decoder(&data[h.payload..]);
     let n_cols = h.plan.n_cols;
     let mut lex = Lexicon::new(n_cols);
     lex.no_final_newline = h.no_final_newline;
     if h.n_keys > MAX_KEY_COUNT || (n_cols == 0 && h.n_keys > 0) {
         return corrupt("bad key count");
     }
-    let mut km = KeyModel::new();
+    let mut key_model = KeyModel::new();
     let mut keys: Vec<String> = Vec::with_capacity(h.n_keys.min(PREALLOC_KEY_LIMIT));
-    let mut buf = String::new();
+    let mut key_buf = String::new();
     for _ in 0..h.n_keys {
-        km.code_key(&mut c, "", &mut buf);
-        keys.push(buf.clone());
-        if c.overrun() {
-            return corrupt("truncated data");
-        }
+        key_model.code_key(&mut coder, "", &mut key_buf);
+        keys.push(key_buf.clone());
+        ensure_not_overrun(&coder)?;
     }
     let mut counts = Vec::with_capacity(keys.len());
-    for k in &keys {
-        counts.push(km.code_count(&mut c, k, 0));
-        if c.overrun() {
-            return corrupt("truncated data");
-        }
+    for key in &keys {
+        counts.push(key_model.code_count(&mut coder, key, 0));
+        ensure_not_overrun(&coder)?;
     }
-    let total_rows: u64 = counts.iter().map(|&n| n as u64).sum();
+    let total_rows: u64 = counts.iter().map(|&group_len| group_len as u64).sum();
     if total_rows > h.text_len {
         return corrupt("bad row count");
     }
@@ -385,33 +419,31 @@ fn decode_unchecked(data: &[u8]) -> Result<(Lexicon, Header), Error> {
             return corrupt("text too large");
         }
         let mut model = Model::new(h.plan.clone());
-        for (k, &n) in keys.iter().zip(&counts) {
+        for (key, &group_len) in keys.iter().zip(&counts) {
             model.start_group();
-            for _ in 0..n {
-                model.code_row(&mut c, &[], k);
+            for _ in 0..group_len {
+                model.code_row(&mut coder, &[], key);
                 lex.push_row(model.row());
-                if c.overrun() || lex.data_len() as u64 > h.text_len {
-                    return corrupt("truncated data");
+                if coder.overrun() || lex.data_len() as u64 > h.text_len {
+                    return corrupt(OVERRUN_MESSAGE);
                 }
             }
         }
     }
-    let mut irr = CharModel::new(2);
+    let mut irregular_model = CharModel::new(2);
     let mut gaps = UintModel::default();
     let rows = lex.rows() as u64;
     let mut at = 0u64;
     for _ in 0..h.n_irregular {
-        at = at.saturating_add(gaps.code(&mut c, 0));
+        at = at.saturating_add(gaps.code(&mut coder, 0));
         if at > rows {
             return corrupt("an irregular line lies past the last row");
         }
         let mut line = Vec::new();
-        irr.code_bytes(&mut c, &[], &mut line);
+        irregular_model.code_bytes(&mut coder, &[], &mut line);
         lex.irregular_at.push(at as u32);
         lex.irregular.push(line);
-        if c.overrun() {
-            return corrupt("truncated data");
-        }
+        ensure_not_overrun(&coder)?;
     }
     Ok((lex, h))
 }

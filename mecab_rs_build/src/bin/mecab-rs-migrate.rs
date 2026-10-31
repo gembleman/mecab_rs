@@ -5,7 +5,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use mecab_rs::__private::HotShape;
+use mecab_rs::__private::{
+    CHAR_BIN_FILE, CHAR_DEF_FILE, CHAR_TABLE_FILE, HotShape, MATRIX_COST_BYTES,
+    MATRIX_HEADER_BYTES, i16_at,
+};
 use mecab_rs::CharTable;
 use mecab_rs_build::rebuild;
 use mecab_rs_build::rebuild::{PAIR_COUNT_BYTES, PairCount, hot_shape_from_pair_counts};
@@ -111,8 +114,6 @@ fn parse_matrix_args(command: &str, args: &[std::ffi::OsString]) -> Result<Matri
 }
 
 const ROWS_PER_CHUNK: usize = 64;
-const DENSE_HEADER_BYTES: usize = 4;
-const DENSE_CELL_BYTES: usize = 2;
 
 type FirstMismatch = (usize, usize, i16, i16);
 
@@ -167,12 +168,12 @@ fn compare_row_chunks(
 }
 
 fn dense_cell(dense: &[u8], left_size: usize, column: usize, row: usize) -> i16 {
-    let at = DENSE_HEADER_BYTES + DENSE_CELL_BYTES * (row * left_size + column);
-    i16::from_le_bytes([dense[at], dense[at + 1]])
+    let at = MATRIX_HEADER_BYTES + MATRIX_COST_BYTES * (row * left_size + column);
+    i16_at(dense, at)
 }
 
 fn dense_has_size(dense: &[u8], left_size: usize, right_size: usize) -> bool {
-    dense.len() == DENSE_HEADER_BYTES + DENSE_CELL_BYTES * left_size * right_size
+    dense.len() == MATRIX_HEADER_BYTES + MATRIX_COST_BYTES * left_size * right_size
 }
 
 fn read_dense(path: &Path) -> Result<Vec<u8>, String> {
@@ -478,13 +479,13 @@ fn migrate_char_table(all: Vec<std::ffi::OsString>) -> Result<(), String> {
         }
     }
     let directory = directory.ok_or("no dictionary directory given")?;
-    let default_def = directory.join("char.def");
+    let default_def = directory.join(CHAR_DEF_FILE);
     let char_def: Option<&Path> = match &char_def {
         Some(file) => Some(file),
         None => default_def.is_file().then_some(default_def.as_path()),
     };
-    let output = directory.join("char.uni");
-    CharTable::convert(&directory.join("char.bin"), char_def, &output)
+    let output = directory.join(CHAR_TABLE_FILE);
+    CharTable::convert(&directory.join(CHAR_BIN_FILE), char_def, &output)
         .map_err(|error| error.to_string())?;
     println!("wrote {}", output.display());
     Ok(())

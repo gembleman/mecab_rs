@@ -1,33 +1,35 @@
 use std::path::Path;
 
 use super::int_stream::{IntContext, decode_payload, encode_payload};
-use super::{Part, Parts, bad, io_error};
+use super::{Part, Parts, io_error};
 use crate::Error;
+use crate::dict_files::{
+    FEATURE_DEF_FILE, LEFT_ID_DEF_FILE, MATRIX_HOT_FILE, MATRIX_ITP_FILE, RIGHT_ID_DEF_FILE,
+};
 use crate::hot_shape::HotShape;
 use crate::int_runtime::{is_runtime_form, runtime_form_of};
 use crate::int_templates::DEFAULT_CLUSTER_COUNT;
 use crate::int_templates::IntTemplates;
 use crate::packed::model::Model;
 use crate::threads::default_threads;
+use crate::wire::{u16_at, u32_at};
 
 const ENCODING_DENSE_DELTA: u32 = 1;
 const ENCODING_INTEGER_MRIT: u32 = 4;
 const ROW_LENGTH_BYTES: usize = 2;
 const WORD_BYTES: usize = 4;
-const ID_DEFINITIONS: [&str; 2] = ["left-id.def", "right-id.def"];
-const FEATURE_DEFINITION: &str = "feature.def";
-const ITP_FILE: &str = "matrix.itp";
+const ID_DEFINITIONS: [&str; 2] = [LEFT_ID_DEF_FILE, RIGHT_ID_DEF_FILE];
 
 fn row_delta(matrix: &[u8], encode: bool) -> Vec<u8> {
     let mut out = matrix.to_vec();
     let (left, right) = (
-        usize::from(u16::from_le_bytes([matrix[0], matrix[1]])),
-        usize::from(u16::from_le_bytes([matrix[2], matrix[3]])),
+        usize::from(u16_at(matrix, 0)),
+        usize::from(u16_at(matrix, 2)),
     );
     for row in out[4..].chunks_exact_mut(left.max(1) * 2).take(right) {
         let mut previous = 0u16;
         for cell in row.as_chunks_mut::<2>().0 {
-            let value = u16::from_le_bytes([cell[0], cell[1]]);
+            let value = u16_at(cell, 0);
             let stored = if encode {
                 value.wrapping_sub(previous)
             } else {
@@ -99,19 +101,19 @@ impl<'a> Take<'a> {
         let (head, tail) = self
             .rest
             .split_at_checked(length)
-            .ok_or_else(|| bad(self.path, "the integer matrix part ends early"))?;
+            .ok_or_else(|| Error::format(self.path, "the integer matrix part ends early"))?;
         self.rest = tail;
         Ok(head)
     }
 
     fn word(&mut self) -> Result<usize, Error> {
         let bytes = self.bytes(WORD_BYTES)?;
-        Ok(u32::from_le_bytes(bytes.try_into().expect("four bytes")) as usize)
+        Ok(u32_at(bytes, 0) as usize)
     }
 
     fn text(&mut self, length: usize) -> Result<&'a str, Error> {
         str::from_utf8(self.bytes(length)?)
-            .map_err(|_| bad(self.path, "an id definition is not valid UTF-8"))
+            .map_err(|_| Error::format(self.path, "an id definition is not valid UTF-8"))
     }
 }
 
@@ -120,13 +122,13 @@ fn parse_integer(bytes: &[u8], path: &Path) -> Result<(IntTemplates, HotShape), 
     let rows = take.word()?;
     let lengths_bytes = rows
         .checked_mul(ROW_LENGTH_BYTES)
-        .ok_or_else(|| bad(path, "the hot rows are too many"))?;
+        .ok_or_else(|| Error::format(path, "the hot rows are too many"))?;
     let hot = HotShape::from_lengths(
         take.bytes(lengths_bytes)?
             .as_chunks::<ROW_LENGTH_BYTES>()
             .0
             .iter()
-            .map(|&length| u32::from(u16::from_le_bytes(length)))
+            .map(|length| u32::from(u16_at(length, 0)))
             .collect(),
     );
     let (left_length, right_length) = (take.word()?, take.word()?);
@@ -134,7 +136,10 @@ fn parse_integer(bytes: &[u8], path: &Path) -> Result<(IntTemplates, HotShape), 
     let right = take.text(right_length)?;
     let templates = decode_payload(take.rest, left, right, path)?;
     if !hot.fits(templates.left_size(), templates.right_size()) {
-        return Err(bad(path, "the hot block lies outside of the matrix"));
+        return Err(Error::format(
+            path,
+            "the hot block lies outside of the matrix",
+        ));
     }
     Ok((templates, hot))
 }
@@ -164,17 +169,17 @@ fn check_regenerated(bytes: &[u8], model: &Model, path: &Path) -> Result<(), Err
 }
 
 fn integer_part(dict_dir: &Path, model: &Model) -> Result<Part, Error> {
-    let itp_path = dict_dir.join(ITP_FILE);
+    let itp_path = dict_dir.join(MATRIX_ITP_FILE);
     if is_runtime_form(&model.templates) {
         return Err(Error::Unsupported(
             "matrix.itp in the runtime form; the transport form needs the full template file",
         ));
     }
     let (_, _, hot) = HotShape::parse(&model.matrix)
-        .map_err(|reason| bad(&dict_dir.join("matrix.hot"), reason))?;
-    let feature_definition = dict_dir.join(FEATURE_DEFINITION);
+        .map_err(|reason| Error::format(&dict_dir.join(MATRIX_HOT_FILE), reason))?;
+    let feature_definition = dict_dir.join(FEATURE_DEF_FILE);
     if !feature_definition.is_file() {
-        return Err(bad(
+        return Err(Error::format(
             &feature_definition,
             "feature.def is missing; rebuild the runtime directory, which keeps feature.def",
         ));
@@ -211,7 +216,7 @@ pub(in crate::packed) fn decode(parts: &Parts) -> Result<(Vec<u8>, Vec<u8>), Err
             let size = |at: usize| {
                 bytes
                     .get(at..at + 2)
-                    .map(|pair| usize::from(u16::from_le_bytes([pair[0], pair[1]])))
+                    .map(|pair| usize::from(u16_at(pair, 0)))
             };
             let (Some(left), Some(right)) = (size(0), size(2)) else {
                 return Err(corrupt("the matrix is too short"));

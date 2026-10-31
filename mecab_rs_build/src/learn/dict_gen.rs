@@ -2,15 +2,18 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::{Config, LineEnds, failure, open_lines};
+use super::{Config, LineEnding, LineEnds, open_lines};
 use crate::build::char_def::CharProperty;
 use crate::build::model::CostModel;
 use crate::build::rewrite::Rewriter;
-use crate::build::text::{BUF_SIZE, Lines, cstr, escape_csv_element, tokenize_csv};
+use crate::build::text::{LINE_BUFFER_BYTES, Lines, cstr, escape_csv_element, tokenize_csv};
 use crate::build::{BuildOptions, compile_system, csv_files};
 use crate::connection_templates::to_cost;
-use mecab_rs::__private::{DictionaryKind, SystemDictionary};
-use mecab_rs::__private::{write_file, write_file_with};
+use mecab_rs::__private::{
+    CHAR_BIN_FILE, CHAR_DEF_FILE, DICRC_FILE, DictionaryKind, FEATURE_DEF_FILE, LEFT_ID_DEF_FILE,
+    MATRIX_DEF_FILE, MODEL_DEF_FILE, REWRITE_DEF_FILE, RIGHT_ID_DEF_FILE, SYS_DIC_FILE,
+    SystemDictionary, UNK_DEF_FILE, write_file, write_file_with,
+};
 use mecab_rs::Error;
 
 #[derive(Clone, Debug)]
@@ -55,10 +58,10 @@ impl ContextIds {
         }
     }
 
-    fn save(&self, left: &Path, right: &Path, crlf: bool) -> Result<(), Error> {
+    fn save(&self, left: &Path, right: &Path, ending: LineEnding) -> Result<(), Error> {
         for (path, map) in [(left, &self.left), (right, &self.right)] {
             write_file(path, |file| {
-                let mut file = LineEnds::new(file, crlf);
+                let mut file = LineEnds::new(file, ending);
                 for (key, id) in map {
                     write!(file, "{id} ")?;
                     file.write_all(key)?;
@@ -106,7 +109,7 @@ fn entry(line: &mut [u8], path: &Path) -> Result<(Vec<u8>, Vec<u8>), Error> {
     let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
     let columns = tokenize_csv(line, LEXICON_COLUMNS);
     if columns.len() != LEXICON_COLUMNS {
-        return Err(failure(path, format!("format error: {shown}")));
+        return Err(Error::learn(path, format!("format error: {shown}")));
     }
     Ok((
         cstr(line, columns[SURFACE_COLUMN]).to_vec(),
@@ -130,15 +133,15 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
     let dic_dir = options.dic_dir.as_path();
     let out_dir = options.out_dir.as_path();
     let mut config = Config::default();
-    config.load(&dic_dir.join("dicrc"))?;
+    config.load(&dic_dir.join(DICRC_FILE))?;
 
     {
-        let system = SystemDictionary::open(&dic_dir.join("sys.dic"), DictionaryKind::System)?;
+        let system = SystemDictionary::open(&dic_dir.join(SYS_DIC_FILE), DictionaryKind::System)?;
         if system.charset().is_empty() {
-            return Err(failure(dic_dir, "the charset of sys.dic is empty"));
+            return Err(Error::learn(dic_dir, "the charset of sys.dic is empty"));
         }
     }
-    let property = CharProperty::open(&dic_dir.join("char.bin"))?;
+    let property = CharProperty::open(&dic_dir.join(CHAR_BIN_FILE))?;
 
     let bos = config.text("bos-feature").as_bytes().to_vec();
     let factor: i32 = config.number("cost-factor");
@@ -150,36 +153,39 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
             .zip(std::fs::canonicalize(out_dir).ok())
             .is_some_and(|(a, b)| a == b);
     if same_directory {
-        return Err(failure(
+        return Err(Error::learn(
             dic_dir,
             "output directory = dictionary directory! Please specify different directory.",
         ));
     }
     if out_dir.as_os_str().is_empty() {
-        return Err(failure(dic_dir, "output directory is empty"));
+        return Err(Error::learn(dic_dir, "output directory is empty"));
     }
     let Some(model_path) = options
         .model
         .as_deref()
         .filter(|path| !path.as_os_str().is_empty())
     else {
-        return Err(failure(dic_dir, "model file is empty"));
+        return Err(Error::learn(dic_dir, "model file is empty"));
     };
     let model = CostModel::open(model_path, dic_dir, "", "UTF-8")?;
     if factor <= 0 {
-        return Err(failure(dic_dir, "cost factor needs to be positive value"));
+        return Err(Error::learn(
+            dic_dir,
+            "cost factor needs to be positive value",
+        ));
     }
     if bos.is_empty() {
-        return Err(failure(dic_dir, "bos-feature is empty"));
+        return Err(Error::learn(dic_dir, "bos-feature is empty"));
     }
     if dictionaries.is_empty() {
-        return Err(failure(
+        return Err(Error::learn(
             dic_dir,
             format!("no dictionary is found in {}", dic_dir.display()),
         ));
     }
-    let rewrite_def = dic_dir.join("rewrite.def");
-    let feature_def = dic_dir.join("feature.def");
+    let rewrite_def = dic_dir.join(REWRITE_DEF_FILE);
+    let feature_def = dic_dir.join(FEATURE_DEF_FILE);
     let mut rewriter = Rewriter::open(&rewrite_def)?;
     std::fs::create_dir_all(out_dir).map_err(super::io_error(out_dir))?;
 
@@ -188,7 +194,7 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
         if matched {
             Ok(rewritten)
         } else {
-            Err(failure(
+            Err(Error::learn(
                 &rewrite_def,
                 format!(
                     "cannot rewrite pattern: {}",
@@ -203,7 +209,7 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
     ids.left_bos = bos.left;
     ids.right_bos = bos.right;
 
-    let unk_def = dic_dir.join("unk.def");
+    let unk_def = dic_dir.join(UNK_DEF_FILE);
     let sources: Vec<&Path> = std::iter::once(unk_def.as_path())
         .chain(dictionaries.iter().map(PathBuf::as_path))
         .collect();
@@ -222,8 +228,8 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
         let _ = writeln!(log, "{count}");
     }
 
-    let left_id = out_dir.join("left-id.def");
-    let right_id = out_dir.join("right-id.def");
+    let left_id = out_dir.join(LEFT_ID_DEF_FILE);
+    let right_id = out_dir.join(RIGHT_ID_DEF_FILE);
     let _ = writeln!(
         log,
         "emitting {}/ {}",
@@ -231,17 +237,17 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
         right_id.display()
     );
     ids.build();
-    ids.save(&left_id, &right_id, options.crlf)?;
+    ids.save(&left_id, &right_id, LineEnding::from(options.crlf))?;
 
     for (number, source) in sources.iter().enumerate() {
         let unknown = number == 0;
         let output = out_dir.join(source.file_name().unwrap_or_default());
-        let mut lines = Lines::open(source, Some(BUF_SIZE))?;
+        let mut lines = Lines::open(source, Some(LINE_BUFFER_BYTES))?;
         let _ = write!(log, "emitting {} ... ", output.display());
         let _ = log.flush();
         let mut count = 0usize;
         write_file_with(&output, |file| {
-            let mut file = LineEnds::new(file, options.crlf);
+            let mut file = LineEnds::new(file, LineEnding::from(options.crlf));
             let io = super::io_error(&output);
             while let Some(line) = lines.next_line()? {
                 let (mut word, feature) = entry(line, source)?;
@@ -253,7 +259,7 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
                     .copied()
                     .unwrap_or(NOT_FOUND);
                 if left <= 0 {
-                    return Err(failure(
+                    return Err(Error::learn(
                         source,
                         format!(
                             "CID is not found for {}",
@@ -262,7 +268,7 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
                     ));
                 }
                 if right <= 0 {
-                    return Err(failure(
+                    return Err(Error::learn(
                         source,
                         format!(
                             "CID is not found for {}",
@@ -272,7 +278,7 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
                 }
                 let char_type = if unknown {
                     property.id(&word).ok_or_else(|| {
-                        failure(
+                        Error::learn(
                             source,
                             format!("unknown property [{}]", String::from_utf8_lossy(&word)),
                         )
@@ -298,16 +304,16 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
         let _ = writeln!(log, "{count}");
     }
 
-    let matrix = out_dir.join("matrix.def");
+    let matrix = out_dir.join(MATRIX_DEF_FILE);
     let mut previous = 0;
     write_file_with(&matrix, |file| {
-        let mut file = LineEnds::new(file, options.crlf);
+        let mut file = LineEnds::new(file, LineEnding::from(options.crlf));
         let io = super::io_error(&matrix);
         if ids.left.is_empty() {
-            return Err(failure(dic_dir, "left id size is empty"));
+            return Err(Error::learn(dic_dir, "left id size is empty"));
         }
         if ids.right.is_empty() {
-            return Err(failure(dic_dir, "right id size is empty"));
+            return Err(Error::learn(dic_dir, "right id size is empty"));
         }
         writeln!(file, "{} {}", ids.right.len(), ids.left.len()).map_err(&io)?;
         let mut row = 0;
@@ -333,11 +339,15 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
         Ok(())
     })?;
 
-    copy(&dic_dir.join("char.def"), &out_dir.join("char.def"), log)?;
-    copy(&rewrite_def, &out_dir.join("rewrite.def"), log)?;
-    copy(&dic_dir.join("dicrc"), &out_dir.join("dicrc"), log)?;
-    copy(&feature_def, &out_dir.join("feature.def"), log)?;
-    copy(model_path, &out_dir.join("model.def"), log)?;
+    copy(
+        &dic_dir.join(CHAR_DEF_FILE),
+        &out_dir.join(CHAR_DEF_FILE),
+        log,
+    )?;
+    copy(&rewrite_def, &out_dir.join(REWRITE_DEF_FILE), log)?;
+    copy(&dic_dir.join(DICRC_FILE), &out_dir.join(DICRC_FILE), log)?;
+    copy(&feature_def, &out_dir.join(FEATURE_DEF_FILE), log)?;
+    copy(model_path, &out_dir.join(MODEL_DEF_FILE), log)?;
     let _ = writeln!(log, "\ndone!");
 
     if options.build {

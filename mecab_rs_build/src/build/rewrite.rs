@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::text::{
-    BUF_SIZE, Lines, atoi, cstr, escape_csv_element, failure, tokenize_csv, tokenize2,
+    LINE_BUFFER_BYTES, Lines, MAX_DEF_COLUMNS, atoi, cstr, escape_csv_element, tokenize_csv,
+    tokenize2,
 };
+use mecab_rs::__private::POS_ID_DEF_FILE;
 use mecab_rs::Error;
-
-const MAX_PATTERN_COLUMNS: usize = 512;
 
 struct RewritePattern {
     source: Vec<Vec<u8>>,
@@ -14,7 +14,7 @@ struct RewritePattern {
 }
 
 fn split_columns(text: &[u8], max_columns: usize) -> Vec<Vec<u8>> {
-    let mut buffer = text[..text.len().min(BUF_SIZE - 1)].to_vec();
+    let mut buffer = text[..text.len().min(LINE_BUFFER_BYTES - 1)].to_vec();
     buffer.push(0);
     tokenize_csv(&mut buffer, max_columns)
         .into_iter()
@@ -68,8 +68,8 @@ fn expand_template(template: &[u8], input: &[&[u8]]) -> Result<Vec<u8>, String> 
 impl RewritePattern {
     fn new(source: &[u8], destination: &[u8]) -> Self {
         Self {
-            source: split_columns(source, MAX_PATTERN_COLUMNS),
-            destination: split_columns(destination, MAX_PATTERN_COLUMNS),
+            source: split_columns(source, MAX_DEF_COLUMNS),
+            destination: split_columns(destination, MAX_DEF_COLUMNS),
         }
     }
 
@@ -121,7 +121,7 @@ fn rule_of(line: &mut [u8], path: &Path) -> Result<RewritePattern, Error> {
     let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
     let found = tokenize2(line, b" \t", 3);
     if found.len() < 2 {
-        return Err(failure(path, format!("format error: {shown}")));
+        return Err(Error::build(path, format!("format error: {shown}")));
     }
     let mut destination = cstr(line, found[1]).to_vec();
     if found.len() >= 3 {
@@ -136,12 +136,12 @@ fn with_columns<T>(
     path: &Path,
     use_columns: impl FnOnce(&[&[u8]]) -> Result<T, Error>,
 ) -> Result<T, Error> {
-    if feature.len() >= BUF_SIZE - 1 {
-        return Err(failure(path, "too long feature"));
+    if feature.len() >= LINE_BUFFER_BYTES - 1 {
+        return Err(Error::build(path, "too long feature"));
     }
     let mut buffer = feature.to_vec();
     buffer.push(0);
-    let found = tokenize_csv(&mut buffer, BUF_SIZE);
+    let found = tokenize_csv(&mut buffer, LINE_BUFFER_BYTES);
     let input: Vec<&[u8]> = found.iter().map(|&start| cstr(&buffer, start)).collect();
     use_columns(&input)
 }
@@ -185,7 +185,7 @@ impl Rewriter {
                         RewriteSection::Left => rewriter.left.0.push(rule),
                         RewriteSection::Right => rewriter.right.0.push(rule),
                         RewriteSection::BeforeAny => {
-                            return Err(failure(path, "no sections found"));
+                            return Err(Error::build(path, "no sections found"));
                         }
                     }
                 }
@@ -197,7 +197,7 @@ impl Rewriter {
     pub(crate) fn rewrite(&self, feature: &[u8], path: &Path) -> Result<(bool, Rewritten), Error> {
         with_columns(feature, path, |input| {
             let mut result = Rewritten::default();
-            let fail = |reason: String| failure(path, reason);
+            let fail = |reason: String| Error::build(path, reason);
             let matched = self
                 .unigram
                 .rewrite(input, &mut result.unigram)
@@ -232,7 +232,7 @@ pub(super) struct PosIds {
 
 impl PosIds {
     pub(super) fn open(dic_dir: &Path) -> Result<Self, Error> {
-        let path = dic_dir.join("pos-id.def");
+        let path = dic_dir.join(POS_ID_DEF_FILE);
         let mut rules = RewriteRules::default();
         if !path.is_file() {
             eprintln!("{} is not found. minimum setting is used", path.display());
@@ -245,11 +245,11 @@ impl PosIds {
             let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
             let found = tokenize2(line, b" \t", 2);
             if found.len() != 2 {
-                return Err(failure(path, format!("format error: {shown}")));
+                return Err(Error::build(path, format!("format error: {shown}")));
             }
             let id = cstr(line, found[1]);
             if !id.iter().all(u8::is_ascii_digit) {
-                return Err(failure(
+                return Err(Error::build(
                     path,
                     format!("not a number: {}", String::from_utf8_lossy(id)),
                 ));
@@ -268,7 +268,7 @@ impl PosIds {
             if self
                 .rules
                 .rewrite(input, &mut output)
-                .map_err(|reason| failure(&self.path, reason))?
+                .map_err(|reason| Error::build(&self.path, reason))?
             {
                 Ok(atoi(&output))
             } else {
@@ -292,7 +292,7 @@ fn read_id_table(path: &Path) -> Result<HashMap<Vec<u8>, i32>, Error> {
         let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
         let found = tokenize2(line, b" \t", 2);
         if found.len() != 2 {
-            return Err(failure(path, format!("format error: {shown}")));
+            return Err(Error::build(path, format!("format error: {shown}")));
         }
         let id = atoi(cstr(line, found[0]));
         map.entry(cstr(line, found[1]).to_vec()).or_insert(id);
@@ -320,7 +320,7 @@ impl ContextIds {
 
     pub(super) fn left_id(&self, feature: &[u8]) -> Result<i32, Error> {
         self.left.get(feature).copied().ok_or_else(|| {
-            failure(
+            Error::build(
                 &self.left_path,
                 format!(
                     "cannot find LEFT-ID  for {}",
@@ -332,7 +332,7 @@ impl ContextIds {
 
     pub(super) fn right_id(&self, feature: &[u8]) -> Result<i32, Error> {
         self.right.get(feature).copied().ok_or_else(|| {
-            failure(
+            Error::build(
                 &self.right_path,
                 format!(
                     "cannot find RIGHT-ID  for {}",

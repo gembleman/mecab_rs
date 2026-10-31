@@ -58,8 +58,13 @@ pub(crate) fn unzigzag(value: u64) -> i64 {
 }
 
 #[inline]
-pub(crate) fn u16_at(bytes: &[u8], at: usize) -> u16 {
+pub fn u16_at(bytes: &[u8], at: usize) -> u16 {
     u16::from_le_bytes(*bytes[at..].first_chunk().expect("in range"))
+}
+
+#[inline]
+pub fn i16_at(bytes: &[u8], at: usize) -> i16 {
+    i16::from_le_bytes(*bytes[at..].first_chunk().expect("in range"))
 }
 
 #[inline]
@@ -68,6 +73,22 @@ pub fn u32_at(bytes: &[u8], at: usize) -> u32 {
 }
 
 #[inline]
-pub(crate) fn u64_at(bytes: &[u8], at: usize) -> u64 {
+pub fn u64_at(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(*bytes[at..].first_chunk().expect("in range"))
+}
+
+pub fn u16_values(bytes: &[u8]) -> impl Iterator<Item = u16> + '_ {
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&chunk| u16::from_le_bytes(chunk))
+}
+
+pub fn u32_values(bytes: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&chunk| u32::from_le_bytes(chunk))
 }

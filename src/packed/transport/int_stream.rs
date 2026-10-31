@@ -1,11 +1,11 @@
 use std::path::Path;
 
 use crate::Error;
-use crate::error::rebuild_error as bad;
+use crate::dict_files::FEATURE_DEF_FILE;
 use crate::int_templates::IntTemplates;
 use crate::part::IntPart;
 use crate::template_universe::{UniverseSide, read_bigrams, universe_projections};
-use crate::wire::{fnv1a64, get_varint, put_varint, u32_at, unzigzag, zigzag};
+use crate::wire::{fnv1a64, get_varint, put_varint, u32_at, u64_at, unzigzag, zigzag};
 
 const MAGIC: &[u8; 4] = b"MRIT";
 const VERSION: u32 = 1;
@@ -23,7 +23,7 @@ impl<'a> Cursor<'a> {
             .position
             .checked_add(length)
             .filter(|&end| end <= self.bytes.len())
-            .ok_or_else(|| bad(self.path, "the data ends early"))?;
+            .ok_or_else(|| Error::rebuild(self.path, "the data ends early"))?;
         let slice = &self.bytes[self.position..end];
         self.position = end;
         Ok(slice)
@@ -35,7 +35,7 @@ impl<'a> Cursor<'a> {
 
     fn varint(&mut self) -> Result<u64, Error> {
         get_varint(self.bytes, &mut self.position)
-            .ok_or_else(|| bad(self.path, "a varint is too long or the data ends early"))
+            .ok_or_else(|| Error::rebuild(self.path, "a varint is too long or the data ends early"))
     }
 }
 
@@ -45,7 +45,7 @@ fn expand(
     right: &UniverseSide,
     path: &Path,
 ) -> Result<IntPart, Error> {
-    let inconsistent = || bad(path, "the id definitions do not match the templates");
+    let inconsistent = || Error::rebuild(path, "the id definitions do not match the templates");
     let key_map = |projection: &[u16], count: usize, side: &UniverseSide| {
         if projection.len() != side.projection.len() {
             return Err(inconsistent());
@@ -112,7 +112,7 @@ fn parse_template_text(text: &str, path: &Path) -> Result<Vec<(String, String)>,
         .map(|line| {
             line.split_once('\t')
                 .map(|(name, body)| (name.to_string(), body.to_string()))
-                .ok_or_else(|| bad(path, "a template line has no tab"))
+                .ok_or_else(|| Error::rebuild(path, "a template line has no tab"))
         })
         .collect()
 }
@@ -151,7 +151,7 @@ pub struct IntContext {
 
 impl IntContext {
     pub fn load(source_dir: &Path, left_id_def: &str, right_id_def: &str) -> Result<Self, Error> {
-        let bigrams = read_bigrams(&source_dir.join("feature.def"))?;
+        let bigrams = read_bigrams(&source_dir.join(FEATURE_DEF_FILE))?;
         Self::new(bigrams, left_id_def, right_id_def, source_dir)
     }
 
@@ -172,7 +172,10 @@ fn encode_streams(
     path: &Path,
 ) -> Result<Streams, Error> {
     if templates.parts().len() != context.universe.len() {
-        return Err(bad(path, "the templates do not match feature.def"));
+        return Err(Error::rebuild(
+            path,
+            "the templates do not match feature.def",
+        ));
     }
     let mut streams = Streams::default();
     for (part, (left, right)) in templates.parts().iter().zip(&context.universe) {
@@ -254,10 +257,10 @@ pub fn decode_payload(
     let body_length = payload
         .len()
         .checked_sub(DIGEST_LEN)
-        .ok_or_else(|| bad(path, "the data is too short"))?;
+        .ok_or_else(|| Error::rebuild(path, "the data is too short"))?;
     let (body, digest) = payload.split_at(body_length);
-    if fnv1a64(body) != u64::from_le_bytes(digest.try_into().unwrap()) {
-        return Err(bad(path, "the FNV digest does not match"));
+    if fnv1a64(body) != u64_at(digest, 0) {
+        return Err(Error::rebuild(path, "the FNV digest does not match"));
     }
     let mut cursor = Cursor {
         bytes: body,
@@ -265,7 +268,10 @@ pub fn decode_payload(
         path,
     };
     if cursor.take(MAGIC.len())? != MAGIC || cursor.word()? != VERSION {
-        return Err(bad(path, "not an integer matrix of this version"));
+        return Err(Error::rebuild(
+            path,
+            "not an integer matrix of this version",
+        ));
     }
     let cost_factor = cursor.word()?;
     let shift = cursor.word()?;
@@ -277,15 +283,18 @@ pub fn decode_payload(
     for length in &mut lengths {
         *length = cursor.word()? as usize;
     }
-    let projection_hash = u64::from_le_bytes(cursor.take(8)?.try_into().unwrap());
+    let projection_hash = u64_at(cursor.take(8)?, 0);
     let text = std::str::from_utf8(cursor.take(lengths[5])?)
-        .map_err(|_| bad(path, "the template text is not UTF-8"))?;
+        .map_err(|_| Error::rebuild(path, "the template text is not UTF-8"))?;
     let bigrams = parse_template_text(text, path)?;
     let context = IntContext::new(bigrams, left_id_def, right_id_def, path)?;
     if context.universe.len() != part_count
         || projection_digest(&context.universe) != projection_hash
     {
-        return Err(bad(path, "the id definitions do not match the data"));
+        return Err(Error::rebuild(
+            path,
+            "the id definitions do not match the data",
+        ));
     }
     let mut stream = |length: usize| -> Result<Cursor<'_>, Error> {
         Ok(Cursor {
@@ -300,9 +309,9 @@ pub fn decode_payload(
     let mut exception_cells = stream(lengths[3])?;
     let mut exception_values = stream(lengths[4])?;
     if cursor.position != body.len() {
-        return Err(bad(path, "the data has trailing bytes"));
+        return Err(Error::rebuild(path, "the data has trailing bytes"));
     }
-    let too_big = || bad(path, "a decoded value is out of range");
+    let too_big = || Error::rebuild(path, "a decoded value is out of range");
     let mut parts = Vec::with_capacity(part_count);
     for (left, right) in &context.universe {
         let mut indptr = Vec::with_capacity(right.count + 1);
@@ -359,7 +368,7 @@ pub fn decode_payload(
         || exception_cells.position != exception_cells.bytes.len()
         || exception_values.position != exception_values.bytes.len()
     {
-        return Err(bad(path, "a stream has trailing bytes"));
+        return Err(Error::rebuild(path, "a stream has trailing bytes"));
     }
     plain.with_exceptions(exceptions)
 }

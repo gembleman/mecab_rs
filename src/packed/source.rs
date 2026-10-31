@@ -5,24 +5,22 @@ use std::path::Path;
 use super::model::{Model, Param};
 use crate::Error;
 use crate::char_property::CharProperty;
-use crate::char_table::CHAR_TABLE_FILE;
+use crate::dict_files::{
+    CHAR_TABLE_FILE, DICRC_FILE, MATRIX_BIN_FILE, MATRIX_HOT_FILE, MATRIX_ITP_FILE, SYS_DIC_FILE,
+    UNK_DIC_FILE,
+};
 use crate::error::io_error;
 use crate::hot_shape::HotShape;
 use crate::int_templates::MappedIntTemplates;
 use crate::system_dictionary::{
-    DictionaryKind, HEADER_SIZE, SystemDictionary, TOKEN_SIZE, TokenRecord,
+    DictionaryKind, HEADER_SIZE, SystemDictionary, TOKEN_SIZE, TokenRecord, VALUE_SIZE_BITS,
 };
+use crate::wire::{u16_at, u32_at};
 
 const ARRAY_BYTES_AT: usize = 24;
 const TOKEN_BYTES_AT: usize = 28;
 const MAX_ROOT_FANOUT: u32 = 256;
-
-fn broken(path: &Path, reason: &'static str) -> Error {
-    Error::Format {
-        file: path.to_path_buf(),
-        reason,
-    }
-}
+const MAX_KEY_TOKENS: u32 = (1 << VALUE_SIZE_BITS) - 1;
 
 fn key_value(line: &[u8]) -> Option<(&[u8], &[u8])> {
     let equals = line.iter().position(|&byte| byte == b'=')?;
@@ -45,13 +43,13 @@ fn dicrc_features(path: &Path) -> Result<(String, Option<String>), Error> {
             continue;
         }
         let Some((key, value)) = key_value(line) else {
-            return Err(broken(path, "a line has no '='"));
+            return Err(Error::format(path, "a line has no '='"));
         };
         values.entry(key).or_insert(value);
     }
     let text = |value: &[u8]| {
         String::from_utf8(value.to_vec())
-            .map_err(|_| broken(path, "bos-feature or unk-feature is not valid UTF-8"))
+            .map_err(|_| Error::format(path, "bos-feature or unk-feature is not valid UTF-8"))
     };
     let unknown = values
         .get(b"unk-feature".as_slice())
@@ -61,7 +59,7 @@ fn dicrc_features(path: &Path) -> Result<(String, Option<String>), Error> {
     let bos = values
         .get(b"bos-feature".as_slice())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| broken(path, "bos-feature is missing"))?;
+        .ok_or_else(|| Error::format(path, "bos-feature is missing"))?;
     Ok((text(bos)?, unknown))
 }
 
@@ -73,19 +71,12 @@ struct RawKey {
 
 fn read_keys(path: &Path) -> Result<Vec<RawKey>, Error> {
     let bytes = fs::read(path).map_err(io_error(path))?;
-    let word = |at: usize| u32::from_le_bytes(*bytes[at..].first_chunk().expect("in range"));
-    let end = HEADER_SIZE + word(ARRAY_BYTES_AT) as usize;
+    let end = HEADER_SIZE + u32_at(&bytes, ARRAY_BYTES_AT) as usize;
     let cells: Vec<[u32; 2]> = bytes[HEADER_SIZE..end]
         .as_chunks::<8>()
         .0
         .iter()
-        .map(|cell| {
-            let [a, b, c, d, e, f, g, h] = *cell;
-            [
-                u32::from_le_bytes([a, b, c, d]),
-                u32::from_le_bytes([e, f, g, h]),
-            ]
-        })
+        .map(|cell| [u32_at(cell, 0), u32_at(cell, 4)])
         .collect();
     let length = cells.len();
     let is_child = |index: usize, check: u32| {
@@ -126,8 +117,8 @@ fn read_keys(path: &Path) -> Result<Vec<RawKey>, Error> {
                 .map_err(|_| Error::Unsupported("a sys.dic key that is not UTF-8"))?;
             keys.push(RawKey {
                 key,
-                first_token: value >> 8,
-                count: value & 0xff,
+                first_token: value >> VALUE_SIZE_BITS,
+                count: value & MAX_KEY_TOKENS,
             });
         }
         Ok(())
@@ -159,7 +150,7 @@ fn read_keys(path: &Path) -> Result<Vec<RawKey>, Error> {
         })
         .count();
     if terminals != keys.len() {
-        return Err(broken(
+        return Err(Error::format(
             path,
             "the double array has keys that are not reachable",
         ));
@@ -168,19 +159,19 @@ fn read_keys(path: &Path) -> Result<Vec<RawKey>, Error> {
 }
 
 pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
-    let (bos_feature, unknown_feature) = dicrc_features(&directory.join("dicrc"))?;
-    let system_path = directory.join("sys.dic");
+    let (bos_feature, unknown_feature) = dicrc_features(&directory.join(DICRC_FILE))?;
+    let system_path = directory.join(SYS_DIC_FILE);
     let system = SystemDictionary::open(&system_path, DictionaryKind::System)?;
-    let unknown_path = directory.join("unk.dic");
+    let unknown_path = directory.join(UNK_DIC_FILE);
     let unknown = SystemDictionary::open(&unknown_path, DictionaryKind::Unknown)?;
     let chars = CharProperty::open(&directory.join(CHAR_TABLE_FILE))?;
-    let hot_path = directory.join("matrix.hot");
-    let int_templates_path = directory.join("matrix.itp");
+    let hot_path = directory.join(MATRIX_HOT_FILE);
+    let int_templates_path = directory.join(MATRIX_ITP_FILE);
     let hot = hot_path.exists() && int_templates_path.exists();
     let matrix_path = if hot {
         hot_path
     } else {
-        directory.join("matrix.bin")
+        directory.join(MATRIX_BIN_FILE)
     };
     if !hot && !matrix_path.exists() {
         return Err(Error::Unsupported(
@@ -195,19 +186,22 @@ pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
     };
     let (left_size, right_size) = if hot {
         let (left_size, right_size, _) =
-            HotShape::parse(&matrix).map_err(|reason| broken(&matrix_path, reason))?;
+            HotShape::parse(&matrix).map_err(|reason| Error::format(&matrix_path, reason))?;
         (left_size, right_size)
     } else {
         let size = |at: usize| {
             matrix
                 .get(at..at + 2)
-                .map(|pair| usize::from(u16::from_le_bytes([pair[0], pair[1]])))
+                .map(|pair| usize::from(u16_at(pair, 0)))
         };
         let (Some(left_size), Some(right_size)) = (size(0), size(2)) else {
-            return Err(broken(&matrix_path, "the file is shorter than its header"));
+            return Err(Error::format(
+                &matrix_path,
+                "the file is shorter than its header",
+            ));
         };
         if left_size == 0 || right_size == 0 || 4 + left_size * right_size * 2 != matrix.len() {
-            return Err(broken(
+            return Err(Error::format(
                 &matrix_path,
                 "the file size does not match the header",
             ));
@@ -217,7 +211,7 @@ pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
     if hot {
         let mapped = MappedIntTemplates::open(&int_templates_path)?;
         if mapped.left_size() != left_size || mapped.right_size() != right_size {
-            return Err(broken(
+            return Err(Error::format(
                 &int_templates_path,
                 "the integer templates do not match the hot matrix",
             ));
@@ -227,7 +221,7 @@ pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
         dictionary.left_size() == left_size && dictionary.right_size() == right_size
     };
     if !matches_matrix(&system) || !matches_matrix(&unknown) {
-        return Err(broken(
+        return Err(Error::format(
             &matrix_path,
             "the matrix size does not match sys.dic or unk.dic",
         ));
@@ -249,8 +243,8 @@ pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
     };
     let mut position = 0u32;
     for raw in &raw_keys {
-        if raw.first_token != position || raw.count == 0 || raw.count > 0xff {
-            return Err(broken(
+        if raw.first_token != position || raw.count == 0 || raw.count > MAX_KEY_TOKENS {
+            return Err(Error::format(
                 &system_path,
                 "the tokens are not in key order, or a key has no token",
             ));
@@ -258,7 +252,7 @@ pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
         position += raw.count;
     }
     if position as usize != system_token_count(&system_path)? {
-        return Err(broken(&system_path, "some tokens belong to no key"));
+        return Err(Error::format(&system_path, "some tokens belong to no key"));
     }
     for raw in raw_keys {
         model.counts.push(raw.count as u8);
@@ -272,9 +266,9 @@ pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
     }
     model.unknown_starts.push(0);
     for category in 0..chars.category_count() {
-        let run = unknown
-            .exact_match(chars.name(category))
-            .ok_or_else(|| broken(&unknown_path, "a character category of char.uni is missing"))?;
+        let run = unknown.exact_match(chars.name(category)).ok_or_else(|| {
+            Error::format(&unknown_path, "a character category of char.uni is missing")
+        })?;
         for index in run {
             let (param, feature) = interner.intern(&mut model, &unknown, unknown.token(index));
             model.unknown_params.push(param);
@@ -289,8 +283,7 @@ fn system_token_count(path: &Path) -> Result<usize, Error> {
     let mut header = [0u8; HEADER_SIZE];
     let mut file = fs::File::open(path).map_err(io_error(path))?;
     std::io::Read::read_exact(&mut file, &mut header).map_err(io_error(path))?;
-    let word = |at: usize| u32::from_le_bytes(*header[at..].first_chunk().expect("in range"));
-    Ok(word(TOKEN_BYTES_AT) as usize / TOKEN_SIZE)
+    Ok(u32_at(&header, TOKEN_BYTES_AT) as usize / TOKEN_SIZE)
 }
 
 struct Interner<'a> {

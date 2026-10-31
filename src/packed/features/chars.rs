@@ -8,6 +8,7 @@ pub(super) const MAX_CHARS: usize = SINGLE_CODES + LEAD_CODES * SECOND_CODES;
 pub(super) const ENTRY_BYTES: usize = 8;
 pub(super) const MAX_EXPANSION: usize = 4;
 const LENGTH_SHIFT: u32 = 32;
+const LENGTH_BITS: u32 = 8;
 const TEXT_BYTES: usize = 4;
 
 pub(super) fn entry_of(ch: char) -> u64 {
@@ -18,7 +19,7 @@ pub(super) fn entry_of(ch: char) -> u64 {
 
 pub(super) fn entry_is_char(entry: u64) -> bool {
     let length = (entry >> LENGTH_SHIFT) as usize;
-    if length == 0 || length > TEXT_BYTES || entry >> (LENGTH_SHIFT + 8) != 0 {
+    if length == 0 || length > TEXT_BYTES || entry >> (LENGTH_SHIFT + LENGTH_BITS) != 0 {
         return false;
     }
     let text = (entry as u32).to_le_bytes();
