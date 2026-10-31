@@ -57,7 +57,7 @@ impl HotShape {
             drop(sender);
             let mut pending = BTreeMap::new();
             let mut next_to_write = 0;
-            for (block, bytes) in receiver.iter() {
+            for (block, bytes) in &receiver {
                 pending.insert(block, bytes);
                 while let Some(bytes) = pending.remove(&next_to_write) {
                     output.write_all(&bytes)?;
@@ -108,6 +108,7 @@ impl HotShape {
                 .all(|&length| length as usize <= left_size)
     }
 
+    #[must_use]
     pub fn clamped(&self, left_size: usize, right_size: usize) -> Self {
         Self::from_lengths(
             self.lengths

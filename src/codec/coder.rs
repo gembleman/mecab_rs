@@ -64,7 +64,7 @@ impl<'a> Coder<'a> {
         let mut coder = Coder::new(Mode::Decode);
         coder.input = input;
         for _ in 0..STATE_BYTES {
-            coder.code = (coder.code << 8) | coder.next_byte() as u32;
+            coder.code = (coder.code << 8) | u32::from(coder.next_byte());
         }
         coder
     }
@@ -116,11 +116,11 @@ impl<'a> Coder<'a> {
     pub fn put(&mut self, cum: u32, freq: u32, total: u32) {
         debug_assert!(freq > 0 && cum + freq <= total && total <= MAX_TOTAL);
         if self.track {
-            self.bits += (total as f64 / freq as f64).log2();
+            self.bits += (f64::from(total) / f64::from(freq)).log2();
         }
         if self.mode == Mode::Encode {
             let r = self.range / total;
-            self.low += (r * cum) as u64;
+            self.low += u64::from(r * cum);
             self.range = r * freq;
             while self.range < TOP {
                 self.range <<= 8;
@@ -140,7 +140,7 @@ impl<'a> Coder<'a> {
         self.code = self.code.wrapping_sub(self.unit.wrapping_mul(cum));
         self.range = self.unit.wrapping_mul(freq);
         while self.range < TOP {
-            self.code = (self.code << 8) | self.next_byte() as u32;
+            self.code = (self.code << 8) | u32::from(self.next_byte());
             self.range <<= 8;
         }
     }
@@ -161,18 +161,18 @@ impl<'a> Coder<'a> {
     }
 
     pub fn uniform(&mut self, v: u64, n: u64) -> u64 {
-        if n <= MAX_TOTAL as u64 {
-            return self.uniform16(v as u32, n as u32) as u64;
+        if n <= u64::from(MAX_TOTAL) {
+            return u64::from(self.uniform16(v as u32, n as u32));
         }
         let high_n = ((n - 1) >> UNIFORM_BITS) + 1;
         let high = self.uniform(v >> UNIFORM_BITS, high_n);
         let low_n = if high == high_n - 1 {
             n - (high << UNIFORM_BITS)
         } else {
-            MAX_TOTAL as u64
+            u64::from(MAX_TOTAL)
         };
         (high << UNIFORM_BITS)
-            | self.uniform16((v & (MAX_TOTAL as u64 - 1)) as u32, low_n as u32) as u64
+            | u64::from(self.uniform16((v & (u64::from(MAX_TOTAL) - 1)) as u32, low_n as u32))
     }
 
     pub fn raw_bits(&mut self, v: u64, nbits: u32) -> u64 {
@@ -181,7 +181,7 @@ impl<'a> Coder<'a> {
         while left > 0 {
             let k = left.min(UNIFORM_BITS);
             left -= k;
-            let part = self.uniform16(((v >> left) & ((1 << k) - 1)) as u32, 1 << k) as u64;
+            let part = u64::from(self.uniform16(((v >> left) & ((1 << k) - 1)) as u32, 1 << k));
             out = (out << k) | part;
         }
         out
@@ -261,18 +261,18 @@ impl UintModel {
             return 0;
         }
         let mut decoded = 1u64;
-        let first_bit = self.top[len][0].code(
+        let first_bit = u64::from(self.top[len][0].code(
             coder,
             (value_plus_one >> (len - 1)) & 1 == 1,
             UINT_FLAG_LIMIT,
-        ) as u64;
+        ));
         decoded = (decoded << 1) | first_bit;
         if len >= 2 {
-            let second_bit = self.top[len][1].code(
+            let second_bit = u64::from(self.top[len][1].code(
                 coder,
                 (value_plus_one >> (len - 2)) & 1 == 1,
                 UINT_FLAG_LIMIT,
-            ) as u64;
+            ));
             decoded = (decoded << 1) | second_bit;
             if len >= 3 {
                 let rest = len as u32 - 2;

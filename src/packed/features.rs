@@ -134,7 +134,7 @@ impl Counts {
         self.rule_count as usize <= MAX_RULES
             && self.rule_groups <= self.rule_entries
             && self.rule_count >= 1
-            && self.rule_groups <= u32::from(u16::MAX)
+            && u16::try_from(self.rule_groups).is_ok()
     }
 }
 

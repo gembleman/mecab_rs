@@ -36,6 +36,7 @@ pub fn int_cost(total: i64, cost_factor: u32, shift: u32) -> i16 {
 }
 
 impl IntPart {
+    #[must_use]
     pub fn compacted(&self) -> Self {
         let mut left_used = vec![false; self.left_count];
         for &key in &self.left_index {
@@ -567,7 +568,7 @@ impl MappedIntTemplates<Mmap> {
     }
 }
 
-#[allow(private_bounds)]
+#[allow(private_bounds, reason = "the section source bound is crate internal")]
 impl<S: SectionSource> MappedIntTemplates<S> {
     pub(crate) fn from_source(map: S, path: &Path) -> Result<Self, Error> {
         let mut reader = TemplateReader::new(map.all_bytes(), path);

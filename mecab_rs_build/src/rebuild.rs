@@ -250,7 +250,10 @@ fn renumber_id_def(text: &str, order: &[usize], path: &Path) -> Result<String, E
     }
     let mut out = String::with_capacity(text.len() + 16);
     for (new_id, &old_id) in order.iter().enumerate() {
-        out.push_str(&format!("{new_id} {}\n", attributes[old_id]));
+        out.push_str(&new_id.to_string());
+        out.push(' ');
+        out.push_str(attributes[old_id]);
+        out.push('\n');
     }
     Ok(out)
 }
@@ -482,30 +485,28 @@ fn slim_dictionary(data: &[u8], path: &Path, keep: &Keep) -> Result<(Vec<u8>, Sl
     let mut by_offset: HashMap<u32, u32> = HashMap::new();
     for token in tokens.as_chunks_mut::<TOKEN_SIZE>().0.iter_mut() {
         let offset = u32_at(token, 8);
-        let place = match by_offset.get(&offset) {
-            Some(&place) => place,
-            None => {
-                let tail = blob.get(offset as usize..).ok_or_else(|| {
-                    Error::rebuild(path, "a feature offset is past the feature section")
-                })?;
-                let length = tail
-                    .iter()
-                    .position(|&byte| byte == 0)
-                    .ok_or_else(|| Error::rebuild(path, "a feature is not NUL-terminated"))?;
-                let text = keep.apply(&tail[..length]);
-                let place = match by_text.get(&text) {
-                    Some(&place) => place,
-                    None => {
-                        let place = out_blob.len() as u32;
-                        out_blob.extend_from_slice(&text);
-                        out_blob.push(0);
-                        by_text.insert(text, place);
-                        place
-                    }
-                };
-                by_offset.insert(offset, place);
+        let place = if let Some(&place) = by_offset.get(&offset) {
+            place
+        } else {
+            let tail = blob.get(offset as usize..).ok_or_else(|| {
+                Error::rebuild(path, "a feature offset is past the feature section")
+            })?;
+            let length = tail
+                .iter()
+                .position(|&byte| byte == 0)
+                .ok_or_else(|| Error::rebuild(path, "a feature is not NUL-terminated"))?;
+            let text = keep.apply(&tail[..length]);
+            let place = if let Some(&place) = by_text.get(&text) {
                 place
-            }
+            } else {
+                let place = out_blob.len() as u32;
+                out_blob.extend_from_slice(&text);
+                out_blob.push(0);
+                by_text.insert(text, place);
+                place
+            };
+            by_offset.insert(offset, place);
+            place
         };
         token[8..12].copy_from_slice(&place.to_le_bytes());
     }

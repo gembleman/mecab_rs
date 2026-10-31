@@ -34,7 +34,10 @@ impl SectionSource for MappedBytes {
     }
 }
 
-#[expect(clippy::missing_safety_doc)]
+#[expect(
+    clippy::missing_safety_doc,
+    reason = "marker trait whose contract is plain old data layout"
+)]
 pub(crate) unsafe trait Plain: Copy {}
 
 unsafe impl Plain for i16 {}

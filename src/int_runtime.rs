@@ -643,7 +643,7 @@ pub(crate) fn is_runtime_form(bytes: &[u8]) -> bool {
         && bytes.get(4..8) == Some(RUNTIME_VERSION.to_le_bytes().as_slice())
 }
 
-#[allow(private_bounds)]
+#[allow(private_bounds, reason = "the section source bound is crate internal")]
 impl<S: SectionSource> RuntimeIntTemplates<S> {
     fn from_source(map: S, path: &Path) -> Result<Self, Error> {
         let mut reader = TemplateReader::new(map.all_bytes(), path);

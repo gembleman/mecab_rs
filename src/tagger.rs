@@ -307,7 +307,7 @@ pub struct Node<'t, 'x> {
     raw: &'t RawNode,
 }
 
-impl<'t, 'x> Node<'t, 'x> {
+impl<'x> Node<'_, 'x> {
     pub fn kind(&self) -> NodeKind {
         match self.raw.source {
             NodeSource::System | NodeSource::SystemExtended | NodeSource::User(_) => {

@@ -14,3 +14,6 @@ lzma-rust2 = { version = "0.19", default-features = false, features = ["std", "e
 
 [features]
 pair-stats = ["mecab_rs/pair-stats"]
+
+[lints]
+workspace = true

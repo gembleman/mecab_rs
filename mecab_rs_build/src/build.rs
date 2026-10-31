@@ -21,6 +21,7 @@ pub(crate) mod text;
 use text::Lines;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools, reason = "one flag per buildable part")]
 pub struct Parts {
     pub unknown: bool,
     pub char_category: bool,

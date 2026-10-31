@@ -182,7 +182,7 @@ impl EndSlot {
 fn prefetch<T>(address: *const T) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(address.cast())
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(address.cast());
     };
     #[cfg(not(target_arch = "x86_64"))]
     let _ = address;
@@ -256,7 +256,7 @@ fn best_lefts(
     }
 
     debug_assert!(!lefts.is_empty());
-    debug_assert!(lefts.len() <= i32::MAX as usize);
+    debug_assert!(i32::try_from(lefts.len()).is_ok());
     let mut costs = [0i32; CONNECT_GROUP_SIZE];
     let mut positions = [0i32; CONNECT_GROUP_SIZE];
     unsafe {
@@ -425,7 +425,7 @@ impl Lattice {
             &dictionary.system,
             &dictionary.unknown,
             sentence,
-        )
+        );
     }
 
     #[inline(always)]

@@ -97,15 +97,14 @@ fn parse(arguments: &[OsString]) -> Result<Parsed, String> {
                 .find(|entry| entry.0 == key)
                 .ok_or_else(|| format!("unrecognized option `{argument}`"))?;
             if entry.2 {
-                value = Some(match inline {
-                    Some(inline) => inline,
-                    None => {
-                        index += 1;
-                        strings
-                            .get(index - 1)
-                            .cloned()
-                            .ok_or_else(|| format!("`{argument}` requires an argument"))?
-                    }
+                value = Some(if let Some(inline) = inline {
+                    inline
+                } else {
+                    index += 1;
+                    strings
+                        .get(index - 1)
+                        .cloned()
+                        .ok_or_else(|| format!("`{argument}` requires an argument"))?
                 });
             } else if inline.is_some() {
                 return Err(format!("`{argument}` doesn't allow an argument"));

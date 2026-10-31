@@ -81,7 +81,7 @@ fn col_info(lex: &Lexicon, sample: &Sample, col: usize) -> ColInfo {
         set.insert(v);
         all_int &= canonical_i64(v).is_some();
         all_u64 &= canonical_u64(v).is_some();
-        kana += v.chars().any(is_kana) as usize;
+        kana += usize::from(v.chars().any(is_kana));
     }
     ColInfo {
         distinct: set.len(),

@@ -119,7 +119,7 @@ pub(super) unsafe fn decode_unchecked(table: &[u8], codes: &[u8], target: *mut u
             target
                 .add(written)
                 .cast::<u64>()
-                .write_unaligned(entry.to_le())
+                .write_unaligned(entry.to_le());
         };
         written += (entry >> LENGTH_SHIFT) as usize;
     }

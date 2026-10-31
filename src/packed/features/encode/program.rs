@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    Class, Error, Numbers, OP_BLOB, OP_BLOB_NEXT, OP_COPY, OP_DERIVE, OP_EMPTY, OP_HIGH, OP_INLINE,
+    OP_KEY, OP_NUM, OP_NUMB, OP_REF, OP_STAR, Planner, SmallKeyMap, TextOp, blob_slot, push_piece,
+    split_fields,
+};
 
 pub(super) fn intern_bytes(
     map: &mut SmallKeyMap<Vec<u8>, u32>,

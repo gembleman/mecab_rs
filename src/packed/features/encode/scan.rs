@@ -1,4 +1,6 @@
-use super::*;
+use super::{
+    BuildHasherDefault, FINAL_MULTIPLIER, HASH_MULTIPLIER, HashMap, HashSet, Hasher, MAX_FIELDS,
+};
 
 #[derive(Default)]
 pub(super) struct SmallKeyHasher(u64);

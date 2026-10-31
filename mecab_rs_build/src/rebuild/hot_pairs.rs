@@ -48,7 +48,7 @@ pub fn hot_shape_from_pair_counts(pairs: &[PairCount], budget: usize) -> HotShap
     let cells_of = |lengths: &[u32]| lengths.iter().map(|&length| length as usize).sum::<usize>();
     let (mut low, mut high) = (0.0, LARGEST_PENALTY);
     for _ in 0..BISECTION_ROUNDS {
-        let middle = (low + high) / 2.0;
+        let middle = f64::midpoint(low, high);
         if cells_of(&lengths_at(middle)) > budget {
             low = middle;
         } else {

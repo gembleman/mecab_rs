@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::io::Write;
 
 use super::features::{FeatureIndex, Features, ID_LIST_END};
@@ -566,37 +567,41 @@ impl Sentence {
         let node = |index: u32| &self.nodes[index as usize];
 
         while node(answer).anext != NIL && node(result).next != NIL {
-            if result_end == answer_end {
-                let (a, r) = (node(answer), node(result));
-                if same_node(
-                    self.surface(answer),
-                    features.get(a.feature),
-                    self.surface(result),
-                    features.get(r.feature),
-                    r.kind == UNKNOWN,
-                    eval_size,
-                    unk_eval_size,
-                ) {
-                    *correct += 1;
-                } else {
-                    zero_one = 1;
+            match result_end.cmp(&answer_end) {
+                Ordering::Equal => {
+                    let (a, r) = (node(answer), node(result));
+                    if same_node(
+                        self.surface(answer),
+                        features.get(a.feature),
+                        self.surface(result),
+                        features.get(r.feature),
+                        r.kind == UNKNOWN,
+                        eval_size,
+                        unk_eval_size,
+                    ) {
+                        *correct += 1;
+                    } else {
+                        zero_one = 1;
+                    }
+                    *precision += 1;
+                    *recall += 1;
+                    result = r.next;
+                    answer = a.anext;
+                    result_end += node(result).rlength as usize;
+                    answer_end += node(answer).rlength as usize;
                 }
-                *precision += 1;
-                *recall += 1;
-                result = r.next;
-                answer = a.anext;
-                result_end += node(result).rlength as usize;
-                answer_end += node(answer).rlength as usize;
-            } else if result_end < answer_end {
-                result = node(result).next;
-                result_end += node(result).rlength as usize;
-                zero_one = 1;
-                *recall += 1;
-            } else {
-                answer = node(answer).anext;
-                answer_end += node(answer).rlength as usize;
-                zero_one = 1;
-                *precision += 1;
+                Ordering::Less => {
+                    result = node(result).next;
+                    result_end += node(result).rlength as usize;
+                    zero_one = 1;
+                    *recall += 1;
+                }
+                Ordering::Greater => {
+                    answer = node(answer).anext;
+                    answer_end += node(answer).rlength as usize;
+                    zero_one = 1;
+                    *precision += 1;
+                }
             }
         }
 

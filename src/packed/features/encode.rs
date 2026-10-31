@@ -18,14 +18,14 @@ mod records;
 mod scan;
 mod stats;
 
-use blob::*;
-use derive::*;
-use numbers::*;
-use program::*;
-use records::*;
+use blob::{Blob, Recoded, plan_blob, recode};
+use derive::{Derive, Planner, TextOp};
+use numbers::{Numbers, Stored, plan_numbers};
+use program::{ProgramBuilder, ProgramSet};
+use records::{Assembly, dump_strings, write_records};
 pub(in crate::packed) use scan::split_fields;
-use scan::*;
-use stats::*;
+use scan::{SmallKeyMap, SmallKeySet, parse_number};
+use stats::{Class, Stat, choose_split};
 
 const MAX_FIELDS: usize = 256;
 const FOLD_MAX_VALUES: usize = 256;

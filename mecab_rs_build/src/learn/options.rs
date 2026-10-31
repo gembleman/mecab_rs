@@ -41,15 +41,14 @@ impl Options {
                     .find(|spec| spec.name == key)
                     .ok_or_else(|| format!("unrecognized option `{argument}`"))?;
                 if spec.takes_value {
-                    let value = match inline {
-                        Some(inline) => inline.to_owned(),
-                        None => {
-                            index += 1;
-                            arguments
-                                .get(index - 1)
-                                .cloned()
-                                .ok_or_else(|| format!("`{argument}` requires an argument"))?
-                        }
+                    let value = if let Some(inline) = inline {
+                        inline.to_owned()
+                    } else {
+                        index += 1;
+                        arguments
+                            .get(index - 1)
+                            .cloned()
+                            .ok_or_else(|| format!("`{argument}` requires an argument"))?
                     };
                     options.values.insert(spec.name.to_owned(), value);
                 } else if inline.is_some() {

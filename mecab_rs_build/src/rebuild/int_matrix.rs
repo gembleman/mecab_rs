@@ -9,6 +9,10 @@ use mecab_rs::Error;
 
 pub const RUNTIME_SHIFT: u32 = 20;
 
+#[allow(
+    clippy::float_cmp,
+    reason = "the cost factor must be exactly an integer"
+)]
 fn integer_cost_factor(templates: &ConnectionTemplates, path: &Path) -> Result<u32, Error> {
     let factor = templates.cost_factor();
     if factor >= 1.0 && factor <= f64::from(mecab_rs::__private::MAX_COST_FACTOR) {

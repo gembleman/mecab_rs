@@ -135,7 +135,7 @@ fn wait_until_fresh(cache: &Path, marker: &Path, identity: TransportIdentity) ->
 pub(crate) fn ensure(xz: &Path, force: bool) -> Result<(PathBuf, bool), Error> {
     let _guard = EXPAND_LOCK
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let cache = cache_path(xz);
     let marker = marker_path(&cache);
     let identity = identify(xz)?;

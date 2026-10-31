@@ -101,10 +101,14 @@ fn projection_digest(universe: &[(UniverseSide, UniverseSide)]) -> u64 {
 }
 
 fn template_text(bigrams: &[(String, String)]) -> String {
-    bigrams
-        .iter()
-        .map(|(name, body)| format!("{name}\t{body}\n"))
-        .collect()
+    let mut text = String::new();
+    for (name, body) in bigrams {
+        text.push_str(name);
+        text.push('\t');
+        text.push_str(body);
+        text.push('\n');
+    }
+    text
 }
 
 fn parse_template_text(text: &str, path: &Path) -> Result<Vec<(String, String)>, Error> {

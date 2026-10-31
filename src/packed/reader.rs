@@ -396,7 +396,7 @@ impl<'a> Cursor<'a> {
         } else if let Some(data) = unit_at(self.cells, value as usize) {
             Step::Key(
                 (data & VALUE_MASK) as u32,
-                (data >> FLAGS_SHIFT) as u8 as u32,
+                u32::from((data >> FLAGS_SHIFT) as u8),
             )
         } else {
             Step::Stop

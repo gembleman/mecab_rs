@@ -46,6 +46,7 @@ dictionary rebuilding:
 
 type Args = [std::ffi::OsString];
 
+#[allow(clippy::needless_pass_by_value, reason = "used as a map_err callback")]
 fn shown(error: mecab_rs::Error) -> String {
     error.to_string()
 }

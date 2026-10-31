@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    Blob, Class, DERIVE_CONTEXT, DERIVE_TARGET, MAX_REMOVED_CHARS, MAX_RULE_SUFFIX, MAX_RULES,
+    MAX_SLOTS, MIN_RULE_USES, RULE_BYTES, RULE_CHAR_BITS, RULE_HEADER_BYTES, SmallKeyMap,
+    blob_slot, split_fields,
+};
 
 pub(super) fn is_key(value: &[u8], key: &[u8]) -> bool {
     !key.is_empty() && value == key && value != b"*"
@@ -263,6 +267,10 @@ impl<'a> Planner<'_, 'a> {
         }
     }
 
+    #[allow(
+        clippy::unused_self,
+        reason = "keeps the encoder method signature uniform"
+    )]
     pub(super) fn uses_key(&self, ops: &[Option<TextOp>]) -> bool {
         ops.iter()
             .any(|op| matches!(op, Some(TextOp::Key | TextOp::Derive)))

@@ -16,7 +16,10 @@ fn ddot(size: usize, x: &[f64], y: &[f64]) -> f64 {
     sum
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the libmecab line search signature"
+)]
 fn mcstep(
     stx: &mut f64,
     fx: &mut f64,
@@ -193,7 +196,10 @@ struct Mcsrch {
 }
 
 impl Mcsrch {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the libmecab line search signature"
+    )]
     fn search(
         &mut self,
         size: usize,
@@ -250,11 +256,11 @@ impl Mcsrch {
                 *stp = stp.max(MIN_STEP);
                 *stp = stp.min(MAX_STEP);
 
-                if (self.brackt
+                if self.brackt
                     && ((*stp <= self.stmin || *stp >= self.stmax)
                         || *nfev >= MAX_EVALUATIONS - 1
-                        || self.infoc == 0))
-                    || (self.brackt && (self.stmax - self.stmin <= WIDTH_TOLERANCE * self.stmax))
+                        || self.infoc == 0
+                        || self.stmax - self.stmin <= WIDTH_TOLERANCE * self.stmax)
                 {
                     *stp = self.stx;
                 }

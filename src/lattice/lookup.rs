@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Candidate, CharInfo, Dictionary, Error, HitSite, Lattice, LinkSpan, NodeSource,
+    PackedDictionary, PackedView, Range, RawNode, Span, SystemDictionary,
+};
 
 impl Lattice {
     #[inline(always)]
@@ -203,7 +206,7 @@ impl Lattice {
                 if !BEST
                     && found.partial
                     && !self.constraints.admits(found.begin, end, |out| {
-                        out.push_str(words.feature(token.feature))
+                        out.push_str(words.feature(token.feature));
                     })
                 {
                     continue;

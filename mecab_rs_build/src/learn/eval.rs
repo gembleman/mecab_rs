@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -130,26 +131,30 @@ pub fn evaluate(
         };
         let (mut i1, mut i2, mut p1, mut p2) = (0, 0, 0, 0);
         while i1 < r1.len() && i2 < r2.len() {
-            if p1 == p2 {
-                for (level, count) in correct.iter_mut().enumerate() {
-                    if r1[i1][level] == r2[i2][level] {
-                        *count += 1;
+            match p1.cmp(&p2) {
+                Ordering::Equal => {
+                    for (level, count) in correct.iter_mut().enumerate() {
+                        if r1[i1][level] == r2[i2][level] {
+                            *count += 1;
+                        }
                     }
+                    p1 += r1[i1][0].len();
+                    p2 += r2[i2][0].len();
+                    i1 += 1;
+                    i2 += 1;
+                    precision += 1;
+                    recall += 1;
                 }
-                p1 += r1[i1][0].len();
-                p2 += r2[i2][0].len();
-                i1 += 1;
-                i2 += 1;
-                precision += 1;
-                recall += 1;
-            } else if p1 < p2 {
-                p1 += r1[i1][0].len();
-                i1 += 1;
-                precision += 1;
-            } else {
-                p2 += r2[i2][0].len();
-                i2 += 1;
-                recall += 1;
+                Ordering::Less => {
+                    p1 += r1[i1][0].len();
+                    i1 += 1;
+                    precision += 1;
+                }
+                Ordering::Greater => {
+                    p2 += r2[i2][0].len();
+                    i2 += 1;
+                    recall += 1;
+                }
             }
         }
         precision += r1.len() - i1;

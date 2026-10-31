@@ -23,10 +23,10 @@ impl NovelChar {
         let block = ch >> BLOCK_SHIFT;
         let coded_block = match self.blocks.code(coder, &[1], block) {
             Some(known) => known,
-            None => coder.uniform(block as u64, BLOCKS) as u32,
+            None => coder.uniform(u64::from(block), BLOCKS) as u32,
         };
         self.blocks.update(coded_block);
-        let low = coder.raw_bits((ch & ((1 << BLOCK_SHIFT) - 1)) as u64, BLOCK_SHIFT) as u32;
+        let low = coder.raw_bits(u64::from(ch & ((1 << BLOCK_SHIFT) - 1)), BLOCK_SHIFT) as u32;
         (coded_block << BLOCK_SHIFT) | low
     }
 }
@@ -53,7 +53,7 @@ impl CharModel {
         loop {
             let mut h = CONTEXT_SEED + context_len as u64;
             for &x in &tail[tail.len() - context_len..] {
-                h = mix(h, x as u64);
+                h = mix(h, u64::from(x));
             }
             ctxs[level] = h;
             level += 1;
@@ -71,7 +71,7 @@ impl CharModel {
     }
 
     fn novel_end(&mut self, coder: &mut Coder, sym: u32) -> u32 {
-        let is_end = coder.uniform((sym == END) as u64, 2) == 1;
+        let is_end = coder.uniform(u64::from(sym == END), 2) == 1;
         if is_end {
             END
         } else {
@@ -111,7 +111,7 @@ impl CharModel {
             let want = if coder.is_decoder() {
                 NOVEL
             } else {
-                it.next().map_or(END, |&b| b as u32)
+                it.next().map_or(END, |&b| u32::from(b))
             };
             let got = self.code_sym(coder, &hist, want);
             if got == END || coder.overrun() {

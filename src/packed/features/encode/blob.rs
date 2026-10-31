@@ -1,4 +1,6 @@
-use super::*;
+use super::{
+    Class, Error, HashMap, MAX_BLOB_FIELDS, MAX_ID_BYTES, SmallKeyMap, Stored, chars, split_fields,
+};
 
 pub(super) struct Blob<'a> {
     pub(super) number: usize,

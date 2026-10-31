@@ -29,7 +29,7 @@ fn size_of_first_line(lines: &mut Lines) -> Result<Option<MatrixSize>, Error> {
     let size_of = |field: usize| {
         usize::try_from(atoi(cstr(line, field)))
             .ok()
-            .filter(|&size| size <= usize::from(u16::MAX))
+            .filter(|&size| u16::try_from(size).is_ok())
     };
     let (left, right) = (size_of(found[0]), size_of(found[1]));
     let (Some(left), Some(right)) = (left, right) else {

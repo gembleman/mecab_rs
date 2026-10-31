@@ -3,7 +3,7 @@ pub(super) const PADDING: usize = 7;
 pub(super) const MAX_RECORD_BITS: u32 = 56;
 
 pub(super) fn width_of(max: u64) -> u32 {
-    (u64::BITS - max.leading_zeros()).max(1)
+    max.bit_width().max(1)
 }
 
 pub(super) const fn mask_of(width: u32) -> u64 {

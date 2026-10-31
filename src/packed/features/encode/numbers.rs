@@ -1,4 +1,6 @@
-use super::*;
+use super::{
+    Class, MAX_NUMERIC, NumSpec, Stat, bits_for, choose_split, parse_number, split_fields,
+};
 
 pub(super) fn shifted_copy(
     earlier: &[u64],

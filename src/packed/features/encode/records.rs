@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    BLOB_SYNC_EVERY, BitWriter, Blob, Counts, Derive, Error, Layout, OP_BLOB, OP_INLINE, OP_NUM,
+    OP_NUM_MAX, OP_NUMB, OP_NUMB_MAX, OP_REF, Pieces, ProgramSet, Recoded, SYNC_EVERY, Stored,
+    bits_for,
+};
 
 pub(super) struct Records {
     pub(super) bytes: Vec<u8>,
@@ -169,6 +173,10 @@ impl Assembly<'_, '_> {
         Ok(bytes)
     }
 
+    #[allow(
+        clippy::unused_self,
+        reason = "keeps the encoder method signature uniform"
+    )]
     pub(super) fn put_pieces(
         &self,
         bytes: &mut [u8],

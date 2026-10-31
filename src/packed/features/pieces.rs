@@ -20,7 +20,7 @@ pub(super) struct Position {
 
 impl Position {
     pub(super) fn to_bytes(self) -> [u8; POSITION_BYTES] {
-        debug_assert!(self.shift <= u32::from(u16::MAX) && self.bits <= MAX_PIECE_BITS);
+        debug_assert!(u16::try_from(self.shift).is_ok() && self.bits <= MAX_PIECE_BITS);
         let word = u64::from(self.base)
             | u64::from(self.shift) << SHIFT_AT
             | u64::from(self.bits) << BITS_AT
@@ -28,6 +28,10 @@ impl Position {
         word.to_le_bytes()
     }
 
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "reads straight from a mapped section slice"
+    )]
     pub(super) fn parse(bytes: &[u8; POSITION_BYTES]) -> Option<Self> {
         let word = u64::from_le_bytes(*bytes);
         let (base, shift, bits) = unpack_position(word);
@@ -47,7 +51,7 @@ pub(super) fn unpack_position(word: u64) -> (usize, usize, u32) {
     (
         word as u32 as usize,
         (word >> SHIFT_AT) as u16 as usize,
-        (word >> BITS_AT) as u8 as u32,
+        u32::from((word >> BITS_AT) as u8),
     )
 }
 
@@ -108,7 +112,7 @@ pub(super) fn build(programs: &[Vec<u8>]) -> Option<Pieces> {
         if bits > MAX_PIECE_BITS {
             return None;
         }
-        let constant = ranked.len() == 1 && ranked[0].0.len() <= usize::from(u16::MAX);
+        let constant = ranked.len() == 1 && u16::try_from(ranked[0].0.len()).is_ok();
         positions.push(if constant {
             Position {
                 base: u32::try_from(pool.len()).ok()?,

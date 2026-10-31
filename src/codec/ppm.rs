@@ -12,7 +12,7 @@ impl Hasher for IdHasher {
     }
     fn write(&mut self, bytes: &[u8]) {
         for &b in bytes {
-            self.0 = (self.0 ^ b as u64).wrapping_mul(FNV_PRIME);
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(FNV_PRIME);
         }
     }
     fn write_u64(&mut self, x: u64) {
@@ -352,7 +352,7 @@ impl Ppm {
         unsafe {
             use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
             let i = (h | 1) as usize & self.mask;
-            _mm_prefetch(self.slots.as_ptr().add(i) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(self.slots.as_ptr().add(i).cast::<i8>(), _MM_HINT_T0);
         }
         #[cfg(not(target_arch = "x86_64"))]
         let _ = h;
@@ -506,7 +506,7 @@ impl Ppm {
                 } else {
                     t.push(&mut self.arena, (sym, 1));
                 }
-                t.len += (t.cap == BIG) as u32;
+                t.len += u32::from(t.cap == BIG);
             } else {
                 continue;
             }

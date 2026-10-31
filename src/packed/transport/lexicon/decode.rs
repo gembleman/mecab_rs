@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    COMMA, Error, HashMap, LINE_END, Model, NUL, NUMBER_FIELDS, Param, QUOTE, UNKNOWN_PARAM_BYTES,
+    decode_lexicon, get_varint,
+};
 use crate::wire::{i16_at, u16_at};
 
 pub(super) struct Reader<'a> {

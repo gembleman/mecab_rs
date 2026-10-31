@@ -95,7 +95,7 @@ impl KeyModel {
         }
         let prev_len = self.prev.len();
         let ctxs = [
-            mix(mix(1, prev_len as u64), self.last_prefix_len as u64),
+            mix(mix(1, prev_len as u64), u64::from(self.last_prefix_len)),
             mix(1, prev_len as u64),
             2,
         ];
@@ -126,13 +126,13 @@ impl KeyModel {
                 (self.cur[shared_len] as u32).wrapping_sub(prev_char + 1)
             };
             let ctxs = [
-                mix(mix(5, char_before), prev_char as u64),
-                mix(6, prev_char as u64),
+                mix(mix(5, char_before), u64::from(prev_char)),
+                mix(6, u64::from(prev_char)),
                 7,
             ];
             let delta = match self.first_char_delta.code(coder, &ctxs, delta) {
                 Some(delta) => delta,
-                None => saturate_u32(self.first_char_delta_escape.code(coder, delta as u64)),
+                None => saturate_u32(self.first_char_delta_escape.code(coder, u64::from(delta))),
             };
             self.first_char_delta.update(delta);
             out.push(
@@ -415,7 +415,9 @@ fn decode_unchecked(data: &[u8]) -> Result<(Lexicon, Header), Error> {
         return corrupt("bad row count");
     }
     if n_cols > 0 {
-        if h.text_len > u32::MAX as u64 || !lex.reserve(total_rows as usize, h.text_len as usize) {
+        if h.text_len > u64::from(u32::MAX)
+            || !lex.reserve(total_rows as usize, h.text_len as usize)
+        {
             return corrupt("text too large");
         }
         let mut model = Model::new(h.plan.clone());
