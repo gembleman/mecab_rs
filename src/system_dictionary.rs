@@ -6,7 +6,7 @@ use std::thread;
 
 use memmap2::Mmap;
 
-use crate::dictionary::map_open_file;
+use crate::dictionary::{map_open_file, open_unwritable};
 use crate::error::Error;
 use crate::section::{Plain, Section};
 use crate::wire::u32_at;
@@ -130,7 +130,7 @@ impl SystemDictionary {
             path: path.to_path_buf(),
             source,
         };
-        let file = File::open(path).map_err(io_error)?;
+        let file = open_unwritable(path).map_err(io_error)?;
         let map = map_open_file(&file, path)?;
         let broken = |reason| Error::Format {
             file: path.to_path_buf(),
@@ -241,12 +241,23 @@ impl SystemDictionary {
 
     pub fn feature(&self, offset: u32) -> &str {
         let rest = &self.map[self.features.start + offset as usize..self.features.end];
+        assert!(
+            rest.first().is_some_and(|&byte| !is_continuation(byte)),
+            "feature offset is not at a character start"
+        );
         let length = rest
             .iter()
             .position(|&byte| byte == 0)
             .expect("open checked that the features end with a NUL byte");
         unsafe { str::from_utf8_unchecked(&rest[..length]) }
     }
+}
+
+const CONTINUATION_MASK: u8 = 0xC0;
+const CONTINUATION_TAG: u8 = 0x80;
+
+fn is_continuation(byte: u8) -> bool {
+    byte & CONTINUATION_MASK == CONTINUATION_TAG
 }
 
 const PARALLEL_MIN_BYTES: usize = 1 << 22;

@@ -21,8 +21,19 @@ pub(crate) fn map_open_file(file: &File, path: &Path) -> Result<Mmap, Error> {
     })
 }
 
+#[cfg(windows)]
+const SHARE_READ_AND_DELETE: u32 = 1 | 4;
+
+pub(crate) fn open_unwritable(path: &Path) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, SHARE_READ_AND_DELETE);
+    options.open(path)
+}
+
 pub(crate) fn map_file(path: &Path) -> Result<Mmap, Error> {
-    let file = File::open(path).map_err(|source| Error::Io {
+    let file = open_unwritable(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
     })?;

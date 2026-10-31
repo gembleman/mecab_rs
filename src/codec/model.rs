@@ -83,7 +83,7 @@ impl Plan {
         let pos_cols = get_varint(b, pos)? as usize;
         let cat_ctx = get_opt(b, pos)?;
         let n = get_varint(b, pos)? as usize;
-        if n_cols > 1 << 20 || n > n_cols || FIXED_COLS + pos_cols > n_cols.max(FIXED_COLS) {
+        if n_cols > 1 << 20 || n > n_cols || pos_cols > n_cols.saturating_sub(FIXED_COLS) {
             return None;
         }
         let mut steps = Vec::new();
@@ -730,7 +730,7 @@ fn code_pos(
         let mut pos = 0;
         for i in 0..p {
             let n = get_varint(b, &mut pos).unwrap_or(0) as usize;
-            let end = (pos + n).min(b.len());
+            let end = pos.saturating_add(n).min(b.len());
             sh.cur[FIXED_COLS + i].clear();
             sh.cur[FIXED_COLS + i].push_str(std::str::from_utf8(&b[pos..end]).unwrap_or(""));
             pos = end;
@@ -859,7 +859,7 @@ fn code_cat_group(
         let mut pos = 0;
         for &si in &g.steps {
             let n = get_varint(b, &mut pos).unwrap_or(0) as usize;
-            let end = (pos + n).min(b.len());
+            let end = pos.saturating_add(n).min(b.len());
             let f = &mut sh.cur[plan_steps[si].col];
             f.clear();
             f.push_str(std::str::from_utf8(&b[pos..end]).unwrap_or(""));

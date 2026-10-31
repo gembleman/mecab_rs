@@ -16,7 +16,7 @@ use super::{
 };
 use crate::char_property::SentenceChars;
 use crate::char_table::{HEADER_BYTES as CHAR_TABLE_HEADER, MAGIC as CHAR_TABLE_MAGIC};
-use crate::dictionary::map_open_file;
+use crate::dictionary::{map_open_file, open_unwritable};
 use crate::error::{Error, io_error};
 use crate::hot_shape::HotShape;
 use crate::int_runtime::is_runtime_form;
@@ -137,7 +137,7 @@ pub struct PackedDictionary {
 
 impl PackedDictionary {
     pub fn open(path: &Path) -> Result<Self, Error> {
-        let file = File::open(path).map_err(io_error(path))?;
+        let file = open_unwritable(path).map_err(io_error(path))?;
         let file_length = file.metadata().map_err(io_error(path))?.len();
         let mut header_bytes = [0u8; HEADER_BYTES];
         if file_length < HEADER_BYTES as u64 {

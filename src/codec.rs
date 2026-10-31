@@ -95,7 +95,7 @@ impl KeyModel {
         ];
         let l = match self.lcp.code(c, &ctxs, if dec { NOVEL } else { l as u32 }) {
             Some(l) => l,
-            None => self.lcp_uint.code(c, l as u64) as u32,
+            None => saturate_u32(self.lcp_uint.code(c, l as u64)),
         };
         self.lcp.update(l);
         let l = (l as usize).min(prev_len);
@@ -114,7 +114,7 @@ impl KeyModel {
             let ctxs = [mix(mix(5, before), pc as u64), mix(6, pc as u64), 7];
             let d = match self.first.code(c, &ctxs, d) {
                 Some(d) => d,
-                None => self.first_uint.code(c, d as u64) as u32,
+                None => saturate_u32(self.first_uint.code(c, d as u64)),
             };
             self.first.update(d);
             out.push(
@@ -142,11 +142,16 @@ impl KeyModel {
         let ctxs = [mix(3, last), 4];
         let n = match self.cnt.code(c, &ctxs, count as u32) {
             Some(n) => n,
-            None => self.cnt_uint.code(c, (count as u64).wrapping_sub(1)) as u32 + 1,
+            None => saturate_u32(self.cnt_uint.code(c, (count as u64).wrapping_sub(1)))
+                .saturating_add(1),
         };
         self.cnt.update(n);
         n as usize
     }
+}
+
+fn saturate_u32(v: u64) -> u32 {
+    u32::try_from(v).unwrap_or(u32::MAX)
 }
 
 fn group_bounds(parsed: &Parsed) -> Vec<(usize, usize)> {

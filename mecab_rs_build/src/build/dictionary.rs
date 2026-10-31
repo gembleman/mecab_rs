@@ -141,6 +141,8 @@ impl<'a> Resources<'a> {
     }
 }
 
+const NO_POS_ID: i32 = -1;
+
 fn invalid_ids_error(left: i32, right: i32, dir: &Path) -> Error {
     failure(dir, format!("invalid ids are found lid={left} rid={right}"))
 }
@@ -182,6 +184,9 @@ fn read_entries(
             let mut cost = to_int(cstr(line, columns[COST_COLUMN]));
             let feature = cstr(line, columns[FEATURE_COLUMN]).to_vec();
             let pos_id = pos_ids.id(&feature)?;
+            if pos_id < NO_POS_ID || pos_id > i32::from(u16::MAX) {
+                return Err(failure(input, format!("pos id out of range: {pos_id}")));
+            }
 
             if cost == NO_VALUE {
                 if kind != DictionaryKind::User {
@@ -198,6 +203,12 @@ fn read_entries(
             }
             if !resources.ids_are_valid(left, right) {
                 return Err(invalid_ids_error(left, right, dir));
+            }
+            if i16::try_from(cost).is_err() {
+                return Err(failure(
+                    input,
+                    format!("cost out of the 16-bit range: {cost}: {shown}"),
+                ));
             }
             if word.is_empty() {
                 eprintln!("empty word is found, discard this line");

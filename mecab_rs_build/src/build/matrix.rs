@@ -25,10 +25,19 @@ fn size_of_first_line(lines: &mut Lines) -> Result<Option<MatrixSize>, Error> {
     if found.len() != 2 {
         return Err(failure(lines.path(), format!("format error: {shown}")));
     }
-    Ok(Some(MatrixSize {
-        left: atoi(cstr(line, found[0])) as usize,
-        right: atoi(cstr(line, found[1])) as usize,
-    }))
+    let size_of = |field: usize| {
+        usize::try_from(atoi(cstr(line, field)))
+            .ok()
+            .filter(|&size| size <= usize::from(u16::MAX))
+    };
+    let (left, right) = (size_of(found[0]), size_of(found[1]));
+    let (Some(left), Some(right)) = (left, right) else {
+        return Err(failure(
+            lines.path(),
+            format!("matrix size out of range: {shown}"),
+        ));
+    };
+    Ok(Some(MatrixSize { left, right }))
 }
 
 pub(super) fn sizes(dic_dir: &Path) -> Result<MatrixSize, Error> {
@@ -80,8 +89,8 @@ pub(super) fn compile(
     };
     let declared =
         size_of_first_line(&mut lines)?.ok_or_else(|| failure(matrix_def, "format error: "))?;
-    let left_size = declared.left as u16 as usize;
-    let right_size = declared.right as u16 as usize;
+    let left_size = declared.left;
+    let right_size = declared.right;
     let mut matrix = vec![0i16; left_size * right_size];
 
     while let Some(line) = lines.next_line()? {
@@ -103,7 +112,9 @@ pub(super) fn compile(
         if left < 0 || right < 0 || left as usize >= left_size || right as usize >= right_size {
             return Err(failure(matrix_def, "index values are out of range"));
         }
-        matrix[left as usize + left_size * right as usize] = cost as i16;
+        let cost = i16::try_from(cost)
+            .map_err(|_| failure(matrix_def, format!("cost out of the 16-bit range: {cost}")))?;
+        matrix[left as usize + left_size * right as usize] = cost;
     }
 
     let write = |output: &mut dyn Write| -> io::Result<()> {
