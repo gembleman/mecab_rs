@@ -10,7 +10,6 @@ use crate::char_layout::{
     CATEGORY_NAME_BYTES, CHAR_BIN_COUNT_BYTES, CHAR_BIN_ENTRIES, CHAR_BIN_ENTRY_BYTES,
     MAX_CATEGORIES, pack_char_info,
 };
-use crate::dict_files::{CHAR_BIN_FILE, CHAR_DEF_FILE, CHAR_TABLE_FILE};
 use crate::error::{Error, IoAction, io_error};
 use crate::file_write::write_file;
 
@@ -433,14 +432,4 @@ impl CharTable {
         let table = Self::from_mecab(char_bin, char_def)?;
         write_file(output, |writer| table.write(writer))
     }
-}
-
-pub fn migrate_char_table(dictionary: impl AsRef<Path>) -> Result<(), Error> {
-    let directory = dictionary.as_ref();
-    let definition = directory.join(CHAR_DEF_FILE);
-    CharTable::convert(
-        &directory.join(CHAR_BIN_FILE),
-        definition.is_file().then_some(definition.as_path()),
-        &directory.join(CHAR_TABLE_FILE),
-    )
 }

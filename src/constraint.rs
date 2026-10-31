@@ -245,6 +245,10 @@ impl ConstraintSet {
         if self.bytes.capacity() > keep_bytes {
             self.bytes.shrink_to(keep_bytes);
         }
+        if self.scratch.capacity() > RETAINED_MIN_ENTRIES {
+            self.scratch.clear();
+            self.scratch.shrink_to(RETAINED_MIN_ENTRIES);
+        }
     }
 
     fn set_feature(&mut self, text_len: usize, begin: usize, end: usize, feature: &str) {

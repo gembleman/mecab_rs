@@ -1,5 +1,4 @@
 use super::digits::{canonical_i64, set_i64};
-use super::report::NumNovel;
 use super::row::RowState;
 use super::spec::NumMode;
 use crate::codec::coder::{Coder, Flag, UintModel};
@@ -19,7 +18,6 @@ pub(super) struct NumState {
     d_intern: Interner,
     d_uint: UintModel,
     refs: FastMap<u64, (i64, i64)>,
-    pub novel: NumNovel,
 }
 
 impl NumState {
@@ -33,13 +31,7 @@ impl NumState {
             d_intern: Interner::default(),
             d_uint: UintModel::default(),
             refs: FastMap::default(),
-            novel: NumNovel::default(),
         }
-    }
-
-    fn record_novel(&mut self, bits_before: f64, coder: &Coder) {
-        self.novel.bits += coder.bits - bits_before;
-        self.novel.count += 1;
     }
 }
 
@@ -121,9 +113,7 @@ fn code_num_delta(
     let id = if let Some(id) = st.d_ppm.code(coder, &ctxs, sym) {
         id
     } else {
-        let b0 = coder.bits;
         let d = unzigzag(st.d_uint.code(coder, zigzag(want)));
-        st.record_novel(b0, coder);
         st.d_intern.find_or_add(&d.to_le_bytes())
     };
     st.d_ppm.update(id);
@@ -155,9 +145,7 @@ fn code_num_value(
     let id = if let Some(id) = st.ppm.code(coder, ctxs, sym) {
         id
     } else {
-        let b0 = coder.bits;
         let v = unzigzag(st.uint.code(coder, zigzag(parsed.unwrap_or(0))));
-        st.record_novel(b0, coder);
         st.intern.find_or_add(&v.to_le_bytes())
     };
     st.ppm.update(id);

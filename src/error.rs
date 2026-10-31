@@ -3,7 +3,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::lattice::MAX_TEXT_LEN;
+use crate::lattice::{MAX_NODE_COST, MAX_TEXT_LEN};
 
 type Cause = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -40,7 +40,6 @@ pub enum IoAction {
     Sync,
     Rename,
     Map,
-    Remove,
     Lock,
 }
 
@@ -57,7 +56,6 @@ impl IoAction {
             Self::Sync => "sync",
             Self::Rename => "rename",
             Self::Map => "map",
-            Self::Remove => "remove",
             Self::Lock => "lock",
         }
     }
@@ -221,7 +219,7 @@ impl fmt::Display for Error {
             Self::Output { .. } => formatter.write_str("cannot write the output"),
             Self::MissingCharTable { path } => write!(
                 formatter,
-                "{} does not exist: this crate reads char.uni instead of char.bin; create it with `mecab_rs::migrate_char_table` or the `mecab-rs-migrate` binary",
+                "{} does not exist: this crate reads char.uni instead of char.bin; create it with the `mecab-rs-migrate` binary",
                 path.display()
             ),
             Self::Tool {
@@ -239,7 +237,7 @@ impl fmt::Display for Error {
             Self::NulInText => formatter.write_str("the input text contains a NUL character"),
             Self::TextTooLong => write!(
                 formatter,
-                "the input text is longer than {MAX_TEXT_LEN} bytes"
+                "the input text is longer than {MAX_TEXT_LEN} bytes or its path cost exceeds {MAX_NODE_COST}"
             ),
             Self::UnsatisfiableConstraint => {
                 formatter.write_str("no node satisfies the given constraints")

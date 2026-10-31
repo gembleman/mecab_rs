@@ -292,6 +292,13 @@ pub(crate) fn shrink_over<T>(buffer: &mut Vec<T>, keep: usize) {
     }
 }
 
+pub(crate) fn shrink_discarding<T>(buffer: &mut Vec<T>, keep: usize) {
+    if buffer.capacity() > keep {
+        buffer.clear();
+    }
+    shrink_over(buffer, keep);
+}
+
 pub(crate) const MAX_NODE_COST: i32 = 1 << 30;
 
 #[cold]
@@ -431,6 +438,8 @@ impl Lattice {
         shrink_over(&mut self.hits, keep);
         shrink_over(&mut self.path, keep);
         shrink_over(&mut self.links, keep);
+        self.marginals.shrink_oversized(keep);
+        self.agenda.shrink_oversized(keep);
         let keep_slots = RETAINED_MIN_ENTRIES.max(slots);
         if self.ends.len() > keep_slots {
             self.ends.truncate(keep_slots);
@@ -443,12 +452,7 @@ impl Lattice {
         dictionary: &Dictionary,
         sentence: &[u8],
     ) -> Result<NodeId, Error> {
-        self.build_with::<NBEST>(
-            dictionary,
-            &dictionary.system,
-            &dictionary.unknown,
-            sentence,
-        )
+        self.build_with::<NBEST>(dictionary, &dictionary.system, sentence)
     }
 
     #[inline(always)]
@@ -456,7 +460,6 @@ impl Lattice {
         &mut self,
         dictionary: &Dictionary,
         system: &PackedDictionary,
-        unknown: &PackedDictionary,
         sentence: &[u8],
     ) -> Result<NodeId, Error> {
         let sentence_len = sentence.len();
@@ -468,8 +471,7 @@ impl Lattice {
             if self.ends[position].lefts.is_empty() {
                 continue;
             }
-            let begun =
-                self.lookup::<false>(dictionary, system, &view, unknown, sentence, position)?;
+            let begun = self.lookup::<false>(dictionary, system, &view, sentence, position)?;
             self.connect::<NBEST>(dictionary, position, begun)?;
         }
         let last_filled_end = self.last_filled_end_slot(sentence_len);
@@ -481,12 +483,7 @@ impl Lattice {
     }
 
     fn build_best(&mut self, dictionary: &Dictionary, sentence: &[u8]) -> Result<(), Error> {
-        self.build_best_with(
-            dictionary,
-            &dictionary.system,
-            &dictionary.unknown,
-            sentence,
-        )
+        self.build_best_with(dictionary, &dictionary.system, sentence)
     }
 
     #[inline(always)]
@@ -494,7 +491,6 @@ impl Lattice {
         &mut self,
         dictionary: &Dictionary,
         system: &PackedDictionary,
-        unknown: &PackedDictionary,
         sentence: &[u8],
     ) -> Result<(), Error> {
         let sentence_len = sentence.len();
@@ -507,8 +503,7 @@ impl Lattice {
             let lead = sentence[position];
             if !self.ends[position].lefts.is_empty() {
                 let first = self.best_nodes.len();
-                let found =
-                    self.lookup::<true>(dictionary, system, &view, unknown, sentence, position);
+                let found = self.lookup::<true>(dictionary, system, &view, sentence, position);
                 debug_assert!(found.is_ok());
                 self.connect_best(dictionary, position, first)?;
             }

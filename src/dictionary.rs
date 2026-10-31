@@ -34,10 +34,15 @@ const DEFAULT_MAX_GROUPING_SIZE: NonZeroUsize = NonZeroUsize::new(24).unwrap();
 const _: () = assert!(cfg!(target_endian = "little"));
 const _: () = assert!(usize::BITS >= 64);
 
+struct SystemParts {
+    packed: Arc<PackedDictionary>,
+    matrix: Matrix,
+    chars: CharProperty,
+}
+
 pub struct Dictionary {
     pub(crate) system: Arc<PackedDictionary>,
     pub(crate) users: Vec<SystemDictionary>,
-    pub(crate) unknown: Arc<PackedDictionary>,
     pub(crate) matrix: Matrix,
     pub(crate) chars: CharProperty,
     pub(crate) unknown_tokens: Vec<Box<[TokenRecord]>>,
@@ -83,50 +88,64 @@ impl Dictionary {
             ));
         }
         if !expand_cache::is_xz(path) {
-            return Self::open_packed(path, PackedDictionary::open(path)?, user_dictionaries);
+            let system = Self::open_system(path)?;
+            return Self::assemble(path, system, user_dictionaries);
         }
         let cache = expand_cache::ensure(path)?;
-        match PackedDictionary::open(&cache.path) {
-            Ok(packed) => Self::open_packed(&cache.path, packed, user_dictionaries),
+        let system = match Self::open_system(&cache.path) {
             Err(Error::Format { .. }) if cache.expansion == Expansion::Reused => {
                 let cache = expand_cache::replace_damaged(path, &cache)?;
-                let packed = PackedDictionary::open(&cache.path)?;
-                Self::open_packed(&cache.path, packed, user_dictionaries)
+                Self::open_system(&cache.path)?
             }
-            Err(error) => Err(error),
-        }
+            other => other?,
+        };
+        Self::assemble(&cache.path, system, user_dictionaries)
     }
 
-    fn open_packed<P: AsRef<Path>>(
-        path: &Path,
-        packed: PackedDictionary,
-        user_dictionaries: &[P],
-    ) -> Result<Self, Error> {
-        let packed = Arc::new(packed);
+    fn open_system(path: &Path) -> Result<SystemParts, Error> {
+        let packed = Arc::new(PackedDictionary::open(path)?);
         let matrix = Self::open_matrix(path, &packed)?;
         let chars = CharProperty::open_bytes(path, packed.char_table_mapped())?;
+        if (matrix.left_size(), matrix.right_size()) != (packed.left_size(), packed.right_size()) {
+            return Err(Error::format(
+                path,
+                "the matrix size does not match the packed dictionary",
+            ));
+        }
+        Ok(SystemParts {
+            packed,
+            matrix,
+            chars,
+        })
+    }
+
+    fn assemble<P: AsRef<Path>>(
+        path: &Path,
+        system: SystemParts,
+        user_dictionaries: &[P],
+    ) -> Result<Self, Error> {
+        let SystemParts {
+            packed,
+            matrix,
+            chars,
+        } = system;
         let users = Self::open_users(user_dictionaries)?;
         let sizes = (matrix.left_size(), matrix.right_size());
-        let user_sizes = users
+        if !users
             .iter()
-            .map(|user| (user.left_size(), user.right_size()));
-        let dictionary_sizes = std::iter::once((packed.left_size(), packed.right_size()));
-        if !dictionary_sizes
-            .chain(user_sizes)
-            .all(|found| found == sizes)
+            .all(|user| (user.left_size(), user.right_size()) == sizes)
         {
             return Err(Error::format(
                 path,
-                "the matrix size does not match the packed dictionary or a user dictionary",
+                "the matrix size does not match a user dictionary",
             ));
         }
         let unknown_tokens = Self::collect_unknown_tokens(&packed);
         let bos_feature = packed.bos_feature().to_owned();
         let unknown_feature = packed.unknown_feature().map(str::to_owned);
         Ok(Self {
-            system: Arc::clone(&packed),
+            system: packed,
             users,
-            unknown: packed,
             matrix,
             chars,
             unknown_tokens,

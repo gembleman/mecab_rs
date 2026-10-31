@@ -1,4 +1,6 @@
-use super::{Constraint, Dictionary, ElementId, Error, Lattice, NodeSource, PathLink};
+use super::{
+    Constraint, Dictionary, ElementId, Error, Lattice, NodeSource, PathLink, shrink_discarding,
+};
 
 #[derive(Default)]
 pub(super) struct Marginals {
@@ -8,6 +10,16 @@ pub(super) struct Marginals {
     beta: Vec<f32>,
     prob: Vec<f32>,
     seeded: Vec<bool>,
+}
+
+impl Marginals {
+    pub(super) fn shrink_oversized(&mut self, keep: usize) {
+        debug_assert!(!self.ready);
+        shrink_discarding(&mut self.alpha, keep);
+        shrink_discarding(&mut self.beta, keep);
+        shrink_discarding(&mut self.prob, keep);
+        shrink_discarding(&mut self.seeded, keep);
+    }
 }
 
 fn logsumexp(x: f64, y: f64) -> f64 {

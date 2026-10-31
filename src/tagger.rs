@@ -455,7 +455,7 @@ impl<'x> Node<'_, 'x> {
             NodeSource::User(index) => {
                 FeatureText::text(dictionary.users[index.position()].feature(self.raw.feature))
             }
-            NodeSource::Unknown => FeatureText::packed(&dictionary.unknown, self.raw.feature, ""),
+            NodeSource::Unknown => FeatureText::packed(&dictionary.system, self.raw.feature, ""),
             NodeSource::UnknownFixed => {
                 FeatureText::text(dictionary.unknown_feature.as_deref().unwrap_or_default())
             }

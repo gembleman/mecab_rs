@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::Error;
 use crate::dict_files::FEATURE_DEF_FILE;
+use crate::hot_shape::MAX_KEYS;
 use crate::int_templates::IntTemplates;
 use crate::part::IntPart;
 use crate::template_universe::{UniverseSide, read_bigrams, universe_projections};
@@ -12,6 +13,7 @@ const VERSION: u32 = 1;
 const DIGEST_LEN: usize = 8;
 const STREAM_COUNT: usize = 6;
 const TEXT_STREAM: usize = 5;
+const MAX_TEMPLATES: usize = 256;
 
 struct Cursor<'a> {
     bytes: &'a [u8],
@@ -322,6 +324,12 @@ fn read_header(cursor: &mut Cursor, path: &Path) -> Result<Header, Error> {
     for length in &mut lengths {
         *length = cursor.word()? as usize;
     }
+    if !(1..=MAX_KEYS).contains(&left_size) || !(1..=MAX_KEYS).contains(&right_size) {
+        return Err(too_big(path));
+    }
+    if part_count > MAX_TEMPLATES || exception_count > left_size * right_size {
+        return Err(too_big(path));
+    }
     let projection_hash = u64_at(cursor.take(8)?, 0);
     Ok(Header {
         cost_factor,
@@ -345,10 +353,14 @@ fn read_context(
     let text = std::str::from_utf8(cursor.take(header.lengths[TEXT_STREAM])?)
         .map_err(|_| Error::rebuild(path, "the template text is not UTF-8"))?;
     let bigrams = parse_template_text(text, path)?;
+    if bigrams.len() != header.part_count {
+        return Err(Error::rebuild(
+            path,
+            "the template count does not match the data",
+        ));
+    }
     let context = IntContext::new(bigrams, left_id_def, right_id_def, path)?;
-    if context.universe.len() != header.part_count
-        || projection_digest(&context.universe) != header.projection_hash
-    {
+    if projection_digest(&context.universe) != header.projection_hash {
         return Err(Error::rebuild(
             path,
             "the id definitions do not match the data",

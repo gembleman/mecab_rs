@@ -24,14 +24,6 @@ pub(super) struct Span {
     pub end: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct AlignStats {
-    pub hit_bits: f64,
-    pub hits: f64,
-    pub miss_bits: f64,
-    pub misses: f64,
-}
-
 pub(super) fn split_script_runs(s: &str, out: &mut Vec<Run>) {
     out.clear();
     for (i, ch) in s.char_indices() {
@@ -217,19 +209,13 @@ fn code_run_reading(
     } else {
         st.run_readings.find(reading.as_bytes()).unwrap_or(NOVEL)
     };
-    let b0 = coder.bits;
     let hit = st
         .run_ppm
         .code(coder, &[mix(12, hash_bytes(run.as_bytes()))], sym);
-    let b1 = coder.bits;
     let id = if let Some(id) = hit {
-        st.align_stats.hit_bits += b1 - b0;
-        st.align_stats.hits += 1.0;
         id
     } else {
         code_segments(st, coder, run, reading, coded_text);
-        st.align_stats.miss_bits += coder.bits - b0;
-        st.align_stats.misses += 1.0;
         st.run_readings.find_or_add(coded_text.as_bytes())
     };
     st.run_ppm.update(id);

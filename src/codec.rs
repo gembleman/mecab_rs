@@ -11,56 +11,23 @@ use crate::error::Undecodable;
 use crate::wire::{FNV_OFFSET, fnv1a};
 use coder::{Coder, UintModel};
 use header::{
-    Body, CodedHeader, Header, OVERRUN_MESSAGE, corrupt, ensure_not_overrun, header_flags,
-    read_header, stored, write_coded_header,
+    Body, CodedHeader, Header, OVERRUN_MESSAGE, charge_symbol, corrupt, ensure_not_overrun,
+    header_flags, lines_fit_text, read_header, stored, write_coded_header,
 };
 use key_model::KeyModel;
-use model::{ColumnAlign, LidReport, Model, NumNovel};
+use model::{Model, Plan};
 use std::ops::Range;
-use std::time::Instant;
 use table::{Parsed, parse_text};
 use text::CharModel;
 
-pub(crate) use model::Plan;
+pub(crate) use header::MAX_LEXICON_TEXT_LEN;
 pub(crate) use table::Lexicon;
 
-const MAX_KEY_COUNT: usize = 1 << 31;
-const PREALLOC_KEY_LIMIT: usize = 1 << 24;
+const PREALLOC_KEY_LIMIT: usize = 1 << 20;
+const RESERVE_BYTES_PER_INPUT_BYTE: u64 = 1 << 10;
 const IRREGULAR_CHAR_ORDER: usize = 2;
-const SYMBOLS_PER_TEXT_BYTE: u64 = 2;
+const SYMBOLS_PER_TEXT_BYTE: u64 = 3;
 const SYMBOL_SLACK: u64 = 1 << 16;
-
-#[derive(Clone, Default)]
-pub(crate) struct EncodeOptions {
-    pub plan: Option<Plan>,
-    pub report: bool,
-    pub verify: bool,
-}
-
-#[derive(Clone)]
-#[expect(
-    dead_code,
-    reason = "report fields are for diagnostic tooling and are only written here"
-)]
-pub(crate) struct StepBits {
-    pub col: usize,
-    pub kind: String,
-    pub bits: f64,
-}
-
-#[derive(Default, Clone)]
-pub(crate) struct Report {
-    pub keys_bits: f64,
-    pub pos_bits: f64,
-    pub counts_bits: f64,
-    pub steps: Vec<StepBits>,
-    pub irregular_bits: f64,
-    pub lid: Option<LidReport>,
-    pub num_novel: Vec<NumNovel>,
-    pub align: Vec<ColumnAlign>,
-    pub plan_seconds: f64,
-    pub code_seconds: f64,
-}
 
 fn group_bounds(parsed: &Parsed) -> Vec<Range<usize>> {
     let mut groups = Vec::new();
@@ -78,14 +45,6 @@ fn group_bounds(parsed: &Parsed) -> Vec<Range<usize>> {
     groups
 }
 
-pub fn encode_lexicon(csv: &[u8]) -> Vec<u8> {
-    let opts = EncodeOptions {
-        verify: true,
-        ..Default::default()
-    };
-    encode_with(csv, &opts).0
-}
-
 struct EncodeInput<'a> {
     parsed: &'a Parsed,
     groups: &'a [Range<usize>],
@@ -99,33 +58,20 @@ impl EncodeInput<'_> {
     }
 }
 
-fn encode_keys(
-    input: &EncodeInput,
-    key_model: &mut KeyModel,
-    coder: &mut Coder,
-    report: &mut Report,
-) {
+fn encode_keys(input: &EncodeInput, key_model: &mut KeyModel, coder: &mut Coder) {
     let mut key_buf = String::new();
     for group in input.groups {
         key_model.code_key(coder, input.group_key(group), &mut key_buf);
     }
-    report.keys_bits = coder.bits;
 }
 
-fn encode_counts(
-    input: &EncodeInput,
-    key_model: &mut KeyModel,
-    coder: &mut Coder,
-    report: &mut Report,
-) {
-    let bits_before = coder.bits;
+fn encode_counts(input: &EncodeInput, key_model: &mut KeyModel, coder: &mut Coder) {
     for group in input.groups {
         key_model.code_count(coder, input.group_key(group), group.len());
     }
-    report.counts_bits = coder.bits - bits_before;
 }
 
-fn encode_rows(input: &EncodeInput, plan: Plan, coder: &mut Coder, report: &mut Report) {
+fn encode_rows(input: &EncodeInput, plan: Plan, coder: &mut Coder) {
     let lex = &input.parsed.lex;
     if lex.n_cols == 0 {
         return;
@@ -142,25 +88,9 @@ fn encode_rows(input: &EncodeInput, plan: Plan, coder: &mut Coder, report: &mut 
             model.code_row(coder, &fields, "");
         }
     }
-    record_model_report(&model, report);
 }
 
-fn record_model_report(model: &Model, report: &mut Report) {
-    report.pos_bits = model.pos_bits();
-    report.lid = model.lid_stats();
-    report.num_novel = model.num_stats();
-    report.align = model.align_stats();
-    for (si, s) in model.plan().steps.iter().enumerate() {
-        report.steps.push(StepBits {
-            col: s.col,
-            kind: format!("{:?}", s.kind),
-            bits: model.step_bits()[si],
-        });
-    }
-}
-
-fn encode_irregular(lex: &Lexicon, coder: &mut Coder, report: &mut Report) {
-    let bits_before = coder.bits;
+fn encode_irregular(lex: &Lexicon, coder: &mut Coder) {
     let mut irregular_model = CharModel::new(IRREGULAR_CHAR_ORDER);
     let mut gaps = UintModel::default();
     let mut line_buf = Vec::new();
@@ -170,7 +100,6 @@ fn encode_irregular(lex: &Lexicon, coder: &mut Coder, report: &mut Report) {
         previous_at = at;
         irregular_model.code_bytes(coder, line, &mut line_buf);
     }
-    report.irregular_bits = coder.bits - bits_before;
 }
 
 fn verified_or_stored(out: Vec<u8>, parsed: &Parsed, text_len: u64) -> Vec<u8> {
@@ -183,7 +112,7 @@ fn verified_or_stored(out: Vec<u8>, parsed: &Parsed, text_len: u64) -> Vec<u8> {
     stored(&text, lex.no_final_newline, parsed.already_grouped)
 }
 
-pub(crate) fn encode_with(csv: &[u8], opts: &EncodeOptions) -> (Vec<u8>, Report) {
+pub fn encode_lexicon(csv: &[u8]) -> Vec<u8> {
     debug_assert!(u32::try_from(csv.len()).is_ok());
     let parsed = parse_text(csv);
     let lex = &parsed.lex;
@@ -192,13 +121,7 @@ pub(crate) fn encode_with(csv: &[u8], opts: &EncodeOptions) -> (Vec<u8>, Report)
         parsed: &parsed,
         groups: &groups,
     };
-    let t0 = Instant::now();
-    let plan = match &opts.plan {
-        Some(p) => p.clone(),
-        None => plan_choice::choose_plan(&parsed, &groups),
-    };
-    let plan_seconds = t0.elapsed().as_secs_f64();
-    let t1 = Instant::now();
+    let plan = plan_choice::choose_plan(&parsed, &groups);
     let (digest, text_len) = lex.digest(Some(&parsed.order));
 
     let mut out = Vec::new();
@@ -214,20 +137,14 @@ pub(crate) fn encode_with(csv: &[u8], opts: &EncodeOptions) -> (Vec<u8>, Report)
         },
     );
 
-    let mut coder = Coder::encoder(opts.report);
+    let mut coder = Coder::encoder();
     let mut key_model = KeyModel::new();
-    let mut report = Report::default();
-    encode_keys(&input, &mut key_model, &mut coder, &mut report);
-    encode_counts(&input, &mut key_model, &mut coder, &mut report);
-    encode_rows(&input, plan, &mut coder, &mut report);
-    encode_irregular(lex, &mut coder, &mut report);
+    encode_keys(&input, &mut key_model, &mut coder);
+    encode_counts(&input, &mut key_model, &mut coder);
+    encode_rows(&input, plan, &mut coder);
+    encode_irregular(lex, &mut coder);
     out.extend_from_slice(&coder.finish());
-    report.plan_seconds = plan_seconds;
-    report.code_seconds = t1.elapsed().as_secs_f64();
-    if opts.verify {
-        out = verified_or_stored(out, &parsed, text_len);
-    }
-    (out, report)
+    verified_or_stored(out, &parsed, text_len)
 }
 
 fn decode_stored(data: &[u8], h: &Header) -> Result<Lexicon, Undecodable> {
@@ -248,6 +165,7 @@ fn decode_keys(
     let mut keys: Vec<String> = Vec::with_capacity(n_keys.min(PREALLOC_KEY_LIMIT));
     let mut key_buf = String::new();
     for _ in 0..n_keys {
+        charge_symbol(coder)?;
         key_model.code_key(coder, "", &mut key_buf);
         keys.push(key_buf.clone());
         ensure_not_overrun(coder)?;
@@ -262,6 +180,7 @@ fn decode_counts(
 ) -> Result<Vec<usize>, Undecodable> {
     let mut counts = Vec::with_capacity(keys.len());
     for key in keys {
+        charge_symbol(coder)?;
         counts.push(key_model.code_count(coder, key, 0));
         ensure_not_overrun(coder)?;
     }
@@ -284,6 +203,7 @@ fn decode_rows_into(
     for (key, &group_len) in rows.keys.iter().zip(rows.counts) {
         model.start_group();
         for _ in 0..group_len {
+            charge_symbol(coder)?;
             model.code_row(coder, &[], key);
             lex.push_row(model.row());
             if coder.overrun() || lex.data_len() as u64 > rows.text_len {
@@ -304,6 +224,7 @@ fn decode_irregular(
     let rows = lex.rows() as u64;
     let mut at = 0u64;
     for _ in 0..n_irregular {
+        charge_symbol(coder)?;
         at = at.saturating_add(gaps.code(coder, 0));
         if at > rows {
             return corrupt("an irregular line lies past the last row");
@@ -315,6 +236,21 @@ fn decode_irregular(
         ensure_not_overrun(coder)?;
     }
     Ok(())
+}
+
+fn reserve_hint(data_len: usize, text_len: u64) -> u64 {
+    (data_len as u64)
+        .saturating_mul(RESERVE_BYTES_PER_INPUT_BYTE)
+        .min(text_len)
+}
+
+fn reserve_lexicon(lex: &mut Lexicon, total_rows: u64, hint_bytes: u64) -> Result<(), Undecodable> {
+    let hint_rows = hint_bytes / lex.n_cols.max(1) as u64;
+    if lex.reserve(total_rows.min(hint_rows) as usize, hint_bytes as usize) {
+        Ok(())
+    } else {
+        corrupt("text too large")
+    }
 }
 
 fn decode_coded(
@@ -333,22 +269,21 @@ fn decode_coded(
     let n_cols = plan.n_cols;
     let mut lex = Lexicon::new(n_cols);
     lex.no_final_newline = h.no_final_newline;
-    if n_keys > MAX_KEY_COUNT || (n_cols == 0 && n_keys > 0) {
+    if n_cols == 0 && n_keys > 0 {
         return corrupt("bad key count");
     }
     let mut key_model = KeyModel::new();
     let keys = decode_keys(&mut coder, &mut key_model, n_keys)?;
     let counts = decode_counts(&mut coder, &mut key_model, &keys)?;
     let total_rows: u64 = counts.iter().map(|&group_len| group_len as u64).sum();
-    if total_rows > h.text_len {
+    if total_rows < n_keys as u64
+        || !lines_fit_text(h.text_len, n_cols as u64, total_rows, n_irregular as u64)
+    {
         return corrupt("bad row count");
     }
     if n_cols > 0 {
-        if h.text_len > u64::from(u32::MAX)
-            || !lex.reserve(total_rows as usize, h.text_len as usize)
-        {
-            return corrupt("text too large");
-        }
+        let hint_bytes = reserve_hint(data.len() - h.payload, h.text_len);
+        reserve_lexicon(&mut lex, total_rows, hint_bytes)?;
         let rows = DecodeRows {
             plan,
             keys: &keys,

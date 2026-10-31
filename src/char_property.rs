@@ -9,6 +9,7 @@ use crate::char_table::{
     PALETTE_ENTRY_BYTES, VERSION,
 };
 use crate::error::Error;
+use crate::lattice::{RETAINED_MIN_ENTRIES, shrink_discarding};
 use crate::mapped_bytes::MappedBytes;
 use crate::mapped_file::MappedFile;
 use crate::utf8::{
@@ -117,6 +118,7 @@ impl SentenceChars {
         let table = chars.table();
         assert!(u32::try_from(length).is_ok());
         self.length = length;
+        self.shrink_oversized(length);
         if self.entries.len() <= length {
             self.entries.resize(length + 1, Entry::default());
         }
@@ -160,6 +162,10 @@ impl SentenceChars {
                 chain,
             };
         }
+    }
+
+    fn shrink_oversized(&mut self, length: usize) {
+        shrink_discarding(&mut self.entries, RETAINED_MIN_ENTRIES.max(length + 1));
     }
 
     #[inline]

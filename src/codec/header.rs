@@ -13,6 +13,7 @@ const HEADER_PREFIX_LEN: usize = FLAGS_OFFSET + 1;
 const DIGEST_BYTES: usize = 8;
 const STORED_HEADER_SLACK: usize = 32;
 pub(super) const OVERRUN_MESSAGE: &str = "truncated data";
+pub(crate) const MAX_LEXICON_TEXT_LEN: u64 = 1 << 30;
 
 pub(super) enum Body {
     Stored,
@@ -41,6 +42,15 @@ pub(super) fn ensure_not_overrun(coder: &Coder) -> Result<(), Undecodable> {
         return corrupt(OVERRUN_MESSAGE);
     }
     Ok(())
+}
+
+#[inline]
+pub(super) fn charge_symbol(coder: &mut Coder) -> Result<(), Undecodable> {
+    if coder.spend_symbol() {
+        Ok(())
+    } else {
+        corrupt(OVERRUN_MESSAGE)
+    }
 }
 
 pub(super) fn header_flags(no_final_newline: bool, grouped: bool) -> u8 {
@@ -102,6 +112,9 @@ fn read_prefix(data: &[u8]) -> Result<Prefix, Undecodable> {
     let Some(text_len) = get_varint(data, &mut pos) else {
         return corrupt("truncated header");
     };
+    if text_len > MAX_LEXICON_TEXT_LEN {
+        return corrupt("text too large");
+    }
     let Some(digest) = data
         .get(pos..pos + DIGEST_BYTES)
         .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
@@ -117,17 +130,22 @@ fn read_prefix(data: &[u8]) -> Result<Prefix, Undecodable> {
     })
 }
 
+pub(super) fn lines_fit_text(text_len: u64, n_cols: u64, rows: u64, irregular: u64) -> bool {
+    let min_bytes = u128::from(rows) * u128::from(n_cols) + u128::from(irregular);
+    min_bytes <= u128::from(text_len) + 1 && n_cols <= text_len.saturating_add(1)
+}
+
 fn read_coded_body(data: &[u8], prefix: &mut Prefix) -> Result<Body, Undecodable> {
     let pos = &mut prefix.pos;
     let (Some(n_keys), Some(n_irregular)) = (get_varint(data, pos), get_varint(data, pos)) else {
         return corrupt("truncated header");
     };
-    if n_keys > prefix.text_len || n_irregular > prefix.text_len {
-        return corrupt("bad line count");
-    }
     let Some(plan) = Plan::read(data, pos) else {
         return corrupt("bad plan");
     };
+    if !lines_fit_text(prefix.text_len, plan.n_cols as u64, n_keys, n_irregular) {
+        return corrupt("bad line count");
+    }
     Ok(Body::Coded {
         n_keys: n_keys as usize,
         n_irregular: n_irregular as usize,

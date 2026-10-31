@@ -1,6 +1,5 @@
 use super::digits::{canonical_u64, set_u64};
 use super::num::IRREGULAR_FLAG_LIMIT;
-use super::report::{LidModeCounts, LidStats};
 use super::row::RowState;
 use super::spec::LidSpec;
 use crate::codec::coder::{Coder, Flag, UintModel};
@@ -58,8 +57,6 @@ pub(super) struct LidState {
     irregular: Flag,
     partner_bad: Flag,
     last_new: u64,
-    pub stats: LidStats,
-    pub mode_counts: LidModeCounts,
 }
 
 impl LidState {
@@ -76,8 +73,6 @@ impl LidState {
             irregular: Flag::default(),
             partner_bad: Flag::default(),
             last_new: 0,
-            stats: LidStats::default(),
-            mode_counts: LidModeCounts::default(),
         }
     }
 
@@ -98,7 +93,6 @@ impl LidState {
     }
 
     fn code_mode(&mut self, row: &RowState, coder: &mut Coder, want: LidMode) -> LidMode {
-        let b0 = coder.bits;
         let ctxs = [
             mix(mix(32, row.pos_first_hash), row.str_shape),
             mix(30, row.pos_first_hash),
@@ -109,10 +103,7 @@ impl LidState {
             None => coder.uniform(u64::from(want.to_symbol()), LID_MODE_COUNT as u64) as u32,
         };
         self.mode_ppm.update(mode_symbol);
-        let mode = LidMode::from_symbol(mode_symbol);
-        self.stats.mode += coder.bits - b0;
-        self.mode_counts.bump(mode);
-        mode
+        LidMode::from_symbol(mode_symbol)
     }
 
     fn code_new_id(
@@ -304,14 +295,10 @@ fn code_lid_regular(
     if dec && matches!(mode, LidMode::Range | LidMode::OrderDelta) {
         near = encoder_neighbours(st, row, spec);
     }
-    let b1 = coder.bits;
     let new_id = st.code_new_id(coder, mode, id, seen, near);
-    st.stats.add_id_bits(mode, coder.bits - b1);
-    let b2 = coder.bits;
     st.record_new_id(row, spec, mode, kh, new_id);
     let low = st.code_low_bits(row, coder, spec, new_id, v);
     row.lid_ref_key = mix(mix(77, new_id), low >> LO_BITS_MAX) | 1;
-    st.stats.low += coder.bits - b2;
     if dec {
         set_u64(&mut row.fields[col], (new_id << shift) | low);
     }

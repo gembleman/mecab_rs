@@ -1,12 +1,12 @@
 use std::path::Path;
 
 use super::int_stream::{IntContext, decode_payload, encode_payload};
-use super::{IoAction, Part, Parts, io_error};
+use super::{IoAction, MAX_PAYLOAD, Part, Parts, io_error};
 use crate::Error;
 use crate::dict_files::{
     FEATURE_DEF_FILE, LEFT_ID_DEF_FILE, MATRIX_HOT_FILE, MATRIX_ITP_FILE, RIGHT_ID_DEF_FILE,
 };
-use crate::hot_shape::HotShape;
+use crate::hot_shape::{HotShape, MAX_KEYS};
 use crate::int_runtime::{is_runtime_form, runtime_form_of};
 use crate::int_templates::DEFAULT_CLUSTER_COUNT;
 use crate::int_templates::IntTemplates;
@@ -131,6 +131,12 @@ fn parse_integer(bytes: &[u8], path: &Path) -> Result<(IntTemplates, HotShape), 
             .map(|length| u32::from(u16_at(length, 0)))
             .collect(),
     );
+    if hot.rows() > MAX_KEYS || hot.matrix_bytes() as u64 > MAX_PAYLOAD {
+        return Err(Error::format(
+            path,
+            "the hot block is larger than any dictionary",
+        ));
+    }
     let (left_length, right_length) = (take.word()?, take.word()?);
     let left = take.text(left_length)?;
     let right = take.text(right_length)?;

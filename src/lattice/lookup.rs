@@ -42,7 +42,6 @@ impl Lattice {
         dictionary: &Dictionary,
         system: &PackedDictionary,
         view: &PackedView<'_>,
-        unknown: &PackedDictionary,
         sentence: &[u8],
         begin: usize,
     ) -> Result<Range<usize>, Error> {
@@ -61,6 +60,11 @@ impl Lattice {
             return Ok(first..first);
         }
         let char_info = scan.info;
+        let width = if surface == end {
+            chars.char_info(sentence, surface, sentence_len).1
+        } else {
+            scan.width
+        };
         let key_end = if end == surface { sentence_len } else { end };
         let found = HitSite {
             begin,
@@ -81,11 +85,11 @@ impl Lattice {
             end,
             whole,
             char_info,
-            width: scan.width,
+            width,
         };
-        self.add_unknown_candidates::<BEST>(dictionary, unknown, sentence, &site, first);
+        self.add_unknown_candidates::<BEST>(dictionary, system, sentence, &site, first);
         if partial && self.node_count::<BEST>() == first {
-            self.add_constrained_unknown(dictionary, unknown, sentence, begin, surface, end)?;
+            self.add_constrained_unknown(dictionary, system, sentence, begin, surface, end)?;
         }
         Ok(first..self.node_count::<BEST>())
     }
@@ -195,6 +199,9 @@ impl Lattice {
                 continue;
             }
             self.add_unknown::<BEST>(dictionary, unknown, char_info, &site.span(after_char));
+            if after_char == site.end {
+                break;
+            }
             let (next_info, width) = if site.whole {
                 self.sentence_chars.char_info(after_char)
             } else {
@@ -282,8 +289,9 @@ impl Lattice {
     ) -> Result<(), Error> {
         let first = self.nodes.len();
         let mut cursor = surface;
+        let char_limit = if surface == end { sentence.len() } else { end };
         let char_info = loop {
-            let (info, width) = dictionary.chars.char_info(sentence, cursor, end);
+            let (info, width) = dictionary.chars.char_info(sentence, cursor, char_limit);
             cursor += width;
             if cursor > end || !self.constraints.is_inside_token(cursor) {
                 break info;

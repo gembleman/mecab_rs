@@ -34,7 +34,6 @@ pub(super) struct ModelState {
     active: Option<Vec<bool>>,
     has_numbers: bool,
     pub step_bits: Vec<f64>,
-    pub pos_bits: f64,
 }
 
 fn build_steps(plan: &Plan) -> Vec<StepState> {
@@ -84,7 +83,6 @@ impl ModelState {
                 .iter()
                 .any(|s| matches!(s.kind, Kind::Num { .. } | Kind::Lid(_))),
             step_bits: vec![0.0; plan.steps.len()],
-            pos_bits: 0.0,
         }
     }
 
@@ -109,12 +107,10 @@ impl ModelState {
 
     #[inline]
     fn code_pos(&mut self, pos_cols: usize, coder: &mut Coder) {
-        let before = coder.bits;
         if pos_cols > 0 {
             self.pos
                 .code(&mut self.row_state, coder, self.active.is_some());
         }
-        self.pos_bits += coder.bits - before;
     }
 
     #[inline]

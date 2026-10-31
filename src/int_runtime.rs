@@ -486,8 +486,8 @@ impl<S: SectionSource> RuntimeIntTemplates<S> {
         }
         let listed = unsafe { self.columns.view_in(file).get_unchecked(span) };
         match listed.binary_search_by(|exception| (exception & !ABOVE).cmp(&left_node_rc)) {
-            Ok(at) if listed[at] & ABOVE != 0 => computed + 1,
-            Ok(_) => computed - 1,
+            Ok(at) if listed[at] & ABOVE != 0 => computed.saturating_add(1),
+            Ok(_) => computed.saturating_sub(1),
             Err(_) => computed,
         }
     }

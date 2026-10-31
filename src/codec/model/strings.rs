@@ -1,4 +1,4 @@
-use super::align::{AlignStats, code_aligned};
+use super::align::code_aligned;
 use super::row::RowState;
 use super::spec::MAX_RECENT;
 use super::strings_plan::plan_str;
@@ -70,7 +70,6 @@ pub(super) struct StrState {
     limit: usize,
     pub group_plan: Option<GroupPlan>,
     pub group_exact: u32,
-    pub align_stats: AlignStats,
     pub seg_ppm: Ppm,
     pub segs: Interner,
     pub known: HashSet<u64>,
@@ -93,7 +92,6 @@ impl StrState {
             recent: Vec::new(),
             group_plan: None,
             group_exact: 0,
-            align_stats: AlignStats::default(),
             seg_ppm: Ppm::default(),
             segs: Interner::default(),
             known: HashSet::default(),

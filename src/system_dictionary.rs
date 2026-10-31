@@ -210,7 +210,7 @@ impl SystemDictionary {
             features: header.tokens_end..header.features_end,
             left_size: header.left_size,
             right_size: header.right_size,
-            read_block_bytes,
+            read_block_bytes: read_block_bytes.max(1),
         };
         checked.run().map_err(&io_error)?.map_err(broken)?;
         Ok(Self {
@@ -266,7 +266,7 @@ impl SystemDictionary {
         }
         let (value, check) = cell(cells, i64::from(base))?;
         let found = base.cast_unsigned() == check && value < 0;
-        found.then(|| PrefixHit::new(-value - 1, key.len()).tokens())
+        found.then(|| PrefixHit::new(!value, key.len()).tokens())
     }
 
     pub fn token(&self, index: usize) -> TokenRecord {

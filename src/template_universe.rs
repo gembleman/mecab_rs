@@ -11,6 +11,9 @@ use crate::error::{IoAction, io_error};
 #[cfg(feature = "xz")]
 const NO_FIRE_LIMIT: usize = 0xFFFF;
 
+#[cfg(feature = "xz")]
+const MAX_ID_ROWS: usize = 0x1_0000;
+
 #[derive(Debug)]
 pub enum Piece {
     Text(String),
@@ -192,14 +195,26 @@ pub(crate) struct UniverseSide {
 }
 
 #[cfg(feature = "xz")]
+fn bounded_id_rows(text: &str, path: &Path) -> Result<Vec<Vec<String>>, Error> {
+    let rows = id_rows(text, path)?;
+    if rows.len() > MAX_ID_ROWS {
+        return Err(Error::rebuild(
+            path,
+            format!("more than {MAX_ID_ROWS} id rows"),
+        ));
+    }
+    Ok(rows)
+}
+
+#[cfg(feature = "xz")]
 pub(crate) fn universe_projections(
     bigrams: &[(String, String)],
     left_id_def: &str,
     right_id_def: &str,
     source: &Path,
 ) -> Result<Vec<(UniverseSide, UniverseSide)>, Error> {
-    let left_rows = id_rows(right_id_def, &source.join(RIGHT_ID_DEF_FILE))?;
-    let right_rows = id_rows(left_id_def, &source.join(LEFT_ID_DEF_FILE))?;
+    let left_rows = bounded_id_rows(right_id_def, &source.join(RIGHT_ID_DEF_FILE))?;
+    let right_rows = bounded_id_rows(left_id_def, &source.join(LEFT_ID_DEF_FILE))?;
     let side = |keys: Vec<Option<String>>| -> Result<UniverseSide, Error> {
         let distinct: BTreeSet<&str> = keys.iter().flatten().map(String::as_str).collect();
         if distinct.len() > NO_FIRE_LIMIT {

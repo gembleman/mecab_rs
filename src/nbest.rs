@@ -3,6 +3,7 @@ use std::collections::BinaryHeap;
 use std::ops::Range;
 
 use crate::ids::{ElementId, NodeId};
+use crate::lattice::shrink_over;
 
 #[derive(Clone, Copy)]
 pub(super) struct PathLink {
@@ -46,6 +47,15 @@ pub(super) struct Agenda {
 }
 
 impl Agenda {
+    pub(super) fn shrink_oversized(&mut self, keep: usize) {
+        if self.elements.capacity() > keep || self.heap.capacity() > keep {
+            self.elements.clear();
+            self.heap.clear();
+        }
+        shrink_over(&mut self.elements, keep);
+        self.heap.shrink_to(keep);
+    }
+
     pub(super) fn start(&mut self, eos: NodeId) {
         self.elements.clear();
         self.heap.clear();

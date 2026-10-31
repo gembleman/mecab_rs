@@ -3,7 +3,7 @@ use std::io::Write;
 
 use super::{Part, Parts};
 use crate::Error;
-use crate::codec::{decode_lexicon, encode_lexicon};
+use crate::codec::{MAX_LEXICON_TEXT_LEN, decode_lexicon, encode_lexicon};
 use crate::error::Undecodable;
 use crate::packed::model::{Model, Param};
 use crate::wire::{get_varint, put_varint};
@@ -157,9 +157,9 @@ fn unrestorable() -> Error {
 pub(super) fn encode(model: &Model) -> Result<Vec<Part>, Error> {
     check_encodable(model)?;
     let csv = model_to_csv(model)?;
-    if u32::try_from(csv.len()).is_err() {
+    if csv.len() as u64 > MAX_LEXICON_TEXT_LEN {
         return Err(Error::Unsupported(
-            "a lexicon text of 4 GiB or more cannot be coded",
+            "a lexicon text of more than 1 GiB cannot be coded",
         ));
     }
     let lexicon = encode_lexicon(&csv);

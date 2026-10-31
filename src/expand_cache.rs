@@ -15,7 +15,6 @@ const DIGEST_HEX_DIGITS: usize = 16;
 const STALE_LEFTOVER_AGE: Duration = Duration::from_secs(3600);
 const XZ_SUFFIX: &str = ".xz";
 const RUNTIME_SUFFIX: &str = ".mrd";
-const LEGACY_MARKER_SUFFIX: &str = ".src";
 const BAD_SUFFIX: &str = "bad";
 const LOCK_SUFFIX: &str = ".lock";
 const VERSION_MARK: &str = ".v";
@@ -182,21 +181,6 @@ fn remove_leftovers(cache: &Path, base: &str) {
     }
 }
 
-fn remove_legacy_cache(xz: &Path) {
-    let name = xz.file_name().unwrap_or_default().to_string_lossy();
-    let legacy = match strip_suffix_ignoring_case(&name, XZ_SUFFIX) {
-        Some(stem) => xz.with_file_name(stem),
-        None => xz.with_file_name(format!("{name}{RUNTIME_SUFFIX}")),
-    };
-    let mut marker = legacy.clone().into_os_string();
-    marker.push(LEGACY_MARKER_SUFFIX);
-    let marker = PathBuf::from(marker);
-    if marker.is_file() {
-        let _ = fs::remove_file(&legacy);
-        let _ = fs::remove_file(&marker);
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Fingerprint {
     length: u64,
@@ -262,7 +246,6 @@ fn quarantine(cache: &Path) -> Result<(), Error> {
 
 fn clean_around(xz: &Path, cache: &Path) {
     remove_leftovers(cache, &base_name(xz));
-    remove_legacy_cache(xz);
 }
 
 fn lock_path(cache: &Path) -> PathBuf {

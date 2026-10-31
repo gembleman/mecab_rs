@@ -52,10 +52,8 @@ impl<'a> Coder<'a> {
         }
     }
 
-    pub(crate) fn encoder(track_bits: bool) -> Coder<'static> {
-        let mut coder = Coder::new(Mode::Encode);
-        coder.track = track_bits;
-        coder
+    pub(crate) fn encoder() -> Coder<'static> {
+        Coder::new(Mode::Encode)
     }
 
     pub(crate) fn counter() -> Coder<'static> {
