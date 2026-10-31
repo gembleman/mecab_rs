@@ -83,6 +83,10 @@ impl Lexicon {
         }
     }
 
+    fn end_offset(&self) -> u32 {
+        u32::try_from(self.data.len()).unwrap_or(u32::MAX)
+    }
+
     pub fn rows(&self) -> usize {
         self.ends.len().checked_div(self.n_cols).unwrap_or(0)
     }
@@ -107,7 +111,7 @@ impl Lexicon {
         debug_assert_eq!(fields.len(), self.n_cols);
         for f in fields {
             self.data.extend_from_slice(f.as_ref().as_bytes());
-            self.ends.push(self.data.len() as u32);
+            self.ends.push(self.end_offset());
         }
     }
 
@@ -230,7 +234,7 @@ impl Lexicon {
         for &e in ends {
             self.data.extend_from_slice(&buf[start..e as usize]);
             start = e as usize;
-            self.ends.push(self.data.len() as u32);
+            self.ends.push(self.end_offset());
         }
     }
 }

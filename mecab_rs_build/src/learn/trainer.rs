@@ -172,6 +172,10 @@ pub fn train(
         }
     }
 
+    if sentences.is_empty() {
+        return Err(learn_error(corpus, "the corpus has no sentences"));
+    }
+
     let renumbered = index.shrink(freq, &mut observed);
     index.clear_cache();
     features.clear_rewrites();
@@ -262,6 +266,13 @@ pub fn train(
             let penalty = alpha[i] - old_alpha[i];
             objective += penalty * penalty / (2.0 * cost);
             expected[i] = expected[i] - observed[i] + penalty / cost;
+        }
+
+        if !objective.is_finite() {
+            return Err(learn_error(
+                dic_dir,
+                format!("the objective became non-finite at iteration {iteration}"),
+            ));
         }
 
         let diff = if iteration == 0 {

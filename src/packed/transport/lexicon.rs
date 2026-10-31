@@ -156,7 +156,13 @@ fn unrestorable() -> Error {
 
 pub(super) fn encode(model: &Model) -> Result<Vec<Part>, Error> {
     check_encodable(model)?;
-    let lexicon = encode_lexicon(&model_to_csv(model)?);
+    let csv = model_to_csv(model)?;
+    if u32::try_from(csv.len()).is_err() {
+        return Err(Error::Unsupported(
+            "a lexicon text of 4 GiB or more cannot be coded",
+        ));
+    }
+    let lexicon = encode_lexicon(&csv);
     let (unknown, pos) = (unknown_tokens(model), pos_runs(model));
     let restored = restore(&lexicon, &unknown, &pos).map_err(|_| unrestorable())?;
     if !same_lexicon(&restored, model) {

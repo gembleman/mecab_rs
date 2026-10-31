@@ -247,6 +247,7 @@ impl Default for UintModel {
 
 impl UintModel {
     pub(crate) fn code(&mut self, coder: &mut Coder, v: u64) -> u64 {
+        debug_assert!(coder.is_decoder() || v < u64::MAX);
         let value_plus_one = v.wrapping_add(1);
         let bit_len = if coder.is_decoder() {
             0

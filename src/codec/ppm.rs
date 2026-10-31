@@ -376,6 +376,7 @@ impl Ppm {
 
     #[inline]
     pub(crate) fn code(&mut self, coder: &mut Coder, ctxs: &[u64], sym: u32) -> Option<u32> {
+        debug_assert!(ctxs.len() <= MAX_LEVELS);
         if (self.used + MAX_LEVELS) * 2 > self.slots.len() {
             self.grow();
         }

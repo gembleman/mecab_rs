@@ -69,6 +69,8 @@ impl KeyModel {
     }
 
     fn code_first_char(&mut self, coder: &mut Coder, shared_len: usize) -> char {
+        debug_assert!(shared_len < self.prev.len());
+        debug_assert!(coder.is_decoder() || shared_len < self.cur.len());
         let prev_char = self.prev[shared_len] as u32;
         let char_before = if shared_len > 0 {
             self.prev[shared_len - 1] as u64

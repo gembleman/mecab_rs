@@ -457,6 +457,18 @@ impl FeatureIndex {
         let mut entries: Vec<(&Vec<u8>, i32)> =
             self.dic.iter().map(|(key, &id)| (key, id)).collect();
         entries.sort_unstable();
+        if let Some((key, _)) = entries
+            .iter()
+            .find(|&&(_, id)| !alpha[weight_index(id)].is_finite())
+        {
+            return Err(learn_error(
+                path,
+                format!(
+                    "the weight of `{}` is not finite",
+                    String::from_utf8_lossy(key)
+                ),
+            ));
+        }
         write_file(path, |file| {
             let mut file = LineEnds::new(file, ending);
             file.write_all(header.as_bytes())?;

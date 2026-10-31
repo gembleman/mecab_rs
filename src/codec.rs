@@ -182,6 +182,7 @@ fn verified_or_stored(out: Vec<u8>, parsed: &Parsed, text_len: u64) -> Vec<u8> {
 }
 
 pub(crate) fn encode_with(csv: &[u8], opts: &EncodeOptions) -> (Vec<u8>, Report) {
+    debug_assert!(u32::try_from(csv.len()).is_ok());
     let parsed = parse_text(csv);
     let lex = &parsed.lex;
     let groups = group_bounds(&parsed);

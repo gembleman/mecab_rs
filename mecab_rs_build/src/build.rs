@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -98,17 +99,26 @@ impl BuildReport {
 
 const MIN_CSV_NAME_LEN: usize = 5;
 
+fn is_csv_name(name: &OsStr) -> bool {
+    let bytes = name.as_encoded_bytes();
+    bytes.len() >= MIN_CSV_NAME_LEN && bytes.to_ascii_lowercase().ends_with(b".csv")
+}
+
+fn csv_order_key(name: &OsStr) -> (Vec<u8>, &OsStr) {
+    (name.as_encoded_bytes().to_ascii_uppercase(), name)
+}
+
 pub(crate) fn csv_files(dic_dir: &Path) -> Result<Vec<PathBuf>, Error> {
     let mut names = Vec::new();
     let listing = fs::read_dir(dic_dir).map_err(io_error(IoAction::Read, dic_dir))?;
     for entry in listing {
         let entry = entry.map_err(io_error(IoAction::Read, dic_dir))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.len() >= MIN_CSV_NAME_LEN && name.to_ascii_lowercase().ends_with(".csv") {
+        let name = entry.file_name();
+        if is_csv_name(&name) {
             names.push(name);
         }
     }
-    names.sort_by_key(|name| name.to_ascii_uppercase());
+    names.sort_by(|a, b| csv_order_key(a).cmp(&csv_order_key(b)));
     Ok(names.into_iter().map(|name| dic_dir.join(name)).collect())
 }
 

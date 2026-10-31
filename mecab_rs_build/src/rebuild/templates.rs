@@ -111,7 +111,8 @@ fn parse_weight_line<'line, 'names>(
     let weight: f64 = std::str::from_utf8(&line[..tab])
         .ok()
         .and_then(|text| text.parse().ok())
-        .ok_or_else(|| rebuild_error_at(model_def, number, "the weight is not a number"))?;
+        .filter(|weight: &f64| weight.is_finite())
+        .ok_or_else(|| rebuild_error_at(model_def, number, "the weight is not a finite number"))?;
     Ok(Some(WeightEntry {
         targets,
         rest,
