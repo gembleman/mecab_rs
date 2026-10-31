@@ -163,7 +163,7 @@ impl Plan {
         for s in &self.steps {
             let refs: Vec<usize> = match &s.kind {
                 Kind::Lid(l) => {
-                    if l.shift == 0 || l.shift > 54 {
+                    if l.shift == 0 || l.shift > MAX_LID_SHIFT {
                         return false;
                     }
                     l.order
@@ -1087,6 +1087,7 @@ pub const FIXED_COLS: usize = 4;
 const IRREGULAR_FLAG_LIMIT: u32 = 30000;
 const LO_BITS_MAX: u8 = 24;
 pub const MAX_STR_STEPS: usize = 200;
+pub const MAX_LID_SHIFT: u8 = 54;
 
 fn remember(recent: &mut Vec<String>, limit: usize, v: &str) {
     if limit == 0 {
@@ -1625,11 +1626,15 @@ fn code_lid(st: &mut LidState, sh: &mut Shared, c: &mut Coder, col: usize, spec:
             }
             2 => {
                 let a = near.0.unwrap_or(0) as i64;
-                (a + unzigzag(st.delta.code(c, zigzag((id as i64).wrapping_sub(a))))) as u64
+                a.wrapping_add(unzigzag(
+                    st.delta.code(c, zigzag((id as i64).wrapping_sub(a))),
+                )) as u64
             }
             4 => {
                 let a = st.last_new as i64;
-                (a + unzigzag(st.from_last.code(c, zigzag((id as i64).wrapping_sub(a))))) as u64
+                a.wrapping_add(unzigzag(
+                    st.from_last.code(c, zigzag((id as i64).wrapping_sub(a))),
+                )) as u64
             }
             _ => st.direct.code(c, id),
         };

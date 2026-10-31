@@ -17,6 +17,7 @@ const MIN_ORDER_PAIRS: usize = 20;
 const STR_SOURCE_LIMIT: usize = 199;
 const LID_ORDER_CANDIDATES: usize = 3;
 const MAX_POS_COLS: usize = 6;
+const LID_SHIFT_SEARCH_END: u8 = 62;
 
 fn build_sample(parsed: &Parsed, groups: &[(usize, usize)], target: usize) -> Sample {
     let rows = parsed.order.len();
@@ -96,7 +97,7 @@ fn find_shift_pair(lex: &Lexicon, sample: &Sample, cols: &[usize]) -> Option<(us
             if a == b {
                 continue;
             }
-            'shift: for s in 1..=62u8 {
+            'shift: for s in 1..=LID_SHIFT_SEARCH_END {
                 let mut nonzero = false;
                 let mut varies = false;
                 let mut first = None;

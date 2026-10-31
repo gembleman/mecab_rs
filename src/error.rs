@@ -76,7 +76,7 @@ impl fmt::Display for Error {
             }
             Self::MissingCharTable { path } => write!(
                 formatter,
-                "{} does not exist: this crate reads char.uni instead of char.bin; create it                  with `mecab_rs::migrate_char_table` or the `mecab-rs-migrate` binary",
+                "{} does not exist: this crate reads char.uni instead of char.bin; create it with `mecab_rs::migrate_char_table` or the `mecab-rs-migrate` binary",
                 path.display()
             ),
             Self::Rebuild { path, reason } => {
