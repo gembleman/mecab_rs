@@ -1,13 +1,11 @@
 use std::mem::size_of;
 use std::path::Path;
 
-use memmap2::Mmap;
-
-use crate::dictionary::map_file;
 use crate::error::Error;
 use crate::hot_shape::{CELL_SUM_BOUND, MAX_KEYS};
 use crate::int_templates::{MAGIC, MAX_COST_FACTOR, MAX_SHIFT, int_cost};
 use crate::mapped_bytes::MappedBytes;
+use crate::mapped_file::MappedFile;
 use crate::section::{Section, SectionSource};
 use crate::templates::TemplateReader;
 
@@ -361,7 +359,7 @@ impl RuntimeArrays {
     }
 }
 
-pub struct RuntimeIntTemplates<S = Mmap> {
+pub struct RuntimeIntTemplates<S = MappedFile> {
     map: S,
     cost_factor: u32,
     shift: u32,
@@ -380,10 +378,10 @@ pub struct RuntimeIntTemplates<S = Mmap> {
     tables: Section<u8>,
 }
 
-impl RuntimeIntTemplates<Mmap> {
+impl RuntimeIntTemplates<MappedFile> {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
-        Self::from_source(map_file(path)?, path)
+        Self::from_source(MappedFile::open(path)?, path)
     }
 }
 

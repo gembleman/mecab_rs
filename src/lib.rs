@@ -20,6 +20,7 @@ mod int_runtime;
 mod int_templates;
 mod lattice;
 mod mapped_bytes;
+mod mapped_file;
 mod matrix;
 mod nbest;
 pub mod packed;
@@ -42,4 +43,6 @@ pub use dictionary::Dictionary;
 pub use error::{Error, ToolStage};
 pub use feature_text::FeatureText;
 pub use partial::PartialInput;
-pub use tagger::{DEFAULT_THETA, FeatureId, LatticeView, NBest, Node, NodeKind, Path, Tagger};
+pub use tagger::{
+    DEFAULT_THETA, DictionaryHandle, FeatureId, LatticeView, NBest, Node, NodeKind, Path, Tagger,
+};

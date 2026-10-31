@@ -1,12 +1,9 @@
-use std::fs::File;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
-use memmap2::Mmap;
-
 use crate::char_property::CharProperty;
-use crate::error::{Error, io_error};
+use crate::error::Error;
 use crate::expand_cache;
 use crate::matrix::Matrix;
 use crate::packed::PackedDictionary;
@@ -33,27 +30,8 @@ impl UserIndex {
 }
 const DEFAULT_MAX_GROUPING_SIZE: NonZeroUsize = NonZeroUsize::new(24).unwrap();
 
-pub(crate) fn map_open_file(file: &File, path: &Path) -> Result<Mmap, Error> {
-    unsafe { Mmap::map(file) }.map_err(io_error(path))
-}
-
-#[cfg(windows)]
-const SHARE_READ_AND_DELETE: u32 = 1 | 4;
-
-pub(crate) fn open_unwritable(path: &Path) -> std::io::Result<File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, SHARE_READ_AND_DELETE);
-    options.open(path)
-}
-
-pub(crate) fn map_file(path: &Path) -> Result<Mmap, Error> {
-    let file = open_unwritable(path).map_err(io_error(path))?;
-    map_open_file(&file, path)
-}
-
 const _: () = assert!(cfg!(target_endian = "little"));
+const _: () = assert!(usize::BITS >= 64);
 
 pub struct Dictionary {
     pub(crate) system: Arc<PackedDictionary>,

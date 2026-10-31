@@ -8,9 +8,9 @@ use crate::char_table::{
     BMP_LEN, CHAR_TABLE_HEADER_BYTES, CODE_POINTS, EXTENDER_FLAG, MAGIC, MAX_PALETTE,
     PALETTE_ENTRY_BYTES, VERSION,
 };
-use crate::dictionary::map_file;
 use crate::error::Error;
 use crate::mapped_bytes::MappedBytes;
+use crate::mapped_file::MappedFile;
 use crate::utf8::{
     CONTINUATION_PAYLOAD, FOUR_BYTE_LEAD, FOUR_BYTE_PAYLOAD, THREE_BYTE_PAYLOAD, TWO_BYTE_PAYLOAD,
     is_continuation, is_four_byte_lead, is_three_byte_lead, is_two_byte_lead,
@@ -247,7 +247,7 @@ impl CharProperty {
                 path: path.to_path_buf(),
             });
         }
-        let map = MappedBytes::whole(map_file(path)?);
+        let map = MappedBytes::whole(MappedFile::open(path)?);
         Self::from_mapped(map, path)
     }
 

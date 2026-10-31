@@ -3,8 +3,6 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
-use memmap2::Mmap;
-
 use super::bits::{MAX_RECORD_BITS, mask_of, section_bytes};
 use super::features::check::MappedLayout;
 use super::features::{FeatureView, NumSpec, check as feature_check};
@@ -19,11 +17,11 @@ use super::{
 };
 use crate::char_property::SentenceChars;
 use crate::char_table::{CHAR_TABLE_HEADER_BYTES, MAGIC as CHAR_TABLE_MAGIC};
-use crate::dictionary::{map_open_file, open_unwritable};
 use crate::error::{Error, io_error};
 use crate::hot_shape::HotShape;
 use crate::int_runtime::is_runtime_form;
 use crate::mapped_bytes::MappedBytes;
+use crate::mapped_file::{MappedFile, open_unwritable};
 use crate::matrix::MATRIX_HEADER_BYTES;
 use crate::section::Section;
 use crate::system_dictionary::PrefixHit;
@@ -109,7 +107,7 @@ impl Source<'_> {
 }
 
 pub struct PackedDictionary {
-    map: Arc<Mmap>,
+    map: Arc<MappedFile>,
     sections: [Range<usize>; SECTIONS],
     char_index: Section<u16>,
     char_blocks: Section<u16>,
@@ -139,12 +137,12 @@ impl PackedDictionary {
         read_at(&file, &mut header_bytes, 0).map_err(io_error(path))?;
         let header = validate::parse_header(&header_bytes, path)?;
         let sections = validate::parse_sections(&header_bytes, file_length, path)?;
+        let map = Arc::new(MappedFile::map(file, path)?);
         let source = Source {
-            file: &file,
+            file: map.file(),
             path,
             sections: sections.clone(),
         };
-        let map = Arc::new(map_open_file(&file, path)?);
         if map.len() as u64 != file_length {
             return Err(Error::format(path, "the file changed while it was opened"));
         }
@@ -154,7 +152,7 @@ impl PackedDictionary {
 
     fn from_validated(
         path: &Path,
-        map: Arc<Mmap>,
+        map: Arc<MappedFile>,
         sections: [Range<usize>; SECTIONS],
         validated: validate::Validated,
     ) -> Result<Self, Error> {

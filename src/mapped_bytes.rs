@@ -1,16 +1,16 @@
 use std::ops::{Deref, Range};
 use std::sync::Arc;
 
-use memmap2::Mmap;
+use crate::mapped_file::MappedFile;
 
 #[derive(Clone)]
 pub(crate) struct MappedBytes {
-    map: Arc<Mmap>,
+    map: Arc<MappedFile>,
     range: Range<usize>,
 }
 
 impl MappedBytes {
-    pub(crate) fn whole(map: Mmap) -> Self {
+    pub(crate) fn whole(map: MappedFile) -> Self {
         let length = map.len();
         Self {
             map: Arc::new(map),
@@ -18,7 +18,7 @@ impl MappedBytes {
         }
     }
 
-    pub(crate) fn from_arc(map: Arc<Mmap>, range: Range<usize>) -> Option<Self> {
+    pub(crate) fn from_arc(map: Arc<MappedFile>, range: Range<usize>) -> Option<Self> {
         (range.start <= range.end && range.end <= map.len()).then_some(Self { map, range })
     }
 

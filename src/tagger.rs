@@ -1,6 +1,6 @@
-use std::ops::Deref;
 use std::ops::Range;
 use std::slice;
+use std::sync::Arc;
 
 use crate::constraint::{Constraint, ConstraintSet};
 use crate::dictionary::Dictionary;
@@ -37,12 +37,36 @@ fn check_text(text: &str) -> Result<(), Error> {
     Ok(())
 }
 
+mod sealed {
+    pub trait Sealed {}
+}
+
+pub trait DictionaryHandle: sealed::Sealed {
+    fn dictionary(&self) -> &Dictionary;
+}
+
+impl sealed::Sealed for &Dictionary {}
+
+impl DictionaryHandle for &Dictionary {
+    fn dictionary(&self) -> &Dictionary {
+        self
+    }
+}
+
+impl sealed::Sealed for Arc<Dictionary> {}
+
+impl DictionaryHandle for Arc<Dictionary> {
+    fn dictionary(&self) -> &Dictionary {
+        self
+    }
+}
+
 pub struct Tagger<D> {
     dictionary: D,
     lattice: Lattice,
 }
 
-impl<D: Deref<Target = Dictionary>> Tagger<D> {
+impl<D: DictionaryHandle> Tagger<D> {
     pub fn new(dictionary: D) -> Self {
         Self {
             dictionary,
@@ -56,12 +80,12 @@ impl<D: Deref<Target = Dictionary>> Tagger<D> {
         run: impl FnOnce(&mut Lattice, &Dictionary) -> Result<(), Error>,
     ) -> Result<(), Error> {
         check_text(text)?;
-        run(&mut self.lattice, &self.dictionary)
+        run(&mut self.lattice, self.dictionary.dictionary())
     }
 
     fn frame<'t, 'x>(&'t self, text: &'x str) -> Frame<'t, 'x> {
         Frame {
-            dictionary: &self.dictionary,
+            dictionary: self.dictionary.dictionary(),
             constraints: self.lattice.constraints(),
             text,
         }
@@ -121,7 +145,7 @@ impl<D: Deref<Target = Dictionary>> Tagger<D> {
             lattice.start_nbest(dictionary, text, constraints)
         })?;
         Ok(NBest {
-            dictionary: &self.dictionary,
+            dictionary: self.dictionary.dictionary(),
             lattice: &mut self.lattice,
             text,
         })

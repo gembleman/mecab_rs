@@ -4,10 +4,8 @@ use std::ops::Range;
 use std::path::Path;
 use std::thread;
 
-use memmap2::Mmap;
-
-use crate::dictionary::{map_open_file, open_unwritable};
 use crate::error::{Error, io_error};
+use crate::mapped_file::MappedFile;
 use crate::section::{Plain, Section};
 use crate::utf8::is_continuation;
 use crate::wire::u32_at;
@@ -165,7 +163,7 @@ fn check_last_feature_byte(file: &File, header: &Header, path: &Path) -> Result<
 }
 
 pub struct SystemDictionary {
-    map: Mmap,
+    map: MappedFile,
     left_size: usize,
     right_size: usize,
     cells: Section<[u32; 2]>,
@@ -184,8 +182,7 @@ impl SystemDictionary {
         read_block_bytes: usize,
     ) -> Result<Self, Error> {
         let io_error = io_error(path);
-        let file = open_unwritable(path).map_err(&io_error)?;
-        let map = map_open_file(&file, path)?;
+        let map = MappedFile::open(path)?;
         let broken = |reason| Error::format(path, reason);
         let bytes = &map[..];
         let header = Header::parse(bytes, kind, path)?;
@@ -193,9 +190,9 @@ impl SystemDictionary {
             .ok_or_else(|| broken("the double array is misaligned"))?;
         let tokens = Section::new(bytes, header.array_end..header.tokens_end)
             .ok_or_else(|| broken("the token table is misaligned"))?;
-        check_last_feature_byte(&file, &header, path)?;
+        check_last_feature_byte(map.file(), &header, path)?;
         let checked = Checked {
-            file: &file,
+            file: map.file(),
             cells: HEADER_SIZE..header.array_end,
             tokens: header.array_end..header.tokens_end,
             features: header.tokens_end..header.features_end,

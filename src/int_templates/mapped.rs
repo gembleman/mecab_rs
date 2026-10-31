@@ -1,16 +1,14 @@
 use std::path::Path;
 
-use memmap2::Mmap;
-
 use super::{MAX_PARTS, RuntimeInputs, TemplateHeader, int_cost, validate};
 use crate::clusters::MappedClusters;
-use crate::dictionary::map_file;
 use crate::error::Error;
+use crate::mapped_file::MappedFile;
 use crate::part::{MappedPart, total_of};
 use crate::section::{Section, SectionSource};
 use crate::templates::TemplateReader;
 
-pub struct MappedIntTemplates<S = Mmap> {
+pub struct MappedIntTemplates<S = MappedFile> {
     map: S,
     cost_factor: u32,
     shift: u32,
@@ -66,10 +64,10 @@ fn exception_row_starts(cells: &[u32], left_size: usize, right_size: usize) -> V
     exception_rows
 }
 
-impl MappedIntTemplates<Mmap> {
+impl MappedIntTemplates<MappedFile> {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
-        Self::from_source(map_file(path)?, path)
+        Self::from_source(MappedFile::open(path)?, path)
     }
 }
 

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use memmap2::{Mmap, MmapOptions};
+use memmap2::MmapOptions;
 
 use super::{
     ABOVE, BLOCK_BYTES, BLOCK_CELLS, MIN_SPARSE_GAIN, RUNTIME_VERSION, SHAPE_WORDS, TABLE_SLACK,
@@ -10,6 +10,7 @@ use crate::dict_files::MATRIX_ITP_FILE;
 use crate::error::{Error, io_error};
 use crate::hot_shape::HotShape;
 use crate::int_templates::{MAGIC, MappedIntTemplates, RuntimeInputs, int_cost};
+use crate::section::SectionSource;
 use crate::templates::write_array;
 
 struct Renumbered {
@@ -39,7 +40,8 @@ fn renumber(keys: impl Iterator<Item = u16>, count: usize, hot: usize) -> Renumb
     }
 }
 
-impl MappedIntTemplates<Mmap> {
+#[allow(private_bounds, reason = "the section source bound is crate internal")]
+impl<S: SectionSource> MappedIntTemplates<S> {
     pub fn runtime_form(&self, shape: &HotShape) -> Result<Vec<u8>, Error> {
         let inputs = self.runtime_inputs().ok_or(Error::Unsupported(
             "integer templates without clusters have no runtime form",

@@ -21,6 +21,18 @@ impl SectionSource for memmap2::Mmap {
     }
 }
 
+impl SectionSource for crate::mapped_file::MappedFile {
+    #[inline]
+    fn bytes(&self, start: usize, end: usize) -> &[u8] {
+        &self[start..end]
+    }
+
+    #[inline]
+    fn all_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
 impl SectionSource for MappedBytes {
     #[inline]
     fn bytes(&self, start: usize, end: usize) -> &[u8] {
