@@ -135,6 +135,37 @@ fn cut_at_nul(key: &mut Vec<u8>) {
     }
 }
 
+fn identity_renumbering(size: usize) -> Vec<i32> {
+    (0..size)
+        .map(|id| i32::try_from(id).expect("fewer than 2^31 features"))
+        .collect()
+}
+
+fn renumbering(counts: &[usize], freq: usize) -> Vec<i32> {
+    let mut next = 0i32;
+    counts
+        .iter()
+        .map(|&count| {
+            if count >= freq {
+                next += 1;
+                next - 1
+            } else {
+                DROPPED
+            }
+        })
+        .collect()
+}
+
+pub(super) fn remap_weights(old: &[f64], renumbered: &[i32], size: usize) -> Vec<f64> {
+    let mut remapped = vec![0.0; size];
+    for (&weight, &new) in old.iter().zip(renumbered) {
+        if new >= 0 {
+            remapped[new as usize] = weight;
+        }
+    }
+    remapped
+}
+
 impl FeatureIndex {
     pub(super) fn open(dic_dir: &Path) -> Result<Self, Error> {
         let feature_def = dic_dir.join("feature.def");
@@ -220,7 +251,7 @@ impl FeatureIndex {
         })
     }
 
-    pub(super) fn shrink(&mut self, freq: usize, observed: &mut Vec<f64>) {
+    pub(super) fn shrink(&mut self, freq: usize, observed: &mut Vec<f64>) -> Vec<i32> {
         let mut counts = vec![0usize; self.maxid];
         for cached in self.cache.values() {
             let mut at = cached.start as usize;
@@ -230,17 +261,11 @@ impl FeatureIndex {
             }
         }
         if freq <= 1 {
-            return;
+            return identity_renumbering(counts.len());
         }
 
-        self.maxid = 0;
-        let mut renumbered = vec![DROPPED; counts.len()];
-        for (old, &count) in counts.iter().enumerate() {
-            if count >= freq {
-                renumbered[old] = i32::try_from(self.maxid).expect("fewer than 2^31 features");
-                self.maxid += 1;
-            }
-        }
+        let renumbered = renumbering(&counts, freq);
+        self.maxid = renumbered.iter().filter(|&&new| new != DROPPED).count();
 
         self.dic.retain(|_, id| {
             let new = renumbered[*id as usize];
@@ -262,14 +287,8 @@ impl FeatureIndex {
             self.pool[to] = ID_LIST_END;
         }
 
-        let mut shrunk = vec![0.0; self.maxid];
-        for (old, &value) in observed.iter().enumerate() {
-            let new = renumbered[old];
-            if new >= 0 {
-                shrunk[new as usize] = value;
-            }
-        }
-        *observed = shrunk;
+        *observed = remap_weights(observed, &renumbered, self.maxid);
+        renumbered
     }
 
     pub(super) fn clear_cache(&mut self) {
@@ -314,7 +333,10 @@ impl FeatureIndex {
         if model_charset.is_empty() {
             return Err(failure(path, "charset is empty"));
         }
-        if Charset::decode(&model_charset) != Charset::decode(dictionary_charset) {
+        let old_charset = Charset::parse(&model_charset).map_err(|reason| failure(path, reason))?;
+        let new_charset =
+            Charset::parse(dictionary_charset).map_err(|reason| failure(path, reason))?;
+        if old_charset != new_charset {
             return Err(failure(
                 path,
                 format!("cannot create model from={model_charset} to={dictionary_charset}"),

@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::features::{FeatureIndex, Features};
+use super::features::{FeatureIndex, Features, remap_weights};
 use super::lattice::{Reader, Sentence};
 use super::lbfgs::Lbfgs;
 use super::tokenizer::Tokenizer;
@@ -135,10 +135,7 @@ pub fn train(
         return Err(failure(dic_dir, "unk-eval-size is out of range: 0"));
     }
     if freq == 0 {
-        return Err(failure(
-            dic_dir,
-            format!("freq is out of range: {unk_eval_size}"),
-        ));
+        return Err(failure(dic_dir, format!("freq is out of range: {freq}")));
     }
     if threads == 0 || threads > MAX_THREADS {
         return Err(failure(dic_dir, format!("# thread is invalid: {threads}")));
@@ -170,14 +167,14 @@ pub fn train(
         }
     }
 
-    index.shrink(freq, &mut observed);
+    let renumbered = index.shrink(freq, &mut observed);
     index.clear_cache();
     features.clear_rewrites();
 
     let size = index.size();
     observed.resize(size, 0.0);
     let mut expected = vec![0.0; size];
-    old_alpha.resize(size, 0.0);
+    let old_alpha = remap_weights(&old_alpha, &renumbered, size);
     let mut alpha = old_alpha.clone();
 
     let _ = writeln!(log);

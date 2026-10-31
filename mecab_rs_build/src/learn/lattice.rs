@@ -250,7 +250,10 @@ impl Sentence {
         let mut sentence = Vec::new();
         loop {
             let Some(line) = lines.next_line()? else {
-                return Ok(None);
+                if words.is_empty() {
+                    return Ok(None);
+                }
+                return Err(failure(&path, "missing EOS at the end of the corpus"));
             };
             let text = cstr(line, 0);
             if text == b"EOS" || text.is_empty() {

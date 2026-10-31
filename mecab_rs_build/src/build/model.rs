@@ -138,8 +138,11 @@ fn require_same_charset(
     if dictionary_charset.is_empty() {
         return Ok(());
     }
-    let model = Charset::decode(&String::from_utf8_lossy(model_charset));
-    if model != Charset::decode(dictionary_charset) {
+    let model = Charset::parse(&String::from_utf8_lossy(model_charset))
+        .map_err(|reason| failure(text_model, reason))?;
+    let dictionary =
+        Charset::parse(dictionary_charset).map_err(|reason| failure(text_model, reason))?;
+    if model != dictionary {
         return Err(failure(
             text_model,
             format!(
@@ -431,7 +434,11 @@ impl CostModel {
             .is_some_and(|count| count * ENTRY_BYTES + COUNT_BYTES + CHARSET_BYTES == bytes.len());
         let bytes = if is_binary {
             let name = cstr(&bytes[COUNT_BYTES..COUNT_BYTES + CHARSET_BYTES], 0);
-            if Charset::decode(&String::from_utf8_lossy(name)) != Charset::decode(charset) {
+            let model_charset = Charset::parse(&String::from_utf8_lossy(name))
+                .map_err(|reason| failure(model, reason))?;
+            let dictionary_charset =
+                Charset::parse(charset).map_err(|reason| failure(model, reason))?;
+            if model_charset != dictionary_charset {
                 return Err(failure(
                     model,
                     format!(

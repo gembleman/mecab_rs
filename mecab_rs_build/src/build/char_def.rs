@@ -62,7 +62,15 @@ fn parse_hex_code(text: &[u8], path: &Path) -> Result<i32, Error> {
     let mut value: i32 = 0;
     for &digit in digits {
         let digit = char::from(digit).to_digit(16).ok_or_else(no_hex)?;
-        value = value.wrapping_mul(16).wrapping_add(digit as i32);
+        value = value
+            .checked_mul(16)
+            .and_then(|value| value.checked_add(digit as i32))
+            .ok_or_else(|| {
+                failure(
+                    path,
+                    format!("hex value overflows: {}", String::from_utf8_lossy(text)),
+                )
+            })?;
     }
     Ok(value)
 }
@@ -188,6 +196,16 @@ fn read_char_def(char_def: &Path) -> Result<CharDef, Error> {
             if columns.len() < 4 {
                 return Err(failure(&source, format!("format error: {shown}")));
             }
+            if first.len() >= NAME_BYTES {
+                return Err(failure(
+                    &source,
+                    format!(
+                        "category name is longer than {} bytes: {}",
+                        NAME_BYTES - 1,
+                        String::from_utf8_lossy(first)
+                    ),
+                ));
+            }
             if categories.contains_key(first) {
                 return Err(failure(
                     &source,
@@ -294,8 +312,8 @@ pub(super) fn compile(char_def: &Path, unk_def: &Path) -> Result<Vec<u8>, Error>
     bytes.extend_from_slice(&(categories.len() as u32).to_le_bytes());
     for name in &order {
         let mut padded = [0u8; NAME_BYTES];
-        let length = name.len().min(NAME_BYTES - 1);
-        padded[..length].copy_from_slice(&name[..length]);
+        debug_assert!(name.len() < NAME_BYTES);
+        padded[..name.len()].copy_from_slice(name);
         bytes.extend_from_slice(&padded);
     }
     for info in &table {

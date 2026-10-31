@@ -258,6 +258,9 @@ impl CharTable {
                 name[..length.unwrap_or(NAME_BYTES)].to_vec()
             })
             .collect();
+        if names.iter().any(|name| name.len() >= NAME_BYTES) {
+            return Err(broken("a category name has no terminating NUL"));
+        }
         let mut interner = Interner {
             palette: Vec::new(),
             index: HashMap::new(),
@@ -336,8 +339,8 @@ impl CharTable {
         output.write_all(&(self.palette.len() as u32).to_le_bytes())?;
         for name in &self.names {
             let mut padded = [0u8; NAME_BYTES];
-            let length = name.len().min(NAME_BYTES - 1);
-            padded[..length].copy_from_slice(&name[..length]);
+            debug_assert!(name.len() < NAME_BYTES);
+            padded[..name.len()].copy_from_slice(name);
             output.write_all(&padded)?;
         }
         for entry in &self.palette {

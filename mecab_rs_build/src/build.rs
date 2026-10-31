@@ -74,12 +74,13 @@ pub(crate) enum Charset {
 }
 
 impl Charset {
-    pub(crate) fn decode(name: &str) -> Self {
+    pub(crate) fn parse(name: &str) -> Result<Self, String> {
         match name.to_ascii_lowercase().as_str() {
+            "" | "utf8" | "utf_8" | "utf-8" => Ok(Self::Utf8),
             "sjis" | "shift-jis" | "shift_jis" | "cp932" | "euc" | "euc_jp" | "euc-jp"
             | "utf16" | "utf_16" | "utf-16" | "utf16be" | "utf_16be" | "utf-16be" | "utf16le"
-            | "utf_16le" | "utf-16le" | "ascii" => Self::Other,
-            _ => Self::Utf8,
+            | "utf_16le" | "utf-16le" | "ascii" => Ok(Self::Other),
+            _ => Err(format!("unknown charset: {name}")),
         }
     }
 }
@@ -176,7 +177,8 @@ impl Settings {
             ),
             (&self.config_charset, "config-charset"),
         ] {
-            if Charset::decode(name) != Charset::Utf8 {
+            let charset = Charset::parse(name).map_err(|reason| failure(&dicrc, reason))?;
+            if charset != Charset::Utf8 {
                 return Err(failure(
                     &dicrc,
                     format!(

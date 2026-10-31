@@ -58,7 +58,8 @@ impl ConstraintSet {
                     end,
                     pattern,
                 } => {
-                    if start >= end || end > text_len || pattern.contains('\0') {
+                    let end = end.min(text_len);
+                    if start >= end || pattern.contains('\0') {
                         continue;
                     }
                     self.set_feature(text_len, start, end, pattern);
