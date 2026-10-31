@@ -195,7 +195,7 @@ fn lid_trial(
     specs[best].clone()
 }
 
-pub fn choose_plan(parsed: &Parsed, groups: &[Range<usize>]) -> Plan {
+pub(crate) fn choose_plan(parsed: &Parsed, groups: &[Range<usize>]) -> Plan {
     let lex = &parsed.lex;
     let n = lex.n_cols;
     let mut plan = Plan {

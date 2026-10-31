@@ -431,7 +431,9 @@ fn main() {
         "mecab_rs" => {
             let t = Instant::now();
             let mut d = mecab_rs::Dictionary::open(&o.dict).expect("open mecab_rs dictionary");
-            d.set_max_grouping_size(o.max_grouping);
+            d.set_max_grouping_size(
+                std::num::NonZeroUsize::new(o.max_grouping).expect("--max-grouping is positive"),
+            );
             let load_s = t.elapsed().as_secs_f64();
             let mut es = MecabRs {
                 tagger: mecab_rs::Tagger::new(&d),

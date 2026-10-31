@@ -1,7 +1,7 @@
 use crate::wire::{FNV_OFFSET, fnv1a};
 use std::collections::HashMap;
 
-pub fn parse_line(line: &str, buf: &mut Vec<u8>, ends: &mut Vec<u32>) -> bool {
+pub(crate) fn parse_line(line: &str, buf: &mut Vec<u8>, ends: &mut Vec<u32>) -> bool {
     let bytes = line.as_bytes();
     let mut i = 0;
     loop {
@@ -181,13 +181,13 @@ impl Lexicon {
     }
 }
 
-pub struct Parsed {
+pub(crate) struct Parsed {
     pub lex: Lexicon,
     pub order: Vec<u32>,
     pub already_grouped: bool,
 }
 
-pub fn parse_text(text: &[u8]) -> Parsed {
+pub(crate) fn parse_text(text: &[u8]) -> Parsed {
     let no_final_newline = text.last().is_some_and(|&last| last != b'\n');
     let body = if text.last() == Some(&b'\n') {
         &text[..text.len() - 1]

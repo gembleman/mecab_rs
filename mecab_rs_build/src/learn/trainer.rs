@@ -6,7 +6,7 @@ use super::lattice::{Reader, Sentence};
 use super::lbfgs::Lbfgs;
 use super::tokenizer::Tokenizer;
 use super::{Config, Existing, LineEnding, format_g, open_lines};
-use mecab_rs::__private::DICRC_FILE;
+use mecab_rs::__private::files::DICRC_FILE;
 use mecab_rs::Error;
 
 const MAX_THREADS: usize = 512;

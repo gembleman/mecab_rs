@@ -5,10 +5,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use mecab_rs::__private::{
-    CHAR_BIN_FILE, CHAR_DEF_FILE, CHAR_TABLE_FILE, HotShape, MATRIX_COST_BYTES,
-    MATRIX_HEADER_BYTES, i16_at,
-};
+use mecab_rs::__private::files::{CHAR_BIN_FILE, CHAR_DEF_FILE, CHAR_TABLE_FILE};
+use mecab_rs::__private::in_range_bytes::i16_at;
+use mecab_rs::__private::matrix::{HotShape, MATRIX_COST_BYTES, MATRIX_HEADER_BYTES};
 use mecab_rs::CharTable;
 use mecab_rs_build::rebuild;
 use mecab_rs_build::rebuild::{PAIR_COUNT_BYTES, PairCount, hot_shape_from_pair_counts};
@@ -257,9 +256,9 @@ fn parse_check_args(args: &Args) -> Result<CheckArgs, String> {
     Ok(parsed)
 }
 
-fn read_templates(path: &Path) -> Result<mecab_rs::__private::IntTemplates, String> {
+fn read_templates(path: &Path) -> Result<mecab_rs::__private::matrix::IntTemplates, String> {
     let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    mecab_rs::__private::IntTemplates::from_file_bytes(&bytes, path).map_err(shown)
+    mecab_rs::__private::matrix::IntTemplates::from_file_bytes(&bytes, path).map_err(shown)
 }
 
 fn check_runtime_int(args: &Args) -> Result<(), String> {
@@ -272,8 +271,8 @@ fn check_runtime_int(args: &Args) -> Result<(), String> {
     };
     let dense = dense.map(|path| read_dense(path)).transpose()?;
     let templates = read_templates(full)?;
-    let full = mecab_rs::__private::MappedIntTemplates::open(full).map_err(shown)?;
-    let runtime = mecab_rs::__private::RuntimeIntTemplates::open(runtime).map_err(shown)?;
+    let full = mecab_rs::__private::matrix::MappedIntTemplates::open(full).map_err(shown)?;
+    let runtime = mecab_rs::__private::matrix::RuntimeIntTemplates::open(runtime).map_err(shown)?;
     let (left_size, right_size) = (full.left_size(), full.right_size());
     if (left_size, right_size) != (runtime.left_size(), runtime.right_size()) {
         return Err("the two files have different sizes".into());
@@ -295,8 +294,12 @@ fn check_runtime_int(args: &Args) -> Result<(), String> {
                         continue;
                     }
                     let (column_id, row_id) = (column as u16, row as u16);
-                    let expected = full.cost(column_id, row_id);
-                    let found = runtime.cost(column_id, row_id);
+                    let expected = full
+                        .try_cost(column_id, row_id)
+                        .expect("cell inside the matrix");
+                    let found = runtime
+                        .try_cost(column_id, row_id)
+                        .expect("cell inside the matrix");
                     let by_templates = (row * 31 + column) % 61 == 0;
                     let real = dense
                         .as_ref()
@@ -304,7 +307,11 @@ fn check_runtime_int(args: &Args) -> Result<(), String> {
                     comparison.compared_cell();
                     if !real
                         || found != expected
-                        || (by_templates && templates.cost(column_id, row_id) != found)
+                        || (by_templates
+                            && templates
+                                .try_cost(column_id, row_id)
+                                .expect("cell inside the matrix")
+                                != found)
                     {
                         comparison.mismatch(column, row, expected, found);
                     }
@@ -327,7 +334,7 @@ fn check_runtime_int(args: &Args) -> Result<(), String> {
 
 #[cfg(feature = "pair-stats")]
 fn pair_stats(args: &Args) -> Result<(), String> {
-    const STATS_MAX_GROUPING: usize = 10;
+    const STATS_MAX_GROUPING: std::num::NonZeroUsize = std::num::NonZeroUsize::new(10).unwrap();
     let mut output = None;
     let mut inputs: Vec<PathBuf> = Vec::new();
     let mut iterator = args.iter();
@@ -359,7 +366,7 @@ fn pair_stats(args: &Args) -> Result<(), String> {
             sentences += 1;
         }
     }
-    let pairs: Vec<PairCount> = mecab_rs::__private::take_pair_counts()
+    let pairs: Vec<PairCount> = mecab_rs::__private::support::take_pair_counts()
         .into_iter()
         .map(|(row, column, count)| PairCount { row, column, count })
         .collect();

@@ -2,6 +2,23 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolStage {
+    Rebuild,
+    Build,
+    Learn,
+}
+
+impl ToolStage {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Rebuild => "rebuild",
+            Self::Build => "build",
+            Self::Learn => "learn",
+        }
+    }
+}
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -21,15 +38,8 @@ pub enum Error {
     MissingCharTable {
         path: PathBuf,
     },
-    Rebuild {
-        path: PathBuf,
-        reason: String,
-    },
-    Build {
-        path: PathBuf,
-        reason: String,
-    },
-    Learn {
+    Tool {
+        stage: ToolStage,
         path: PathBuf,
         reason: String,
     },
@@ -55,25 +65,24 @@ impl Error {
         }
     }
 
-    pub fn rebuild(path: &Path, reason: impl Into<String>) -> Self {
-        Self::Rebuild {
+    pub fn tool(stage: ToolStage, path: &Path, reason: impl Into<String>) -> Self {
+        Self::Tool {
+            stage,
             path: path.to_path_buf(),
             reason: reason.into(),
         }
+    }
+
+    pub fn rebuild(path: &Path, reason: impl Into<String>) -> Self {
+        Self::tool(ToolStage::Rebuild, path, reason)
     }
 
     pub fn build(path: &Path, reason: impl Into<String>) -> Self {
-        Self::Build {
-            path: path.to_path_buf(),
-            reason: reason.into(),
-        }
+        Self::tool(ToolStage::Build, path, reason)
     }
 
     pub fn learn(path: &Path, reason: impl Into<String>) -> Self {
-        Self::Learn {
-            path: path.to_path_buf(),
-            reason: reason.into(),
-        }
+        Self::tool(ToolStage::Learn, path, reason)
     }
 }
 
@@ -113,18 +122,17 @@ impl fmt::Display for Error {
                 "{} does not exist: this crate reads char.uni instead of char.bin; create it with `mecab_rs::migrate_char_table` or the `mecab-rs-migrate` binary",
                 path.display()
             ),
-            Self::Rebuild { path, reason } => {
+            Self::Tool {
+                stage,
+                path,
+                reason,
+            } => {
                 write!(
                     formatter,
-                    "cannot rebuild from {}: {reason}",
+                    "cannot {} from {}: {reason}",
+                    stage.verb(),
                     path.display()
                 )
-            }
-            Self::Build { path, reason } => {
-                write!(formatter, "cannot build from {}: {reason}", path.display())
-            }
-            Self::Learn { path, reason } => {
-                write!(formatter, "cannot learn from {}: {reason}", path.display())
             }
             Self::Unsupported(what) => write!(formatter, "unsupported: {what}"),
             Self::NulInText => formatter.write_str("the input text contains a NUL character"),

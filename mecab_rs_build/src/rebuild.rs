@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 
-use mecab_rs::__private::{
-    HEADER_SIZE, LEFT_ID_DEF_FILE, MAGIC_ID, MATRIX_BIN_FILE, RIGHT_ID_DEF_FILE, SYS_DIC_FILE,
-    TOKEN_SIZE, UNK_DIC_FILE, io_error, u16_at, u32_at, write_file, write_file_with,
+use mecab_rs::__private::dictionary_format::{HEADER_SIZE, MAGIC_ID, TOKEN_SIZE};
+use mecab_rs::__private::files::{
+    LEFT_ID_DEF_FILE, MATRIX_BIN_FILE, RIGHT_ID_DEF_FILE, SYS_DIC_FILE, UNK_DIC_FILE, io_error,
+    write_file, write_file_with,
 };
+use mecab_rs::__private::in_range_bytes::{u16_at, u32_at};
 use mecab_rs::{Dictionary, Error, Tagger};
 
 mod hot_pairs;
@@ -17,7 +19,7 @@ mod runtime;
 mod templates;
 
 pub use hot_pairs::{PAIR_COUNT_BYTES, PairCount, hot_shape_from_pair_counts};
-pub use mecab_rs::__private::default_threads;
+pub use mecab_rs::__private::support::default_threads;
 pub use runtime::{RuntimeOptions, RuntimeReport, StatsSource, build_runtime};
 pub use templates::{DEFAULT_HOT_CELLS, compile_templates};
 

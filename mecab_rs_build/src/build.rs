@@ -2,10 +2,11 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use mecab_rs::__private::{
-    CHAR_BIN_FILE, CHAR_DEF_FILE, CHAR_TABLE_FILE, DICRC_FILE, DictionaryKind, MATRIX_BIN_FILE,
-    MATRIX_DEF_FILE, MODEL_BIN_FILE, MODEL_DEF_FILE, SYS_DIC_FILE, UNK_DEF_FILE, UNK_DIC_FILE,
-    io_error, write_file, write_file_with,
+use mecab_rs::__private::dictionary_format::DictionaryKind;
+use mecab_rs::__private::files::{
+    CHAR_BIN_FILE, CHAR_DEF_FILE, CHAR_TABLE_FILE, DICRC_FILE, MATRIX_BIN_FILE, MATRIX_DEF_FILE,
+    MODEL_BIN_FILE, MODEL_DEF_FILE, SYS_DIC_FILE, UNK_DEF_FILE, UNK_DIC_FILE, io_error, write_file,
+    write_file_with,
 };
 use mecab_rs::CharTable;
 use mecab_rs::Error;

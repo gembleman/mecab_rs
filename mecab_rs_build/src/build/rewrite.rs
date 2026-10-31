@@ -5,7 +5,7 @@ use super::text::{
     LINE_BUFFER_BYTES, Lines, MAX_DEF_COLUMNS, atoi, cstr, escape_csv_element, tokenize_csv,
     tokenize2,
 };
-use mecab_rs::__private::POS_ID_DEF_FILE;
+use mecab_rs::__private::files::POS_ID_DEF_FILE;
 use mecab_rs::Error;
 
 struct RewritePattern {

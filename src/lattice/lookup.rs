@@ -1,6 +1,6 @@
 use super::{
     Candidate, CharInfo, Dictionary, Error, HitSite, Lattice, LinkSpan, NodeSource,
-    PackedDictionary, PackedView, Range, RawNode, Span, SystemDictionary,
+    PackedDictionary, PackedView, Range, RawNode, Span, SystemDictionary, UserIndex,
 };
 
 impl Lattice {
@@ -62,7 +62,7 @@ impl Lattice {
             self.push_system_hits::<BEST>(
                 dictionary,
                 user,
-                NodeSource::User(index as u8),
+                NodeSource::User(UserIndex::from_position(index)),
                 sentence,
                 &found,
             );
@@ -91,7 +91,7 @@ impl Lattice {
                 chars.seek_other_type(sentence, after_char, end, char_info)
             };
             after_char = grouped_end;
-            if group_scan.count <= dictionary.max_grouping_size {
+            if group_scan.count <= dictionary.max_grouping_size.get() {
                 let span = Span {
                     begin,
                     surface,

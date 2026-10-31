@@ -1,4 +1,4 @@
-use mecab_rs::__private::Part;
+use mecab_rs::__private::matrix::Part;
 use mecab_rs::Error;
 
 const MIN_COST: f64 = -32767.0;

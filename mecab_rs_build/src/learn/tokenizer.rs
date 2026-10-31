@@ -2,11 +2,12 @@ use std::path::Path;
 
 use super::Config;
 use crate::build::char_def::CharProperty;
-use mecab_rs::__private::{
-    CHAR_BIN_FILE, DEFAULT_TYPE_MASK, DEFAULT_TYPE_SHIFT, DICRC_FILE, DictionaryKind, FLAG_MASK,
-    GROUP_SHIFT, INVOKE_SHIFT, LENGTH_MASK, LENGTH_SHIFT, PrefixHit, SYS_DIC_FILE,
-    SystemDictionary, TYPE_MASK, UNK_DIC_FILE,
+use mecab_rs::__private::char_layout::{
+    DEFAULT_TYPE_MASK, DEFAULT_TYPE_SHIFT, FLAG_MASK, GROUP_SHIFT, INVOKE_SHIFT, LENGTH_MASK,
+    LENGTH_SHIFT, TYPE_MASK,
 };
+use mecab_rs::__private::dictionary_format::{DictionaryKind, PrefixHit, SystemDictionary};
+use mecab_rs::__private::files::{CHAR_BIN_FILE, DICRC_FILE, SYS_DIC_FILE, UNK_DIC_FILE};
 use mecab_rs::Error;
 
 const DEFAULT_MAX_GROUPING_SIZE: usize = 24;
@@ -175,8 +176,8 @@ impl Tokenizer {
                 let token = self.system.token(index);
                 found.push(Found {
                     position: begin2,
-                    length: hit.length,
-                    rlength: begin2 - begin + hit.length,
+                    length: hit.length(),
+                    rlength: begin2 - begin + hit.length(),
                     kind: NORMAL,
                     char_type: default_type(cinfo) as u8,
                     feature: FeatureSource::System(token.feature),

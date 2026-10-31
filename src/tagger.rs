@@ -11,9 +11,10 @@ use crate::lattice::{Lattice, NodeSource, RawNode};
 
 pub const DEFAULT_THETA: f32 = 0.75;
 
-const UNKNOWN_FEATURE_ID_BIT: u64 = 1 << 32;
-const UNKNOWN_FIXED_FEATURE_ID: u64 = 1 << 33;
-const USER_DICTIONARY_ID_SHIFT: u32 = 40;
+const FEATURE_OFFSET_BITS: u32 = 32;
+const UNKNOWN_FEATURE_ID_BIT: u64 = 1 << FEATURE_OFFSET_BITS;
+const UNKNOWN_FIXED_FEATURE_ID: u64 = 1 << (FEATURE_OFFSET_BITS + 1);
+const USER_DICTIONARY_ID_SHIFT: u32 = FEATURE_OFFSET_BITS + 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeKind {
@@ -49,6 +50,30 @@ impl<D: Deref<Target = Dictionary>> Tagger<D> {
         }
     }
 
+    fn run_on(
+        &mut self,
+        text: &str,
+        run: impl FnOnce(&mut Lattice, &Dictionary) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        check_text(text)?;
+        run(&mut self.lattice, &self.dictionary)
+    }
+
+    fn frame<'t, 'x>(&'t self, text: &'x str) -> Frame<'t, 'x> {
+        Frame {
+            dictionary: &self.dictionary,
+            constraints: self.lattice.constraints(),
+            text,
+        }
+    }
+
+    fn view<'t, 'x>(&'t self, text: &'x str) -> LatticeView<'t, 'x> {
+        LatticeView {
+            frame: self.frame(text),
+            lattice: &self.lattice,
+        }
+    }
+
     pub fn parse<'t, 'x>(&'t mut self, text: &'x str) -> Result<Path<'t, 'x>, Error> {
         self.parse_with(text, &[])
     }
@@ -58,19 +83,10 @@ impl<D: Deref<Target = Dictionary>> Tagger<D> {
         text: &'x str,
         constraints: &[Constraint<'_>],
     ) -> Result<Path<'t, 'x>, Error> {
-        check_text(text)?;
-        self.lattice
-            .parse_best(&self.dictionary, text, constraints)?;
-        Ok(Path {
-            frame: Frame {
-                dictionary: &self.dictionary,
-                constraints: self.lattice.constraints(),
-                text,
-            },
-            nodes: self.lattice.nodes(),
-            order: self.lattice.path().iter(),
-            cost: self.lattice.path_cost(),
-        })
+        self.run_on(text, |lattice, dictionary| {
+            lattice.parse_best(dictionary, text, constraints)
+        })?;
+        Ok(self.view(text).best_path())
     }
 
     pub fn parse_lattice<'t, 'x>(
@@ -78,16 +94,10 @@ impl<D: Deref<Target = Dictionary>> Tagger<D> {
         text: &'x str,
         constraints: &[Constraint<'_>],
     ) -> Result<LatticeView<'t, 'x>, Error> {
-        check_text(text)?;
-        self.lattice.parse(&self.dictionary, text, constraints)?;
-        Ok(LatticeView {
-            frame: Frame {
-                dictionary: &self.dictionary,
-                constraints: self.lattice.constraints(),
-                text,
-            },
-            lattice: &self.lattice,
-        })
+        self.run_on(text, |lattice, dictionary| {
+            lattice.parse(dictionary, text, constraints)
+        })?;
+        Ok(self.view(text))
     }
 
     pub fn parse_marginal<'t, 'x>(
@@ -96,17 +106,10 @@ impl<D: Deref<Target = Dictionary>> Tagger<D> {
         constraints: &[Constraint<'_>],
         theta: f32,
     ) -> Result<LatticeView<'t, 'x>, Error> {
-        check_text(text)?;
-        self.lattice
-            .parse_marginal(&self.dictionary, text, constraints, theta)?;
-        Ok(LatticeView {
-            frame: Frame {
-                dictionary: &self.dictionary,
-                constraints: self.lattice.constraints(),
-                text,
-            },
-            lattice: &self.lattice,
-        })
+        self.run_on(text, |lattice, dictionary| {
+            lattice.parse_marginal(dictionary, text, constraints, theta)
+        })?;
+        Ok(self.view(text))
     }
 
     pub fn parse_nbest<'t, 'x>(
@@ -114,9 +117,9 @@ impl<D: Deref<Target = Dictionary>> Tagger<D> {
         text: &'x str,
         constraints: &[Constraint<'_>],
     ) -> Result<NBest<'t, 'x>, Error> {
-        check_text(text)?;
-        self.lattice
-            .start_nbest(&self.dictionary, text, constraints)?;
+        self.run_on(text, |lattice, dictionary| {
+            lattice.start_nbest(dictionary, text, constraints)
+        })?;
         Ok(NBest {
             dictionary: &self.dictionary,
             lattice: &mut self.lattice,
@@ -175,10 +178,12 @@ impl<'t, 'x> LatticeView<'t, 'x> {
     }
 
     pub fn bos(&self) -> Node<'t, 'x> {
+        debug_assert!(!self.lattice.nodes().is_empty());
         self.node(&self.lattice.nodes()[0])
     }
 
     pub fn eos(&self) -> Node<'t, 'x> {
+        debug_assert!(!self.lattice.nodes().is_empty());
         self.node(
             self.lattice
                 .nodes()
@@ -197,6 +202,10 @@ impl<'t, 'x> LatticeView<'t, 'x> {
     }
 
     pub fn is_best(&self, node: Node<'_, '_>) -> bool {
+        debug_assert!(
+            self.lattice.path().is_sorted_by_key(|id| id.index()),
+            "the best path is in ascending node order"
+        );
         self.index_of(node).is_some_and(|index| {
             self.lattice
                 .path()
@@ -350,7 +359,7 @@ impl<'x> Node<'_, 'x> {
                 dictionary.system.key_of(self.surface(), self.raw.feature),
             ),
             NodeSource::User(index) => {
-                FeatureText::text(dictionary.users[usize::from(index)].feature(self.raw.feature))
+                FeatureText::text(dictionary.users[index.position()].feature(self.raw.feature))
             }
             NodeSource::Unknown => FeatureText::packed(&dictionary.unknown, self.raw.feature, ""),
             NodeSource::UnknownFixed => {
@@ -368,7 +377,7 @@ impl<'x> Node<'_, 'x> {
         match self.raw.source {
             NodeSource::System | NodeSource::SystemExtended => Some(FeatureId(offset)),
             NodeSource::User(index) => Some(FeatureId(
-                ((u64::from(index) + 1) << USER_DICTIONARY_ID_SHIFT) | offset,
+                (index.number() << USER_DICTIONARY_ID_SHIFT) | offset,
             )),
             NodeSource::Unknown => Some(FeatureId(offset | UNKNOWN_FEATURE_ID_BIT)),
             NodeSource::UnknownFixed => Some(FeatureId(UNKNOWN_FIXED_FEATURE_ID)),

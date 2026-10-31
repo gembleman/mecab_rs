@@ -27,7 +27,7 @@ use crate::mapped_bytes::MappedBytes;
 use crate::matrix::MATRIX_HEADER_BYTES;
 use crate::section::Section;
 use crate::system_dictionary::PrefixHit;
-pub use crate::system_dictionary::TokenRecord;
+pub(crate) use crate::system_dictionary::TokenRecord;
 use crate::templates::{TEMPLATE_HEADER_PEEK_BYTES, header_sizes};
 use crate::utf8::is_continuation;
 use crate::wire::{u16_at, u16_values, u32_at, u32_values, u64_at};

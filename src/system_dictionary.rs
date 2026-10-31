@@ -18,15 +18,15 @@ pub const HEADER_SIZE: usize = 72;
 pub const TOKEN_SIZE: usize = 16;
 pub const VALUE_SIZE_BITS: u32 = 8;
 const VALUE_SIZE_MASK: i32 = 0xff;
-pub const OUTSIDE_TOKEN_TABLE: &str = "a double array entry points outside the token table";
+pub(crate) const OUTSIDE_TOKEN_TABLE: &str = "a double array entry points outside the token table";
 const VERSION_AT: usize = 4;
 const KIND_AT: usize = 8;
 const LEFT_SIZE_AT: usize = 16;
 const RIGHT_SIZE_AT: usize = 20;
-pub const ARRAY_BYTES_AT: usize = 24;
-pub const TOKEN_BYTES_AT: usize = 28;
-pub const FEATURE_BYTES_AT: usize = 32;
-pub const CHARSET_AT: usize = 40;
+pub(crate) const ARRAY_BYTES_AT: usize = 24;
+pub(crate) const TOKEN_BYTES_AT: usize = 28;
+pub(crate) const FEATURE_BYTES_AT: usize = 32;
+pub(crate) const CHARSET_AT: usize = 40;
 pub const CHARSET_BYTES: usize = HEADER_SIZE - CHARSET_AT;
 const CHARSET: Range<usize> = CHARSET_AT..HEADER_SIZE;
 const UTF8_NAMES: [&[u8]; 2] = [b"utf-8", b"utf8"];
@@ -55,7 +55,7 @@ fn is_utf8_charset(name: &[u8]) -> bool {
 pub struct PrefixHit {
     pub(crate) first_token: usize,
     pub(crate) token_count: usize,
-    pub length: usize,
+    pub(crate) length: usize,
 }
 
 impl PrefixHit {
@@ -146,12 +146,11 @@ impl SystemDictionary {
         if !is_utf8_charset(charset_name(bytes)) {
             return Err(Error::Unsupported("a dictionary charset other than UTF-8"));
         }
-        let array_end = HEADER_SIZE + u32_at(bytes, ARRAY_BYTES_AT) as usize;
-        let tokens_end = array_end + u32_at(bytes, TOKEN_BYTES_AT) as usize;
-        let features_end = tokens_end + u32_at(bytes, FEATURE_BYTES_AT) as usize;
-        if features_end != bytes.len() {
+        let ends = section_ends(bytes);
+        let Some((array_end, tokens_end, features_end)) = ends.filter(|ends| ends.2 == bytes.len())
+        else {
             return Err(broken("the section sizes do not add up to the file size"));
-        }
+        };
         let left_size = u32_at(bytes, LEFT_SIZE_AT) as usize;
         let right_size = u32_at(bytes, RIGHT_SIZE_AT) as usize;
         let cells = Section::new(bytes, HEADER_SIZE..array_end)
@@ -252,8 +251,17 @@ impl SystemDictionary {
 
 const PARALLEL_MIN_BYTES: usize = 1 << 22;
 const MAX_CHECK_THREADS: usize = 8;
-pub const CHECK_BLOCK_BYTES: usize = 1 << 18;
-pub const CELL_SIZE: usize = 8;
+pub(crate) const CHECK_BLOCK_BYTES: usize = 1 << 18;
+pub(crate) const CELL_SIZE: usize = 8;
+
+fn section_ends(bytes: &[u8]) -> Option<(usize, usize, usize)> {
+    let end_after =
+        |start: usize, size_at: usize| start.checked_add(u32_at(bytes, size_at) as usize);
+    let array_end = end_after(HEADER_SIZE, ARRAY_BYTES_AT)?;
+    let tokens_end = end_after(array_end, TOKEN_BYTES_AT)?;
+    let features_end = end_after(tokens_end, FEATURE_BYTES_AT)?;
+    Some((array_end, tokens_end, features_end))
+}
 
 fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
     while !buf.is_empty() {

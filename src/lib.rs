@@ -2,7 +2,7 @@
 pub mod __private;
 mod char_layout;
 mod char_property;
-pub mod char_table;
+mod char_table;
 mod clusters;
 #[cfg(feature = "xz")]
 mod codec;
@@ -39,7 +39,7 @@ mod wire;
 pub use char_table::{CharTable, migrate_char_table};
 pub use constraint::{BoundaryKind, Constraint};
 pub use dictionary::Dictionary;
-pub use error::Error;
+pub use error::{Error, ToolStage};
 pub use feature_text::FeatureText;
 pub use partial::PartialInput;
 pub use tagger::{DEFAULT_THETA, FeatureId, LatticeView, NBest, Node, NodeKind, Path, Tagger};

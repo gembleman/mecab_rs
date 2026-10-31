@@ -719,7 +719,14 @@ impl<S: SectionSource> RuntimeIntTemplates<S> {
         self.hot_right
     }
 
-    pub fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
+    pub fn try_cost(&self, left_node_rc: u16, right_node_lc: u16) -> Option<i16> {
+        let (column, row) = (usize::from(left_node_rc), usize::from(right_node_lc));
+        let in_cold_part = column >= self.hot_left || row >= self.hot_right;
+        let inside = column < self.left_size && row < self.right_size;
+        (in_cold_part && inside).then(|| self.cost(left_node_rc, right_node_lc))
+    }
+
+    pub(crate) fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
         let (column, row) = (usize::from(left_node_rc), usize::from(right_node_lc));
         assert!(
             column >= self.hot_left || row >= self.hot_right,

@@ -15,8 +15,8 @@ use std::time::Instant;
 use table::{Parsed, parse_text};
 use text::CharModel;
 
-pub use model::Plan;
-pub use table::Lexicon;
+pub(crate) use model::Plan;
+pub(crate) use table::Lexicon;
 
 const MAGIC: &[u8; 4] = b"MLX1";
 const FLAG_NO_FINAL_NEWLINE: u8 = 1;
@@ -32,7 +32,7 @@ const STORED_HEADER_SLACK: usize = 32;
 const OVERRUN_MESSAGE: &str = "truncated data";
 
 #[derive(Clone, Default)]
-pub struct EncodeOptions {
+pub(crate) struct EncodeOptions {
     pub plan: Option<Plan>,
     pub report: bool,
     pub verify: bool,
@@ -43,14 +43,14 @@ pub struct EncodeOptions {
     dead_code,
     reason = "report fields are for diagnostic tooling and are only written here"
 )]
-pub struct StepBits {
+pub(crate) struct StepBits {
     pub col: usize,
     pub kind: String,
     pub bits: f64,
 }
 
 #[derive(Default, Clone)]
-pub struct Report {
+pub(crate) struct Report {
     pub keys_bits: f64,
     pub pos_bits: f64,
     pub counts_bits: f64,
@@ -211,7 +211,7 @@ pub fn encode_lexicon(csv: &[u8]) -> Vec<u8> {
     encode_with(csv, &opts).0
 }
 
-pub fn encode_with(csv: &[u8], opts: &EncodeOptions) -> (Vec<u8>, Report) {
+pub(crate) fn encode_with(csv: &[u8], opts: &EncodeOptions) -> (Vec<u8>, Report) {
     let parsed = parse_text(csv);
     let lex = &parsed.lex;
     let groups = group_bounds(&parsed);

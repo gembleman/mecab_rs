@@ -1,4 +1,5 @@
-use mecab_rs::__private::{HotShape, u16_at, u32_at};
+use mecab_rs::__private::in_range_bytes::{u16_at, u32_at};
+use mecab_rs::__private::matrix::HotShape;
 
 const BISECTION_ROUNDS: usize = 64;
 const LARGEST_PENALTY: f64 = 1e15;

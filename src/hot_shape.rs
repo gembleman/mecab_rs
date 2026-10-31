@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-pub const HOT_HEADER_BYTES: usize = 8;
+pub(crate) const HOT_HEADER_BYTES: usize = 8;
 pub(crate) const MAX_KEYS: usize = 0xFFFF;
 pub(crate) const CELL_SUM_BOUND: u128 = 1 << 62;
 const ROWS_PER_BLOCK: usize = 64;

@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use crate::build::text::{LINE_BUFFER_BYTES, Lines, key_value};
-use mecab_rs::__private::io_error;
+use mecab_rs::__private::files::io_error;
 use mecab_rs::Error;
 
 mod dict_gen;

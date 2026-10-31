@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 
-use mecab_rs::__private::io_error;
+use mecab_rs::__private::files::io_error;
 use mecab_rs::Error;
 
 pub(crate) const LINE_BUFFER_BYTES: usize = 8192;

@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,7 +13,25 @@ use crate::packed::PackedDictionary;
 use crate::system_dictionary::{DictionaryKind, SystemDictionary, TokenRecord};
 
 const MAX_USER_DICTIONARIES: usize = u8::MAX as usize;
-const DEFAULT_MAX_GROUPING_SIZE: usize = 24;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UserIndex(u8);
+
+impl UserIndex {
+    pub(crate) fn from_position(position: usize) -> Self {
+        debug_assert!(position < MAX_USER_DICTIONARIES);
+        Self(position as u8)
+    }
+
+    pub(crate) fn position(self) -> usize {
+        usize::from(self.0)
+    }
+
+    pub(crate) fn number(self) -> u64 {
+        u64::from(self.0) + 1
+    }
+}
+const DEFAULT_MAX_GROUPING_SIZE: NonZeroUsize = NonZeroUsize::new(24).unwrap();
 
 pub(crate) fn map_open_file(file: &File, path: &Path) -> Result<Mmap, Error> {
     unsafe { Mmap::map(file) }.map_err(io_error(path))
@@ -45,15 +64,15 @@ pub struct Dictionary {
     pub(crate) unknown_tokens: Vec<Box<[TokenRecord]>>,
     pub(crate) bos_feature: String,
     pub(crate) unknown_feature: Option<String>,
-    pub(crate) max_grouping_size: usize,
+    pub(crate) max_grouping_size: NonZeroUsize,
 }
 
 impl Dictionary {
-    pub fn max_grouping_size(&self) -> usize {
+    pub fn max_grouping_size(&self) -> NonZeroUsize {
         self.max_grouping_size
     }
 
-    pub fn set_max_grouping_size(&mut self, size: usize) {
+    pub fn set_max_grouping_size(&mut self, size: NonZeroUsize) {
         self.max_grouping_size = size;
     }
 

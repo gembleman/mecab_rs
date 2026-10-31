@@ -23,14 +23,14 @@ const EX_DOMAIN: u64 = 1001;
 const MAX_RECENT: usize = 8;
 const EX_REF_OFFSET: u32 = 1;
 const NO_PREVIOUS: u64 = 0;
-pub const FIXED_COLS: usize = 4;
+pub(crate) const FIXED_COLS: usize = 4;
 const IRREGULAR_FLAG_LIMIT: u32 = 30000;
 const LO_BITS_MAX: u8 = 24;
-pub const MAX_STR_STEPS: usize = 200;
-pub const MAX_LID_SHIFT: u8 = 54;
+pub(crate) const MAX_STR_STEPS: usize = 200;
+pub(crate) const MAX_LID_SHIFT: u8 = 54;
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct LidSpec {
+pub(crate) struct LidSpec {
     pub shift: u8,
     pub partner: Option<usize>,
     pub order: Option<usize>,
@@ -40,7 +40,7 @@ pub struct LidSpec {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum NumMode {
+pub(crate) enum NumMode {
     Plain = 0,
     Surface = 1,
     LidLinked = 2,
@@ -99,7 +99,7 @@ impl LidMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct LidStats {
+pub(crate) struct LidStats {
     pub mode: f64,
     pub seen: f64,
     pub range: f64,
@@ -120,7 +120,7 @@ impl LidStats {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LidModeCounts {
+pub(crate) struct LidModeCounts {
     pub seen: u64,
     pub range: u64,
     pub order_delta: u64,
@@ -141,13 +141,13 @@ impl LidModeCounts {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LidReport {
+pub(crate) struct LidReport {
     pub stats: LidStats,
     pub mode_counts: LidModeCounts,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct AlignStats {
+pub(crate) struct AlignStats {
     pub hit_bits: f64,
     pub hits: f64,
     pub miss_bits: f64,
@@ -155,13 +155,13 @@ pub struct AlignStats {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ColumnAlign {
+pub(crate) struct ColumnAlign {
     pub col: usize,
     pub stats: AlignStats,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct NumNovel {
+pub(crate) struct NumNovel {
     pub bits: f64,
     pub count: u64,
 }
@@ -229,7 +229,7 @@ struct Span {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Kind {
+pub(crate) enum Kind {
     Cat,
     Str { align: bool, recent: u8 },
     Lid(LidSpec),
@@ -237,13 +237,13 @@ pub enum Kind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Step {
+pub(crate) struct Step {
     pub col: usize,
     pub kind: Kind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct Plan {
+pub(crate) struct Plan {
     pub n_cols: usize,
     pub pos_cols: usize,
     pub cat_ctx: Option<usize>,
@@ -274,7 +274,7 @@ fn read_usize(bytes: &[u8], pos: &mut usize) -> Option<usize> {
 }
 
 impl Plan {
-    pub fn write(&self, out: &mut Vec<u8>) {
+    pub(crate) fn write(&self, out: &mut Vec<u8>) {
         put_varint(out, self.n_cols as u64);
         put_varint(out, self.pos_cols as u64);
         put_opt(out, self.cat_ctx);
@@ -306,7 +306,7 @@ impl Plan {
         }
     }
 
-    pub fn read(bytes: &[u8], pos: &mut usize) -> Option<Plan> {
+    pub(crate) fn read(bytes: &[u8], pos: &mut usize) -> Option<Plan> {
         let n_cols = read_usize(bytes, pos)?;
         let pos_cols = read_usize(bytes, pos)?;
         let cat_ctx = get_opt(bytes, pos)?;
@@ -372,7 +372,7 @@ impl Plan {
         plan.valid().then_some(plan)
     }
 
-    pub fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         let mut coded = vec![false; self.n_cols];
         if self.n_cols > 0 {
             coded[0] = true;
@@ -522,7 +522,7 @@ struct RowState {
     reading_spans: Vec<Span>,
 }
 
-pub struct Model {
+pub(crate) struct Model {
     plan: Plan,
     steps: Vec<StepState>,
     row_state: RowState,
@@ -574,7 +574,7 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
 }
 
 impl Model {
-    pub fn new(plan: Plan) -> Model {
+    pub(crate) fn new(plan: Plan) -> Model {
         let mut steps = Vec::new();
         let mut srcs = vec![0usize];
         for s in &plan.steps {
@@ -705,22 +705,22 @@ impl Model {
         }
     }
 
-    pub fn plan(&self) -> &Plan {
+    pub(crate) fn plan(&self) -> &Plan {
         &self.plan
     }
 
-    pub fn set_active(&mut self, mask: Option<Vec<bool>>, bundle_cats: bool) {
+    pub(crate) fn set_active(&mut self, mask: Option<Vec<bool>>, bundle_cats: bool) {
         self.active = mask;
         self.bundle_cats = bundle_cats;
     }
 
-    pub fn set_srcs(&mut self, si: usize, srcs: Vec<usize>) {
+    pub(crate) fn set_srcs(&mut self, si: usize, srcs: Vec<usize>) {
         if let StepState::Str(st) = &mut self.steps[si] {
             st.srcs = srcs;
         }
     }
 
-    pub fn lid_stats(&self) -> Option<LidReport> {
+    pub(crate) fn lid_stats(&self) -> Option<LidReport> {
         self.steps.iter().find_map(|s| match s {
             StepState::Lid(l) => Some(LidReport {
                 stats: l.stats,
@@ -730,7 +730,7 @@ impl Model {
         })
     }
 
-    pub fn align_stats(&self) -> Vec<ColumnAlign> {
+    pub(crate) fn align_stats(&self) -> Vec<ColumnAlign> {
         self.steps
             .iter()
             .zip(&self.plan.steps)
@@ -746,7 +746,7 @@ impl Model {
             .collect()
     }
 
-    pub fn num_stats(&self) -> Vec<NumNovel> {
+    pub(crate) fn num_stats(&self) -> Vec<NumNovel> {
         self.steps
             .iter()
             .filter_map(|s| match s {
@@ -756,15 +756,15 @@ impl Model {
             .collect()
     }
 
-    pub fn row(&self) -> &[String] {
+    pub(crate) fn row(&self) -> &[String] {
         &self.row_state.fields
     }
 
-    pub fn start_group(&mut self) {
+    pub(crate) fn start_group(&mut self) {
         self.row_state.first_in_group = true;
     }
 
-    pub fn code_row(&mut self, coder: &mut Coder, fields: &[&str], surface: &str) {
+    pub(crate) fn code_row(&mut self, coder: &mut Coder, fields: &[&str], surface: &str) {
         let row = &mut self.row_state;
         if coder.is_decoder() {
             row.fields[0].clear();

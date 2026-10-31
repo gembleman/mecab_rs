@@ -2,10 +2,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use super::text::{LINE_BUFFER_BYTES, Lines, MAX_DEF_COLUMNS, atoi, cstr, tokenize_csv, tokenize2};
-use mecab_rs::__private::{
+use mecab_rs::__private::char_layout::{
     CATEGORY_NAME_BYTES, CHAR_BIN_COUNT_BYTES, CHAR_BIN_ENTRIES, CHAR_BIN_ENTRY_BYTES,
-    DEFAULT_TYPE_SHIFT, MAX_CATEGORIES, TYPE_MASK, io_error, pack_char_info, u32_at, u32_values,
+    DEFAULT_TYPE_SHIFT, MAX_CATEGORIES, TYPE_MASK, pack_char_info,
 };
+use mecab_rs::__private::files::io_error;
+use mecab_rs::__private::in_range_bytes::{u32_at, u32_values};
 use mecab_rs::Error;
 
 const CHAR_PROPERTY_DEF_DEFAULT: &str = "DEFAULT 1 0 0\nSPACE   0 1 0\n0x0020 SPACE\n";

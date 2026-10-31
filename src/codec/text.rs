@@ -14,7 +14,7 @@ const CONTEXT_SEED: u64 = 0x5151;
 const MAX_CONTEXT_LEVELS: usize = 8;
 
 #[derive(Default)]
-pub struct NovelChar {
+pub(crate) struct NovelChar {
     blocks: Ppm,
 }
 
@@ -31,14 +31,14 @@ impl NovelChar {
     }
 }
 
-pub struct CharModel {
+pub(crate) struct CharModel {
     order: usize,
     ppm: Ppm,
     novel: NovelChar,
 }
 
 impl CharModel {
-    pub fn new(order: usize) -> Self {
+    pub(crate) fn new(order: usize) -> Self {
         CharModel {
             order,
             ppm: Ppm::default(),
@@ -79,7 +79,13 @@ impl CharModel {
         }
     }
 
-    pub fn code_str(&mut self, coder: &mut Coder, tail: &[u32], text: &str, out: &mut String) {
+    pub(crate) fn code_str(
+        &mut self,
+        coder: &mut Coder,
+        tail: &[u32],
+        text: &str,
+        out: &mut String,
+    ) {
         out.clear();
         let mut hist: Vec<u32> = tail.to_vec();
         let mut it = text.chars();
@@ -103,7 +109,7 @@ impl CharModel {
 }
 
 impl CharModel {
-    pub fn code_bytes(&mut self, coder: &mut Coder, text: &[u8], out: &mut Vec<u8>) {
+    pub(crate) fn code_bytes(&mut self, coder: &mut Coder, text: &[u8], out: &mut Vec<u8>) {
         out.clear();
         let mut hist: Vec<u32> = Vec::new();
         let mut it = text.iter();
@@ -126,11 +132,11 @@ impl CharModel {
     }
 }
 
-pub fn is_kana(ch: char) -> bool {
+pub(crate) fn is_kana(ch: char) -> bool {
     (HIRAGANA_FIRST..=KANA_LAST).contains(&ch)
 }
 
-pub fn kata(ch: char) -> char {
+pub(crate) fn kata(ch: char) -> char {
     if (HIRAGANA_FIRST..=HIRAGANA_LAST).contains(&ch) {
         char::from_u32(ch as u32 + HIRAGANA_TO_KATAKANA).unwrap_or(ch)
     } else {

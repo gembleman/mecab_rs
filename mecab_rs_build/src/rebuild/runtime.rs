@@ -5,10 +5,11 @@ use super::templates::compile_templates;
 use super::{
     ContextStats, Keep, Renumbering, SlimReport, collect_stats, copy_entries, prepare_output,
 };
-use mecab_rs::__private::{
-    CHAR_BIN_FILE, CHAR_DEF_FILE, CHAR_TABLE_FILE, DICRC_FILE, FEATURE_DEF_FILE, HotShape,
-    LEFT_ID_DEF_FILE, MATRIX_BIN_FILE, RIGHT_ID_DEF_FILE,
+use mecab_rs::__private::files::{
+    CHAR_BIN_FILE, CHAR_DEF_FILE, CHAR_TABLE_FILE, DICRC_FILE, FEATURE_DEF_FILE, LEFT_ID_DEF_FILE,
+    MATRIX_BIN_FILE, RIGHT_ID_DEF_FILE,
 };
+use mecab_rs::__private::matrix::HotShape;
 use mecab_rs::{CharTable, Error};
 
 pub enum StatsSource<'a> {

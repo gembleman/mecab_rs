@@ -76,10 +76,10 @@ pub(crate) struct HotColumn<'m, S = MappedBytes> {
 #[inline(never)]
 fn cold_cost<S: SectionSource>(
     templates: &ColdPath<S>,
-    left_right_id: u16,
-    right_left_id: u16,
+    left_node_rc: u16,
+    right_node_lc: u16,
 ) -> i16 {
-    templates.cost(left_right_id, right_left_id)
+    templates.cost(left_node_rc, right_node_lc)
 }
 
 impl<'m, S: SectionSource> HotColumn<'m, S> {

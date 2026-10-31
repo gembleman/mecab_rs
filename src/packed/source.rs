@@ -13,12 +13,11 @@ use crate::error::io_error;
 use crate::hot_shape::HotShape;
 use crate::int_templates::MappedIntTemplates;
 use crate::system_dictionary::{
-    DictionaryKind, HEADER_SIZE, SystemDictionary, TOKEN_SIZE, TokenRecord, VALUE_SIZE_BITS,
+    ARRAY_BYTES_AT, DictionaryKind, HEADER_SIZE, SystemDictionary, TOKEN_BYTES_AT, TOKEN_SIZE,
+    TokenRecord, VALUE_SIZE_BITS,
 };
 use crate::wire::{u16_at, u32_at};
 
-const ARRAY_BYTES_AT: usize = 24;
-const TOKEN_BYTES_AT: usize = 28;
 const MAX_ROOT_FANOUT: u32 = 256;
 const MAX_KEY_TOKENS: u32 = (1 << VALUE_SIZE_BITS) - 1;
 

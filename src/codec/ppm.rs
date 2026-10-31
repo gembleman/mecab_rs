@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
 #[derive(Default)]
-pub struct IdHasher(u64);
+pub(crate) struct IdHasher(u64);
 
 impl Hasher for IdHasher {
     fn finish(&self) -> u64 {
@@ -20,10 +20,10 @@ impl Hasher for IdHasher {
     }
 }
 
-pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<IdHasher>>;
+pub(crate) type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<IdHasher>>;
 
 #[inline]
-pub fn mix(h: u64, x: u64) -> u64 {
+pub(crate) fn mix(h: u64, x: u64) -> u64 {
     let mut z = h
         .wrapping_mul(MIX_HASH_MULTIPLIER)
         .wrapping_add(x.wrapping_mul(MIX_VALUE_MULTIPLIER))
@@ -33,7 +33,7 @@ pub fn mix(h: u64, x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-pub fn hash_bytes(b: &[u8]) -> u64 {
+pub(crate) fn hash_bytes(b: &[u8]) -> u64 {
     let mut h = HASH_BYTES_SEED ^ b.len() as u64;
     let (chunks, rest) = b.as_chunks::<8>();
     for &ch in chunks {
@@ -48,20 +48,20 @@ pub fn hash_bytes(b: &[u8]) -> u64 {
 }
 
 #[derive(Default)]
-pub struct Interner {
+pub(crate) struct Interner {
     map: FastMap<u64, u32>,
     buf: Vec<u8>,
     ends: Vec<usize>,
 }
 
 impl Interner {
-    pub fn get(&self, id: u32) -> &[u8] {
+    pub(crate) fn get(&self, id: u32) -> &[u8] {
         let i = id as usize;
         let start = if i == 0 { 0 } else { self.ends[i - 1] };
         &self.buf[start..self.ends[i]]
     }
 
-    pub fn find(&self, key: &[u8]) -> Option<u32> {
+    pub(crate) fn find(&self, key: &[u8]) -> Option<u32> {
         let mut h = hash_bytes(key);
         loop {
             match self.map.get(&h) {
@@ -72,7 +72,7 @@ impl Interner {
         }
     }
 
-    pub fn add(&mut self, key: &[u8]) -> u32 {
+    pub(crate) fn add(&mut self, key: &[u8]) -> u32 {
         let mut h = hash_bytes(key);
         while self.map.contains_key(&h) {
             h = h.wrapping_add(1);
@@ -85,7 +85,7 @@ impl Interner {
     }
 
     #[inline]
-    pub fn find_or_add(&mut self, key: &[u8]) -> u32 {
+    pub(crate) fn find_or_add(&mut self, key: &[u8]) -> u32 {
         match self.find(key) {
             Some(id) => id,
             None => self.add(key),
@@ -95,7 +95,7 @@ impl Interner {
 
 const TOTAL_LIMIT: u32 = 60000;
 const MAX_SYMBOLS: u32 = 24000;
-pub const NOVEL: u32 = u32::MAX;
+pub(crate) const NOVEL: u32 = u32::MAX;
 const MAX_LEVELS: usize = 8;
 
 const BIG_AT: u32 = 24;
@@ -284,7 +284,7 @@ struct Slot {
     t: Table,
 }
 
-pub struct Ppm {
+pub(crate) struct Ppm {
     slots: Vec<Slot>,
     mask: usize,
     used: usize,
@@ -331,7 +331,7 @@ impl Ppm {
         }
     }
 
-    pub fn distinct(&self, h: u64) -> u32 {
+    pub(crate) fn distinct(&self, h: u64) -> u32 {
         let h = h | 1;
         let mut i = h as usize & self.mask;
         loop {
@@ -347,7 +347,7 @@ impl Ppm {
     }
 
     #[inline]
-    pub fn prefetch(&self, h: u64) {
+    pub(crate) fn prefetch(&self, h: u64) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
@@ -375,7 +375,7 @@ impl Ppm {
     }
 
     #[inline]
-    pub fn code(&mut self, coder: &mut Coder, ctxs: &[u64], sym: u32) -> Option<u32> {
+    pub(crate) fn code(&mut self, coder: &mut Coder, ctxs: &[u64], sym: u32) -> Option<u32> {
         if (self.used + MAX_LEVELS) * 2 > self.slots.len() {
             self.grow();
         }
@@ -477,7 +477,7 @@ impl Ppm {
     }
 
     #[inline]
-    pub fn update(&mut self, sym: u32) {
+    pub(crate) fn update(&mut self, sym: u32) {
         let n = self.nvisited;
         for k in 0..n {
             let t = &mut self.slots[self.visited[k] as usize].t;

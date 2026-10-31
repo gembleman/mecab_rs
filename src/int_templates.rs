@@ -20,12 +20,12 @@ use crate::templates::{TemplateReader, write_array};
 pub(crate) const MAGIC: &[u8; 4] = b"MXIT";
 const VERSION: u32 = 1;
 const MAX_PARTS: usize = 256;
-pub const DEFAULT_CLUSTER_COUNT: usize = 12;
+pub(crate) const DEFAULT_CLUSTER_COUNT: usize = 12;
 const MAX_COST: i64 = 32767;
-pub const MAX_SHIFT: u32 = 40;
+pub(crate) const MAX_SHIFT: u32 = 40;
 pub const MAX_COST_FACTOR: u32 = 1 << 24;
 
-pub fn int_cost(total: i64, cost_factor: u32, shift: u32) -> i16 {
+pub(crate) fn int_cost(total: i64, cost_factor: u32, shift: u32) -> i16 {
     let scaled = -i64::from(cost_factor) * total;
     let cost = if scaled >= 0 {
         scaled >> shift
@@ -355,7 +355,7 @@ impl IntTemplates {
         )
     }
 
-    pub fn computed_cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
+    pub(crate) fn computed_cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
         let total = total_of(
             self.parts.iter().map(IntPart::slices),
             left_node_rc,
@@ -364,7 +364,13 @@ impl IntTemplates {
         int_cost(total, self.cost_factor, self.shift)
     }
 
-    pub fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
+    pub fn try_cost(&self, left_node_rc: u16, right_node_lc: u16) -> Option<i16> {
+        let inside = usize::from(left_node_rc) < self.left_size
+            && usize::from(right_node_lc) < self.right_size;
+        inside.then(|| self.cost(left_node_rc, right_node_lc))
+    }
+
+    fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
         let cell = usize::from(right_node_lc) * self.left_size + usize::from(left_node_rc);
         exception_of(&self.exception_cells, &self.exception_values, cell)
             .unwrap_or_else(|| self.computed_cost(left_node_rc, right_node_lc))
@@ -660,7 +666,13 @@ impl<S: SectionSource> MappedIntTemplates<S> {
         })
     }
 
-    pub fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
+    pub fn try_cost(&self, left_node_rc: u16, right_node_lc: u16) -> Option<i16> {
+        let inside = usize::from(left_node_rc) < self.left_size
+            && usize::from(right_node_lc) < self.right_size;
+        inside.then(|| self.cost(left_node_rc, right_node_lc))
+    }
+
+    fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
         let row = usize::from(right_node_lc);
         let cell = row * self.left_size + usize::from(left_node_rc);
         let span = self.exception_rows[row] as usize..self.exception_rows[row + 1] as usize;

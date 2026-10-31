@@ -184,13 +184,13 @@ pub fn project(keys: &[Option<String>], relevant: &[&str]) -> Vec<u16> {
 }
 
 #[cfg(feature = "xz")]
-pub struct UniverseSide {
+pub(crate) struct UniverseSide {
     pub projection: Vec<u16>,
     pub count: usize,
 }
 
 #[cfg(feature = "xz")]
-pub fn universe_projections(
+pub(crate) fn universe_projections(
     bigrams: &[(String, String)],
     left_id_def: &str,
     right_id_def: &str,

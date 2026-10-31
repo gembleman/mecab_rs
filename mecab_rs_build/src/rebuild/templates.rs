@@ -5,9 +5,12 @@ use std::path::Path;
 
 use super::read_file;
 use crate::connection_templates::{ConnectionTemplates, TemplatePart};
-use mecab_rs::__private::{
-    DICRC_FILE, FEATURE_DEF_FILE, HotShape, LEFT_ID_DEF_FILE, MODEL_DEF_FILE, RIGHT_ID_DEF_FILE,
-    id_rows, io_error, parse_side, project, read_bigrams, side_keys,
+use mecab_rs::__private::files::{
+    DICRC_FILE, FEATURE_DEF_FILE, LEFT_ID_DEF_FILE, MODEL_DEF_FILE, RIGHT_ID_DEF_FILE, io_error,
+};
+use mecab_rs::__private::matrix::HotShape;
+use mecab_rs::__private::template_universe::{
+    id_rows, parse_side, project, read_bigrams, side_keys,
 };
 use mecab_rs::Error;
 

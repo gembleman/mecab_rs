@@ -2,7 +2,9 @@ use std::path::Path;
 
 use super::Charset;
 use super::text::{LINE_BUFFER_BYTES, Lines, atof, cstr, tokenize_csv, tokenize2};
-use mecab_rs::__private::{CHARSET_BYTES, FEATURE_DEF_FILE, io_error, u32_at, u64_at};
+use mecab_rs::__private::dictionary_format::CHARSET_BYTES;
+use mecab_rs::__private::files::{FEATURE_DEF_FILE, io_error};
+use mecab_rs::__private::in_range_bytes::{u32_at, u64_at};
 use mecab_rs::Error;
 
 const FEATURE_BUFFER_BYTES: usize = 2048;

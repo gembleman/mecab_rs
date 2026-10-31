@@ -9,9 +9,11 @@ use super::model::CostModel;
 use super::rewrite::{ContextIds, PosIds, Rewriter};
 use super::text::{LINE_BUFFER_BYTES, Lines, atoi, cstr, escape_csv_element, tokenize_csv};
 use crate::connection_templates::to_cost;
-use mecab_rs::__private::{
-    CHARSET_BYTES, DIC_VERSION, DictionaryKind, FEATURE_DEF_FILE, HEADER_SIZE, LEFT_ID_DEF_FILE,
-    MAGIC_ID, REWRITE_DEF_FILE, RIGHT_ID_DEF_FILE, TOKEN_SIZE, VALUE_SIZE_BITS, write_file,
+use mecab_rs::__private::dictionary_format::{
+    CHARSET_BYTES, DIC_VERSION, DictionaryKind, HEADER_SIZE, MAGIC_ID, TOKEN_SIZE, VALUE_SIZE_BITS,
+};
+use mecab_rs::__private::files::{
+    FEATURE_DEF_FILE, LEFT_ID_DEF_FILE, REWRITE_DEF_FILE, RIGHT_ID_DEF_FILE, write_file,
 };
 use mecab_rs::Error;
 

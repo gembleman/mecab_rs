@@ -46,7 +46,7 @@ pub struct Model {
     pub unknown_feature: Option<String>,
 }
 
-pub struct LexiconSections {
+pub(crate) struct LexiconSections {
     sections: [Cow<'static, [u8]>; SECTIONS],
     code_count: u32,
     param_bits: u32,

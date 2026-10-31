@@ -8,6 +8,7 @@ macro_rules! define_id {
 
         impl $name {
             pub(crate) fn from_index(index: usize) -> Self {
+                debug_assert!(index < u32::MAX as usize);
                 Self(NonZero::new(index as u32 + 1).unwrap())
             }
 

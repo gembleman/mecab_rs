@@ -2,9 +2,9 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use super::text::{LINE_BUFFER_BYTES, Lines, atoi, cstr, tokenize2};
-use mecab_rs::__private::{
-    MATRIX_BIN_FILE, MATRIX_COST_BYTES, MATRIX_DEF_FILE, MATRIX_HEADER_BYTES, io_error, u16_at,
-};
+use mecab_rs::__private::files::{MATRIX_BIN_FILE, MATRIX_DEF_FILE, io_error};
+use mecab_rs::__private::in_range_bytes::u16_at;
+use mecab_rs::__private::matrix::{MATRIX_COST_BYTES, MATRIX_HEADER_BYTES};
 use mecab_rs::Error;
 
 const MATRIX_DEF_DEFAULT: &str = "1 1\n0 0 0\n";

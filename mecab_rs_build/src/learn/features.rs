@@ -8,7 +8,8 @@ use crate::build::Charset;
 use crate::build::model::{Templates, bigram_keys, unigram_keys};
 use crate::build::rewrite::{Rewriter, Rewritten};
 use crate::build::text::{LINE_BUFFER_BYTES, Lines, atof, cstr, tokenize2};
-use mecab_rs::__private::{FEATURE_DEF_FILE, FNV_OFFSET, FNV_PRIME, REWRITE_DEF_FILE, write_file};
+use mecab_rs::__private::files::{FEATURE_DEF_FILE, REWRITE_DEF_FILE, write_file};
+use mecab_rs::__private::hash::{FNV_OFFSET, FNV_PRIME};
 use mecab_rs::Error;
 
 pub(super) struct Fnv(u64);

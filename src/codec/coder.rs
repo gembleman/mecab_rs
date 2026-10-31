@@ -3,7 +3,7 @@ const UINT_FLAG_LIMIT: u32 = 1024;
 const UINT_MAX_BITS: usize = 63;
 const UINT_SLOTS: usize = UINT_MAX_BITS + 2;
 const UNIFORM_BITS: u32 = 16;
-pub const MAX_TOTAL: u32 = 1 << UNIFORM_BITS;
+pub(crate) const MAX_TOTAL: u32 = 1 << UNIFORM_BITS;
 const STATE_BYTES: usize = 5;
 const CARRY_BOUNDARY: u32 = 0xFF00_0000;
 const LOW_MASK: u64 = 0x00FF_FFFF;
@@ -15,7 +15,7 @@ enum Mode {
     Count,
 }
 
-pub struct Coder<'a> {
+pub(crate) struct Coder<'a> {
     mode: Mode,
     low: u64,
     range: u32,
@@ -48,19 +48,19 @@ impl<'a> Coder<'a> {
         }
     }
 
-    pub fn encoder(track_bits: bool) -> Coder<'static> {
+    pub(crate) fn encoder(track_bits: bool) -> Coder<'static> {
         let mut coder = Coder::new(Mode::Encode);
         coder.track = track_bits;
         coder
     }
 
-    pub fn counter() -> Coder<'static> {
+    pub(crate) fn counter() -> Coder<'static> {
         let mut coder = Coder::new(Mode::Count);
         coder.track = true;
         coder
     }
 
-    pub fn decoder(input: &'a [u8]) -> Coder<'a> {
+    pub(crate) fn decoder(input: &'a [u8]) -> Coder<'a> {
         let mut coder = Coder::new(Mode::Decode);
         coder.input = input;
         for _ in 0..STATE_BYTES {
@@ -70,7 +70,7 @@ impl<'a> Coder<'a> {
     }
 
     #[inline]
-    pub fn is_decoder(&self) -> bool {
+    pub(crate) fn is_decoder(&self) -> bool {
         self.mode == Mode::Decode
     }
 
@@ -81,7 +81,7 @@ impl<'a> Coder<'a> {
         b
     }
 
-    pub fn overrun(&self) -> bool {
+    pub(crate) fn overrun(&self) -> bool {
         self.pos > self.input.len() + 8
     }
 
@@ -103,7 +103,7 @@ impl<'a> Coder<'a> {
         self.low = (self.low & LOW_MASK) << 8;
     }
 
-    pub fn finish(mut self) -> Vec<u8> {
+    pub(crate) fn finish(mut self) -> Vec<u8> {
         if self.mode == Mode::Encode {
             for _ in 0..STATE_BYTES {
                 self.shift_low();
@@ -113,7 +113,7 @@ impl<'a> Coder<'a> {
     }
 
     #[inline]
-    pub fn put(&mut self, cum: u32, freq: u32, total: u32) {
+    pub(crate) fn put(&mut self, cum: u32, freq: u32, total: u32) {
         debug_assert!(freq > 0 && cum + freq <= total && total <= MAX_TOTAL);
         if self.track {
             self.bits += (f64::from(total) / f64::from(freq)).log2();
@@ -130,13 +130,13 @@ impl<'a> Coder<'a> {
     }
 
     #[inline]
-    pub fn target(&mut self, total: u32) -> u32 {
+    pub(crate) fn target(&mut self, total: u32) -> u32 {
         self.unit = self.range / total;
         (self.code / self.unit).min(total - 1)
     }
 
     #[inline]
-    pub fn consume(&mut self, cum: u32, freq: u32) {
+    pub(crate) fn consume(&mut self, cum: u32, freq: u32) {
         self.code = self.code.wrapping_sub(self.unit.wrapping_mul(cum));
         self.range = self.unit.wrapping_mul(freq);
         while self.range < TOP {
@@ -160,7 +160,7 @@ impl<'a> Coder<'a> {
         }
     }
 
-    pub fn uniform(&mut self, v: u64, n: u64) -> u64 {
+    pub(crate) fn uniform(&mut self, v: u64, n: u64) -> u64 {
         if n <= u64::from(MAX_TOTAL) {
             return u64::from(self.uniform16(v as u32, n as u32));
         }
@@ -175,7 +175,7 @@ impl<'a> Coder<'a> {
             | u64::from(self.uniform16((v & (u64::from(MAX_TOTAL) - 1)) as u32, low_n as u32))
     }
 
-    pub fn raw_bits(&mut self, v: u64, nbits: u32) -> u64 {
+    pub(crate) fn raw_bits(&mut self, v: u64, nbits: u32) -> u64 {
         let mut out = 0u64;
         let mut left = nbits;
         while left > 0 {
@@ -189,14 +189,14 @@ impl<'a> Coder<'a> {
 }
 
 #[derive(Clone, Copy, Default)]
-pub struct Flag {
+pub(crate) struct Flag {
     n0: u32,
     n1: u32,
 }
 
 impl Flag {
     #[inline]
-    pub fn code(&mut self, coder: &mut Coder, bit: bool, limit: u32) -> bool {
+    pub(crate) fn code(&mut self, coder: &mut Coder, bit: bool, limit: u32) -> bool {
         let f0 = 2 * self.n0 + 1;
         let f1 = 2 * self.n1 + 1;
         let total = f0 + f1;
@@ -231,7 +231,7 @@ impl Flag {
 }
 
 #[derive(Clone)]
-pub struct UintModel {
+pub(crate) struct UintModel {
     len: [Flag; UINT_SLOTS],
     top: [[Flag; 2]; UINT_SLOTS],
 }
@@ -246,7 +246,7 @@ impl Default for UintModel {
 }
 
 impl UintModel {
-    pub fn code(&mut self, coder: &mut Coder, v: u64) -> u64 {
+    pub(crate) fn code(&mut self, coder: &mut Coder, v: u64) -> u64 {
         let value_plus_one = v.wrapping_add(1);
         let bit_len = if coder.is_decoder() {
             0

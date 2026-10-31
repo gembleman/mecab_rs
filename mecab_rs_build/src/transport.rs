@@ -3,7 +3,8 @@ use std::path::Path;
 
 use lzma_rust2::{XzOptions, XzWriter};
 
-use mecab_rs::__private::{transport_payload, write_file};
+use mecab_rs::__private::files::write_file;
+use mecab_rs::__private::support::transport_payload;
 use mecab_rs::Error;
 
 const MAX_DICT_SIZE: u32 = 512 << 20;

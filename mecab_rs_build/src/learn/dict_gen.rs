@@ -9,10 +9,11 @@ use crate::build::rewrite::Rewriter;
 use crate::build::text::{LINE_BUFFER_BYTES, Lines, cstr, escape_csv_element, tokenize_csv};
 use crate::build::{BuildOptions, compile_system, csv_files};
 use crate::connection_templates::to_cost;
-use mecab_rs::__private::{
-    CHAR_BIN_FILE, CHAR_DEF_FILE, DICRC_FILE, DictionaryKind, FEATURE_DEF_FILE, LEFT_ID_DEF_FILE,
-    MATRIX_DEF_FILE, MODEL_DEF_FILE, REWRITE_DEF_FILE, RIGHT_ID_DEF_FILE, SYS_DIC_FILE,
-    SystemDictionary, UNK_DEF_FILE, write_file, write_file_with,
+use mecab_rs::__private::dictionary_format::{DictionaryKind, SystemDictionary};
+use mecab_rs::__private::files::{
+    CHAR_BIN_FILE, CHAR_DEF_FILE, DICRC_FILE, FEATURE_DEF_FILE, LEFT_ID_DEF_FILE, MATRIX_DEF_FILE,
+    MODEL_DEF_FILE, REWRITE_DEF_FILE, RIGHT_ID_DEF_FILE, SYS_DIC_FILE, UNK_DEF_FILE, write_file,
+    write_file_with,
 };
 use mecab_rs::Error;
 

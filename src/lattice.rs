@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use crate::char_property::{CharInfo, SentenceChars};
 use crate::constraint::{Constraint, ConstraintSet};
-use crate::dictionary::Dictionary;
+use crate::dictionary::{Dictionary, UserIndex};
 use crate::error::Error;
 use crate::ids::{ElementId, NodeId};
 use crate::matrix::Matrix;
@@ -25,7 +25,7 @@ fn newest_first<I: DoubleEndedIterator>(candidates: I) -> std::iter::Rev<I> {
 pub(crate) enum NodeSource {
     System,
     SystemExtended,
-    User(u8),
+    User(UserIndex),
     Unknown,
     UnknownFixed,
     Constrained,
