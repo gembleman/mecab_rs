@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::Error;
 #[cfg(feature = "xz")]
 use crate::dict_files::{LEFT_ID_DEF_FILE, RIGHT_ID_DEF_FILE};
-use crate::error::io_error;
+use crate::error::{IoAction, io_error};
 
 #[cfg(feature = "xz")]
 const NO_FIRE_LIMIT: usize = 0xFFFF;
@@ -157,8 +157,9 @@ pub fn side_keys(pieces: &[Piece], rows: &[Vec<String>]) -> Vec<Option<String>> 
 }
 
 pub fn read_bigrams(feature_def: &Path) -> Result<Vec<(String, String)>, Error> {
-    let text = String::from_utf8(fs::read(feature_def).map_err(io_error(feature_def))?)
-        .map_err(|_| Error::rebuild(feature_def, "not UTF-8"))?;
+    let text =
+        String::from_utf8(fs::read(feature_def).map_err(io_error(IoAction::Read, feature_def))?)
+            .map_err(|_| Error::rebuild(feature_def, "not UTF-8"))?;
     let mut bigrams = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("BIGRAM ") {

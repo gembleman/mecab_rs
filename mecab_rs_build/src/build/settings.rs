@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::tool_error::{Position, build_error};
 use mecab_rs::__private::files::{CHAR_BIN_FILE, DICRC_FILE};
 use mecab_rs::Error;
 
@@ -51,23 +52,21 @@ struct DicrcEntries(Vec<(Vec<u8>, Vec<u8>)>);
 impl DicrcEntries {
     fn read(dicrc: &Path) -> Result<Self, Error> {
         if !dicrc.is_file() {
-            return Err(Error::build(
+            return Err(build_error(
                 dicrc,
                 format!("no such file or directory: {}", dicrc.display()),
             ));
         }
         let mut lines = Lines::open(dicrc, None)?;
         let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        while let Some(line) = lines.next_line()? {
+        while let Some((number, line)) = lines.next_line()? {
             let line = text::cstr(line, 0);
             if line.is_empty() || COMMENT_MARKS.contains(&line[0]) {
                 continue;
             }
             let Some((key, value)) = text::key_value(line) else {
-                return Err(Error::build(
-                    dicrc,
-                    format!("format error: {}", String::from_utf8_lossy(line)),
-                ));
+                return Err(Position::new(dicrc, number)
+                    .build(format!("format error: {}", String::from_utf8_lossy(line))));
             };
             let already_set = entries.iter().any(|(name, _)| name == key);
             if !already_set {
@@ -117,10 +116,10 @@ impl Settings {
     pub(super) fn require_supported(&self) -> Result<(), Error> {
         let dicrc = self.dic_dir.join(DICRC_FILE);
         if self.options.dictionary_charset.is_empty() {
-            return Err(Error::build(&dicrc, "input dictionary charset is empty"));
+            return Err(build_error(&dicrc, "input dictionary charset is empty"));
         }
         if self.options.charset.is_empty() {
-            return Err(Error::build(&dicrc, "output dictionary charset is empty"));
+            return Err(build_error(&dicrc, "output dictionary charset is empty"));
         }
         for (name, what) in [
             (&self.options.dictionary_charset, "the dictionary charset"),
@@ -130,9 +129,9 @@ impl Settings {
             ),
             (&self.config_charset, "config-charset"),
         ] {
-            let charset = Charset::parse(name).map_err(|reason| Error::build(&dicrc, reason))?;
+            let charset = Charset::parse(name).map_err(|reason| build_error(&dicrc, reason))?;
             if charset != Charset::Utf8 {
-                return Err(Error::build(
+                return Err(build_error(
                     &dicrc,
                     format!(
                         "{what} is {name}, but only UTF-8 is supported: convert the sources to UTF-8 and set config-charset = UTF-8 in dicrc"
@@ -141,7 +140,7 @@ impl Settings {
             }
         }
         if self.node_format {
-            return Err(Error::build(&dicrc, "node-format (-F) is not supported"));
+            return Err(build_error(&dicrc, "node-format (-F) is not supported"));
         }
         Ok(())
     }
@@ -150,7 +149,7 @@ impl Settings {
         if self.cost_factor > 0 {
             Ok(())
         } else {
-            Err(Error::build(
+            Err(build_error(
                 &self.dic_dir.join(DICRC_FILE),
                 "cost factor needs to be positive value: set cost-factor in dicrc",
             ))
@@ -163,7 +162,7 @@ impl Settings {
         let model = self
             .model
             .as_deref()
-            .ok_or_else(|| Error::build(&self.dic_dir, "cannot open: no model file (-m)"))?;
+            .ok_or_else(|| build_error(&self.dic_dir, "cannot open: no model file (-m)"))?;
         let cost = model::CostModel::open(
             model,
             &self.dic_dir,

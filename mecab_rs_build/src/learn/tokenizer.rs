@@ -2,6 +2,7 @@ use std::path::Path;
 
 use super::Config;
 use crate::build::char_def::CharProperty;
+use crate::tool_error::learn_error;
 use mecab_rs::__private::char_layout::{
     DEFAULT_TYPE_MASK, DEFAULT_TYPE_SHIFT, FLAG_MASK, GROUP_SHIFT, INVOKE_SHIFT, LENGTH_MASK,
     LENGTH_SHIFT, TYPE_MASK,
@@ -92,7 +93,7 @@ impl Tokenizer {
         for category in 0..chars.category_count() {
             let name = chars.name(category);
             let run = unknown.exact_match(name).ok_or_else(|| {
-                Error::learn(
+                learn_error(
                     &unknown_path,
                     format!(
                         "cannot find UNK category: {}",
@@ -104,7 +105,7 @@ impl Tokenizer {
         }
         let bos_feature = config.text("bos-feature").as_bytes().to_vec();
         if bos_feature.is_empty() {
-            return Err(Error::learn(
+            return Err(learn_error(
                 &dic_dir.join(DICRC_FILE),
                 "bos-feature is undefined in dicrc",
             ));

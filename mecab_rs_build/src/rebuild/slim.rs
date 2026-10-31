@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::tool_error::rebuild_error;
 use mecab_rs::__private::dictionary_format::{HEADER_SIZE, MAGIC_ID, TOKEN_SIZE};
 use mecab_rs::__private::in_range_bytes::u32_at;
 use mecab_rs::Error;
@@ -99,10 +100,10 @@ struct Sections {
 
 fn read_sections(data: &[u8], path: &Path) -> Result<Sections, Error> {
     if data.len() < HEADER_SIZE {
-        return Err(Error::rebuild(path, "shorter than the 72-byte header"));
+        return Err(rebuild_error(path, "shorter than the 72-byte header"));
     }
     if header_word(data, HEADER_MAGIC_AT / WORD_BYTES) ^ MAGIC_ID != data.len() as u32 {
-        return Err(Error::rebuild(path, "magic does not match the file size"));
+        return Err(rebuild_error(path, "magic does not match the file size"));
     }
     let (array_size, token_size, feature_size) = (
         header_word(data, DOUBLE_ARRAY_SIZE_WORD) as usize,
@@ -112,7 +113,7 @@ fn read_sections(data: &[u8], path: &Path) -> Result<Sections, Error> {
     let token_start = HEADER_SIZE + array_size;
     let feature_start = token_start + token_size;
     if token_size % TOKEN_SIZE != 0 || feature_start + feature_size != data.len() {
-        return Err(Error::rebuild(
+        return Err(rebuild_error(
             path,
             "the sections do not add up to the file size",
         ));
@@ -156,11 +157,11 @@ impl SlimFeatures {
         }
         let tail = source_blob
             .get(offset as usize..)
-            .ok_or_else(|| Error::rebuild(path, "a feature offset is past the feature section"))?;
+            .ok_or_else(|| rebuild_error(path, "a feature offset is past the feature section"))?;
         let length = tail
             .iter()
             .position(|&byte| byte == 0)
-            .ok_or_else(|| Error::rebuild(path, "a feature is not NUL-terminated"))?;
+            .ok_or_else(|| rebuild_error(path, "a feature is not NUL-terminated"))?;
         let place = self.place_of_text(keep.apply(&tail[..length]));
         self.by_offset.insert(offset, place);
         Ok(place)

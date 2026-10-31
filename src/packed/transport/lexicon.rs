@@ -4,6 +4,7 @@ use std::io::Write;
 use super::{Part, Parts};
 use crate::Error;
 use crate::codec::{decode_lexicon, encode_lexicon};
+use crate::error::Undecodable;
 use crate::packed::model::{Model, Param};
 use crate::wire::{get_varint, put_varint};
 
@@ -149,14 +150,17 @@ fn same_lexicon(a: &Model, b: &Model) -> bool {
         && a.unknown_features == b.unknown_features
 }
 
+fn unrestorable() -> Error {
+    Error::Unsupported("a lexicon that the codec form does not restore exactly")
+}
+
 pub(super) fn encode(model: &Model) -> Result<Vec<Part>, Error> {
     check_encodable(model)?;
     let lexicon = encode_lexicon(&model_to_csv(model)?);
     let (unknown, pos) = (unknown_tokens(model), pos_runs(model));
-    if !same_lexicon(&restore(&lexicon, &unknown, &pos)?, model) {
-        return Err(Error::Unsupported(
-            "a lexicon that the codec form does not restore exactly",
-        ));
+    let restored = restore(&lexicon, &unknown, &pos).map_err(|_| unrestorable())?;
+    if !same_lexicon(&restored, model) {
+        return Err(unrestorable());
     }
     Ok(vec![
         Part {
@@ -181,5 +185,5 @@ pub(super) fn decode(parts: &Parts) -> Result<Model, Error> {
     let lexicon = parts.plain(LEXICON_PART, ENCODING_CODEC)?;
     let unknown = parts.plain(UNKNOWN_PART, ENCODING_PLAIN)?;
     let pos = parts.plain(POS_PART, ENCODING_PLAIN)?;
-    restore(lexicon, unknown, pos)
+    restore(lexicon, unknown, pos).map_err(|Undecodable(reason)| parts.corrupt(reason))
 }

@@ -4,13 +4,15 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
+use crate::tool_error::{io_error, rebuild_error};
 use mecab_rs::__private::dictionary_format::{HEADER_SIZE, TOKEN_SIZE};
 use mecab_rs::__private::files::{
-    LEFT_ID_DEF_FILE, MATRIX_BIN_FILE, RIGHT_ID_DEF_FILE, SYS_DIC_FILE, UNK_DIC_FILE, io_error,
-    write_file, write_file_with,
+    LEFT_ID_DEF_FILE, MATRIX_BIN_FILE, RIGHT_ID_DEF_FILE, SYS_DIC_FILE, UNK_DIC_FILE, write_file,
+    write_file_with,
 };
 use mecab_rs::__private::in_range_bytes::u16_at;
 use mecab_rs::Error;
+use mecab_rs::IoAction;
 
 use super::slim::{Keep, SlimReport, slim_dictionary};
 use super::stats::{ContextStats, matrix_shape};
@@ -43,12 +45,12 @@ fn patch_tokens(
     new_rc: &[usize],
 ) -> Result<(), Error> {
     if data.len() < HEADER_SIZE {
-        return Err(Error::rebuild(path, "shorter than the 72-byte header"));
+        return Err(rebuild_error(path, "shorter than the 72-byte header"));
     }
     let (dsize, tsize) = (header_word(data, 6) as usize, header_word(data, 7) as usize);
     let start = HEADER_SIZE + dsize;
     if tsize % TOKEN_SIZE != 0 || start.checked_add(tsize).is_none_or(|end| end > data.len()) {
-        return Err(Error::rebuild(
+        return Err(rebuild_error(
             path,
             "the token section does not fit the file",
         ));
@@ -61,7 +63,7 @@ fn patch_tokens(
         for (field, map) in [(0, new_lc), (2, new_rc)] {
             let old = usize::from(u16_at(token, field));
             let new = map.get(old).ok_or_else(|| {
-                Error::rebuild(path, format!("a token uses id {old}, outside the matrix"))
+                rebuild_error(path, format!("a token uses id {old}, outside the matrix"))
             })?;
             token[field..field + 2].copy_from_slice(&(*new as u16).to_le_bytes());
         }
@@ -75,7 +77,7 @@ fn renumber_id_def(text: &str, order: &[usize], path: &Path) -> Result<String, E
         rows.pop();
     }
     if rows.len() != order.len() {
-        return Err(Error::rebuild(
+        return Err(rebuild_error(
             path,
             format!(
                 "{} rows, but the matrix expects {}",
@@ -88,7 +90,7 @@ fn renumber_id_def(text: &str, order: &[usize], path: &Path) -> Result<String, E
     for (index, row) in rows.iter().enumerate() {
         let (_, rest) = row
             .split_once(' ')
-            .ok_or_else(|| Error::rebuild(path, format!("row {} has no attributes", index + 1)))?;
+            .ok_or_else(|| rebuild_error(path, format!("row {} has no attributes", index + 1)))?;
         attributes.push(rest);
     }
     let mut out = String::with_capacity(text.len() + 16);
@@ -110,7 +112,7 @@ fn write_permuted_matrix(
 ) -> Result<(), Error> {
     let (left_size, right_size) = (order_rc.len(), order_lc.len());
     if matrix.len() != 4 + 2 * left_size * right_size {
-        return Err(Error::rebuild(
+        return Err(rebuild_error(
             path,
             format!(
                 "{} bytes, but a {left_size} x {right_size} matrix takes {}",
@@ -119,7 +121,7 @@ fn write_permuted_matrix(
             ),
         ));
     }
-    let sink = io_error(path);
+    let sink = io_error(IoAction::Write, path);
     writer.write_all(&matrix[..4]).map_err(&sink)?;
     let mut row = vec![0u8; left_size * 2];
     for &old_row in order_lc {
@@ -150,7 +152,7 @@ impl Renumbering {
     ) -> Result<Self, Error> {
         let (left_size, right_size) = matrix_shape(dict_dir)?;
         if stats.right.len() != left_size || stats.left.len() != right_size {
-            return Err(Error::rebuild(
+            return Err(rebuild_error(
                 stats_dir,
                 format!(
                     "right.tsv has {} ids and left.tsv {}, but the matrix is {left_size} x {right_size}",
@@ -166,7 +168,7 @@ impl Renumbering {
         for (name, order) in ID_DEF_FILES.iter().zip([&order_lc, &order_rc]) {
             let source = dict_dir.join(name);
             let text = String::from_utf8(read_file(&source)?)
-                .map_err(|_| Error::rebuild(&source, "not UTF-8"))?;
+                .map_err(|_| rebuild_error(&source, "not UTF-8"))?;
             id_defs.push((*name, renumber_id_def(&text, order, &source)?));
         }
         Ok(Self {
@@ -212,8 +214,8 @@ impl Renumbering {
 
     pub(crate) fn write_matrix(&self, dict_dir: &Path, out_dir: &Path) -> Result<(), Error> {
         let matrix_path = dict_dir.join(MATRIX_BIN_FILE);
-        let file = File::open(&matrix_path).map_err(io_error(&matrix_path))?;
-        let matrix = unsafe { Mmap::map(&file) }.map_err(io_error(&matrix_path))?;
+        let file = File::open(&matrix_path).map_err(io_error(IoAction::Open, &matrix_path))?;
+        let matrix = unsafe { Mmap::map(&file) }.map_err(io_error(IoAction::Map, &matrix_path))?;
         write_file_with(&out_dir.join(MATRIX_BIN_FILE), |writer| {
             write_permuted_matrix(
                 writer,

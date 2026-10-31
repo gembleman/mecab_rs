@@ -77,7 +77,7 @@ impl Dictionary {
         let (cache, expanded) = expand_cache::ensure(path, false)?;
         match PackedDictionary::open(&cache) {
             Ok(packed) => Self::open_packed(&cache, packed, user_dictionaries),
-            Err(Error::Format { .. } | Error::Corrupt(_)) if !expanded => {
+            Err(Error::Format { .. }) if !expanded => {
                 let (cache, _) = expand_cache::ensure(path, true)?;
                 Self::open_packed(&cache, PackedDictionary::open(&cache)?, user_dictionaries)
             }

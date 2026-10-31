@@ -7,7 +7,7 @@ use super::{
 };
 use crate::clusters::ClusterShape;
 use crate::dict_files::MATRIX_ITP_FILE;
-use crate::error::{Error, io_error};
+use crate::error::{Error, IoAction, io_error};
 use crate::hot_shape::HotShape;
 use crate::int_templates::{MAGIC, MappedIntTemplates, RuntimeInputs, int_cost};
 use crate::section::SectionSource;
@@ -62,9 +62,11 @@ pub fn runtime_form_of(bytes: &[u8], shape: &HotShape) -> Result<Vec<u8>, Error>
     let mut map = MmapOptions::new()
         .len(bytes.len().max(1))
         .map_anon()
-        .map_err(io_error(path))?;
+        .map_err(io_error(IoAction::Map, path))?;
     map[..bytes.len()].copy_from_slice(bytes);
-    let map = map.make_read_only().map_err(io_error(path))?;
+    let map = map
+        .make_read_only()
+        .map_err(io_error(IoAction::Map, path))?;
     MappedIntTemplates::from_source(map, path)?.runtime_form(shape)
 }
 
@@ -226,7 +228,10 @@ fn write_runtime(
 ) -> Result<Vec<u8>, Error> {
     let (left_size, right_size) = (inputs.left_size, inputs.right_size);
     if !shape.fits(left_size, right_size) {
-        return Err(Error::Corrupt("the hot block lies outside of the matrix"));
+        return Err(Error::format(
+            Path::new(MATRIX_ITP_FILE),
+            "the hot block lies outside of the matrix",
+        ));
     }
     let hot = shape.inscribed_rectangle();
     if left_size > usize::from(!ABOVE) {
@@ -265,10 +270,10 @@ fn assemble_runtime(
         out.extend_from_slice(&word.to_le_bytes());
     }
     pad(&mut out);
-    let io_error = |_| Error::Corrupt("a runtime template array could not be written");
-    write_array(&mut out, &exceptions.row_starts, u32::to_le_bytes).map_err(io_error)?;
-    write_array(&mut out, &exceptions.columns, u16::to_le_bytes).map_err(io_error)?;
-    write_array(&mut out, &clusters.left_keys, u16::to_le_bytes).map_err(io_error)?;
+    let io_error = io_error(IoAction::Write, Path::new(MATRIX_ITP_FILE));
+    write_array(&mut out, &exceptions.row_starts, u32::to_le_bytes).map_err(&io_error)?;
+    write_array(&mut out, &exceptions.columns, u16::to_le_bytes).map_err(&io_error)?;
+    write_array(&mut out, &clusters.left_keys, u16::to_le_bytes).map_err(&io_error)?;
     write_array(&mut out, &clusters.right_keys, u16::to_le_bytes).map_err(io_error)?;
     out.extend_from_slice(&clusters.tables);
     out.extend_from_slice(&[0; TABLE_SLACK]);

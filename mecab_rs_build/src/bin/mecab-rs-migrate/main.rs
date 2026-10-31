@@ -17,7 +17,7 @@ use usage::{REBUILD_USAGE, USAGE};
 
 #[allow(clippy::needless_pass_by_value, reason = "used as a map_err callback")]
 fn shown(error: mecab_rs::Error) -> String {
-    error.to_string()
+    error.report()
 }
 
 fn run() -> Result<(), String> {
@@ -92,7 +92,7 @@ fn migrate_char_table(all: Vec<OsString>) -> Result<(), String> {
     };
     let output = directory.join(CHAR_TABLE_FILE);
     CharTable::convert(&directory.join(CHAR_BIN_FILE), char_def, &output)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.report())?;
     println!("wrote {}", output.display());
     Ok(())
 }

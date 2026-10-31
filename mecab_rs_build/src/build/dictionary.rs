@@ -9,6 +9,7 @@ use super::model::CostModel;
 use super::rewrite::{ContextIds, PosIds, Rewriter};
 use super::text::{LINE_BUFFER_BYTES, Lines, atoi, cstr, escape_csv_element, tokenize_csv};
 use crate::connection_templates::to_cost;
+use crate::tool_error::{Position, build_error};
 use mecab_rs::__private::dictionary_format::{
     CHARSET_BYTES, DIC_VERSION, DictionaryKind, HEADER_SIZE, MAGIC_ID, TOKEN_SIZE, VALUE_SIZE_BITS,
 };
@@ -73,7 +74,7 @@ fn open_context_ids(settings: &Settings, sizes: MatrixSize) -> Result<ContextIds
     let dir = &settings.dic_dir;
     let ids = ContextIds::open(&dir.join(LEFT_ID_DEF_FILE), &dir.join(RIGHT_ID_DEF_FILE))?;
     if ids.left_size() != sizes.left || ids.right_size() != sizes.right {
-        return Err(Error::build(
+        return Err(build_error(
             dir,
             format!(
                 "Context ID files(left-id.def or right-id.def may be broken: {} {} {} {}",
@@ -135,7 +136,7 @@ impl<'a> Resources<'a> {
         let rewriter = self.rewriter.get_or_open(|| Rewriter::open(&path))?;
         let (matched, rewritten) = rewriter.rewrite(feature, &path)?;
         if !matched {
-            return Err(Error::build(
+            return Err(build_error(
                 &path,
                 format!("rewrite failed: {}", String::from_utf8_lossy(feature)),
             ));
@@ -158,7 +159,7 @@ impl<'a> Resources<'a> {
         if valid {
             Ok(())
         } else {
-            Err(Error::build(
+            Err(build_error(
                 &self.settings.dic_dir,
                 format!("invalid ids are found lid={left_id} rid={right_id}"),
             ))
@@ -177,11 +178,11 @@ struct Row {
     feature: Vec<u8>,
 }
 
-fn parse_row(line: &mut [u8], input: &Path) -> Result<Row, Error> {
+fn parse_row(line: &mut [u8], at: Position) -> Result<Row, Error> {
     let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
     let columns = tokenize_csv(line, CSV_COLUMNS);
     if columns.len() != CSV_COLUMNS {
-        return Err(Error::build(input, format!("format error: {shown}")));
+        return Err(at.build(format!("format error: {shown}")));
     }
     Ok(Row {
         shown,
@@ -193,13 +194,10 @@ fn parse_row(line: &mut [u8], input: &Path) -> Result<Row, Error> {
     })
 }
 
-fn read_pos_id(pos_ids: &PosIds, row: &Row, input: &Path) -> Result<u16, Error> {
+fn read_pos_id(pos_ids: &PosIds, row: &Row, at: Position) -> Result<u16, Error> {
     let pos_id = pos_ids.id(&row.feature)?;
     if !(NO_POS_ID..=i32::from(u16::MAX)).contains(&pos_id) {
-        return Err(Error::build(
-            input,
-            format!("pos id out of range: {pos_id}"),
-        ));
+        return Err(at.build(format!("pos id out of range: {pos_id}")));
     }
     Ok(pos_id as u16)
 }
@@ -208,16 +206,13 @@ fn estimate_cost(
     resources: &mut Resources,
     kind: DictionaryKind,
     row: &Row,
-    input: &Path,
+    at: Position,
 ) -> Result<i32, Error> {
     if row.cost != NO_VALUE {
         return Ok(row.cost);
     }
     if kind != DictionaryKind::User {
-        return Err(Error::build(
-            input,
-            "cost field should not be empty in sys/unk dic.",
-        ));
+        return Err(at.build("cost field should not be empty in sys/unk dic."));
     }
     resources.calc_cost(&row.word, &row.feature)
 }
@@ -246,22 +241,22 @@ struct EntryReader<'a, 's> {
 }
 
 impl EntryReader<'_, '_> {
-    fn read_row(&mut self, row: Row, input: &Path) -> Result<bool, Error> {
-        let pos_id = read_pos_id(self.pos_ids, &row, input)?;
-        let cost = estimate_cost(self.resources, self.kind, &row, input)?;
+    fn read_row(&mut self, row: Row, at: Position) -> Result<bool, Error> {
+        let pos_id = read_pos_id(self.pos_ids, &row, at)?;
+        let cost = estimate_cost(self.resources, self.kind, &row, at)?;
         let (left, right) = resolve_ids(self.resources, &row)?;
         self.resources.require_valid_ids(left, right)?;
         let cost = i16::try_from(cost).map_err(|_| {
-            Error::build(
-                input,
-                format!("cost out of the 16-bit range: {cost}: {}", row.shown),
-            )
+            at.build(format!(
+                "cost out of the 16-bit range: {cost}: {}",
+                row.shown
+            ))
         })?;
         if row.word.is_empty() {
             eprintln!("empty word is found, discard this line");
             return Ok(false);
         }
-        let feature = self.append_feature(&row, input)?;
+        let feature = self.append_feature(&row, at)?;
         self.entries.push(Entry {
             surface: row.word,
             left_id: left as u16,
@@ -273,19 +268,16 @@ impl EntryReader<'_, '_> {
         Ok(true)
     }
 
-    fn append_feature(&mut self, row: &Row, input: &Path) -> Result<u32, Error> {
+    fn append_feature(&mut self, row: &Row, at: Position) -> Result<u32, Error> {
         let offset = self.features.len();
         if !self.resources.settings.options.wakati {
             if str::from_utf8(&row.feature).is_err() {
-                return Err(Error::build(
-                    input,
-                    format!("the feature is not valid UTF-8: {}", row.shown),
-                ));
+                return Err(at.build(format!("the feature is not valid UTF-8: {}", row.shown)));
             }
             self.features.extend_from_slice(&row.feature);
             self.features.push(0);
         }
-        u32::try_from(offset).map_err(|_| Error::build(input, "the features are longer than 4 GiB"))
+        u32::try_from(offset).map_err(|_| at.build("the features are longer than 4 GiB"))
     }
 
     fn read_input(&mut self, input: &Path) -> Result<usize, Error> {
@@ -296,9 +288,10 @@ impl EntryReader<'_, '_> {
             Lines::open(input, Some(LINE_BUFFER_BYTES))?
         };
         let mut count = 0;
-        while let Some(line) = lines.next_line()? {
-            let row = parse_row(line, input)?;
-            if self.read_row(row, input)? {
+        while let Some((number, line)) = lines.next_line()? {
+            let at = Position::new(input, number);
+            let row = parse_row(line, at)?;
+            if self.read_row(row, at)? {
                 count += 1;
             }
         }
@@ -341,9 +334,8 @@ fn group_by_surface<'a>(entries: &'a [Entry], output: &Path) -> Result<SurfaceGr
     let mut push_group = |first_entry: usize, size: usize| -> Result<(), Error> {
         keys.push(&entries[first_entry].surface);
         values.push(
-            i32::try_from(size + (first_entry << VALUE_SIZE_BITS)).map_err(|_| {
-                Error::build(output, "too many entries for the double array values")
-            })?,
+            i32::try_from(size + (first_entry << VALUE_SIZE_BITS))
+                .map_err(|_| build_error(output, "too many entries for the double array values"))?,
         );
         Ok(())
     };
@@ -391,7 +383,7 @@ fn encode_header(
 ) -> Result<Vec<u8>, Error> {
     let as_u32 = |value: usize, what: &str| {
         u32::try_from(value)
-            .map_err(|_| Error::build(output, format!("{what} is longer than 4 GiB")))
+            .map_err(|_| build_error(output, format!("{what} is longer than 4 GiB")))
     };
     let total = HEADER_SIZE + lengths.array + lengths.tokens + lengths.features;
     let mut header = Vec::with_capacity(HEADER_SIZE);
@@ -436,7 +428,7 @@ pub(super) fn compile(
         features.push(0);
     }
     if entries.is_empty() {
-        return Err(Error::build(output, "no entries to compile"));
+        return Err(build_error(output, "no entries to compile"));
     }
 
     entries.sort_by(|a, b| a.surface.cmp(&b.surface));
@@ -469,10 +461,10 @@ fn assign_input(
 ) -> Result<usize, Error> {
     let mut lines = Lines::open(input, Some(LINE_BUFFER_BYTES))?;
     let mut count = 0;
-    while let Some(line) = lines.next_line()? {
+    while let Some((number, line)) = lines.next_line()? {
         let Row {
             mut word, feature, ..
-        } = parse_row(line, input)?;
+        } = parse_row(line, Position::new(input, number))?;
         let cost = resources.calc_cost(&word, &feature)?;
         let (left, right) = resources.ids_of(&feature)?;
         resources.require_valid_ids(left, right)?;

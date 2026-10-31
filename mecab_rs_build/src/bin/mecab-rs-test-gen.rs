@@ -54,7 +54,7 @@ fn run() -> Result<(), String> {
                 .map_err(|error| format!("permission denied: {path}: {error}"))?,
         )),
     };
-    test_sentences(&inputs, &mut out).map_err(|error| error.to_string())?;
+    test_sentences(&inputs, &mut out).map_err(|error| error.report())?;
     out.flush().map_err(|error| error.to_string())
 }
 

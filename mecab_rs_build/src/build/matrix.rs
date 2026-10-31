@@ -2,10 +2,12 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use super::text::{LINE_BUFFER_BYTES, Lines, atoi, cstr, tokenize2};
-use mecab_rs::__private::files::{MATRIX_BIN_FILE, MATRIX_DEF_FILE, io_error};
+use crate::tool_error::{Position, build_error, io_error};
+use mecab_rs::__private::files::{MATRIX_BIN_FILE, MATRIX_DEF_FILE};
 use mecab_rs::__private::in_range_bytes::u16_at;
 use mecab_rs::__private::matrix::{MATRIX_COST_BYTES, MATRIX_HEADER_BYTES};
 use mecab_rs::Error;
+use mecab_rs::IoAction;
 
 const MATRIX_DEF_DEFAULT: &str = "1 1\n0 0 0\n";
 const FIELDS_PER_LINE: usize = 3;
@@ -17,14 +19,15 @@ pub(super) struct MatrixSize {
     pub(super) right: usize,
 }
 
-fn size_of_first_line(lines: &mut Lines) -> Result<Option<MatrixSize>, Error> {
-    let Some(line) = lines.next_line()? else {
+fn size_of_first_line(lines: &mut Lines, path: &Path) -> Result<Option<MatrixSize>, Error> {
+    let Some((number, line)) = lines.next_line()? else {
         return Ok(None);
     };
+    let at = Position::new(path, number);
     let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
     let found = tokenize2(line, b"\t ", 2);
     if found.len() != 2 {
-        return Err(Error::build(lines.path(), format!("format error: {shown}")));
+        return Err(at.build(format!("format error: {shown}")));
     }
     let size_of = |field: usize| {
         usize::try_from(atoi(cstr(line, field)))
@@ -33,10 +36,7 @@ fn size_of_first_line(lines: &mut Lines) -> Result<Option<MatrixSize>, Error> {
     };
     let (left, right) = (size_of(found[0]), size_of(found[1]));
     let (Some(left), Some(right)) = (left, right) else {
-        return Err(Error::build(
-            lines.path(),
-            format!("matrix size out of range: {shown}"),
-        ));
+        return Err(at.build(format!("matrix size out of range: {shown}")));
     };
     Ok(Some(MatrixSize { left, right }))
 }
@@ -45,7 +45,9 @@ pub(super) fn sizes(dic_dir: &Path) -> Result<MatrixSize, Error> {
     let text = dic_dir.join(MATRIX_DEF_FILE);
     if text.is_file() {
         let mut lines = Lines::open(&text, Some(LINE_BUFFER_BYTES))?;
-        return Ok(size_of_first_line(&mut lines)?.unwrap_or(MatrixSize { left: 0, right: 0 }));
+        return Ok(
+            size_of_first_line(&mut lines, &text)?.unwrap_or(MatrixSize { left: 0, right: 0 })
+        );
     }
     let binary = dic_dir.join(MATRIX_BIN_FILE);
     if let Ok(mut file) = std::fs::File::open(&binary)
@@ -88,13 +90,14 @@ pub(super) fn compile(
         );
         Lines::builtin(MATRIX_DEF_DEFAULT, matrix_def, Some(LINE_BUFFER_BYTES))
     };
-    let declared = size_of_first_line(&mut lines)?
-        .ok_or_else(|| Error::build(matrix_def, "format error: "))?;
+    let declared = size_of_first_line(&mut lines, matrix_def)?
+        .ok_or_else(|| build_error(matrix_def, "format error: "))?;
     let left_size = declared.left;
     let right_size = declared.right;
     let mut matrix = vec![0i16; left_size * right_size];
 
-    while let Some(line) = lines.next_line()? {
+    while let Some((number, line)) = lines.next_line()? {
+        let at = Position::new(matrix_def, number);
         let mut cursor = 0;
         let mut numbers = [0i32; FIELDS_PER_LINE];
         let mut count = 0;
@@ -107,15 +110,14 @@ pub(super) fn compile(
         }
         if count != FIELDS_PER_LINE {
             let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
-            return Err(Error::build(matrix_def, format!("format error: {shown}")));
+            return Err(at.build(format!("format error: {shown}")));
         }
         let [left, right, cost] = numbers;
         if left < 0 || right < 0 || left as usize >= left_size || right as usize >= right_size {
-            return Err(Error::build(matrix_def, "index values are out of range"));
+            return Err(at.build("index values are out of range"));
         }
-        let cost = i16::try_from(cost).map_err(|_| {
-            Error::build(matrix_def, format!("cost out of the 16-bit range: {cost}"))
-        })?;
+        let cost = i16::try_from(cost)
+            .map_err(|_| at.build(format!("cost out of the 16-bit range: {cost}")))?;
         matrix[left as usize + left_size * right as usize] = cost;
     }
 
@@ -132,5 +134,5 @@ pub(super) fn compile(
         }
         Ok(())
     };
-    write(output).map_err(io_error(output_path))
+    write(output).map_err(io_error(IoAction::Write, output_path))
 }

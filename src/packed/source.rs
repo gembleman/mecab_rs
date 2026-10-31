@@ -9,7 +9,7 @@ use crate::dict_files::{
     CHAR_TABLE_FILE, DICRC_FILE, MATRIX_BIN_FILE, MATRIX_HOT_FILE, MATRIX_ITP_FILE, SYS_DIC_FILE,
     UNK_DIC_FILE,
 };
-use crate::error::io_error;
+use crate::error::{IoAction, io_error};
 use crate::hot_shape::HotShape;
 use crate::int_templates::MappedIntTemplates;
 use crate::system_dictionary::{
@@ -36,7 +36,7 @@ fn key_value(line: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 fn dicrc_features(path: &Path) -> Result<(String, Option<String>), Error> {
-    let bytes = fs::read(path).map_err(io_error(path))?;
+    let bytes = fs::read(path).map_err(io_error(IoAction::Read, path))?;
     let mut values: HashMap<&[u8], &[u8]> = HashMap::new();
     for line in bytes.split(|&byte| byte == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -225,7 +225,7 @@ struct SystemKeys {
 }
 
 fn read_keys(path: &Path) -> Result<SystemKeys, Error> {
-    let bytes = fs::read(path).map_err(io_error(path))?;
+    let bytes = fs::read(path).map_err(io_error(IoAction::Read, path))?;
     let truncated = || Error::format(path, "the file is shorter than its header");
     let header = bytes.get(..HEADER_SIZE).ok_or_else(truncated)?;
     let token_count = u32_at(header, TOKEN_BYTES_AT) as usize / TOKEN_SIZE;
@@ -297,9 +297,9 @@ fn load_matrix(directory: &Path) -> Result<MatrixFiles, Error> {
             "a dictionary without matrix.bin or matrix.hot and matrix.itp",
         ));
     }
-    let matrix = fs::read(&path).map_err(io_error(&path))?;
+    let matrix = fs::read(&path).map_err(io_error(IoAction::Read, &path))?;
     let templates = if hot {
-        fs::read(&int_templates_path).map_err(io_error(&int_templates_path))?
+        fs::read(&int_templates_path).map_err(io_error(IoAction::Read, &int_templates_path))?
     } else {
         Vec::new()
     };
@@ -419,7 +419,7 @@ pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
         matrix: files.matrix,
         templates: files.templates,
         char_table: fs::read(directory.join(CHAR_TABLE_FILE))
-            .map_err(io_error(&directory.join(CHAR_TABLE_FILE)))?,
+            .map_err(io_error(IoAction::Read, &directory.join(CHAR_TABLE_FILE)))?,
         bos_feature,
         unknown_feature,
         ..Model::default()

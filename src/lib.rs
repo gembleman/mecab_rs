@@ -40,7 +40,7 @@ mod wire;
 pub use char_table::{CharTable, migrate_char_table};
 pub use constraint::{BoundaryKind, Constraint};
 pub use dictionary::Dictionary;
-pub use error::{Error, ToolStage};
+pub use error::{Error, IoAction, ToolStage};
 pub use feature_text::FeatureText;
 pub use partial::PartialInput;
 pub use tagger::{

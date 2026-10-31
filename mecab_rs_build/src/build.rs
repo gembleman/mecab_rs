@@ -2,14 +2,16 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::tool_error::{build_error, io_error};
 use mecab_rs::__private::dictionary_format::DictionaryKind;
 use mecab_rs::__private::files::{
     CHAR_BIN_FILE, CHAR_DEF_FILE, CHAR_TABLE_FILE, DICRC_FILE, MATRIX_BIN_FILE, MATRIX_DEF_FILE,
-    MODEL_BIN_FILE, MODEL_DEF_FILE, SYS_DIC_FILE, UNK_DEF_FILE, UNK_DIC_FILE, io_error, write_file,
+    MODEL_BIN_FILE, MODEL_DEF_FILE, SYS_DIC_FILE, UNK_DEF_FILE, UNK_DIC_FILE, write_file,
     write_file_with,
 };
 use mecab_rs::CharTable;
 use mecab_rs::Error;
+use mecab_rs::IoAction;
 
 pub(crate) mod char_def;
 mod darts;
@@ -98,9 +100,9 @@ const MIN_CSV_NAME_LEN: usize = 5;
 
 pub(crate) fn csv_files(dic_dir: &Path) -> Result<Vec<PathBuf>, Error> {
     let mut names = Vec::new();
-    let listing = fs::read_dir(dic_dir).map_err(io_error(dic_dir))?;
+    let listing = fs::read_dir(dic_dir).map_err(io_error(IoAction::Read, dic_dir))?;
     for entry in listing {
-        let entry = entry.map_err(io_error(dic_dir))?;
+        let entry = entry.map_err(io_error(IoAction::Read, dic_dir))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.len() >= MIN_CSV_NAME_LEN && name.to_ascii_lowercase().ends_with(".csv") {
             names.push(name);
@@ -125,7 +127,7 @@ pub fn compile_system(
 ) -> Result<BuildReport, Error> {
     let settings = Settings::load(dic_dir, options)?;
     let parts = selected_parts(options);
-    fs::create_dir_all(out_dir).map_err(io_error(out_dir))?;
+    fs::create_dir_all(out_dir).map_err(io_error(IoAction::Create, out_dir))?;
     let mut report = BuildReport::default();
 
     if parts.char_category || parts.unknown {
@@ -188,7 +190,7 @@ fn write_model(settings: &Settings, out_dir: &Path) -> Result<BuildReport, Error
 fn write_system_dictionary(settings: &Settings, out_dir: &Path) -> Result<BuildReport, Error> {
     let inputs = csv_files(&settings.dic_dir)?;
     if inputs.is_empty() {
-        return Err(Error::build(
+        return Err(build_error(
             &settings.dic_dir,
             "no dictionaries are specified",
         ));
@@ -211,14 +213,14 @@ fn copy_dicrc(dic_dir: &Path, out_dir: &Path) -> Result<(), Error> {
     let source = dic_dir.join(DICRC_FILE);
     let same = fs::canonicalize(dic_dir).ok() == fs::canonicalize(out_dir).ok();
     if !same && !target.exists() {
-        fs::copy(&source, &target).map_err(io_error(&source))?;
+        fs::copy(&source, &target).map_err(io_error(IoAction::Copy, &source))?;
     }
     Ok(())
 }
 
 fn require_user_inputs(dic_dir: &Path, csv_files: &[PathBuf]) -> Result<(), Error> {
     if csv_files.is_empty() {
-        Err(Error::build(dic_dir, "no dictionaries are specified"))
+        Err(build_error(dic_dir, "no dictionaries are specified"))
     } else {
         Ok(())
     }

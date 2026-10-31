@@ -1,6 +1,6 @@
 use super::coder::Coder;
 use super::model::Plan;
-use crate::Error;
+use crate::error::Undecodable;
 use crate::wire::{FNV_OFFSET, fnv1a, get_varint, put_varint};
 
 pub(super) const MAGIC: &[u8; 4] = b"MLX1";
@@ -31,12 +31,12 @@ pub(super) struct Header {
     pub payload: usize,
 }
 
-pub(super) fn corrupt<T>(why: &'static str) -> Result<T, Error> {
-    Err(Error::Corrupt(why))
+pub(super) fn corrupt<T>(why: &'static str) -> Result<T, Undecodable> {
+    Err(Undecodable(why))
 }
 
 #[inline]
-pub(super) fn ensure_not_overrun(coder: &Coder) -> Result<(), Error> {
+pub(super) fn ensure_not_overrun(coder: &Coder) -> Result<(), Undecodable> {
     if coder.overrun() {
         return corrupt(OVERRUN_MESSAGE);
     }
@@ -90,7 +90,7 @@ struct Prefix {
     pos: usize,
 }
 
-fn read_prefix(data: &[u8]) -> Result<Prefix, Error> {
+fn read_prefix(data: &[u8]) -> Result<Prefix, Undecodable> {
     if data.len() < HEADER_PREFIX_LEN || &data[..MAGIC.len()] != MAGIC {
         return corrupt("not a lexicon stream");
     }
@@ -117,7 +117,7 @@ fn read_prefix(data: &[u8]) -> Result<Prefix, Error> {
     })
 }
 
-fn read_coded_body(data: &[u8], prefix: &mut Prefix) -> Result<Body, Error> {
+fn read_coded_body(data: &[u8], prefix: &mut Prefix) -> Result<Body, Undecodable> {
     let pos = &mut prefix.pos;
     let (Some(n_keys), Some(n_irregular)) = (get_varint(data, pos), get_varint(data, pos)) else {
         return corrupt("truncated header");
@@ -135,7 +135,7 @@ fn read_coded_body(data: &[u8], prefix: &mut Prefix) -> Result<Body, Error> {
     })
 }
 
-pub(super) fn read_header(data: &[u8]) -> Result<Header, Error> {
+pub(super) fn read_header(data: &[u8]) -> Result<Header, Undecodable> {
     let mut prefix = read_prefix(data)?;
     let body = if prefix.flags & FLAG_STORED != 0 {
         Body::Stored

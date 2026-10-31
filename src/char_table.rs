@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
@@ -9,7 +10,7 @@ use crate::char_layout::{
     MAX_CATEGORIES, pack_char_info,
 };
 use crate::dict_files::{CHAR_BIN_FILE, CHAR_DEF_FILE, CHAR_TABLE_FILE};
-use crate::error::{Error, io_error};
+use crate::error::{Error, IoAction, io_error};
 use crate::file_write::write_file;
 
 pub(crate) const MAGIC: &[u8; 4] = b"MXCU";
@@ -140,12 +141,8 @@ impl<'a> CharDefParser<'a> {
         }
     }
 
-    fn fail(&self, line: usize, reason: impl Into<String>) -> Error {
-        Error::CharDef {
-            file: self.file.to_path_buf(),
-            line,
-            reason: reason.into(),
-        }
+    fn fail(&self, line: usize, reason: impl Into<Cow<'static, str>>) -> Error {
+        Error::format_at(self.file, line, reason)
     }
 
     fn read_line(&mut self, number: usize, raw: &'a [u8]) -> Result<(), Error> {
@@ -224,12 +221,15 @@ impl<'a> CharDefParser<'a> {
 
     fn finish(self) -> Result<CharDef, Error> {
         if self.names.len() >= MAX_CATEGORIES {
-            return Err(self.fail(0, "too many categories(>= 18)"));
+            return Err(Error::format(self.file, "too many categories(>= 18)"));
         }
         for required in [&b"DEFAULT"[..], b"SPACE"] {
             if !self.categories.contains_key(required) {
                 let name = String::from_utf8_lossy(required);
-                return Err(self.fail(0, format!("category [{name}] is undefined")));
+                return Err(Error::format(
+                    self.file,
+                    format!("category [{name}] is undefined"),
+                ));
             }
         }
         Ok(CharDef {
@@ -390,7 +390,7 @@ impl CharTable {
     }
 
     pub fn from_mecab(char_bin: &Path, char_def: Option<&Path>) -> Result<Self, Error> {
-        let read = |path: &Path| fs::read(path).map_err(io_error(path));
+        let read = |path: &Path| fs::read(path).map_err(io_error(IoAction::Read, path));
         let bin = read(char_bin)?;
         let def = char_def
             .map(|path| read(path).map(|bytes| (bytes, path)))

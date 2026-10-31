@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::error::{Error, io_error};
+use crate::error::{Error, IoAction, io_error};
 use crate::packed::VERSION as MRD_VERSION;
 use crate::wire::{FNV_OFFSET, fnv1a};
 
@@ -62,19 +62,23 @@ struct TransportIdentity {
 }
 
 fn identify(xz: &Path) -> Result<TransportIdentity, Error> {
-    let mut file = File::open(xz).map_err(io_error(xz))?;
-    let length = file.metadata().map_err(io_error(xz))?.len();
+    let mut file = File::open(xz).map_err(io_error(IoAction::Open, xz))?;
+    let length = file
+        .metadata()
+        .map_err(io_error(IoAction::Inspect, xz))?
+        .len();
     let mut digest = FNV_OFFSET;
     let mut buffer = Vec::new();
     let head = IDENTITY_HEAD_BYTES.min(length);
     let tail_from = length.saturating_sub(IDENTITY_TAIL_BYTES).max(head);
     for (from, to) in [(0, head), (tail_from, length)] {
         buffer.clear();
-        file.seek(SeekFrom::Start(from)).map_err(io_error(xz))?;
+        file.seek(SeekFrom::Start(from))
+            .map_err(io_error(IoAction::Seek, xz))?;
         (&mut file)
             .take(to - from)
             .read_to_end(&mut buffer)
-            .map_err(io_error(xz))?;
+            .map_err(io_error(IoAction::Read, xz))?;
         digest = fnv1a(digest, &buffer);
     }
     Ok(TransportIdentity {
@@ -97,15 +101,17 @@ fn is_fresh(cache: &Path, marker: &Path, identity: TransportIdentity) -> bool {
     text == marker_text(identity, metadata.len())
 }
 
+fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let mut file = File::create(path).map_err(io_error(IoAction::Create, path))?;
+    file.write_all(bytes)
+        .map_err(io_error(IoAction::Write, path))?;
+    file.sync_all().map_err(io_error(IoAction::Sync, path))
+}
+
 fn write_replacing(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     let temporary = temporary_path(path, "tmp");
-    let result = File::create(&temporary)
-        .and_then(|mut file| {
-            file.write_all(bytes)?;
-            file.sync_all()
-        })
-        .map_err(io_error(&temporary))
-        .and_then(|()| fs::rename(&temporary, path).map_err(io_error(path)));
+    let result = write_synced(&temporary, bytes)
+        .and_then(|()| fs::rename(&temporary, path).map_err(io_error(IoAction::Rename, path)));
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
@@ -113,12 +119,14 @@ fn write_replacing(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 }
 
 fn flush_to_disk(file: &Path) -> Result<u64, Error> {
-    OpenOptions::new()
+    let handle = OpenOptions::new()
         .write(true)
         .open(file)
-        .and_then(|handle| handle.sync_all())
-        .map_err(io_error(file))?;
-    Ok(fs::metadata(file).map_err(io_error(file))?.len())
+        .map_err(io_error(IoAction::Open, file))?;
+    handle.sync_all().map_err(io_error(IoAction::Sync, file))?;
+    Ok(fs::metadata(file)
+        .map_err(io_error(IoAction::Inspect, file))?
+        .len())
 }
 
 fn wait_until_fresh(cache: &Path, marker: &Path, identity: TransportIdentity) -> bool {
@@ -166,7 +174,7 @@ fn install(
     identity: TransportIdentity,
     length: u64,
 ) -> Result<bool, Error> {
-    if let Err(error) = fs::rename(temporary, cache).map_err(io_error(cache)) {
+    if let Err(error) = fs::rename(temporary, cache).map_err(io_error(IoAction::Rename, cache)) {
         let _ = fs::remove_file(temporary);
         if wait_until_fresh(cache, marker, identity) {
             return Ok(false);

@@ -1,5 +1,8 @@
+use crate::tool_error::rebuild_error;
+use mecab_rs::__private::files::MATRIX_ITP_FILE;
 use mecab_rs::__private::matrix::Part;
 use mecab_rs::Error;
+use std::path::Path;
 
 const MIN_COST: f64 = -32767.0;
 const MAX_COST: f64 = 32767.0;
@@ -82,7 +85,10 @@ fn validate(part: &TemplatePart, left_size: usize, right_size: usize) -> Result<
     if has_sizes(part, left_size, right_size) && is_consistent(part) {
         Ok(())
     } else {
-        Err(Error::Corrupt("a connection template is inconsistent"))
+        Err(rebuild_error(
+            Path::new(MATRIX_ITP_FILE),
+            "a connection template is inconsistent",
+        ))
     }
 }
 
@@ -111,7 +117,10 @@ impl ConnectionTemplates {
             || left_size > MAX_MATRIX_SIZE
             || right_size > MAX_MATRIX_SIZE
         {
-            return Err(Error::Corrupt("the template matrix size is out of range"));
+            return Err(rebuild_error(
+                Path::new(MATRIX_ITP_FILE),
+                "the template matrix size is out of range",
+            ));
         }
         for part in &mut parts {
             validate(part, left_size, right_size)?;

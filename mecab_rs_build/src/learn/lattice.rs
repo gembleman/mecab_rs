@@ -5,6 +5,7 @@ use super::features::{FeatureId, FeatureIndex, Features, PoolOffset, ids_from, w
 use super::surface_and_feature;
 use super::tokenizer::{BOS, EOS, Found, NORMAL, Tokenizer, UNKNOWN};
 use crate::build::text::{Lines, cstr};
+use crate::tool_error::{Position, learn_error};
 use mecab_rs::Error;
 
 const TEXT_PADDING: usize = 8;
@@ -161,24 +162,22 @@ fn read_words(lines: &mut Lines, path: &FilePath) -> Result<Option<AnswerWords>,
     let mut words: Vec<Word> = Vec::new();
     let mut text = Vec::new();
     loop {
-        let Some(line) = lines.next_line()? else {
+        let Some((number, line)) = lines.next_line()? else {
             if words.is_empty() {
                 return Ok(None);
             }
-            return Err(Error::learn(path, "missing EOS at the end of the corpus"));
+            return Err(learn_error(path, "missing EOS at the end of the corpus"));
         };
         let line = cstr(line, 0);
         if line == b"EOS" || line.is_empty() {
             break;
         }
+        let at = Position::new(path, number);
         let Some((surface, feature)) = surface_and_feature(line) else {
-            return Err(Error::learn(
-                path,
-                format!("format error: {}", String::from_utf8_lossy(line)),
-            ));
+            return Err(at.learn(format!("format error: {}", String::from_utf8_lossy(line))));
         };
         if surface.len() > usize::from(u16::MAX) {
-            return Err(Error::learn(path, "a surface is longer than 65535 bytes"));
+            return Err(at.learn("a surface is longer than 65535 bytes"));
         }
         text.extend_from_slice(surface);
         words.push(Word {
@@ -187,10 +186,10 @@ fn read_words(lines: &mut Lines, path: &FilePath) -> Result<Option<AnswerWords>,
         });
     }
     if text.is_empty() {
-        return Err(Error::learn(path, "empty sentence"));
+        return Err(learn_error(path, "empty sentence"));
     }
     if u32::try_from(text.len()).is_err() {
-        return Err(Error::learn(path, SENTENCE_TOO_LONG));
+        return Err(learn_error(path, SENTENCE_TOO_LONG));
     }
     Ok(Some(AnswerWords { words, text }))
 }
@@ -244,7 +243,7 @@ fn same_node(
 impl Sentence {
     fn node(&mut self, node: Node, source: &FilePath) -> Result<NodeId, Error> {
         let index =
-            NodeId::new(self.nodes.len()).ok_or_else(|| Error::learn(source, TOO_MANY_NODES))?;
+            NodeId::new(self.nodes.len()).ok_or_else(|| learn_error(source, TOO_MANY_NODES))?;
         self.nodes.push(node);
         Ok(index)
     }
@@ -294,7 +293,7 @@ impl Sentence {
             let mut left = self.end_list[position];
             while left != NodeId::NIL {
                 let path = PathId::new(self.paths.len())
-                    .ok_or_else(|| Error::learn(source, TOO_MANY_PATHS))?;
+                    .ok_or_else(|| learn_error(source, TOO_MANY_PATHS))?;
                 self.paths.push(Path {
                     rnode: right,
                     lnode: left,
@@ -502,11 +501,11 @@ impl Sentence {
             let word = words.get(index);
             let right = self.find_answer_node(reader, word, position);
             if right == NodeId::NIL {
-                return Err(Error::learn(source, "no node for a word of the answer"));
+                return Err(learn_error(source, "no node for a word of the answer"));
             }
             let left_path = self.find_left_path(right, prev);
             if left_path == PathId::NIL {
-                return Err(Error::learn(source, "lpath is NULL"));
+                return Err(learn_error(source, "lpath is NULL"));
             }
             self.count_observed(reader, left_path, right, observed);
             self.answer.push(left_path);

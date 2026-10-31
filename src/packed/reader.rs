@@ -17,7 +17,7 @@ use super::{
 };
 use crate::char_property::SentenceChars;
 use crate::char_table::{CHAR_TABLE_HEADER_BYTES, MAGIC as CHAR_TABLE_MAGIC};
-use crate::error::{Error, io_error};
+use crate::error::{Error, IoAction, io_error};
 use crate::hot_shape::HotShape;
 use crate::int_runtime::is_runtime_form;
 use crate::mapped_bytes::MappedBytes;
@@ -81,7 +81,7 @@ impl Source<'_> {
             return Err(self.broken("a read leaves its section"));
         }
         let start = range.start + from;
-        read_at(self.file, buffer, start as u64).map_err(io_error(self.path))
+        read_at(self.file, buffer, start as u64).map_err(io_error(IoAction::Read, self.path))
     }
 
     fn read_all(&self, section: usize) -> Result<Vec<u8>, Error> {
@@ -135,13 +135,16 @@ pub struct PackedDictionary {
 
 impl PackedDictionary {
     pub fn open(path: &Path) -> Result<Self, Error> {
-        let file = open_unwritable(path).map_err(io_error(path))?;
-        let file_length = file.metadata().map_err(io_error(path))?.len();
+        let file = open_unwritable(path).map_err(io_error(IoAction::Open, path))?;
+        let file_length = file
+            .metadata()
+            .map_err(io_error(IoAction::Inspect, path))?
+            .len();
         let mut header_bytes = [0u8; HEADER_BYTES];
         if file_length < HEADER_BYTES as u64 {
             return Err(Error::format(path, "the file is shorter than its header"));
         }
-        read_at(&file, &mut header_bytes, 0).map_err(io_error(path))?;
+        read_at(&file, &mut header_bytes, 0).map_err(io_error(IoAction::Read, path))?;
         let header = validate::parse_header(&header_bytes, path)?;
         let sections = validate::parse_sections(&header_bytes, file_length, path)?;
         let map = Arc::new(MappedFile::map(file, path)?);

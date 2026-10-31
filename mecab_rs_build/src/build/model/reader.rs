@@ -1,9 +1,11 @@
 use std::path::Path;
 
+use crate::tool_error::{Position, build_error, io_error};
 use mecab_rs::__private::dictionary_format::CHARSET_BYTES;
-use mecab_rs::__private::files::{FEATURE_DEF_FILE, io_error};
+use mecab_rs::__private::files::FEATURE_DEF_FILE;
 use mecab_rs::__private::in_range_bytes::{u32_at, u64_at};
 use mecab_rs::Error;
+use mecab_rs::IoAction;
 
 use super::fingerprint::fingerprint;
 use super::writer::convert;
@@ -26,18 +28,19 @@ impl Templates {
             unigram: Vec::new(),
             bigram: Vec::new(),
         };
-        while let Some(line) = lines.next_line()? {
+        while let Some((number, line)) = lines.next_line()? {
             if line[0] == 0 || line[0] == b'#' || line[0] == b' ' {
                 continue;
             }
+            let at = Position::new(feature_def, number);
             let found = tokenize2(line, b"\t ", 2);
             if found.len() != 2 {
-                return Err(Error::build(feature_def, "format error"));
+                return Err(at.build("format error"));
             }
             match cstr(line, found[0]) {
                 b"UNIGRAM" => templates.unigram.push(cstr(line, found[1]).to_vec()),
                 b"BIGRAM" => templates.bigram.push(cstr(line, found[1]).to_vec()),
-                _ => return Err(Error::build(feature_def, "format error")),
+                _ => return Err(at.build("format error")),
             }
         }
         Ok(templates)
@@ -62,7 +65,7 @@ fn template_column<'a>(
         *cursor += 1;
     }
     if template.get(*cursor) != Some(&b'[') {
-        return Err(Error::build(path, "getIndex(): unmatched '['"));
+        return Err(build_error(path, "getIndex(): unmatched '['"));
     }
     *cursor += 1;
     let mut number = 0usize;
@@ -83,7 +86,7 @@ fn template_column<'a>(
                 }
                 return Ok(Some(found));
             }
-            _ => return Err(Error::build(path, "unmatched '['")),
+            _ => return Err(build_error(path, "unmatched '['")),
         }
         *cursor += 1;
     }
@@ -162,7 +165,7 @@ pub(crate) fn unigram_keys(
                         b'u' => key.extend_from_slice(ufeature),
                         b'w' => key.extend_from_slice(surface),
                         other => {
-                            return Err(Error::build(
+                            return Err(build_error(
                                 feature_def,
                                 format!("unknown meta char: {}", char::from(other)),
                             ));
@@ -215,7 +218,7 @@ pub(crate) fn bigram_keys(
                         b'l' => key.extend_from_slice(lfeature),
                         b'r' => key.extend_from_slice(rfeature),
                         other => {
-                            return Err(Error::build(
+                            return Err(build_error(
                                 feature_def,
                                 format!("unknown meta char: {}", char::from(other)),
                             ));
@@ -237,11 +240,11 @@ fn require_binary_charset(model: &Path, bytes: &[u8], charset: &str) -> Result<(
         0,
     );
     let model_charset = Charset::parse(&String::from_utf8_lossy(name))
-        .map_err(|reason| Error::build(model, reason))?;
+        .map_err(|reason| build_error(model, reason))?;
     let dictionary_charset =
-        Charset::parse(charset).map_err(|reason| Error::build(model, reason))?;
+        Charset::parse(charset).map_err(|reason| build_error(model, reason))?;
     if model_charset != dictionary_charset {
-        return Err(Error::build(
+        return Err(build_error(
             model,
             format!(
                 "model charset and dictionary charset are different. model_charset={} dictionary_charset={charset}",
@@ -264,7 +267,7 @@ fn read_binary_model(
     dictionary_charset: &str,
     charset: &str,
 ) -> Result<Vec<u8>, Error> {
-    let bytes = std::fs::read(model).map_err(io_error(model))?;
+    let bytes = std::fs::read(model).map_err(io_error(IoAction::Read, model))?;
     if is_binary_model(&bytes) {
         require_binary_charset(model, &bytes, charset)?;
         Ok(bytes)

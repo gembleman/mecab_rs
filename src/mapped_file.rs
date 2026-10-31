@@ -4,7 +4,7 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
-use crate::error::{Error, io_error};
+use crate::error::{Error, IoAction, io_error};
 
 #[cfg(windows)]
 const SHARE_READ_AND_DELETE: u32 = 1 | 4;
@@ -24,12 +24,12 @@ pub struct MappedFile {
 
 impl MappedFile {
     pub(crate) fn open(path: &Path) -> Result<Self, Error> {
-        let file = open_unwritable(path).map_err(io_error(path))?;
+        let file = open_unwritable(path).map_err(io_error(IoAction::Open, path))?;
         Self::map(file, path)
     }
 
     pub(crate) fn map(file: File, path: &Path) -> Result<Self, Error> {
-        let map = unsafe { Mmap::map(&file) }.map_err(io_error(path))?;
+        let map = unsafe { Mmap::map(&file) }.map_err(io_error(IoAction::Map, path))?;
         Ok(Self { map, file })
     }
 

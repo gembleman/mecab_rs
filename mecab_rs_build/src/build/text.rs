@@ -2,8 +2,9 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 
-use mecab_rs::__private::files::io_error;
+use crate::tool_error::{build_error_at, io_error};
 use mecab_rs::Error;
+use mecab_rs::IoAction;
 
 pub(crate) const LINE_BUFFER_BYTES: usize = 8192;
 pub(crate) const MAX_DEF_COLUMNS: usize = 512;
@@ -197,12 +198,13 @@ pub(crate) struct Lines {
     reader: Box<dyn BufRead>,
     path: PathBuf,
     buffer: Vec<u8>,
+    number: usize,
     c_buffer_size: Option<usize>,
 }
 
 impl Lines {
     pub(crate) fn open(path: &Path, c_buffer_size: Option<usize>) -> Result<Self, Error> {
-        let file = File::open(path).map_err(io_error(path))?;
+        let file = File::open(path).map_err(io_error(IoAction::Open, path))?;
         Ok(Self::new(
             Box::new(BufReader::with_capacity(READ_BUFFER_BYTES, file)),
             path,
@@ -223,6 +225,7 @@ impl Lines {
             reader,
             path: path.to_path_buf(),
             buffer: Vec::new(),
+            number: 0,
             c_buffer_size,
         }
     }
@@ -231,15 +234,16 @@ impl Lines {
         &self.path
     }
 
-    pub(crate) fn next_line(&mut self) -> Result<Option<&mut [u8]>, Error> {
+    pub(crate) fn next_line(&mut self) -> Result<Option<(usize, &mut [u8])>, Error> {
         self.buffer.clear();
         let read = self
             .reader
             .read_until(b'\n', &mut self.buffer)
-            .map_err(io_error(&self.path))?;
+            .map_err(io_error(IoAction::Read, &self.path))?;
         if read == 0 {
             return Ok(None);
         }
+        self.number += 1;
         if self.buffer.last() == Some(&b'\n') {
             self.buffer.pop();
             if self.buffer.last() == Some(&b'\r') {
@@ -249,12 +253,13 @@ impl Lines {
         if let Some(size) = self.c_buffer_size
             && self.buffer.len() > size - 2
         {
-            return Err(Error::build(
+            return Err(build_error_at(
                 &self.path,
+                self.number,
                 format!("a line is longer than {} bytes", size - 2),
             ));
         }
         self.buffer.push(0);
-        Ok(Some(&mut self.buffer))
+        Ok(Some((self.number, &mut self.buffer)))
     }
 }

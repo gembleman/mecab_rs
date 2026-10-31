@@ -2,13 +2,14 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::text::{LINE_BUFFER_BYTES, Lines, MAX_DEF_COLUMNS, atoi, cstr, tokenize_csv, tokenize2};
+use crate::tool_error::{Position, build_error, io_error};
 use mecab_rs::__private::char_layout::{
     CATEGORY_NAME_BYTES, CHAR_BIN_COUNT_BYTES, CHAR_BIN_ENTRIES, CHAR_BIN_ENTRY_BYTES,
     DEFAULT_TYPE_SHIFT, MAX_CATEGORIES, TYPE_MASK, pack_char_info,
 };
-use mecab_rs::__private::files::io_error;
 use mecab_rs::__private::in_range_bytes::{u32_at, u32_values};
 use mecab_rs::Error;
+use mecab_rs::IoAction;
 
 const CHAR_PROPERTY_DEF_DEFAULT: &str = "DEFAULT 1 0 0\nSPACE   0 1 0\n0x0020 SPACE\n";
 pub(super) const UNK_DEF_DEFAULT: &str = "DEFAULT,0,0,0,*\nSPACE,0,0,0,*\n";
@@ -40,13 +41,8 @@ struct CodeRange {
     categories: Vec<Vec<u8>>,
 }
 
-fn parse_hex_code(text: &[u8], path: &Path) -> Result<i32, Error> {
-    let no_hex = || {
-        Error::build(
-            path,
-            format!("no hex value: {}", String::from_utf8_lossy(text)),
-        )
-    };
+fn parse_hex_code(text: &[u8], at: Position) -> Result<i32, Error> {
+    let no_hex = || at.build(format!("no hex value: {}", String::from_utf8_lossy(text)));
     let [b'0', b'x' | b'X', digits @ ..] = text else {
         return Err(no_hex());
     };
@@ -60,10 +56,10 @@ fn parse_hex_code(text: &[u8], path: &Path) -> Result<i32, Error> {
             .checked_mul(16)
             .and_then(|value| value.checked_add(digit as i32))
             .ok_or_else(|| {
-                Error::build(
-                    path,
-                    format!("hex value overflows: {}", String::from_utf8_lossy(text)),
-                )
+                at.build(format!(
+                    "hex value overflows: {}",
+                    String::from_utf8_lossy(text)
+                ))
             })?;
     }
     Ok(value)
@@ -75,14 +71,14 @@ fn char_info_of_categories(
     path: &Path,
 ) -> Result<CharInfo, Error> {
     let undefined = |name: &[u8]| {
-        Error::build(
+        build_error(
             path,
             format!("category [{}] is undefined", String::from_utf8_lossy(name)),
         )
     };
     let first = categories
         .first()
-        .ok_or_else(|| Error::build(path, "category size is empty"))?;
+        .ok_or_else(|| build_error(path, "category size is empty"))?;
     let mut base = *table.get(first).ok_or_else(|| undefined(first))?;
     for name in categories {
         let info = table.get(name).ok_or_else(|| undefined(name))?;
@@ -104,21 +100,18 @@ fn parse_code_range(
     first: &[u8],
     columns: &[usize],
     line: &[u8],
-    source: &Path,
+    at: Position,
     categories: &BTreeMap<Vec<u8>, CharInfo>,
 ) -> Result<CodeRange, Error> {
     let (low, high) = match first.windows(2).position(|pair| pair == b"..") {
         Some(dots) => (&first[..dots], &first[dots + 2..]),
         None => (first, first),
     };
-    let low = parse_hex_code(low, source)?;
-    let high = parse_hex_code(high, source)?;
+    let low = parse_hex_code(low, at)?;
+    let high = parse_hex_code(high, at)?;
     let in_table = |code: i32| (0..CHAR_BIN_ENTRIES as i32).contains(&code);
     if !(in_table(low) && in_table(high) && low <= high) {
-        return Err(Error::build(
-            source,
-            format!("range error: low={low} high={high}"),
-        ));
+        return Err(at.build(format!("range error: low={low} high={high}")));
     }
     let mut names = Vec::new();
     for &column in &columns[1..] {
@@ -127,10 +120,10 @@ fn parse_code_range(
             break;
         }
         if !categories.contains_key(name) {
-            return Err(Error::build(
-                source,
-                format!("category [{}] is undefined", String::from_utf8_lossy(name)),
-            ));
+            return Err(at.build(format!(
+                "category [{}] is undefined",
+                String::from_utf8_lossy(name)
+            )));
         }
         names.push(name.to_vec());
     }
@@ -159,32 +152,26 @@ const REQUIRED_CATEGORIES: [&str; 2] = ["DEFAULT", "SPACE"];
 fn define_category(
     columns: &[usize],
     line: &[u8],
-    source: &Path,
+    at: Position,
     shown: &str,
     char_def: &mut CharDef,
 ) -> Result<(), Error> {
     if columns.len() < 4 {
-        return Err(Error::build(source, format!("format error: {shown}")));
+        return Err(at.build(format!("format error: {shown}")));
     }
     let name = cstr(line, columns[0]);
     if name.len() >= CATEGORY_NAME_BYTES {
-        return Err(Error::build(
-            source,
-            format!(
-                "category name is longer than {} bytes: {}",
-                CATEGORY_NAME_BYTES - 1,
-                String::from_utf8_lossy(name)
-            ),
-        ));
+        return Err(at.build(format!(
+            "category name is longer than {} bytes: {}",
+            CATEGORY_NAME_BYTES - 1,
+            String::from_utf8_lossy(name)
+        )));
     }
     if char_def.categories.contains_key(name) {
-        return Err(Error::build(
-            source,
-            format!(
-                "category {} is already defined",
-                String::from_utf8_lossy(name)
-            ),
-        ));
+        return Err(at.build(format!(
+            "category {} is already defined",
+            String::from_utf8_lossy(name)
+        )));
     }
     let info = parse_category(columns, line, char_def.order.len());
     char_def.categories.insert(name.to_vec(), info);
@@ -208,21 +195,22 @@ fn read_char_def(char_def: &Path) -> Result<CharDef, Error> {
         categories: BTreeMap::new(),
         order: Vec::new(),
     };
-    while let Some(line) = lines.next_line()? {
+    while let Some((number, line)) = lines.next_line()? {
         if line[0] == 0 || line[0] == b'#' {
             continue;
         }
+        let at = Position::new(&source, number);
         let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
         let columns = tokenize2(line, b"\t ", MAX_DEF_COLUMNS);
         if columns.len() < 2 {
-            return Err(Error::build(&source, format!("format error: {shown}")));
+            return Err(at.build(format!("format error: {shown}")));
         }
         let first = cstr(line, columns[0]);
         if first.starts_with(b"0x") {
-            let range = parse_code_range(first, &columns, line, &source, &result.categories)?;
+            let range = parse_code_range(first, &columns, line, at, &result.categories)?;
             result.ranges.push(range);
         } else {
-            define_category(&columns, line, &source, &shown, &mut result)?;
+            define_category(&columns, line, at, &shown, &mut result)?;
         }
     }
     Ok(result)
@@ -233,14 +221,14 @@ fn require_core_categories(
     char_def: &Path,
 ) -> Result<(), Error> {
     if categories.len() >= MAX_CATEGORIES {
-        return Err(Error::build(
+        return Err(build_error(
             char_def,
             format!("too many categories(>= {MAX_CATEGORIES})"),
         ));
     }
     for required in REQUIRED_CATEGORIES {
         if !categories.contains_key(required.as_bytes()) {
-            return Err(Error::build(
+            return Err(build_error(
                 char_def,
                 format!("category [{required}] is undefined"),
             ));
@@ -265,22 +253,20 @@ fn read_unknown_categories(
     };
     let unk_source = lines.path().to_path_buf();
     let mut unknown: HashSet<Vec<u8>> = HashSet::new();
-    while let Some(line) = lines.next_line()? {
+    while let Some((number, line)) = lines.next_line()? {
+        let at = Position::new(&unk_source, number);
         let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
         let columns = tokenize_csv(line, 2);
         if columns.is_empty() {
-            return Err(Error::build(&unk_source, format!("format error: {shown}")));
+            return Err(at.build(format!("format error: {shown}")));
         }
         let key = cstr(line, columns[0]);
         if !categories.contains_key(key) {
-            return Err(Error::build(
-                &unk_source,
-                format!(
-                    "category [{}] is undefined in {}",
-                    String::from_utf8_lossy(key),
-                    char_def.display()
-                ),
-            ));
+            return Err(at.build(format!(
+                "category [{}] is undefined in {}",
+                String::from_utf8_lossy(key),
+                char_def.display()
+            )));
         }
         unknown.insert(key.to_vec());
     }
@@ -296,7 +282,7 @@ fn require_categories_complete(
     let (unknown, unk_source) = read_unknown_categories(unk_def, char_def, categories)?;
     for name in categories.keys() {
         if !unknown.contains(name) {
-            return Err(Error::build(
+            return Err(build_error(
                 &unk_source,
                 format!(
                     "category [{}] is undefined in {}",
@@ -372,13 +358,13 @@ pub(crate) struct CharProperty {
 
 impl CharProperty {
     pub(crate) fn open(path: &Path) -> Result<Self, Error> {
-        let bytes = std::fs::read(path).map_err(io_error(path))?;
+        let bytes = std::fs::read(path).map_err(io_error(IoAction::Read, path))?;
         let categories = (bytes.len() >= CHAR_BIN_COUNT_BYTES)
             .then(|| u32_at(&bytes, 0) as usize)
-            .ok_or_else(|| Error::build(path, "invalid file size"))?;
+            .ok_or_else(|| build_error(path, "invalid file size"))?;
         let table_at = CHAR_BIN_COUNT_BYTES + CATEGORY_NAME_BYTES * categories;
         if bytes.len() != table_at + CHAR_BIN_ENTRY_BYTES * CHAR_BIN_ENTRIES {
-            return Err(Error::build(path, "invalid file size"));
+            return Err(build_error(path, "invalid file size"));
         }
         let names = bytes[CHAR_BIN_COUNT_BYTES..table_at]
             .as_chunks::<CATEGORY_NAME_BYTES>()

@@ -9,6 +9,7 @@ use crate::build::rewrite::Rewriter;
 use crate::build::text::{LINE_BUFFER_BYTES, Lines, cstr, escape_csv_element, tokenize_csv};
 use crate::build::{BuildOptions, compile_system, csv_files};
 use crate::connection_templates::to_cost;
+use crate::tool_error::{Position, io_error, learn_error};
 use mecab_rs::__private::dictionary_format::{DictionaryKind, SystemDictionary};
 use mecab_rs::__private::files::{
     CHAR_BIN_FILE, CHAR_DEF_FILE, DICRC_FILE, FEATURE_DEF_FILE, LEFT_ID_DEF_FILE, MATRIX_DEF_FILE,
@@ -16,6 +17,7 @@ use mecab_rs::__private::files::{
     write_file_with,
 };
 use mecab_rs::Error;
+use mecab_rs::IoAction;
 
 #[derive(Clone, Debug)]
 pub struct GenerateOptions {
@@ -106,11 +108,11 @@ const SURFACE_COLUMN: usize = 0;
 const FEATURE_COLUMN: usize = 4;
 const NOT_FOUND: i32 = -1;
 
-fn entry(line: &mut [u8], path: &Path) -> Result<(Vec<u8>, Vec<u8>), Error> {
+fn entry(line: &mut [u8], at: Position) -> Result<(Vec<u8>, Vec<u8>), Error> {
     let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
     let columns = tokenize_csv(line, LEXICON_COLUMNS);
     if columns.len() != LEXICON_COLUMNS {
-        return Err(Error::learn(path, format!("format error: {shown}")));
+        return Err(at.learn(format!("format error: {shown}")));
     }
     Ok((
         cstr(line, columns[SURFACE_COLUMN]).to_vec(),
@@ -127,7 +129,7 @@ fn copy(source: &Path, destination: &Path, log: &mut dyn Write) -> Result<(), Er
     );
     std::fs::copy(source, destination)
         .map(|_| ())
-        .map_err(super::io_error(source))
+        .map_err(io_error(IoAction::Copy, source))
 }
 
 pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Error> {
@@ -139,7 +141,7 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
     {
         let system = SystemDictionary::open(&dic_dir.join(SYS_DIC_FILE), DictionaryKind::System)?;
         if system.charset().is_empty() {
-            return Err(Error::learn(dic_dir, "the charset of sys.dic is empty"));
+            return Err(learn_error(dic_dir, "the charset of sys.dic is empty"));
         }
     }
     let property = CharProperty::open(&dic_dir.join(CHAR_BIN_FILE))?;
@@ -154,33 +156,33 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
             .zip(std::fs::canonicalize(out_dir).ok())
             .is_some_and(|(a, b)| a == b);
     if same_directory {
-        return Err(Error::learn(
+        return Err(learn_error(
             dic_dir,
             "output directory = dictionary directory! Please specify different directory.",
         ));
     }
     if out_dir.as_os_str().is_empty() {
-        return Err(Error::learn(dic_dir, "output directory is empty"));
+        return Err(learn_error(dic_dir, "output directory is empty"));
     }
     let Some(model_path) = options
         .model
         .as_deref()
         .filter(|path| !path.as_os_str().is_empty())
     else {
-        return Err(Error::learn(dic_dir, "model file is empty"));
+        return Err(learn_error(dic_dir, "model file is empty"));
     };
     let model = CostModel::open(model_path, dic_dir, "", "UTF-8")?;
     if factor <= 0 {
-        return Err(Error::learn(
+        return Err(learn_error(
             dic_dir,
             "cost factor needs to be positive value",
         ));
     }
     if bos.is_empty() {
-        return Err(Error::learn(dic_dir, "bos-feature is empty"));
+        return Err(learn_error(dic_dir, "bos-feature is empty"));
     }
     if dictionaries.is_empty() {
-        return Err(Error::learn(
+        return Err(learn_error(
             dic_dir,
             format!("no dictionary is found in {}", dic_dir.display()),
         ));
@@ -188,14 +190,14 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
     let rewrite_def = dic_dir.join(REWRITE_DEF_FILE);
     let feature_def = dic_dir.join(FEATURE_DEF_FILE);
     let mut rewriter = Rewriter::open(&rewrite_def)?;
-    std::fs::create_dir_all(out_dir).map_err(super::io_error(out_dir))?;
+    std::fs::create_dir_all(out_dir).map_err(io_error(IoAction::Create, out_dir))?;
 
     let rewrite = |rewriter: &mut Rewriter, feature: &[u8]| {
         let (matched, rewritten) = rewriter.rewrite_cached(feature, &rewrite_def)?;
         if matched {
             Ok(rewritten)
         } else {
-            Err(Error::learn(
+            Err(learn_error(
                 &rewrite_def,
                 format!(
                     "cannot rewrite pattern: {}",
@@ -219,8 +221,8 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
         let _ = write!(log, "reading {} ... ", source.display());
         let _ = log.flush();
         let mut count = 0usize;
-        while let Some(line) = lines.next_line()? {
-            let (_, feature) = entry(line, source)?;
+        while let Some((number, line)) = lines.next_line()? {
+            let (_, feature) = entry(line, Position::new(source, number))?;
             let rewritten = rewrite(&mut rewriter, &feature)?;
             ids.left.entry(rewritten.left).or_insert(1);
             ids.right.entry(rewritten.right).or_insert(1);
@@ -240,8 +242,8 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
     ids.build();
     ids.save(&left_id, &right_id, LineEnding::from(options.crlf))?;
 
-    for (number, source) in sources.iter().enumerate() {
-        let unknown = number == 0;
+    for (index, source) in sources.iter().enumerate() {
+        let unknown = index == 0;
         let output = out_dir.join(source.file_name().unwrap_or_default());
         let mut lines = Lines::open(source, Some(LINE_BUFFER_BYTES))?;
         let _ = write!(log, "emitting {} ... ", output.display());
@@ -249,9 +251,10 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
         let mut count = 0usize;
         write_file_with(&output, |file| {
             let mut file = LineEnds::new(file, LineEnding::from(options.crlf));
-            let io = super::io_error(&output);
-            while let Some(line) = lines.next_line()? {
-                let (mut word, feature) = entry(line, source)?;
+            let io = io_error(IoAction::Write, &output);
+            while let Some((number, line)) = lines.next_line()? {
+                let at = Position::new(source, number);
+                let (mut word, feature) = entry(line, at)?;
                 let rewritten = rewrite(&mut rewriter, &feature)?;
                 let left = ids.left.get(&rewritten.left).copied().unwrap_or(NOT_FOUND);
                 let right = ids
@@ -260,29 +263,23 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
                     .copied()
                     .unwrap_or(NOT_FOUND);
                 if left <= 0 {
-                    return Err(Error::learn(
-                        source,
-                        format!(
-                            "CID is not found for {}",
-                            String::from_utf8_lossy(&rewritten.left)
-                        ),
-                    ));
+                    return Err(at.learn(format!(
+                        "CID is not found for {}",
+                        String::from_utf8_lossy(&rewritten.left)
+                    )));
                 }
                 if right <= 0 {
-                    return Err(Error::learn(
-                        source,
-                        format!(
-                            "CID is not found for {}",
-                            String::from_utf8_lossy(&rewritten.right)
-                        ),
-                    ));
+                    return Err(at.learn(format!(
+                        "CID is not found for {}",
+                        String::from_utf8_lossy(&rewritten.right)
+                    )));
                 }
                 let char_type = if unknown {
                     property.id(&word).ok_or_else(|| {
-                        Error::learn(
-                            source,
-                            format!("unknown property [{}]", String::from_utf8_lossy(&word)),
-                        )
+                        at.learn(format!(
+                            "unknown property [{}]",
+                            String::from_utf8_lossy(&word)
+                        ))
                     })? as u8
                 } else {
                     property.default_type(&word)
@@ -309,12 +306,12 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
     let mut previous = 0;
     write_file_with(&matrix, |file| {
         let mut file = LineEnds::new(file, LineEnding::from(options.crlf));
-        let io = super::io_error(&matrix);
+        let io = io_error(IoAction::Write, &matrix);
         if ids.left.is_empty() {
-            return Err(Error::learn(dic_dir, "left id size is empty"));
+            return Err(learn_error(dic_dir, "left id size is empty"));
         }
         if ids.right.is_empty() {
-            return Err(Error::learn(dic_dir, "right id size is empty"));
+            return Err(learn_error(dic_dir, "right id size is empty"));
         }
         writeln!(file, "{} {}", ids.right.len(), ids.left.len()).map_err(&io)?;
         let mut row = 0;

@@ -8,6 +8,7 @@ use crate::build::Charset;
 use crate::build::model::{Templates, bigram_keys, unigram_keys};
 use crate::build::rewrite::{Rewriter, Rewritten};
 use crate::build::text::{LINE_BUFFER_BYTES, Lines, atof, cstr, tokenize2};
+use crate::tool_error::{Position, caused_by, learn_error};
 use mecab_rs::__private::files::{FEATURE_DEF_FILE, REWRITE_DEF_FILE, write_file};
 use mecab_rs::__private::hash::{FNV_OFFSET, FNV_PRIME};
 use mecab_rs::Error;
@@ -110,7 +111,7 @@ impl Features {
             return Ok(id);
         }
         let id = FeatureId::next_after(self.list.len())
-            .ok_or_else(|| Error::learn(&self.rewrite_def, TOO_MANY_FEATURES))?;
+            .ok_or_else(|| learn_error(&self.rewrite_def, TOO_MANY_FEATURES))?;
         self.ids.insert(feature.to_vec(), id);
         self.list.push(feature.to_vec());
         self.rewritten.push(None);
@@ -127,7 +128,7 @@ impl Features {
             let feature = &self.list[id.index()];
             let (matched, rewritten) = self.rewriter.rewrite(feature, &self.rewrite_def)?;
             if !matched {
-                return Err(Error::learn(
+                return Err(learn_error(
                     &self.rewrite_def,
                     format!(
                         " cannot rewrite pattern: {}",
@@ -178,7 +179,7 @@ fn id_of(
     if let Some(&id) = dic.get(key) {
         return Ok(id);
     }
-    let id = i32::try_from(*maxid).map_err(|_| Error::learn(feature_def, TOO_MANY_IDS))?;
+    let id = i32::try_from(*maxid).map_err(|_| learn_error(feature_def, TOO_MANY_IDS))?;
     *maxid += 1;
     dic.insert(key.to_vec(), id);
     Ok(id)
@@ -224,14 +225,14 @@ pub(super) fn remap_weights(old: &[f64], renumbered: &[i32], size: usize) -> Vec
 fn read_model_header(lines: &mut Lines, path: &Path) -> Result<(String, Settings), Error> {
     let mut model_charset = String::new();
     let mut settings = Vec::new();
-    while let Some(line) = lines.next_line()? {
+    while let Some((number, line)) = lines.next_line()? {
         if line[0] == 0 {
             break;
         }
         let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
         let found = tokenize2(line, b":", 2);
         if found.len() != 2 {
-            return Err(Error::learn(path, format!("format error: {shown}")));
+            return Err(Position::new(path, number).learn(format!("format error: {shown}")));
         }
         let key = String::from_utf8_lossy(cstr(line, found[0])).into_owned();
         let value =
@@ -243,7 +244,7 @@ fn read_model_header(lines: &mut Lines, path: &Path) -> Result<(String, Settings
         }
     }
     if model_charset.is_empty() {
-        return Err(Error::learn(path, "charset is empty"));
+        return Err(learn_error(path, "charset is empty"));
     }
     Ok((model_charset, settings))
 }
@@ -253,11 +254,11 @@ fn require_same_charset(
     model_charset: &str,
     dictionary_charset: &str,
 ) -> Result<(), Error> {
-    let old_charset = Charset::parse(model_charset).map_err(|reason| Error::learn(path, reason))?;
+    let old_charset = Charset::parse(model_charset).map_err(|reason| learn_error(path, reason))?;
     let new_charset =
-        Charset::parse(dictionary_charset).map_err(|reason| Error::learn(path, reason))?;
+        Charset::parse(dictionary_charset).map_err(|reason| learn_error(path, reason))?;
     if old_charset != new_charset {
-        return Err(Error::learn(
+        return Err(learn_error(
             path,
             format!("cannot create model from={model_charset} to={dictionary_charset}"),
         ));
@@ -344,7 +345,7 @@ impl FeatureIndex {
             return Err(error);
         }
         let start =
-            PoolOffset::at_end_of(pool).ok_or_else(|| Error::learn(feature_def, TOO_MANY_IDS))?;
+            PoolOffset::at_end_of(pool).ok_or_else(|| learn_error(feature_def, TOO_MANY_IDS))?;
         pool.extend_from_slice(scratch);
         pool.push(ID_LIST_END);
         cache.insert(key, Cached { start, times: 1 });
@@ -413,12 +414,17 @@ impl FeatureIndex {
         self.dic.clear();
         self.cache.clear();
         self.maxid = 0;
-        let mut lines = Lines::open(path, Some(LINE_BUFFER_BYTES)).map_err(|_| {
-            Error::learn(
-                path,
-                format!("cannot open the old model {}", path.display()),
-            )
-        })?;
+        let mut lines =
+            Lines::open(path, Some(LINE_BUFFER_BYTES)).map_err(|error| match error {
+                Error::Io { source, .. } => caused_by(
+                    learn_error(
+                        path,
+                        format!("cannot open the old model {}", path.display()),
+                    ),
+                    source,
+                ),
+                other => other,
+            })?;
         let (model_charset, settings) = read_model_header(&mut lines, path)?;
         require_same_charset(path, &model_charset, dictionary_charset)?;
         let alpha = self.read_old_weights(&mut lines, path)?;
@@ -427,13 +433,13 @@ impl FeatureIndex {
 
     fn read_old_weights(&mut self, lines: &mut Lines, path: &Path) -> Result<Vec<f64>, Error> {
         let mut alpha = Vec::new();
-        while let Some(line) = lines.next_line()? {
+        while let Some((number, line)) = lines.next_line()? {
             let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
             let found = tokenize2(line, b"\t", 2);
             if found.len() != 2 {
-                return Err(Error::learn(path, format!("format error: {shown}")));
+                return Err(Position::new(path, number).learn(format!("format error: {shown}")));
             }
-            let id = i32::try_from(self.maxid).map_err(|_| Error::learn(path, TOO_MANY_IDS))?;
+            let id = i32::try_from(self.maxid).map_err(|_| learn_error(path, TOO_MANY_IDS))?;
             self.dic.entry(cstr(line, found[1]).to_vec()).or_insert(id);
             self.maxid += 1;
             alpha.push(atof(cstr(line, found[0])));

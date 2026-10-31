@@ -7,7 +7,7 @@ mod ppm;
 mod table;
 mod text;
 
-use crate::Error;
+use crate::error::Undecodable;
 use crate::wire::{FNV_OFFSET, fnv1a};
 use coder::{Coder, UintModel};
 use header::{
@@ -227,7 +227,7 @@ pub(crate) fn encode_with(csv: &[u8], opts: &EncodeOptions) -> (Vec<u8>, Report)
     (out, report)
 }
 
-fn decode_stored(data: &[u8], h: &Header) -> Result<Lexicon, Error> {
+fn decode_stored(data: &[u8], h: &Header) -> Result<Lexicon, Undecodable> {
     let text = &data[h.payload..];
     if text.len() as u64 != h.text_len || fnv1a(FNV_OFFSET, text) != h.digest {
         return corrupt("digest mismatch");
@@ -241,7 +241,7 @@ fn decode_keys(
     coder: &mut Coder,
     key_model: &mut KeyModel,
     n_keys: usize,
-) -> Result<Vec<String>, Error> {
+) -> Result<Vec<String>, Undecodable> {
     let mut keys: Vec<String> = Vec::with_capacity(n_keys.min(PREALLOC_KEY_LIMIT));
     let mut key_buf = String::new();
     for _ in 0..n_keys {
@@ -256,7 +256,7 @@ fn decode_counts(
     coder: &mut Coder,
     key_model: &mut KeyModel,
     keys: &[String],
-) -> Result<Vec<usize>, Error> {
+) -> Result<Vec<usize>, Undecodable> {
     let mut counts = Vec::with_capacity(keys.len());
     for key in keys {
         counts.push(key_model.code_count(coder, key, 0));
@@ -272,7 +272,11 @@ struct DecodeRows<'a> {
     text_len: u64,
 }
 
-fn decode_rows_into(coder: &mut Coder, lex: &mut Lexicon, rows: &DecodeRows) -> Result<(), Error> {
+fn decode_rows_into(
+    coder: &mut Coder,
+    lex: &mut Lexicon,
+    rows: &DecodeRows,
+) -> Result<(), Undecodable> {
     let mut model = Model::new(rows.plan.clone());
     for (key, &group_len) in rows.keys.iter().zip(rows.counts) {
         model.start_group();
@@ -287,7 +291,11 @@ fn decode_rows_into(coder: &mut Coder, lex: &mut Lexicon, rows: &DecodeRows) -> 
     Ok(())
 }
 
-fn decode_irregular(coder: &mut Coder, lex: &mut Lexicon, n_irregular: usize) -> Result<(), Error> {
+fn decode_irregular(
+    coder: &mut Coder,
+    lex: &mut Lexicon,
+    n_irregular: usize,
+) -> Result<(), Undecodable> {
     let mut irregular_model = CharModel::new(IRREGULAR_CHAR_ORDER);
     let mut gaps = UintModel::default();
     let rows = lex.rows() as u64;
@@ -312,7 +320,7 @@ fn decode_coded(
     n_keys: usize,
     n_irregular: usize,
     plan: &Plan,
-) -> Result<Lexicon, Error> {
+) -> Result<Lexicon, Undecodable> {
     let mut coder = Coder::decoder(&data[h.payload..]);
     let n_cols = plan.n_cols;
     let mut lex = Lexicon::new(n_cols);
@@ -345,7 +353,7 @@ fn decode_coded(
     Ok(lex)
 }
 
-fn decode_unchecked(data: &[u8]) -> Result<(Lexicon, Header), Error> {
+fn decode_unchecked(data: &[u8]) -> Result<(Lexicon, Header), Undecodable> {
     let h = read_header(data)?;
     let lex = match &h.body {
         Body::Stored => decode_stored(data, &h)?,
@@ -358,7 +366,7 @@ fn decode_unchecked(data: &[u8]) -> Result<(Lexicon, Header), Error> {
     Ok((lex, h))
 }
 
-pub fn decode_lexicon(data: &[u8]) -> Result<Vec<u8>, Error> {
+pub fn decode_lexicon(data: &[u8]) -> Result<Vec<u8>, Undecodable> {
     let (lex, h) = decode_unchecked(data)?;
     let text = lex.to_text();
     if fnv1a(FNV_OFFSET, &text) != h.digest || text.len() as u64 != h.text_len {

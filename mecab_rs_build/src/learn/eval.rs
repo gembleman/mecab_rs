@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::{open_lines, surface_and_feature};
 use crate::build::text::{LINE_BUFFER_BYTES, Lines, atoi, cstr, tokenize_csv, tokenize2};
+use crate::tool_error::{Position, learn_error, output_error};
 use mecab_rs::Error;
 
 struct Stream {
@@ -15,12 +16,6 @@ type Sentence = Vec<Vec<Vec<u8>>>;
 
 const LEVEL_TOKEN_LIMIT: usize = 512;
 
-const OUTPUT_PATH: &str = "output";
-
-fn output_error(source: io::Error) -> Error {
-    Error::io(Path::new(OUTPUT_PATH), source)
-}
-
 fn read_sentence(stream: &mut Stream, levels: &[i32]) -> Result<Option<Sentence>, Error> {
     if stream.failed {
         return Ok(None);
@@ -28,17 +23,18 @@ fn read_sentence(stream: &mut Stream, levels: &[i32]) -> Result<Option<Sentence>
     let path = stream.lines.path().to_path_buf();
     let mut words = Vec::new();
     loop {
-        let Some(line) = stream.lines.next_line()? else {
+        let Some((number, line)) = stream.lines.next_line()? else {
             stream.failed = true;
             break;
         };
         if cstr(line, 0) == b"EOS" {
             break;
         }
+        let at = Position::new(&path, number);
         let text = cstr(line, 0);
         let Some((surface, feature)) = surface_and_feature(text) else {
             let shown = String::from_utf8_lossy(text);
-            return Err(Error::learn(&path, format!("format error: {shown}")));
+            return Err(at.learn(format!("format error: {shown}")));
         };
         let mut buffer = feature.to_vec();
         buffer.push(0);
@@ -53,7 +49,7 @@ fn read_sentence(stream: &mut Stream, levels: &[i32]) -> Result<Option<Sentence>
                 usize::try_from(level).unwrap_or(0)
             };
             if wanted > count {
-                return Err(Error::learn(&path, format!(" out of range {level}")));
+                return Err(at.learn(format!(" out of range {level}")));
             }
             let mut key = surface.to_vec();
             for column in &columns[..wanted] {
@@ -97,7 +93,7 @@ fn print_evaluation(
 
 fn parse_levels(levels: &str, system: &Path) -> Result<Vec<i32>, Error> {
     if levels.is_empty() {
-        return Err(Error::learn(system, "level_str is NULL"));
+        return Err(learn_error(system, "level_str is NULL"));
     }
     let mut buffer = levels.as_bytes().to_vec();
     buffer.push(0);
@@ -106,7 +102,7 @@ fn parse_levels(levels: &str, system: &Path) -> Result<Vec<i32>, Error> {
         .map(|start| atoi(cstr(&buffer, start)))
         .collect();
     if levels.is_empty() {
-        return Err(Error::learn(system, "level_str is empty"));
+        return Err(learn_error(system, "level_str is empty"));
     }
     Ok(levels)
 }
@@ -208,7 +204,7 @@ pub fn test_sentences(inputs: &[PathBuf], out: &mut dyn Write) -> Result<(), Err
         } else {
             open_lines(input)?
         };
-        while let Some(line) = lines.next_line()? {
+        while let Some((_, line)) = lines.next_line()? {
             let text = cstr(line, 0);
             let end = text
                 .iter()

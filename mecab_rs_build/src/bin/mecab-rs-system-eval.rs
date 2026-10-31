@@ -66,7 +66,7 @@ fn run() -> Result<ExitCode, String> {
         level,
         &mut out,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.report())?;
     out.flush().map_err(|error| error.to_string())?;
     Ok(ExitCode::SUCCESS)
 }

@@ -9,9 +9,44 @@ pub mod dictionary_format {
     };
 }
 
+pub mod errors {
+    use std::io;
+    use std::path::Path;
+
+    use crate::{Error, ToolStage};
+
+    pub use crate::error::{IoAction, Undecodable};
+
+    pub fn io(action: IoAction, path: &Path, source: io::Error) -> Error {
+        Error::io(action, path, source)
+    }
+
+    pub fn io_error(action: IoAction, path: &Path) -> impl Fn(io::Error) -> Error + '_ {
+        crate::error::io_error(action, path)
+    }
+
+    pub fn output(source: io::Error) -> Error {
+        Error::output(source)
+    }
+
+    pub fn tool(stage: ToolStage, path: &Path, reason: impl Into<String>) -> Error {
+        Error::tool(stage, path, reason)
+    }
+
+    pub fn on_line(error: Error, line: usize) -> Error {
+        error.on_line(line)
+    }
+
+    pub fn caused_by(
+        error: Error,
+        cause: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Error {
+        error.caused_by(cause)
+    }
+}
+
 pub mod files {
     pub use crate::dict_files::*;
-    pub use crate::error::io_error;
     pub use crate::file_write::{write_file, write_file_with};
 }
 

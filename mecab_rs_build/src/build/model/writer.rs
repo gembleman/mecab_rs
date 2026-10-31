@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::tool_error::{Position, build_error};
 use mecab_rs::__private::dictionary_format::CHARSET_BYTES;
 use mecab_rs::Error;
 
@@ -22,14 +23,14 @@ struct ModelEntry {
 
 fn read_model_charset(lines: &mut Lines, text_model: &Path) -> Result<Vec<u8>, Error> {
     let mut model_charset = Vec::new();
-    while let Some(line) = lines.next_line()? {
+    while let Some((number, line)) = lines.next_line()? {
         if line[0] == 0 {
             break;
         }
         let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
         let found = tokenize2(line, b":", 2);
         if found.len() != 2 {
-            return Err(Error::build(text_model, format!("format error: {shown}")));
+            return Err(Position::new(text_model, number).build(format!("format error: {shown}")));
         }
         if cstr(line, found[0]) == b"charset" {
             model_charset = cstr(line, found[1]).get(1..).unwrap_or_default().to_vec();
@@ -47,11 +48,11 @@ fn require_same_charset(
         return Ok(());
     }
     let model = Charset::parse(&String::from_utf8_lossy(model_charset))
-        .map_err(|reason| Error::build(text_model, reason))?;
+        .map_err(|reason| build_error(text_model, reason))?;
     let dictionary =
-        Charset::parse(dictionary_charset).map_err(|reason| Error::build(text_model, reason))?;
+        Charset::parse(dictionary_charset).map_err(|reason| build_error(text_model, reason))?;
     if model != dictionary {
-        return Err(Error::build(
+        return Err(build_error(
             text_model,
             format!(
                 "dictionary charset and model charset are different. dictionary_charset={dictionary_charset} model_charset={}",
@@ -64,11 +65,11 @@ fn require_same_charset(
 
 fn read_entries(lines: &mut Lines, text_model: &Path) -> Result<Vec<ModelEntry>, Error> {
     let mut entries = Vec::new();
-    while let Some(line) = lines.next_line()? {
+    while let Some((number, line)) = lines.next_line()? {
         let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
         let found = tokenize2(line, b"\t", 2);
         if found.len() != 2 {
-            return Err(Error::build(text_model, format!("format error: {shown}")));
+            return Err(Position::new(text_model, number).build(format!("format error: {shown}")));
         }
         entries.push(ModelEntry {
             fingerprint: fingerprint(cstr(line, found[1])),

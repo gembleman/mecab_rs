@@ -6,6 +6,7 @@ use super::lattice::{EvalSizes, Reader, Sentence, Tally};
 use super::lbfgs::Lbfgs;
 use super::tokenizer::Tokenizer;
 use super::{Config, Existing, LineEnding, format_g, open_lines};
+use crate::tool_error::learn_error;
 use mecab_rs::__private::files::DICRC_FILE;
 use mecab_rs::Error;
 
@@ -106,31 +107,31 @@ pub fn train(
     let freq: usize = config.number("freq");
 
     if cost.is_nan() || cost <= 0.0 {
-        return Err(Error::learn(
+        return Err(learn_error(
             dic_dir,
             format!("cost parameter is out of range: {}", format_g(cost)),
         ));
     }
     if eta.is_nan() || eta <= 0.0 {
-        return Err(Error::learn(
+        return Err(learn_error(
             dic_dir,
             format!("eta is out of range: {}", format_g(eta)),
         ));
     }
     if eval_size == 0 {
-        return Err(Error::learn(dic_dir, "eval-size is out of range: 0"));
+        return Err(learn_error(dic_dir, "eval-size is out of range: 0"));
     }
     if unk_eval_size == 0 {
-        return Err(Error::learn(dic_dir, "unk-eval-size is out of range: 0"));
+        return Err(learn_error(dic_dir, "unk-eval-size is out of range: 0"));
     }
     if freq == 0 {
-        return Err(Error::learn(
+        return Err(learn_error(
             dic_dir,
             format!("freq is out of range: {freq}"),
         ));
     }
     if threads == 0 || threads > MAX_THREADS {
-        return Err(Error::learn(
+        return Err(learn_error(
             dic_dir,
             format!("# thread is invalid: {threads}"),
         ));
@@ -286,7 +287,7 @@ pub fn train(
 
         let status = lbfgs.optimize(size, &mut alpha, objective, &expected);
         if status < 0 {
-            return Err(Error::learn(dic_dir, "unexpected error in LBFGS routine"));
+            return Err(learn_error(dic_dir, "unexpected error in LBFGS routine"));
         }
         if status == 0 {
             break;

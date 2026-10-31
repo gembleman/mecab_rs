@@ -3,6 +3,7 @@ use std::path::Path;
 
 use lzma_rust2::{XzOptions, XzWriter};
 
+use crate::tool_error::rebuild_error;
 use mecab_rs::__private::files::write_file;
 use mecab_rs::__private::support::transport_payload;
 use mecab_rs::Error;
@@ -21,7 +22,7 @@ pub fn compress(payload: &[u8], path: &Path) -> Result<Vec<u8>, Error> {
         .dict_size
         .max(u32::try_from(payload.len()).unwrap_or(u32::MAX))
         .min(MAX_DICT_SIZE);
-    let failed = |error: std::io::Error| Error::rebuild(path, format!("xz: {error}"));
+    let failed = |error: std::io::Error| rebuild_error(path, format!("xz: {error}"));
     let mut writer = XzWriter::new(Vec::new(), options).map_err(failed)?;
     writer.write_all(payload).map_err(failed)?;
     writer.finish().map_err(failed)

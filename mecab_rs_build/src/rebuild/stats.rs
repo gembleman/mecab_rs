@@ -2,8 +2,10 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use mecab_rs::__private::files::{MATRIX_BIN_FILE, io_error, write_file};
+use crate::tool_error::{caused_by, io_error, rebuild_error, rebuild_error_at};
+use mecab_rs::__private::files::{MATRIX_BIN_FILE, write_file};
 use mecab_rs::__private::in_range_bytes::u16_at;
+use mecab_rs::IoAction;
 use mecab_rs::{Dictionary, Error, Tagger};
 
 use super::read_file;
@@ -17,7 +19,7 @@ pub(super) fn matrix_shape(dict_dir: &Path) -> Result<(usize, usize), Error> {
     let mut header = [0u8; MATRIX_HEADER_PREFIX_BYTES];
     File::open(&path)
         .and_then(|mut file| file.read_exact(&mut header))
-        .map_err(io_error(&path))?;
+        .map_err(io_error(IoAction::Read, &path))?;
     Ok((
         usize::from(u16_at(&header, 0)),
         usize::from(u16_at(&header, 2)),
@@ -32,7 +34,7 @@ pub struct ContextStats {
 
 impl ContextStats {
     pub fn write_tsv(&self, directory: &Path) -> Result<(), Error> {
-        fs::create_dir_all(directory).map_err(io_error(directory))?;
+        fs::create_dir_all(directory).map_err(io_error(IoAction::Create, directory))?;
         for (name, counts) in [(RIGHT_STATS, &self.right), (LEFT_STATS, &self.left)] {
             write_file(&directory.join(name), |writer| {
                 for (id, count) in counts.iter().enumerate() {
@@ -80,18 +82,22 @@ impl ContextStats {
         corpus: &Path,
     ) -> Result<(), Error> {
         let bytes = read_file(corpus)?;
-        let text = std::str::from_utf8(&bytes).map_err(|_| Error::rebuild(corpus, "not UTF-8"))?;
-        for line in text.split_terminator('\n') {
+        let text = std::str::from_utf8(&bytes).map_err(|_| rebuild_error(corpus, "not UTF-8"))?;
+        for (index, line) in text.split_terminator('\n').enumerate() {
             let sentence = line.strip_suffix('\r').unwrap_or(line);
-            self.count_sentence(tagger, sentence)?;
+            self.count_sentence(tagger, sentence).map_err(|error| {
+                caused_by(
+                    rebuild_error_at(corpus, index + 1, "cannot analyse the sentence"),
+                    error,
+                )
+            })?;
         }
         Ok(())
     }
 }
 
 fn read_counts(path: &Path) -> Result<Vec<u64>, Error> {
-    let text =
-        String::from_utf8(read_file(path)?).map_err(|_| Error::rebuild(path, "not UTF-8"))?;
+    let text = String::from_utf8(read_file(path)?).map_err(|_| rebuild_error(path, "not UTF-8"))?;
     let mut counts = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let parsed = line
@@ -100,9 +106,10 @@ fn read_counts(path: &Path) -> Result<Vec<u64>, Error> {
         match parsed {
             Some((id, count)) if id == counts.len() => counts.push(count),
             _ => {
-                return Err(Error::rebuild(
+                return Err(rebuild_error_at(
                     path,
-                    format!("line {}: expected `{}<TAB>count`", index + 1, counts.len()),
+                    index + 1,
+                    format!("expected `{}<TAB>count`", counts.len()),
                 ));
             }
         }

@@ -4,6 +4,7 @@ use std::sync::{Mutex, PoisonError};
 use std::thread;
 
 use crate::connection_templates::{ConnectionTemplates, ExactRows};
+use crate::tool_error::rebuild_error;
 use mecab_rs::__private::files::{MATRIX_HOT_FILE, MATRIX_ITP_FILE};
 use mecab_rs::__private::matrix::{HotShape, IntPart, IntTemplates};
 use mecab_rs::Error;
@@ -22,7 +23,7 @@ fn integer_cost_factor(templates: &ConnectionTemplates, path: &Path) -> Result<u
             return Ok(integer);
         }
     }
-    Err(Error::rebuild(
+    Err(rebuild_error(
         path,
         "the cost-factor is not a usable integer",
     ))
@@ -43,7 +44,7 @@ pub fn quantize(
             for at in span[0] as usize..span[1] as usize {
                 let rounded = (part.weight[at] * scale).round();
                 if rounded.is_nan() || rounded.abs() > f64::from(i32::MAX) {
-                    return Err(Error::rebuild(
+                    return Err(rebuild_error(
                         path,
                         "a weight does not fit the integer grid",
                     ));
@@ -88,7 +89,10 @@ pub fn find_exceptions(
         || candidate.left_size() != left_size
         || candidate.right_size() != right_size
     {
-        return Err(Error::Corrupt("the candidate does not fit the matrix"));
+        return Err(rebuild_error(
+            Path::new(MATRIX_ITP_FILE),
+            "the candidate does not fit the matrix",
+        ));
     }
     let view = candidate.view();
     let next_row = AtomicUsize::new(0);

@@ -5,6 +5,7 @@ use super::text::{
     LINE_BUFFER_BYTES, Lines, MAX_DEF_COLUMNS, atoi, cstr, escape_csv_element, tokenize_csv,
     tokenize2,
 };
+use crate::tool_error::{Position, build_error};
 use mecab_rs::__private::files::POS_ID_DEF_FILE;
 use mecab_rs::Error;
 
@@ -117,11 +118,11 @@ enum RewriteSection {
     Right,
 }
 
-fn rule_of(line: &mut [u8], path: &Path) -> Result<RewritePattern, Error> {
+fn rule_of(line: &mut [u8], at: Position) -> Result<RewritePattern, Error> {
     let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
     let found = tokenize2(line, b" \t", 3);
     if found.len() < 2 {
-        return Err(Error::build(path, format!("format error: {shown}")));
+        return Err(at.build(format!("format error: {shown}")));
     }
     let mut destination = cstr(line, found[1]).to_vec();
     if found.len() >= 3 {
@@ -137,7 +138,7 @@ fn with_columns<T>(
     use_columns: impl FnOnce(&[&[u8]]) -> Result<T, Error>,
 ) -> Result<T, Error> {
     if feature.len() >= LINE_BUFFER_BYTES - 1 {
-        return Err(Error::build(path, "too long feature"));
+        return Err(build_error(path, "too long feature"));
     }
     let mut buffer = feature.to_vec();
     buffer.push(0);
@@ -170,7 +171,7 @@ impl Rewriter {
             cache: HashMap::new(),
         };
         let mut section = RewriteSection::BeforeAny;
-        while let Some(line) = lines.next_line()? {
+        while let Some((number, line)) = lines.next_line()? {
             if line[0] == 0 || line[0] == b'#' {
                 continue;
             }
@@ -179,13 +180,13 @@ impl Rewriter {
                 b"[left rewrite]" => section = RewriteSection::Left,
                 b"[right rewrite]" => section = RewriteSection::Right,
                 _ => {
-                    let rule = rule_of(line, path)?;
+                    let rule = rule_of(line, Position::new(path, number))?;
                     match section {
                         RewriteSection::Unigram => rewriter.unigram.0.push(rule),
                         RewriteSection::Left => rewriter.left.0.push(rule),
                         RewriteSection::Right => rewriter.right.0.push(rule),
                         RewriteSection::BeforeAny => {
-                            return Err(Error::build(path, "no sections found"));
+                            return Err(Position::new(path, number).build("no sections found"));
                         }
                     }
                 }
@@ -197,7 +198,7 @@ impl Rewriter {
     pub(crate) fn rewrite(&self, feature: &[u8], path: &Path) -> Result<(bool, Rewritten), Error> {
         with_columns(feature, path, |input| {
             let mut result = Rewritten::default();
-            let fail = |reason: String| Error::build(path, reason);
+            let fail = |reason: String| build_error(path, reason);
             let matched = self
                 .unigram
                 .rewrite(input, &mut result.unigram)
@@ -241,18 +242,16 @@ impl PosIds {
         }
         let path = path.as_path();
         let mut lines = Lines::open(path, None)?;
-        while let Some(line) = lines.next_line()? {
+        while let Some((number, line)) = lines.next_line()? {
+            let at = Position::new(path, number);
             let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
             let found = tokenize2(line, b" \t", 2);
             if found.len() != 2 {
-                return Err(Error::build(path, format!("format error: {shown}")));
+                return Err(at.build(format!("format error: {shown}")));
             }
             let id = cstr(line, found[1]);
             if !id.iter().all(u8::is_ascii_digit) {
-                return Err(Error::build(
-                    path,
-                    format!("not a number: {}", String::from_utf8_lossy(id)),
-                ));
+                return Err(at.build(format!("not a number: {}", String::from_utf8_lossy(id))));
             }
             rules.0.push(RewritePattern::new(cstr(line, found[0]), id));
         }
@@ -268,7 +267,7 @@ impl PosIds {
             if self
                 .rules
                 .rewrite(input, &mut output)
-                .map_err(|reason| Error::build(&self.path, reason))?
+                .map_err(|reason| build_error(&self.path, reason))?
             {
                 Ok(atoi(&output))
             } else {
@@ -288,11 +287,12 @@ pub(super) struct ContextIds {
 fn read_id_table(path: &Path) -> Result<HashMap<Vec<u8>, i32>, Error> {
     let mut lines = Lines::open(path, None)?;
     let mut map = HashMap::new();
-    while let Some(line) = lines.next_line()? {
+    while let Some((number, line)) = lines.next_line()? {
+        let at = Position::new(path, number);
         let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
         let found = tokenize2(line, b" \t", 2);
         if found.len() != 2 {
-            return Err(Error::build(path, format!("format error: {shown}")));
+            return Err(at.build(format!("format error: {shown}")));
         }
         let id = atoi(cstr(line, found[0]));
         map.entry(cstr(line, found[1]).to_vec()).or_insert(id);
@@ -320,7 +320,7 @@ impl ContextIds {
 
     pub(super) fn left_id(&self, feature: &[u8]) -> Result<i32, Error> {
         self.left.get(feature).copied().ok_or_else(|| {
-            Error::build(
+            build_error(
                 &self.left_path,
                 format!(
                     "cannot find LEFT-ID  for {}",
@@ -332,7 +332,7 @@ impl ContextIds {
 
     pub(super) fn right_id(&self, feature: &[u8]) -> Result<i32, Error> {
         self.right.get(feature).copied().ok_or_else(|| {
-            Error::build(
+            build_error(
                 &self.right_path,
                 format!(
                     "cannot find RIGHT-ID  for {}",

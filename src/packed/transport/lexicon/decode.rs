@@ -1,6 +1,6 @@
 use super::{
-    COMMA, Error, HashMap, LINE_END, Model, NUL, NUMBER_FIELDS, Param, QUOTE, UNKNOWN_PARAM_BYTES,
-    decode_lexicon, get_varint,
+    COMMA, HashMap, LINE_END, Model, NUL, NUMBER_FIELDS, Param, QUOTE, UNKNOWN_PARAM_BYTES,
+    Undecodable, decode_lexicon, get_varint,
 };
 use crate::wire::{i16_at, u16_at};
 
@@ -10,22 +10,22 @@ pub(super) struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    pub(super) fn varint(&mut self) -> Result<u64, Error> {
-        get_varint(self.bytes, &mut self.at).ok_or(Error::Corrupt(
+    pub(super) fn varint(&mut self) -> Result<u64, Undecodable> {
+        get_varint(self.bytes, &mut self.at).ok_or(Undecodable(
             "a varint of the unknown tokens is too long or the data ends early",
         ))
     }
 
-    pub(super) fn count(&mut self) -> Result<usize, Error> {
-        usize::try_from(self.varint()?).map_err(|_| Error::Corrupt("a count is too large"))
+    pub(super) fn count(&mut self) -> Result<usize, Undecodable> {
+        usize::try_from(self.varint()?).map_err(|_| Undecodable("a count is too large"))
     }
 
-    pub(super) fn take(&mut self, length: usize) -> Result<&'a [u8], Error> {
+    pub(super) fn take(&mut self, length: usize) -> Result<&'a [u8], Undecodable> {
         let end = self
             .at
             .checked_add(length)
             .filter(|&end| end <= self.bytes.len())
-            .ok_or(Error::Corrupt("the unknown tokens end early"))?;
+            .ok_or(Undecodable("the unknown tokens end early"))?;
         let slice = &self.bytes[self.at..end];
         self.at = end;
         Ok(slice)
@@ -78,16 +78,16 @@ impl<'a> PosIds<'a> {
         }
     }
 
-    pub(super) fn next(&mut self) -> Result<u16, Error> {
+    pub(super) fn next(&mut self) -> Result<u16, Undecodable> {
         if self.left == 0 {
             self.current = u16::try_from(self.reader.varint()?)
-                .map_err(|_| Error::Corrupt("a part-of-speech id is too large"))?;
+                .map_err(|_| Undecodable("a part-of-speech id is too large"))?;
             self.left = self.reader.count()?;
         }
         self.left = self
             .left
             .checked_sub(1)
-            .ok_or(Error::Corrupt("a part-of-speech run is empty"))?;
+            .ok_or(Undecodable("a part-of-speech run is empty"))?;
         Ok(self.current)
     }
 
@@ -146,7 +146,7 @@ pub(super) fn decode_unknown<'a>(
     pos_ids: &mut PosIds,
     model: &mut Model,
     interner: &mut Interner<'a>,
-) -> Result<(), Error> {
+) -> Result<(), Undecodable> {
     let categories = reader.count()?;
     let mut counts = Vec::with_capacity(categories.min(reader.bytes.len()));
     for _ in 0..categories {
@@ -164,17 +164,17 @@ pub(super) fn decode_unknown<'a>(
             };
             let length = reader.count()?;
             let feature = str::from_utf8(reader.take(length)?)
-                .map_err(|_| Error::Corrupt("an unknown feature is not valid UTF-8"))?;
+                .map_err(|_| Undecodable("an unknown feature is not valid UTF-8"))?;
             let (param, feature) = interner.intern(model, param, feature);
             model.unknown_params.push(param);
             model.unknown_features.push(feature);
         }
         let end = u32::try_from(model.unknown_params.len())
-            .map_err(|_| Error::Corrupt("too many unknown tokens"))?;
+            .map_err(|_| Undecodable("too many unknown tokens"))?;
         model.unknown_starts.push(end);
     }
     if !reader.at_end() {
-        return Err(Error::Corrupt("the unknown tokens have trailing bytes"));
+        return Err(Undecodable("the unknown tokens have trailing bytes"));
     }
     Ok(())
 }
@@ -184,12 +184,12 @@ fn append_token_line<'a>(
     pos_ids: &mut PosIds,
     model: &mut Model,
     interner: &mut Interner<'a>,
-) -> Result<(), Error> {
+) -> Result<(), Undecodable> {
     let CsvLine {
         key,
         mut param,
         feature,
-    } = parse_line(line).ok_or(Error::Corrupt("the lexicon text is not valid"))?;
+    } = parse_line(line).ok_or(Undecodable("the lexicon text is not valid"))?;
     param.pos_id = pos_ids.next()?;
     let (param, feature) = interner.intern(model, param, feature);
     model.token_params.push(param);
@@ -198,7 +198,7 @@ fn append_token_line<'a>(
         (Some(last), Some(count)) if *last == key => {
             *count = count
                 .checked_add(1)
-                .ok_or(Error::Corrupt("a key has more than 255 tokens"))?;
+                .ok_or(Undecodable("a key has more than 255 tokens"))?;
         }
         _ => {
             model.keys.push(key);
@@ -208,8 +208,8 @@ fn append_token_line<'a>(
     Ok(())
 }
 
-pub(super) fn model_from_csv(csv: &[u8], unknown: &[u8], pos: &[u8]) -> Result<Model, Error> {
-    let text = str::from_utf8(csv).map_err(|_| Error::Corrupt("the lexicon is not UTF-8"))?;
+pub(super) fn model_from_csv(csv: &[u8], unknown: &[u8], pos: &[u8]) -> Result<Model, Undecodable> {
+    let text = str::from_utf8(csv).map_err(|_| Undecodable("the lexicon is not UTF-8"))?;
     let unknown = Reader {
         bytes: unknown,
         at: 0,
@@ -225,11 +225,11 @@ pub(super) fn model_from_csv(csv: &[u8], unknown: &[u8], pos: &[u8]) -> Result<M
     }
     decode_unknown(unknown, &mut pos_ids, &mut model, &mut interner)?;
     if !pos_ids.at_end() {
-        return Err(Error::Corrupt("the part-of-speech ids have trailing bytes"));
+        return Err(Undecodable("the part-of-speech ids have trailing bytes"));
     }
     Ok(model)
 }
 
-pub(super) fn restore(lexicon: &[u8], unknown: &[u8], pos: &[u8]) -> Result<Model, Error> {
+pub(super) fn restore(lexicon: &[u8], unknown: &[u8], pos: &[u8]) -> Result<Model, Undecodable> {
     model_from_csv(&decode_lexicon(lexicon)?, unknown, pos)
 }

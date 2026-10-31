@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use super::int_stream::{IntContext, decode_payload, encode_payload};
-use super::{Part, Parts, io_error};
+use super::{IoAction, Part, Parts, io_error};
 use crate::Error;
 use crate::dict_files::{
     FEATURE_DEF_FILE, LEFT_ID_DEF_FILE, MATRIX_HOT_FILE, MATRIX_ITP_FILE, RIGHT_ID_DEF_FILE,
@@ -44,7 +44,7 @@ fn row_delta(matrix: &[u8], encode: bool) -> Vec<u8> {
 
 fn read_text(dict_dir: &Path, name: &str) -> Result<String, Error> {
     let path = dict_dir.join(name);
-    std::fs::read_to_string(&path).map_err(io_error(&path))
+    std::fs::read_to_string(&path).map_err(io_error(IoAction::Read, &path))
 }
 
 fn length_word(length: usize) -> Result<[u8; WORD_BYTES], Error> {
@@ -75,7 +75,7 @@ fn hot_matrix(templates: &IntTemplates, hot: &HotShape, path: &Path) -> Result<V
     let mut bytes = Vec::new();
     templates
         .write_hot_matrix(hot, default_threads(), &mut bytes)
-        .map_err(io_error(path))?;
+        .map_err(io_error(IoAction::Write, path))?;
     Ok(bytes)
 }
 
@@ -83,7 +83,7 @@ fn full_templates(templates: &IntTemplates, path: &Path) -> Result<Vec<u8>, Erro
     let mut bytes = Vec::new();
     templates
         .write_clustered_templates(DEFAULT_CLUSTER_COUNT, default_threads(), &mut bytes)
-        .map_err(io_error(path))?;
+        .map_err(io_error(IoAction::Write, path))?;
     Ok(bytes)
 }
 
@@ -227,6 +227,8 @@ pub(in crate::packed) fn decode(parts: &Parts) -> Result<(Vec<u8>, Vec<u8>), Err
             Ok((row_delta(bytes, false), Vec::new()))
         }
         (ENCODING_INTEGER_MRIT, bytes) => decode_integer(bytes, parts.path),
-        _ => Err(Error::Unsupported("a matrix with an unknown encoding")),
+        (found, _) => {
+            Err(parts.corrupt(format!("the part matrix has the unknown encoding {found}")))
+        }
     }
 }

@@ -147,7 +147,7 @@ fn run() -> Result<(), String> {
     let Parsed::Run(arguments) = parse(&arguments)? else {
         return Ok(());
     };
-    let shown = |error: mecab_rs::Error| error.to_string();
+    let shown = |error: mecab_rs::Error| error.report();
     let report = match &arguments.user {
         Some(output) if arguments.assign => build::assign_user_costs(
             &arguments.dic_dir,

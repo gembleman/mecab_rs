@@ -2,6 +2,7 @@ pub(crate) mod int_stream;
 mod lexicon;
 pub(crate) mod matrix;
 
+use std::borrow::Cow;
 use std::io::Read;
 use std::path::Path;
 
@@ -10,7 +11,7 @@ use lzma_rust2::XzReader;
 use super::model::{LexiconSections, Model};
 use super::source::read_dictionary;
 use crate::Error;
-use crate::error::io_error;
+use crate::error::{IoAction, io_error};
 use crate::file_write::write_file;
 use crate::wire::{fnv1a64, u32_at, u64_at};
 
@@ -36,17 +37,20 @@ impl<'a> Parts<'a> {
             .iter()
             .find(|part| part.0 == name)
             .map(|&(_, encoding, bytes)| (encoding, bytes))
-            .ok_or_else(|| Error::format(self.path, "a part is missing"))
+            .ok_or_else(|| Error::format(self.path, format!("the part {name} is missing")))
     }
 
     fn plain(&self, name: &str, encoding: u32) -> Result<&'a [u8], Error> {
         match self.get(name)? {
             (found, bytes) if found == encoding => Ok(bytes),
-            _ => Err(Error::Unsupported("a part with an unknown encoding")),
+            (found, _) => Err(Error::format(
+                self.path,
+                format!("the part {name} has the unknown encoding {found}"),
+            )),
         }
     }
 
-    fn corrupt(&self, reason: &'static str) -> Error {
+    fn corrupt(&self, reason: impl Into<Cow<'static, str>>) -> Error {
         Error::format(self.path, reason)
     }
 }
@@ -193,11 +197,13 @@ pub fn transport_payload(dict_dir: &Path) -> Result<Vec<u8>, Error> {
 }
 
 pub fn expand(xz_file: &Path, out_mrd: &Path) -> Result<(), Error> {
-    let file = std::fs::File::open(xz_file).map_err(io_error(xz_file))?;
+    let file = std::fs::File::open(xz_file).map_err(io_error(IoAction::Open, xz_file))?;
     let mut payload = Vec::new();
     XzReader::new(std::io::BufReader::new(file), false)
         .read_to_end(&mut payload)
-        .map_err(|error| Error::rebuild(xz_file, format!("xz: {error}")))?;
+        .map_err(|cause| {
+            Error::format(xz_file, "the xz stream cannot be decoded").caused_by(cause)
+        })?;
     let (model, sections) = runtime_model(&parse_container(&payload, xz_file)?)?;
     drop(payload);
     let runtime = model.finish_runtime(sections)?;

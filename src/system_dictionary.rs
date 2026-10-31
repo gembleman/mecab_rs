@@ -4,7 +4,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::thread;
 
-use crate::error::{Error, io_error};
+use crate::error::{Error, IoAction, io_error};
 use crate::mapped_file::MappedFile;
 use crate::section::{Plain, Section};
 use crate::utf8::is_continuation;
@@ -152,7 +152,7 @@ fn check_last_feature_byte(file: &File, header: &Header, path: &Path) -> Result<
     }
     let mut last_feature_byte = [0];
     read_exact_at(file, &mut last_feature_byte, header.features_end as u64 - 1)
-        .map_err(io_error(path))?;
+        .map_err(io_error(IoAction::Read, path))?;
     if last_feature_byte[0] != 0 {
         return Err(Error::format(
             path,
@@ -181,7 +181,7 @@ impl SystemDictionary {
         kind: DictionaryKind,
         read_block_bytes: usize,
     ) -> Result<Self, Error> {
-        let io_error = io_error(path);
+        let io_error = io_error(IoAction::Read, path);
         let map = MappedFile::open(path)?;
         let broken = |reason| Error::format(path, reason);
         let bytes = &map[..];

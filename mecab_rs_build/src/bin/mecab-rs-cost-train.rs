@@ -109,7 +109,7 @@ fn run() -> Result<ExitCode, String> {
         &mut log,
     );
     let _ = log.flush();
-    result.map_err(|error| error.to_string())?;
+    result.map_err(|error| error.report())?;
     Ok(ExitCode::SUCCESS)
 }
 

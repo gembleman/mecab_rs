@@ -85,7 +85,7 @@ fn run() -> Result<(), String> {
     let mut log = stdout.lock();
     let result = generate(&generate_options, &mut log);
     let _ = log.flush();
-    result.map_err(|error| error.to_string())
+    result.map_err(|error| error.report())
 }
 
 fn main() -> ExitCode {

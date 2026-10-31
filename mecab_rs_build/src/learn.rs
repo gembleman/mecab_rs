@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use crate::build::text::{LINE_BUFFER_BYTES, Lines, key_value};
-use mecab_rs::__private::files::io_error;
+use crate::tool_error::{caused_by, learn_error};
 use mecab_rs::Error;
 
 mod dict_gen;
@@ -35,19 +35,14 @@ impl Config {
     }
 
     pub(crate) fn load(&mut self, path: &Path) -> Result<(), Error> {
-        let bytes = std::fs::read(path).map_err(|_| {
-            Error::learn(
-                path,
-                format!("no such file or directory: {}", path.display()),
-            )
-        })?;
+        let bytes = std::fs::read(path).map_err(|source| missing_file(path, source))?;
         for line in bytes.split(|&byte| byte == b'\n') {
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             if line.is_empty() || line[0] == b';' || line[0] == b'#' {
                 continue;
             }
             let Some((key, value)) = key_value(line) else {
-                return Err(Error::learn(
+                return Err(learn_error(
                     path,
                     format!("format error: {}", String::from_utf8_lossy(line)),
                 ));
@@ -178,10 +173,17 @@ pub(crate) fn surface_and_feature(line: &[u8]) -> Option<(&[u8], &[u8])> {
 
 pub(crate) fn open_lines(path: &Path) -> Result<Lines, Error> {
     Lines::open(path, Some(LINE_BUFFER_BYTES)).map_err(|error| match error {
-        Error::Io { .. } => Error::learn(
+        Error::Io { source, .. } => missing_file(path, source),
+        other => other,
+    })
+}
+
+pub(crate) fn missing_file(path: &Path, source: std::io::Error) -> Error {
+    caused_by(
+        learn_error(
             path,
             format!("no such file or directory: {}", path.display()),
         ),
-        other => other,
-    })
+        source,
+    )
 }

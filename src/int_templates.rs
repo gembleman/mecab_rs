@@ -6,7 +6,8 @@ use crate::clusters::{
     ClusterPlan, ClusterShape, fill_cells, interleaved_ids, left_ids, plan_clusters, right_ids,
     write_cluster_layout,
 };
-use crate::error::Error;
+use crate::dict_files::MATRIX_ITP_FILE;
+use crate::error::{Error, Undecodable};
 use crate::hot_shape::{CELL_SUM_BOUND, HotShape, MAX_KEYS};
 #[cfg(feature = "xz")]
 use crate::int_runtime::runtime_form_from;
@@ -161,10 +162,10 @@ fn validate<'a>(
     left_size: usize,
     right_size: usize,
     exception_cells: &[u32],
-) -> Result<(), Error> {
-    let corrupt = Error::Corrupt("the integer templates are inconsistent");
+) -> Result<(), Undecodable> {
+    let corrupt = Undecodable("the integer templates are inconsistent");
     if left_size == 0 || right_size == 0 || left_size > MAX_KEYS || right_size > MAX_KEYS {
-        return Err(Error::Corrupt("the template matrix size is out of range"));
+        return Err(Undecodable("the template matrix size is out of range"));
     }
     if shift > MAX_SHIFT || cost_factor > MAX_COST_FACTOR {
         return Err(corrupt);
@@ -293,7 +294,8 @@ impl IntTemplates {
             left_size,
             right_size,
             &exception_cells,
-        )?;
+        )
+        .map_err(|error| error.in_file(Path::new(MATRIX_ITP_FILE)))?;
         Ok(Self {
             cost_factor,
             shift,
