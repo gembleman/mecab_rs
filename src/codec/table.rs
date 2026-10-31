@@ -59,6 +59,7 @@ pub struct Lexicon {
     data: Vec<u8>,
     ends: Vec<u32>,
     pub irregular: Vec<Vec<u8>>,
+    pub irregular_at: Vec<u32>,
     pub no_final_newline: bool,
 }
 
@@ -98,54 +99,59 @@ impl Lexicon {
         }
     }
 
+    pub fn push_irregular(&mut self, line: Vec<u8>) {
+        self.irregular_at.push(self.rows() as u32);
+        self.irregular.push(line);
+    }
+
+    fn write_row<F: FnMut(&[u8])>(&self, r: usize, sink: &mut F) {
+        for c in 0..self.n_cols {
+            if c > 0 {
+                sink(b",");
+            }
+            let f = self.field_bytes(r, c);
+            if f.iter().any(|&x| x == b',' || x == b'"') {
+                sink(b"\"");
+                let mut start = 0;
+                for (i, &x) in f.iter().enumerate() {
+                    if x == b'"' {
+                        sink(&f[start..=i]);
+                        sink(b"\"");
+                        start = i + 1;
+                    }
+                }
+                sink(&f[start..]);
+                sink(b"\"");
+            } else {
+                sink(f);
+            }
+        }
+    }
+
     pub fn write_text<F: FnMut(&[u8])>(&self, order: Option<&[u32]>, mut sink: F) {
+        debug_assert_eq!(self.irregular.len(), self.irregular_at.len());
         let rows = self.rows();
         let total = rows + self.irregular.len();
         let mut emitted = 0usize;
-        let mut emit_row = |r: usize, sink: &mut F| {
-            for c in 0..self.n_cols {
-                if c > 0 {
-                    sink(b",");
-                }
-                let f = self.field_bytes(r, c);
-                if f.iter().any(|&x| x == b',' || x == b'"') {
-                    sink(b"\"");
-                    let mut start = 0;
-                    for (i, &x) in f.iter().enumerate() {
-                        if x == b'"' {
-                            sink(&f[start..=i]);
-                            sink(b"\"");
-                            start = i + 1;
-                        }
-                    }
-                    sink(&f[start..]);
-                    sink(b"\"");
-                } else {
-                    sink(f);
-                }
-            }
+        let mut end_line = |sink: &mut F| {
             emitted += 1;
             if emitted < total || !self.no_final_newline {
                 sink(b"\n");
             }
         };
-        match order {
-            Some(o) => {
-                for &r in o {
-                    emit_row(r as usize, &mut sink);
-                }
+        let mut next_irregular = 0usize;
+        for slot in 0..=rows {
+            while next_irregular < self.irregular.len()
+                && (slot == rows || self.irregular_at[next_irregular] as usize <= slot)
+            {
+                sink(&self.irregular[next_irregular]);
+                end_line(&mut sink);
+                next_irregular += 1;
             }
-            None => {
-                for r in 0..rows {
-                    emit_row(r, &mut sink);
-                }
-            }
-        }
-        for l in &self.irregular {
-            emitted += 1;
-            sink(l);
-            if emitted < total || !self.no_final_newline {
-                sink(b"\n");
+            if slot < rows {
+                let r = order.map_or(slot, |o| o[slot] as usize);
+                self.write_row(r, &mut sink);
+                end_line(&mut sink);
             }
         }
     }
@@ -206,8 +212,6 @@ pub fn parse_text(text: &[u8]) -> Parsed {
         .map_or(0, |(&k, _)| k);
     let mut lex = Lexicon::new(n_cols);
     lex.no_final_newline = no_final_newline;
-    let mut seen_irregular = false;
-    let mut regular_after_irregular = false;
     if !text.is_empty() {
         for l in lines() {
             let mut ok = false;
@@ -224,11 +228,8 @@ pub fn parse_text(text: &[u8]) -> Parsed {
                     }
                 }
             }
-            if ok {
-                regular_after_irregular |= seen_irregular;
-            } else {
-                seen_irregular = true;
-                lex.irregular.push(l.to_vec());
+            if !ok {
+                lex.push_irregular(l.to_vec());
             }
         }
     }
@@ -242,6 +243,6 @@ pub fn parse_text(text: &[u8]) -> Parsed {
     Parsed {
         lex,
         order,
-        already_grouped: sorted && !regular_after_irregular,
+        already_grouped: sorted,
     }
 }

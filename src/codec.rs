@@ -237,8 +237,12 @@ pub fn encode_with(csv: &[u8], opts: &EncodeOptions) -> (Vec<u8>, Report) {
     }
     let before = c.bits;
     let mut irr = CharModel::new(2);
+    let mut gaps = UintModel::default();
     let mut tmp = Vec::new();
-    for l in &lex.irregular {
+    let mut previous_at = 0;
+    for (l, &at) in lex.irregular.iter().zip(&lex.irregular_at) {
+        gaps.code(&mut c, u64::from(at - previous_at));
+        previous_at = at;
         irr.code_bytes(&mut c, l, &mut tmp);
     }
     report.irregular_bits = c.bits - before;
@@ -388,9 +392,17 @@ fn decode_unchecked(data: &[u8]) -> Result<(Lexicon, Header), Error> {
         }
     }
     let mut irr = CharModel::new(2);
+    let mut gaps = UintModel::default();
+    let rows = lex.rows() as u64;
+    let mut at = 0u64;
     for _ in 0..h.n_irregular {
+        at = at.saturating_add(gaps.code(&mut c, 0));
+        if at > rows {
+            return corrupt("an irregular line lies past the last row");
+        }
         let mut line = Vec::new();
         irr.code_bytes(&mut c, &[], &mut line);
+        lex.irregular_at.push(at as u32);
         lex.irregular.push(line);
         if c.overrun() {
             return corrupt("truncated data");
