@@ -270,7 +270,12 @@ fn best_left<const SELECT: bool>(
 
 const CONNECT_GROUP_SIZE: usize = 4;
 
-const END_SLOTS_PAST_TEXT: usize = 2;
+pub(crate) const END_SLOTS_PAST_TEXT: usize = 2;
+
+const EOS_END_PAST_LAST_FILLED: usize = 1;
+
+pub(crate) const MAX_TEXT_LEN: usize =
+    u32::MAX as usize - END_SLOTS_PAST_TEXT - EOS_END_PAST_LAST_FILLED;
 
 #[cfg(feature = "pair-stats")]
 fn record_pairs(nodes: &[BestNode], lefts: &[LeftCandidate]) {
@@ -359,6 +364,7 @@ impl Lattice {
 
     fn reset(&mut self, text: &str, constraints: &[Constraint<'_>]) {
         let sentence_len = text.len();
+        debug_assert!(sentence_len <= MAX_TEXT_LEN);
         self.nodes.clear();
         self.best_nodes.clear();
         self.path.clear();
@@ -485,11 +491,12 @@ impl Lattice {
 
     #[inline(always)]
     fn push_eos<const BEST: bool>(&mut self, sentence_len: usize, last_filled_end: usize) -> usize {
+        debug_assert!(last_filled_end <= sentence_len && sentence_len <= MAX_TEXT_LEN);
         if BEST {
             self.best_nodes.push(BestNode {
                 candidate: Candidate {
                     surface: sentence_len as u32,
-                    end: last_filled_end as u32 + 1,
+                    end: last_filled_end as u32 + EOS_END_PAST_LAST_FILLED as u32,
                     source: NodeSource::Eos,
                     ..Candidate::bos()
                 },

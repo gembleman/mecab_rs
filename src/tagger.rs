@@ -2,12 +2,13 @@ use std::ops::Range;
 use std::slice;
 use std::sync::Arc;
 
-use crate::constraint::{Constraint, ConstraintSet};
+use crate::constraint::{ConstraintSet, Constraints};
 use crate::dictionary::Dictionary;
 use crate::error::Error;
 use crate::feature_text::FeatureText;
 use crate::ids::NodeId;
-use crate::lattice::{Lattice, NodeSource, RawNode};
+use crate::lattice::{Lattice, MAX_TEXT_LEN, NodeSource, RawNode};
+use crate::partial::PartialInput;
 
 pub const DEFAULT_THETA: f32 = 0.75;
 
@@ -28,7 +29,7 @@ pub enum NodeKind {
 pub struct FeatureId(u64);
 
 fn check_text(text: &str) -> Result<(), Error> {
-    if u32::try_from(text.len()).is_err() {
+    if text.len() > MAX_TEXT_LEN {
         return Err(Error::TextTooLong);
     }
     if text.contains('\0') {
@@ -99,50 +100,60 @@ impl<D: DictionaryHandle> Tagger<D> {
     }
 
     pub fn parse<'t, 'x>(&'t mut self, text: &'x str) -> Result<Path<'t, 'x>, Error> {
-        self.parse_with(text, &[])
+        self.parse_with(&Constraints::new(text))
     }
 
     pub fn parse_with<'t, 'x>(
         &'t mut self,
-        text: &'x str,
-        constraints: &[Constraint<'_>],
+        constraints: &Constraints<'x>,
     ) -> Result<Path<'t, 'x>, Error> {
+        let text = constraints.text();
         self.run_on(text, |lattice, dictionary| {
-            lattice.parse_best(dictionary, text, constraints)
+            lattice.parse_best(dictionary, text, constraints.as_slice())
         })?;
         Ok(self.view(text).best_path())
     }
 
+    pub fn parse_partial<'t, 'x>(
+        &'t mut self,
+        input: &'x PartialInput<'_>,
+    ) -> Result<Path<'t, 'x>, Error> {
+        self.parse_with(&input.constraints())
+    }
+
     pub fn parse_lattice<'t, 'x>(
         &'t mut self,
-        text: &'x str,
-        constraints: &[Constraint<'_>],
+        constraints: &Constraints<'x>,
     ) -> Result<LatticeView<'t, 'x>, Error> {
+        let text = constraints.text();
         self.run_on(text, |lattice, dictionary| {
-            lattice.parse(dictionary, text, constraints)
+            lattice.parse(dictionary, text, constraints.as_slice())
         })?;
         Ok(self.view(text))
     }
 
     pub fn parse_marginal<'t, 'x>(
         &'t mut self,
-        text: &'x str,
-        constraints: &[Constraint<'_>],
+        constraints: &Constraints<'x>,
         theta: f32,
     ) -> Result<LatticeView<'t, 'x>, Error> {
+        if !(theta.is_finite() && theta >= 0.0) {
+            return Err(Error::InvalidTheta { theta });
+        }
+        let text = constraints.text();
         self.run_on(text, |lattice, dictionary| {
-            lattice.parse_marginal(dictionary, text, constraints, theta)
+            lattice.parse_marginal(dictionary, text, constraints.as_slice(), theta)
         })?;
         Ok(self.view(text))
     }
 
     pub fn parse_nbest<'t, 'x>(
         &'t mut self,
-        text: &'x str,
-        constraints: &[Constraint<'_>],
+        constraints: &Constraints<'x>,
     ) -> Result<NBest<'t, 'x>, Error> {
+        let text = constraints.text();
         self.run_on(text, |lattice, dictionary| {
-            lattice.start_nbest(dictionary, text, constraints)
+            lattice.start_nbest(dictionary, text, constraints.as_slice())
         })?;
         Ok(NBest {
             dictionary: self.dictionary.dictionary(),
@@ -355,7 +366,7 @@ impl<'x> Node<'_, 'x> {
     }
 
     pub fn surface(&self) -> &'x str {
-        self.frame.text.get(self.surface_range()).unwrap_or("")
+        &self.frame.text[self.surface_range()]
     }
 
     pub fn surface_range(&self) -> Range<usize> {

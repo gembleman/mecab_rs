@@ -3,6 +3,8 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::lattice::MAX_TEXT_LEN;
+
 type Cause = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 const CHAIN_SEPARATOR: &str = ": ";
@@ -88,6 +90,12 @@ pub enum Error {
     NulInText,
     TextTooLong,
     UnsatisfiableConstraint,
+    PositionInsideCharacter {
+        position: usize,
+    },
+    InvalidTheta {
+        theta: f32,
+    },
 }
 
 impl Error {
@@ -225,12 +233,21 @@ impl fmt::Display for Error {
             }
             Self::Unsupported(what) => write!(formatter, "unsupported: {what}"),
             Self::NulInText => formatter.write_str("the input text contains a NUL character"),
-            Self::TextTooLong => {
-                formatter.write_str("the input text is longer than u32::MAX bytes")
-            }
+            Self::TextTooLong => write!(
+                formatter,
+                "the input text is longer than {MAX_TEXT_LEN} bytes"
+            ),
             Self::UnsatisfiableConstraint => {
                 formatter.write_str("no node satisfies the given constraints")
             }
+            Self::PositionInsideCharacter { position } => write!(
+                formatter,
+                "constraint position {position} is inside a character of the text"
+            ),
+            Self::InvalidTheta { theta } => write!(
+                formatter,
+                "cannot compute marginals with theta {theta}: it must be finite and positive"
+            ),
         }
     }
 }

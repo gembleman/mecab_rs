@@ -1,3 +1,4 @@
+use crate::error::Error;
 use crate::feature_match::partial_match;
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
@@ -27,6 +28,86 @@ pub enum Constraint<'a> {
     },
 }
 
+#[derive(Clone, Debug)]
+pub struct Constraints<'t> {
+    text: &'t str,
+    items: Vec<Constraint<'t>>,
+}
+
+impl<'t> Constraints<'t> {
+    pub fn new(text: &'t str) -> Self {
+        Self {
+            text,
+            items: Vec::new(),
+        }
+    }
+
+    pub fn text(&self) -> &'t str {
+        self.text
+    }
+
+    pub fn as_slice(&self) -> &[Constraint<'t>] {
+        &self.items
+    }
+
+    pub fn boundary(&mut self, position: usize, kind: BoundaryKind) -> Result<&mut Self, Error> {
+        if self.is_interior(position) {
+            self.check_character_boundary(position)?;
+            self.push_boundary(position, kind);
+        }
+        Ok(self)
+    }
+
+    pub fn feature(
+        &mut self,
+        start: usize,
+        end: usize,
+        pattern: &'t str,
+    ) -> Result<&mut Self, Error> {
+        if self.is_effective_feature(start, end, pattern) {
+            self.check_character_boundary(start)?;
+            self.check_character_boundary(end.min(self.text.len()))?;
+            self.push_feature(start, end, pattern);
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn push_boundary(&mut self, position: usize, kind: BoundaryKind) {
+        if self.is_interior(position) {
+            debug_assert!(self.text.is_char_boundary(position));
+            self.items.push(Constraint::Boundary { position, kind });
+        }
+    }
+
+    pub(crate) fn push_feature(&mut self, start: usize, end: usize, pattern: &'t str) {
+        if self.is_effective_feature(start, end, pattern) {
+            let end = end.min(self.text.len());
+            debug_assert!(self.text.is_char_boundary(start) && self.text.is_char_boundary(end));
+            self.items.push(Constraint::Feature {
+                start,
+                end,
+                pattern,
+            });
+        }
+    }
+
+    fn is_interior(&self, position: usize) -> bool {
+        position != 0 && position < self.text.len()
+    }
+
+    fn is_effective_feature(&self, start: usize, end: usize, pattern: &str) -> bool {
+        start < end.min(self.text.len()) && !pattern.contains('\0')
+    }
+
+    fn check_character_boundary(&self, position: usize) -> Result<(), Error> {
+        if self.text.is_char_boundary(position) {
+            Ok(())
+        } else {
+            Err(Error::PositionInsideCharacter { position })
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ConstraintSet {
     boundary: Vec<Boundary>,
@@ -45,23 +126,19 @@ impl ConstraintSet {
         for constraint in constraints {
             match *constraint {
                 Constraint::Boundary { position, kind } => {
-                    if position != 0 && position < text_len {
-                        let boundary = match kind {
-                            BoundaryKind::Token => Boundary::Token,
-                            BoundaryKind::Inside => Boundary::Inside,
-                        };
-                        self.set_boundary(text_len, position, boundary);
-                    }
+                    debug_assert!(position != 0 && position < text_len);
+                    let boundary = match kind {
+                        BoundaryKind::Token => Boundary::Token,
+                        BoundaryKind::Inside => Boundary::Inside,
+                    };
+                    self.set_boundary(text_len, position, boundary);
                 }
                 Constraint::Feature {
                     start,
                     end,
                     pattern,
                 } => {
-                    let end = end.min(text_len);
-                    if start >= end || pattern.contains('\0') {
-                        continue;
-                    }
+                    debug_assert!(start < end && end <= text_len);
                     self.set_feature(text_len, start, end, pattern);
                 }
             }

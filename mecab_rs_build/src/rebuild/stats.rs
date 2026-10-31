@@ -6,7 +6,7 @@ use crate::tool_error::{caused_by, io_error, rebuild_error, rebuild_error_at};
 use mecab_rs::__private::files::{MATRIX_BIN_FILE, write_file};
 use mecab_rs::__private::in_range_bytes::u16_at;
 use mecab_rs::IoAction;
-use mecab_rs::{Dictionary, Error, Tagger};
+use mecab_rs::{Constraints, Dictionary, Error, Tagger};
 
 use super::read_file;
 
@@ -58,7 +58,7 @@ impl ContextStats {
         tagger: &mut Tagger<&Dictionary>,
         sentence: &str,
     ) -> Result<(), Error> {
-        let view = tagger.parse_lattice(sentence, &[])?;
+        let view = tagger.parse_lattice(&Constraints::new(sentence))?;
         for position in 0..=sentence.len() {
             let ends = view.end_nodes(position);
             let begins = view.begin_nodes(position);
