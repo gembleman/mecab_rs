@@ -597,10 +597,12 @@ fn exception_rows_fit(
             .last()
             .is_some_and(|&end| end as usize == exception_count)
         && starts.windows(2).all(|span| {
-            span[0] <= span[1]
-                && listed[span[0] as usize..span[1] as usize]
-                    .windows(2)
-                    .all(|pair| pair[0] & !ABOVE < pair[1] & !ABOVE)
+            listed
+                .get(span[0] as usize..span[1] as usize)
+                .is_some_and(|row| {
+                    row.windows(2)
+                        .all(|pair| pair[0] & !ABOVE < pair[1] & !ABOVE)
+                })
         })
         && listed
             .iter()

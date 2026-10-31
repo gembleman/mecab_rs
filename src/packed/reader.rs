@@ -66,9 +66,6 @@ pub(super) struct Source<'a> {
     sections: [Range<usize>; SECTIONS],
 }
 
-impl<'a> Source<'a> {
-}
-
 impl Source<'_> {
     pub(super) fn broken(&self, reason: &'static str) -> Error {
         Error::Format {

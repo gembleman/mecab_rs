@@ -682,5 +682,4 @@ impl<S: SectionSource> MappedIntTemplates<S> {
             int_cost(total, self.cost_factor, self.shift)
         })
     }
-
 }
