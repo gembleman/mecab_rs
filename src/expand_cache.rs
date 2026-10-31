@@ -1,23 +1,34 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use crate::error::{Error, IoAction, io_error};
+use crate::file_write::temporary_path;
 use crate::packed::VERSION as MRD_VERSION;
 use crate::wire::{FNV_OFFSET, fnv1a};
 
 const XZ_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0];
 const IDENTITY_HEAD_BYTES: u64 = 4096;
 const IDENTITY_TAIL_BYTES: u64 = 64 << 10;
-const CONCURRENT_WRITER_WAIT: Duration = Duration::from_secs(2);
-const STALE_TEMPORARY_AGE: Duration = Duration::from_secs(3600);
-const MARKER_SUFFIX: &str = ".src";
+const DIGEST_HEX_DIGITS: usize = 16;
+const STALE_LEFTOVER_AGE: Duration = Duration::from_secs(3600);
+const XZ_SUFFIX: &str = ".xz";
+const RUNTIME_SUFFIX: &str = ".mrd";
+const LEGACY_MARKER_SUFFIX: &str = ".src";
+const LOCK_SUFFIX: &str = ".lock";
+const VERSION_MARK: &str = ".v";
 
-static EXPAND_LOCK: Mutex<()> = Mutex::new(());
-static NEXT_TEMPORARY_NUMBER: AtomicUsize = AtomicUsize::new(0);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Expansion {
+    Reused,
+    Expanded,
+}
+
+pub(crate) struct Cache {
+    pub(crate) path: PathBuf,
+    pub(crate) expansion: Expansion,
+}
 
 pub(crate) fn is_xz(path: &Path) -> bool {
     let mut magic = [0u8; 6];
@@ -26,34 +37,6 @@ pub(crate) fn is_xz(path: &Path) -> bool {
         .is_ok()
         && magic == XZ_MAGIC
 }
-
-pub(crate) fn cache_path(xz: &Path) -> PathBuf {
-    let name = xz.file_name().unwrap_or_default().to_string_lossy();
-    let stem = match name.len().checked_sub(3) {
-        Some(at) if name.is_char_boundary(at) && name[at..].eq_ignore_ascii_case(".xz") => {
-            name[..at].to_owned()
-        }
-        _ => format!("{name}.mrd"),
-    };
-    xz.with_file_name(stem)
-}
-
-fn marker_path(cache: &Path) -> PathBuf {
-    let mut name = cache.file_name().unwrap_or_default().to_os_string();
-    name.push(MARKER_SUFFIX);
-    cache.with_file_name(name)
-}
-
-fn temporary_path(cache: &Path, suffix: &str) -> PathBuf {
-    let name = cache.file_name().unwrap_or_default().to_string_lossy();
-    cache.with_file_name(format!(
-        ".{name}.{}.{}.{suffix}",
-        std::process::id(),
-        NEXT_TEMPORARY_NUMBER.fetch_add(1, Ordering::Relaxed)
-    ))
-}
-
-const MARKER_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy)]
 struct TransportIdentity {
@@ -87,123 +70,74 @@ fn identify(xz: &Path) -> Result<TransportIdentity, Error> {
     })
 }
 
-fn marker_text(identity: TransportIdentity, cache_length: u64) -> String {
+fn strip_suffix_ignoring_case<'a>(text: &'a str, suffix: &str) -> Option<&'a str> {
+    let at = text.len().checked_sub(suffix.len())?;
+    (text.is_char_boundary(at) && text[at..].eq_ignore_ascii_case(suffix)).then(|| &text[..at])
+}
+
+fn base_name(xz: &Path) -> String {
+    let name = xz.file_name().unwrap_or_default().to_string_lossy();
+    let without_xz = strip_suffix_ignoring_case(&name, XZ_SUFFIX).unwrap_or(&name);
+    strip_suffix_ignoring_case(without_xz, RUNTIME_SUFFIX)
+        .unwrap_or(without_xz)
+        .to_owned()
+}
+
+fn cache_name(base: &str, identity: TransportIdentity) -> String {
     format!(
-        "mecab_rs transport cache 1\nmrd_version={}\nsource_length={}\nsource_digest={:016x}\ncache_length={}\n",
-        MRD_VERSION, identity.length, identity.head_tail_digest, cache_length
+        "{base}{VERSION_MARK}{MRD_VERSION}-{:x}-{:0width$x}{RUNTIME_SUFFIX}",
+        identity.length,
+        identity.head_tail_digest,
+        width = DIGEST_HEX_DIGITS
     )
 }
 
-fn is_fresh(cache: &Path, marker: &Path, identity: TransportIdentity) -> bool {
-    let (Ok(text), Ok(metadata)) = (fs::read_to_string(marker), fs::metadata(cache)) else {
-        return false;
-    };
-    text == marker_text(identity, metadata.len())
-}
-
-fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let mut file = File::create(path).map_err(io_error(IoAction::Create, path))?;
-    file.write_all(bytes)
-        .map_err(io_error(IoAction::Write, path))?;
-    file.sync_all().map_err(io_error(IoAction::Sync, path))
-}
-
-fn write_replacing(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let temporary = temporary_path(path, "tmp");
-    let result = write_synced(&temporary, bytes)
-        .and_then(|()| fs::rename(&temporary, path).map_err(io_error(IoAction::Rename, path)));
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
-fn flush_to_disk(file: &Path) -> Result<u64, Error> {
-    let handle = OpenOptions::new()
-        .write(true)
-        .open(file)
-        .map_err(io_error(IoAction::Open, file))?;
-    handle.sync_all().map_err(io_error(IoAction::Sync, file))?;
-    Ok(fs::metadata(file)
-        .map_err(io_error(IoAction::Inspect, file))?
-        .len())
-}
-
-fn wait_until_fresh(cache: &Path, marker: &Path, identity: TransportIdentity) -> bool {
-    let started = Instant::now();
-    while started.elapsed() < CONCURRENT_WRITER_WAIT {
-        if is_fresh(cache, marker, identity) {
-            return true;
-        }
-        std::thread::sleep(MARKER_POLL);
-    }
-    false
-}
-
-pub(crate) fn ensure(xz: &Path, force: bool) -> Result<(PathBuf, bool), Error> {
-    let _guard = EXPAND_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let cache = cache_path(xz);
-    let marker = marker_path(&cache);
+pub fn cache_path(xz: &Path) -> Result<PathBuf, Error> {
     let identity = identify(xz)?;
-    if !force && is_fresh(&cache, &marker, identity) {
-        return Ok((cache, false));
-    }
-    remove_stale_temporaries(&cache);
-    if force {
-        let _ = fs::remove_file(&marker);
-    }
-    let temporary = temporary_path(&cache, "mrd");
-    let expanded = expand(xz, &temporary).and_then(|()| flush_to_disk(&temporary));
-    let length = match expanded {
-        Ok(length) => length,
-        Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
-        }
-    };
-    let installed = install(&temporary, &cache, &marker, identity, length)?;
-    Ok((cache, installed))
+    Ok(xz.with_file_name(cache_name(&base_name(xz), identity)))
 }
 
-fn install(
-    temporary: &Path,
-    cache: &Path,
-    marker: &Path,
-    identity: TransportIdentity,
-    length: u64,
-) -> Result<bool, Error> {
-    if let Err(error) = fs::rename(temporary, cache).map_err(io_error(IoAction::Rename, cache)) {
-        let _ = fs::remove_file(temporary);
-        if wait_until_fresh(cache, marker, identity) {
-            return Ok(false);
-        }
-        return Err(error);
-    }
-    let text = marker_text(identity, length);
-    if let Err(error) = write_replacing(marker, text.as_bytes())
-        && !is_fresh(cache, marker, identity)
-    {
-        return Err(error);
-    }
-    Ok(true)
+fn split_prefix(text: &str, accepts: impl Fn(u8) -> bool) -> Option<(&str, &str)> {
+    let length = text.bytes().take_while(|&byte| accepts(byte)).count();
+    (length > 0).then(|| text.split_at(length))
 }
 
-fn is_temporary_of(entry: &str, cache_name: &str) -> bool {
-    let after_name = entry
-        .strip_prefix("..")
-        .or_else(|| entry.strip_prefix('.'))
-        .and_then(|rest| rest.strip_prefix(cache_name));
-    let Some(rest) = after_name else {
-        return false;
-    };
-    let rest = rest.strip_prefix(MARKER_SUFFIX).unwrap_or(rest);
-    let mut parts = rest.strip_prefix('.').unwrap_or("").splitn(3, '.');
+fn split_cache_name<'a>(text: &'a str, base: &str) -> Option<(&'a str, &'a str)> {
+    let after_base = text.strip_prefix(base)?.strip_prefix(VERSION_MARK)?;
+    let (_, rest) = split_prefix(after_base, |byte| byte.is_ascii_digit())?;
+    let rest = rest.strip_prefix('-')?;
+    let (_, rest) = split_prefix(rest, |byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))?;
+    let rest = rest.strip_prefix('-')?;
+    let (digest, rest) = split_prefix(rest, |byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))?;
+    let rest = rest.strip_prefix(RUNTIME_SUFFIX)?;
+    (digest.len() == DIGEST_HEX_DIGITS).then(|| text.split_at(text.len() - rest.len()))
+}
+
+fn is_temporary_remainder(remainder: &str) -> bool {
+    let mut parts = remainder.strip_prefix('.').unwrap_or("").splitn(3, '.');
     let is_number = |part: Option<&str>| {
         part.is_some_and(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
     };
     is_number(parts.next()) && is_number(parts.next()) && parts.next().is_some()
+}
+
+enum Leftover<'a> {
+    Cache(&'a str),
+    Lock(&'a str),
+    Temporary,
+}
+
+fn classify<'a>(entry: &'a str, base: &str) -> Option<Leftover<'a>> {
+    if let Some(hidden) = entry.strip_prefix('.') {
+        let (_, remainder) = split_cache_name(hidden, base)?;
+        return is_temporary_remainder(remainder).then_some(Leftover::Temporary);
+    }
+    let (name, remainder) = split_cache_name(entry, base)?;
+    match remainder {
+        "" => Some(Leftover::Cache(name)),
+        LOCK_SUFFIX => Some(Leftover::Lock(name)),
+        _ => None,
+    }
 }
 
 fn is_stale(path: &Path, now: SystemTime) -> bool {
@@ -211,12 +145,20 @@ fn is_stale(path: &Path, now: SystemTime) -> bool {
         .and_then(|metadata| metadata.modified())
         .is_ok_and(|modified| {
             now.duration_since(modified)
-                .is_ok_and(|age| age >= STALE_TEMPORARY_AGE)
+                .is_ok_and(|age| age >= STALE_LEFTOVER_AGE)
         })
 }
 
-fn remove_stale_temporaries(cache: &Path) {
-    let name = cache.file_name().unwrap_or_default().to_string_lossy();
+fn remove_leftover(path: &Path) {
+    if path.is_dir() {
+        let _ = fs::remove_dir_all(path);
+    } else {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn remove_leftovers(cache: &Path, base: &str) {
+    let current = cache.file_name().unwrap_or_default().to_string_lossy();
     let directory = cache
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
@@ -225,16 +167,102 @@ fn remove_stale_temporaries(cache: &Path) {
     };
     let now = SystemTime::now();
     for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
-        if !is_temporary_of(&entry.file_name().to_string_lossy(), &name) || !is_stale(&path, now) {
-            continue;
-        }
-        if path.is_dir() {
-            let _ = fs::remove_dir_all(&path);
-        } else {
-            let _ = fs::remove_file(&path);
+        let removable = match classify(&name, base) {
+            Some(Leftover::Cache(found) | Leftover::Lock(found)) => found != current,
+            Some(Leftover::Temporary) => is_stale(&path, now),
+            None => false,
+        };
+        if removable {
+            remove_leftover(&path);
         }
     }
+}
+
+fn remove_legacy_cache(xz: &Path) {
+    let name = xz.file_name().unwrap_or_default().to_string_lossy();
+    let legacy = match strip_suffix_ignoring_case(&name, XZ_SUFFIX) {
+        Some(stem) => xz.with_file_name(stem),
+        None => xz.with_file_name(format!("{name}{RUNTIME_SUFFIX}")),
+    };
+    let mut marker = legacy.clone().into_os_string();
+    marker.push(LEGACY_MARKER_SUFFIX);
+    let marker = PathBuf::from(marker);
+    if marker.is_file() {
+        let _ = fs::remove_file(&legacy);
+        let _ = fs::remove_file(&marker);
+    }
+}
+
+pub(crate) fn ensure(xz: &Path) -> Result<Cache, Error> {
+    let identity = identify(xz)?;
+    let base = base_name(xz);
+    let path = xz.with_file_name(cache_name(&base, identity));
+    remove_leftovers(&path, &base);
+    remove_legacy_cache(xz);
+    let expansion = if path.is_file() {
+        Expansion::Reused
+    } else {
+        expand_exclusively(xz, &path)?
+    };
+    Ok(Cache { path, expansion })
+}
+
+pub(crate) fn discard_damaged(cache: &Path) -> Result<(), Error> {
+    match fs::remove_file(cache) {
+        Err(source) if source.kind() != io::ErrorKind::NotFound => {
+            Err(Error::io(IoAction::Remove, cache, source))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn lock_path(cache: &Path) -> PathBuf {
+    let mut name = cache.file_name().unwrap_or_default().to_os_string();
+    name.push(LOCK_SUFFIX);
+    cache.with_file_name(name)
+}
+
+fn lock_exclusively(lock: &Path) -> Result<File, Error> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock)
+        .map_err(io_error(IoAction::Create, lock))?;
+    file.lock().map_err(io_error(IoAction::Lock, lock))?;
+    Ok(file)
+}
+
+fn expand_exclusively(xz: &Path, cache: &Path) -> Result<Expansion, Error> {
+    let _held = lock_exclusively(&lock_path(cache))?;
+    expand_holding_lock(xz, cache)
+}
+
+fn expand_holding_lock(xz: &Path, cache: &Path) -> Result<Expansion, Error> {
+    if cache.is_file() {
+        return Ok(Expansion::Reused);
+    }
+    let temporary = temporary_path(cache, "mrd");
+    let installed = expand(xz, &temporary)
+        .and_then(|()| flush_to_disk(&temporary))
+        .and_then(|()| fs::rename(&temporary, cache).map_err(io_error(IoAction::Rename, cache)));
+    match installed {
+        Ok(()) => Ok(Expansion::Expanded),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+fn flush_to_disk(file: &Path) -> Result<(), Error> {
+    let handle = OpenOptions::new()
+        .write(true)
+        .open(file)
+        .map_err(io_error(IoAction::Open, file))?;
+    handle.sync_all().map_err(io_error(IoAction::Sync, file))
 }
 
 #[cfg(feature = "xz")]

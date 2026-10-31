@@ -47,6 +47,7 @@ pub mod errors {
 
 pub mod files {
     pub use crate::dict_files::*;
+    pub use crate::expand_cache::cache_path as expanded_cache_path;
     pub use crate::file_write::{write_file, write_file_with};
 }
 

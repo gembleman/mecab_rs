@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::char_property::CharProperty;
 use crate::error::Error;
-use crate::expand_cache;
+use crate::expand_cache::{self, Expansion};
 use crate::matrix::Matrix;
 use crate::packed::PackedDictionary;
 use crate::system_dictionary::{DictionaryKind, SystemDictionary, TokenRecord};
@@ -74,12 +74,14 @@ impl Dictionary {
         if !expand_cache::is_xz(path) {
             return Self::open_packed(path, PackedDictionary::open(path)?, user_dictionaries);
         }
-        let (cache, expanded) = expand_cache::ensure(path, false)?;
-        match PackedDictionary::open(&cache) {
-            Ok(packed) => Self::open_packed(&cache, packed, user_dictionaries),
-            Err(Error::Format { .. }) if !expanded => {
-                let (cache, _) = expand_cache::ensure(path, true)?;
-                Self::open_packed(&cache, PackedDictionary::open(&cache)?, user_dictionaries)
+        let cache = expand_cache::ensure(path)?;
+        match PackedDictionary::open(&cache.path) {
+            Ok(packed) => Self::open_packed(&cache.path, packed, user_dictionaries),
+            Err(Error::Format { .. }) if cache.expansion == Expansion::Reused => {
+                expand_cache::discard_damaged(&cache.path)?;
+                let cache = expand_cache::ensure(path)?;
+                let packed = PackedDictionary::open(&cache.path)?;
+                Self::open_packed(&cache.path, packed, user_dictionaries)
             }
             Err(error) => Err(error),
         }

@@ -1,25 +1,38 @@
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::io::{self, BufWriter};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error::{Error, IoAction};
 
 const WRITE_BUFFER_BYTES: usize = 1 << 23;
+
+static NEXT_TEMPORARY_NUMBER: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn temporary_path(target: &Path, suffix: &str) -> PathBuf {
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    target.with_file_name(format!(
+        ".{name}.{}.{}.{suffix}",
+        std::process::id(),
+        NEXT_TEMPORARY_NUMBER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
 
 pub fn write_file_with<E: From<Error>>(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<(), E>,
 ) -> Result<(), E> {
     let io_error = |action, source| E::from(Error::io(action, path, source));
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let temporary = path.with_file_name(format!(".{name}.tmp"));
+    let temporary = temporary_path(path, "tmp");
     let result = (|| {
         let file = File::create(&temporary).map_err(|source| io_error(IoAction::Create, source))?;
         let mut writer = BufWriter::with_capacity(WRITE_BUFFER_BYTES, file);
         write(&mut writer)?;
-        writer
-            .flush()
-            .map_err(|source| io_error(IoAction::Write, source))
+        let file = writer
+            .into_inner()
+            .map_err(|failure| io_error(IoAction::Write, failure.into_error()))?;
+        file.sync_all()
+            .map_err(|source| io_error(IoAction::Sync, source))
     })();
     result
         .and_then(|()| {

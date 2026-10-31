@@ -40,6 +40,8 @@ pub enum IoAction {
     Sync,
     Rename,
     Map,
+    Remove,
+    Lock,
 }
 
 impl IoAction {
@@ -55,6 +57,8 @@ impl IoAction {
             Self::Sync => "sync",
             Self::Rename => "rename",
             Self::Map => "map",
+            Self::Remove => "remove",
+            Self::Lock => "lock",
         }
     }
 }
