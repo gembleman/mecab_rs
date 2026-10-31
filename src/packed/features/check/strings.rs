@@ -108,7 +108,10 @@ pub(super) fn check_blob(
     {
         return Err(invalid());
     }
-    let id_limit_bits = specs[layout.counts.blob_number as usize].hi_bits;
+    let id_limit_bits = specs
+        .get(layout.counts.blob_number as usize)
+        .ok_or_else(invalid)?
+        .hi_bits;
     let threads = thread_count(length >= PARALLEL_MIN_BLOB_BYTES).min(sync.len());
     let parts = sync_parts(sync.len(), threads);
     let bounds = part_bounds(&parts, &sync, length);

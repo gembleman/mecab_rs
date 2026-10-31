@@ -9,8 +9,8 @@ use super::features::{FeatureView, NumSpec, check as feature_check};
 use super::{
     BLOCK_CODES, BLOCK_COUNT, CATEGORY_COUNT_AT, CELLS, CELLS_PADDING, CHAR_BLOCKS, CHAR_INDEX,
     CHAR_TABLE, CODE_COUNT_AT, DATA_LABEL, DICRC, FEATURE_BITS_AT, FEATURES, FLAG_HOT_MATRIX,
-    FLAG_INT_TEMPLATES, FLAGS_AT, HEADER_BYTES, MAGIC, MAGIC_BYTES, MATRIX, MAX_UNITS,
-    PARAM_BITS_AT, PARAM_COUNT_AT, PARAMS, SECTION_ALIGNMENT, SECTION_ENTRY_BYTES,
+    FLAG_INT_TEMPLATES, FLAGS_AT, HEADER_BYTES, MAGIC, MAGIC_BYTES, MATRIX, MAX_CODE_COUNT,
+    MAX_UNITS, PARAM_BITS_AT, PARAM_COUNT_AT, PARAMS, SECTION_ALIGNMENT, SECTION_ENTRY_BYTES,
     SECTION_LENGTH_IN_ENTRY, SECTION_OFFSET_IN_ENTRY, SECTION_TABLE_AT, SECTIONS, TEMPLATES,
     TERMINAL_FLAG, TOKEN_COUNT_AT, TOKENS, UNIT_BYTES, UNKNOWN_STARTS, UNKNOWN_TOKENS,
     UNUSED_LABEL, Unit, VALUE_BITS, VERSION, VERSION_AT,
@@ -73,7 +73,14 @@ impl Source<'_> {
     }
 
     pub(super) fn read(&self, section: usize, from: usize, buffer: &mut [u8]) -> Result<(), Error> {
-        let start = self.sections[section].start + from;
+        let range = &self.sections[section];
+        let inside = from
+            .checked_add(buffer.len())
+            .is_some_and(|end| end <= range.len());
+        if !inside {
+            return Err(self.broken("a read leaves its section"));
+        }
+        let start = range.start + from;
         read_at(self.file, buffer, start as u64).map_err(io_error(self.path))
     }
 

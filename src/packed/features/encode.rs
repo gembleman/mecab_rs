@@ -189,7 +189,7 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         &numbers.stored_values,
         &numbers.values,
     );
-    let derive = Derive::learn(&entries, tokens, &classes, blob.as_ref());
+    let derive = Derive::learn(&entries, tokens, &classes, blob.as_ref())?;
     let planner = Planner {
         classes: &classes,
         derive: &derive,

@@ -31,6 +31,10 @@ impl<'a> Cursor<'a> {
         Ok(slice)
     }
 
+    fn remaining_bytes(&self) -> usize {
+        self.bytes.len() - self.position
+    }
+
     fn word(&mut self) -> Result<u32, Error> {
         Ok(u32_at(self.take(4)?, 0))
     }
@@ -439,6 +443,9 @@ fn decode_exceptions(
     path: &Path,
 ) -> Result<Vec<(u32, i16)>, Error> {
     let left_size = header.left_size;
+    if header.exception_count > inputs.exception_cells.remaining_bytes() {
+        return Err(too_big(path));
+    }
     let mut exceptions = Vec::with_capacity(header.exception_count);
     let mut previous: Option<u64> = None;
     for _ in 0..header.exception_count {
@@ -448,7 +455,9 @@ fn decode_exceptions(
         previous = Some(cell);
         let (column, row) = (cell as usize % left_size, cell as usize / left_size);
         let computed = plain.computed_cost(column as u16, row as u16);
-        let value = i64::from(computed) + unzigzag(inputs.exception_values.varint()?);
+        let value = i64::from(computed)
+            .checked_add(unzigzag(inputs.exception_values.varint()?))
+            .ok_or_else(|| too_big(path))?;
         exceptions.push((
             cell as u32,
             i16::try_from(value).map_err(|_| too_big(path))?,

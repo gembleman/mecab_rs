@@ -41,6 +41,7 @@ pub const LABEL_SHIFT: u32 = VALUE_BITS;
 pub const FLAGS_SHIFT: u32 = 40;
 pub const UNUSED_LABEL: u16 = u16::MAX;
 pub const ROOT_LABEL: u16 = UNUSED_LABEL;
+pub const MAX_CODE_COUNT: usize = UNUSED_LABEL as usize;
 pub const DATA_LABEL: u16 = 0;
 pub const TERMINAL_FLAG: u8 = 1;
 pub const INLINE_FLAG: u8 = 2;

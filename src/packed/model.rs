@@ -10,10 +10,10 @@ use super::trie::{self, Entry};
 use super::{
     BLOCK_CODES, BLOCK_COUNT, CATEGORY_COUNT_AT, CELLS, CELLS_PADDING, CHAR_BLOCKS, CHAR_INDEX,
     CHAR_TABLE, CODE_COUNT_AT, DICRC, FEATURE_BITS_AT, FEATURES, FLAG_HOT_MATRIX,
-    FLAG_INT_TEMPLATES, FLAGS_AT, HEADER_BYTES, MAGIC, MAGIC_BYTES, MATRIX, PARAM_BITS_AT,
-    PARAM_COUNT_AT, PARAMS, SECTION_ALIGNMENT, SECTION_ENTRY_BYTES, SECTION_LENGTH_IN_ENTRY,
-    SECTION_OFFSET_IN_ENTRY, SECTION_TABLE_AT, SECTIONS, TEMPLATES, TOKEN_COUNT_AT, TOKENS,
-    UNIT_BYTES, UNKNOWN_STARTS, UNKNOWN_TOKENS, VERSION, VERSION_AT,
+    FLAG_INT_TEMPLATES, FLAGS_AT, HEADER_BYTES, MAGIC, MAGIC_BYTES, MATRIX, MAX_CODE_COUNT,
+    PARAM_BITS_AT, PARAM_COUNT_AT, PARAMS, SECTION_ALIGNMENT, SECTION_ENTRY_BYTES,
+    SECTION_LENGTH_IN_ENTRY, SECTION_OFFSET_IN_ENTRY, SECTION_TABLE_AT, SECTIONS, TEMPLATES,
+    TOKEN_COUNT_AT, TOKENS, UNIT_BYTES, UNKNOWN_STARTS, UNKNOWN_TOKENS, VERSION, VERSION_AT,
 };
 use crate::Error;
 use crate::dict_files::MATRIX_HOT_FILE;
@@ -84,7 +84,7 @@ impl Model {
         }
         let mut chars: Vec<(char, u32)> = frequency.into_iter().collect();
         chars.sort_unstable_by_key(|&(char, count)| (std::cmp::Reverse(count), char));
-        if chars.len() >= usize::from(u16::MAX) {
+        if chars.len() >= MAX_CODE_COUNT {
             return Err(Error::Unsupported(
                 "more than 65534 different key characters",
             ));

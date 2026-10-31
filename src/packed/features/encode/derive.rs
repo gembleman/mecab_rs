@@ -3,6 +3,7 @@ use super::{
     MAX_SLOTS, MIN_RULE_USES, RULE_BYTES, RULE_CHAR_BITS, RULE_HEADER_BYTES, SmallKeyMap,
     blob_slot, split_fields,
 };
+use crate::Error;
 
 pub(super) fn is_key(value: &[u8], key: &[u8]) -> bool {
     !key.is_empty() && value == key && value != b"*"
@@ -102,7 +103,7 @@ impl<'a> Derive<'a> {
         tokens: &[(u32, &str)],
         classes: &[Class],
         blob: Option<&Blob>,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         let enabled = classes.len() > DERIVE_TARGET
             && DERIVE_CONTEXT
                 .iter()
@@ -110,11 +111,11 @@ impl<'a> Derive<'a> {
             && classes[DERIVE_TARGET] == Class::Text;
         let mut derive = Self::default();
         if !enabled {
-            return derive;
+            return Ok(derive);
         }
         let counts = derive.count_derivations(entries, tokens, blob);
-        derive.register_rules(choose_splits(counts));
-        derive
+        derive.register_rules(choose_splits(counts))?;
+        Ok(derive)
     }
 
     fn count_derivations(
@@ -159,7 +160,7 @@ impl<'a> Derive<'a> {
         counts
     }
 
-    fn register_rules(&mut self, chosen: Vec<(RuleSite, Split<'a>)>) {
+    fn register_rules(&mut self, chosen: Vec<(RuleSite, Split<'a>)>) -> Result<(), Error> {
         self.table_of_context = vec![0; self.contexts.len()];
         let mut rule_index: SmallKeyMap<(u8, &[u8]), u16> = SmallKeyMap::default();
         let mut table = 0u16;
@@ -178,7 +179,9 @@ impl<'a> Derive<'a> {
             };
             if current != Some(id) {
                 current = Some(id);
-                table += 1;
+                table = table
+                    .checked_add(1)
+                    .ok_or(Error::Unsupported("more than 65535 feature rule groups"))?;
                 self.table_of_context[id as usize] = table;
                 self.group_starts.push(self.entries.len() as u32);
             }
@@ -186,6 +189,7 @@ impl<'a> Derive<'a> {
             self.entries
                 .push(last as u32 | u32::from(rule) << RULE_CHAR_BITS);
         }
+        Ok(())
     }
 
     pub(super) fn groups(&self) -> u32 {

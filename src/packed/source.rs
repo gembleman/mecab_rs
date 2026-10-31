@@ -19,6 +19,7 @@ use crate::system_dictionary::{
 use crate::wire::{u16_at, u32_at};
 
 const MAX_ROOT_FANOUT: u32 = 256;
+const MAX_KEY_BYTES: usize = 1 << 12;
 const MAX_KEY_TOKENS: u32 = (1 << VALUE_SIZE_BITS) - 1;
 
 fn key_value(line: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -38,6 +39,7 @@ fn dicrc_features(path: &Path) -> Result<(String, Option<String>), Error> {
     let bytes = fs::read(path).map_err(io_error(path))?;
     let mut values: HashMap<&[u8], &[u8]> = HashMap::new();
     for line in bytes.split(|&byte| byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() || line[0] == b';' || line[0] == b'#' {
             continue;
         }
@@ -68,7 +70,11 @@ struct RawKey {
     count: u32,
 }
 
-struct ChildIndex {
+#[derive(Clone, Copy)]
+struct Node(u32);
+
+struct DoubleArray {
+    cells: Vec<[u32; 2]>,
     start: Vec<u32>,
     children: Vec<u32>,
 }
@@ -77,109 +83,178 @@ fn is_child(index: usize, check: u32) -> bool {
     check != 0 && index > check as usize && index - check as usize <= MAX_ROOT_FANOUT as usize
 }
 
-fn child_index(cells: &[[u32; 2]]) -> ChildIndex {
-    let mut start = vec![0u32; cells.len() + 2];
-    for (index, &[_, check]) in cells.iter().enumerate() {
-        if is_child(index, check) {
-            start[check as usize + 1] += 1;
-        }
-    }
-    for at in 1..start.len() {
-        start[at] += start[at - 1];
-    }
-    let mut fill = start.clone();
-    let mut children = vec![0u32; start[cells.len() + 1] as usize];
-    for (index, &[_, check]) in cells.iter().enumerate() {
-        if is_child(index, check) {
-            children[fill[check as usize] as usize] = index as u32;
-            fill[check as usize] += 1;
-        }
-    }
-    ChildIndex { start, children }
+fn edge_byte(parent: Node, child_cell: u32) -> u8 {
+    let offset = child_cell - parent.0 - 1;
+    u8::try_from(offset).expect("is_child admits only offsets 0..=255")
 }
 
-fn terminal_value(cells: &[[u32; 2]], base: u32) -> Option<u32> {
-    cells
-        .get(base as usize)
-        .filter(|&&[value, check]| check == base && value.cast_signed() < 0)
-        .map(|&[value, _]| !value)
+impl DoubleArray {
+    fn new(cells: Vec<[u32; 2]>) -> Self {
+        let mut start = vec![0u32; cells.len() + 2];
+        for (index, &[_, check]) in cells.iter().enumerate() {
+            if is_child(index, check) {
+                start[check as usize + 1] += 1;
+            }
+        }
+        for at in 1..start.len() {
+            start[at] += start[at - 1];
+        }
+        let mut fill = start.clone();
+        let mut children = vec![0u32; start[cells.len() + 1] as usize];
+        for (index, &[_, check]) in cells.iter().enumerate() {
+            if is_child(index, check) {
+                children[fill[check as usize] as usize] = index as u32;
+                fill[check as usize] += 1;
+            }
+        }
+        Self {
+            cells,
+            start,
+            children,
+        }
+    }
+
+    fn node(&self, base: u32) -> Option<Node> {
+        ((base as usize) < self.cells.len()).then_some(Node(base))
+    }
+
+    fn child_cells(&self, node: Node) -> &[u32] {
+        let from = self.start[node.0 as usize] as usize;
+        let to = self.start[node.0 as usize + 1] as usize;
+        &self.children[from..to]
+    }
+
+    fn terminal_value(&self, node: Node) -> Option<u32> {
+        let [value, check] = self.cells[node.0 as usize];
+        (check == node.0 && value.cast_signed() < 0).then_some(!value)
+    }
+
+    fn count_terminals(&self) -> usize {
+        self.cells
+            .iter()
+            .enumerate()
+            .filter(|&(index, &[value, check])| {
+                index != 0 && check as usize == index && value.cast_signed() < 0
+            })
+            .count()
+    }
 }
 
-fn visit_terminal(
-    cells: &[[u32; 2]],
-    base: u32,
-    spelling: &[u8],
-    keys: &mut Vec<RawKey>,
-) -> Result<(), Error> {
-    if let Some(value) = terminal_value(cells, base) {
-        let key = String::from_utf8(spelling.to_vec())
-            .map_err(|_| Error::Unsupported("a sys.dic key that is not UTF-8"))?;
-        keys.push(RawKey {
+struct Frame<'a> {
+    node: Node,
+    children: std::slice::Iter<'a, u32>,
+    key_length: usize,
+}
+
+struct Walk<'a> {
+    array: &'a DoubleArray,
+    path: &'a Path,
+    seen: Vec<bool>,
+    spelling: Vec<u8>,
+    keys: Vec<RawKey>,
+}
+
+impl<'a> Walk<'a> {
+    fn new(array: &'a DoubleArray, path: &'a Path) -> Self {
+        Self {
+            array,
+            path,
+            seen: vec![false; array.cells.len()],
+            spelling: Vec::new(),
+            keys: Vec::new(),
+        }
+    }
+
+    fn enter(&mut self, base: u32) -> Result<Frame<'a>, Error> {
+        let node = self.array.node(base).ok_or_else(|| {
+            Error::format(self.path, "a double array base lies outside the array")
+        })?;
+        if self.spelling.len() > MAX_KEY_BYTES {
+            return Err(Error::format(self.path, "a sys.dic key is too long"));
+        }
+        if std::mem::replace(&mut self.seen[node.0 as usize], true) {
+            return Err(Error::format(
+                self.path,
+                "a double array node is reached twice",
+            ));
+        }
+        self.record_terminal(node)?;
+        Ok(Frame {
+            node,
+            children: self.array.child_cells(node).iter(),
+            key_length: self.spelling.len(),
+        })
+    }
+
+    fn record_terminal(&mut self, node: Node) -> Result<(), Error> {
+        let Some(value) = self.array.terminal_value(node) else {
+            return Ok(());
+        };
+        let key = String::from_utf8(self.spelling.clone())
+            .map_err(|_| Error::format(self.path, "a sys.dic key is not valid UTF-8"))?;
+        self.keys.push(RawKey {
             key,
             first_token: value >> VALUE_SIZE_BITS,
             count: value & MAX_KEY_TOKENS,
         });
+        Ok(())
     }
-    Ok(())
-}
 
-fn walk_trie(cells: &[[u32; 2]], index: &ChildIndex, root: u32) -> Result<Vec<RawKey>, Error> {
-    let ChildIndex { start, children } = index;
-    let mut keys = Vec::new();
-    let mut spelling: Vec<u8> = Vec::new();
-    let mut stack: Vec<(u32, u32, usize)> = Vec::new();
-    visit_terminal(cells, root, &spelling, &mut keys)?;
-    stack.push((root, start[root as usize], 0));
-    while let Some(top) = stack.last_mut() {
-        let (base, cursor, key_length) = *top;
-        if base as usize >= cells.len() || cursor >= start[base as usize + 1] {
-            stack.pop();
-            continue;
+    fn run(mut self, root: u32) -> Result<Vec<RawKey>, Error> {
+        let mut stack = vec![self.enter(root)?];
+        while let Some(frame) = stack.last_mut() {
+            let Some(&child_cell) = frame.children.next() else {
+                stack.pop();
+                continue;
+            };
+            let (node, key_length) = (frame.node, frame.key_length);
+            self.spelling.truncate(key_length);
+            self.spelling.push(edge_byte(node, child_cell));
+            let value = self.array.cells[child_cell as usize][0];
+            if value.cast_signed() >= 0 {
+                stack.push(self.enter(value)?);
+            }
         }
-        top.1 += 1;
-        let child_cell = children[cursor as usize];
-        spelling.truncate(key_length);
-        spelling.push((child_cell - base - 1) as u8);
-        let child = cells[child_cell as usize][0];
-        if child.cast_signed() < 0 {
-            continue;
-        }
-        visit_terminal(cells, child, &spelling, &mut keys)?;
-        stack.push((child, start[child as usize], spelling.len()));
+        Ok(self.keys)
     }
-    Ok(keys)
 }
 
-fn count_terminals(cells: &[[u32; 2]]) -> usize {
-    cells
-        .iter()
-        .enumerate()
-        .filter(|&(index, &[value, check])| {
-            index != 0 && check as usize == index && value.cast_signed() < 0
-        })
-        .count()
+struct SystemKeys {
+    keys: Vec<RawKey>,
+    token_count: usize,
 }
 
-fn read_keys(path: &Path) -> Result<Vec<RawKey>, Error> {
+fn read_keys(path: &Path) -> Result<SystemKeys, Error> {
     let bytes = fs::read(path).map_err(io_error(path))?;
-    let end = HEADER_SIZE + u32_at(&bytes, ARRAY_BYTES_AT) as usize;
-    let cells: Vec<[u32; 2]> = bytes[HEADER_SIZE..end]
+    let truncated = || Error::format(path, "the file is shorter than its header");
+    let header = bytes.get(..HEADER_SIZE).ok_or_else(truncated)?;
+    let token_count = u32_at(header, TOKEN_BYTES_AT) as usize / TOKEN_SIZE;
+    let array_end = HEADER_SIZE
+        .checked_add(u32_at(header, ARRAY_BYTES_AT) as usize)
+        .ok_or_else(truncated)?;
+    let cells: Vec<[u32; 2]> = bytes
+        .get(HEADER_SIZE..array_end)
+        .ok_or_else(truncated)?
         .as_chunks::<8>()
         .0
         .iter()
         .map(|cell| [u32_at(cell, 0), u32_at(cell, 4)])
         .collect();
     let Some(&[root, _]) = cells.first() else {
-        return Ok(Vec::new());
+        return Ok(SystemKeys {
+            keys: Vec::new(),
+            token_count,
+        });
     };
-    let keys = walk_trie(&cells, &child_index(&cells), root)?;
-    if count_terminals(&cells) != keys.len() {
+    let array = DoubleArray::new(cells);
+    let keys = Walk::new(&array, path).run(root)?;
+    if array.count_terminals() != keys.len() {
         return Err(Error::format(
             path,
             "the double array has keys that are not reachable",
         ));
     }
-    Ok(keys)
+    Ok(SystemKeys { keys, token_count })
 }
 
 struct MatrixFiles {
@@ -271,18 +346,21 @@ fn check_sizes(
     }
 }
 
-fn check_key_order(raw_keys: &[RawKey], system_path: &Path) -> Result<(), Error> {
+fn check_key_order(system_keys: &SystemKeys, system_path: &Path) -> Result<(), Error> {
+    let out_of_order = || {
+        Error::format(
+            system_path,
+            "the tokens are not in key order, or a key has no token",
+        )
+    };
     let mut position = 0u32;
-    for raw in raw_keys {
+    for raw in &system_keys.keys {
         if raw.first_token != position || raw.count == 0 || raw.count > MAX_KEY_TOKENS {
-            return Err(Error::format(
-                system_path,
-                "the tokens are not in key order, or a key has no token",
-            ));
+            return Err(out_of_order());
         }
-        position += raw.count;
+        position = position.checked_add(raw.count).ok_or_else(out_of_order)?;
     }
-    if position as usize != system_token_count(system_path)? {
+    if position as usize != system_keys.token_count {
         return Err(Error::format(system_path, "some tokens belong to no key"));
     }
     Ok(())
@@ -336,7 +414,7 @@ pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
     let chars = CharProperty::open(&directory.join(CHAR_TABLE_FILE))?;
     let files = load_matrix(directory)?;
     check_sizes(&files, &system, &unknown)?;
-    let raw_keys = read_keys(&system_path)?;
+    let system_keys = read_keys(&system_path)?;
     let mut model = Model {
         matrix: files.matrix,
         templates: files.templates,
@@ -350,17 +428,10 @@ pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
         params: HashMap::new(),
         features: HashMap::new(),
     };
-    check_key_order(&raw_keys, &system_path)?;
-    intern_system_tokens(&mut model, &mut interner, &system, raw_keys);
+    check_key_order(&system_keys, &system_path)?;
+    intern_system_tokens(&mut model, &mut interner, &system, system_keys.keys);
     intern_unknown_tokens(&mut model, &mut interner, &unknown, &chars, &unknown_path)?;
     Ok(model)
-}
-
-fn system_token_count(path: &Path) -> Result<usize, Error> {
-    let mut header = [0u8; HEADER_SIZE];
-    let mut file = fs::File::open(path).map_err(io_error(path))?;
-    std::io::Read::read_exact(&mut file, &mut header).map_err(io_error(path))?;
-    Ok(u32_at(&header, TOKEN_BYTES_AT) as usize / TOKEN_SIZE)
 }
 
 struct Interner<'a> {
