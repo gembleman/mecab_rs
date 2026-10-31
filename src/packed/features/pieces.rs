@@ -88,6 +88,43 @@ pub(super) fn put_bits(bytes: &mut [u8], bit: usize, width: u32, value: u64) {
     }
 }
 
+fn ranked_uses<'a>(lists: &[Vec<&'a [u8]>], position: usize) -> Vec<(&'a [u8], u64)> {
+    let mut uses: HashMap<&[u8], u64> = HashMap::new();
+    for list in lists {
+        if let Some(&piece) = list.get(position) {
+            *uses.entry(piece).or_insert(0) += 1;
+        }
+    }
+    let mut ranked: Vec<(&[u8], u64)> = uses.into_iter().collect();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(right.0)));
+    ranked
+}
+
+fn fill_entries(
+    lists: &[Vec<&[u8]>],
+    positions: &[Position],
+    locals: &[HashMap<&[u8], u32>],
+    entry_bits: u32,
+) -> Vec<u8> {
+    let mut entries = vec![0u8; (lists.len() * entry_bits as usize).div_ceil(8)];
+    for (template, list) in lists.iter().enumerate() {
+        for (position, piece) in list.iter().enumerate() {
+            let spec = positions[position];
+            if spec.constant {
+                continue;
+            }
+            let bit = template * entry_bits as usize + spec.shift as usize;
+            put_bits(
+                &mut entries,
+                bit,
+                spec.bits,
+                u64::from(locals[position][piece]),
+            );
+        }
+    }
+    entries
+}
+
 pub(super) fn build(programs: &[Vec<u8>]) -> Option<Pieces> {
     let lists: Vec<Vec<&[u8]>> = programs
         .iter()
@@ -100,14 +137,7 @@ pub(super) fn build(programs: &[Vec<u8>]) -> Option<Pieces> {
     let mut pool = Vec::new();
     let mut shift = 0u32;
     for position in 0..count {
-        let mut uses: HashMap<&[u8], u64> = HashMap::new();
-        for list in &lists {
-            if let Some(&piece) = list.get(position) {
-                *uses.entry(piece).or_insert(0) += 1;
-            }
-        }
-        let mut ranked: Vec<(&[u8], u64)> = uses.into_iter().collect();
-        ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(right.0)));
+        let ranked = ranked_uses(&lists, position);
         let bits = bits_for(ranked.len() as u64);
         if bits > MAX_PIECE_BITS {
             return None;
@@ -142,27 +172,11 @@ pub(super) fn build(programs: &[Vec<u8>]) -> Option<Pieces> {
     if shift as usize > MAX_ENTRY_BITS {
         return None;
     }
-    let mut entries = vec![0u8; (programs.len() * shift as usize).div_ceil(8)];
-    for (template, list) in lists.iter().enumerate() {
-        for (position, piece) in list.iter().enumerate() {
-            let spec = positions[position];
-            if spec.constant {
-                continue;
-            }
-            let bit = template * shift as usize + spec.shift as usize;
-            put_bits(
-                &mut entries,
-                bit,
-                spec.bits,
-                u64::from(locals[position][piece]),
-            );
-        }
-    }
     Some(Pieces {
+        entries: fill_entries(&lists, &positions, &locals, shift),
         positions,
         offsets,
         pool,
-        entries,
         entry_bits: shift,
     })
 }

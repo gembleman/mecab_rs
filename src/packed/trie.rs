@@ -113,6 +113,54 @@ impl Units {
     }
 }
 
+fn collect_children(nodes: &[Node], id: usize, codes: &mut Vec<u16>, children: &mut Vec<u32>) {
+    codes.clear();
+    children.clear();
+    if nodes[id].needs_data_unit() {
+        codes.push(0);
+    }
+    let mut child = nodes[id].first_child;
+    while child != NONE {
+        codes.push(nodes[child as usize].code);
+        children.push(child);
+        child = nodes[child as usize].next_sibling;
+    }
+}
+
+fn child_unit(node: &Node) -> u64 {
+    let (value, flags) = if node.is_inline() {
+        let count = node.count << INLINE_COUNT_SHIFT;
+        (node.first_token, TERMINAL_FLAG | INLINE_FLAG | count)
+    } else if node.is_terminal() {
+        (0, TERMINAL_FLAG)
+    } else {
+        (0, 0)
+    };
+    unit(value, node.code, flags)
+}
+
+fn place_children(
+    units: &mut Units,
+    nodes: &mut [Node],
+    id: usize,
+    base: usize,
+    children: &[u32],
+    queue: &mut Vec<u32>,
+) {
+    units.set_value(nodes[id].position as usize, base as u32);
+    if nodes[id].needs_data_unit() {
+        let node = &nodes[id];
+        units.take(base, unit(node.first_token, DATA_LABEL, node.count));
+    }
+    for &child in children {
+        let node = &mut nodes[child as usize];
+        let position = base + usize::from(node.code);
+        node.position = position as u32;
+        units.take(position, child_unit(node));
+        queue.push(child);
+    }
+}
+
 pub(super) fn build(entries: &[Entry]) -> Result<Vec<u64>, Error> {
     let mut nodes = vec![Node::new(0)];
     link_trie(entries, &mut nodes)?;
@@ -131,43 +179,13 @@ pub(super) fn build(entries: &[Entry]) -> Result<Vec<u64>, Error> {
     while at < queue.len() {
         let id = queue[at] as usize;
         at += 1;
-        codes.clear();
-        children.clear();
-        if nodes[id].needs_data_unit() {
-            codes.push(0);
-        }
-        let mut child = nodes[id].first_child;
-        while child != NONE {
-            codes.push(nodes[child as usize].code);
-            children.push(child);
-            child = nodes[child as usize].next_sibling;
-        }
+        collect_children(&nodes, id, &mut codes, &mut children);
         if codes.is_empty() {
             continue;
         }
         let base = find_base(&mut units, &codes)?;
         units.take_base(base);
-        let parent = nodes[id].position;
-        units.set_value(parent as usize, base as u32);
-        if nodes[id].needs_data_unit() {
-            let node = &nodes[id];
-            units.take(base, unit(node.first_token, DATA_LABEL, node.count));
-        }
-        for &child in &children {
-            let node = &mut nodes[child as usize];
-            let position = base + usize::from(node.code);
-            node.position = position as u32;
-            let (value, flags) = if node.is_inline() {
-                let count = node.count << INLINE_COUNT_SHIFT;
-                (node.first_token, TERMINAL_FLAG | INLINE_FLAG | count)
-            } else if node.is_terminal() {
-                (0, TERMINAL_FLAG)
-            } else {
-                (0, 0)
-            };
-            units.take(position, unit(value, node.code, flags));
-            queue.push(child);
-        }
+        place_children(&mut units, &mut nodes, id, base, &children, &mut queue);
     }
     Ok(units.cells)
 }

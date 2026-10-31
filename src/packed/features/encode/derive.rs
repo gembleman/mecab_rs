@@ -112,6 +112,17 @@ impl<'a> Derive<'a> {
         if !enabled {
             return derive;
         }
+        let counts = derive.count_derivations(entries, tokens, blob);
+        derive.register_rules(choose_splits(counts));
+        derive
+    }
+
+    fn count_derivations(
+        &mut self,
+        entries: &[&'a [u8]],
+        tokens: &[(u32, &str)],
+        blob: Option<&Blob>,
+    ) -> SmallKeyMap<RuleSite, SmallKeyMap<Split<'a>, u32>> {
         let mut counts: SmallKeyMap<RuleSite, SmallKeyMap<Split<'a>, u32>> = SmallKeyMap::default();
         let mut fields = Vec::new();
         for &(feature, key) in tokens {
@@ -126,8 +137,8 @@ impl<'a> Derive<'a> {
             let Some(context) = context_of(text, &fields) else {
                 continue;
             };
-            let next = derive.contexts.len() as u32;
-            let id = *derive.contexts.entry(context).or_insert(next);
+            let next = self.contexts.len() as u32;
+            let id = *self.contexts.entry(context).or_insert(next);
             let (begin, end) = fields[DERIVE_TARGET];
             let value = &text[begin..end];
             if blob_slot(blob, entry, DERIVE_TARGET).is_some()
@@ -145,17 +156,11 @@ impl<'a> Derive<'a> {
                     .or_insert(0) += 1;
             }
         }
-        let mut chosen: Vec<(RuleSite, Split)> = counts
-            .into_iter()
-            .filter_map(|(at, uses)| {
-                let (split, count) = uses
-                    .into_iter()
-                    .max_by_key(|&(split, count)| (count, std::cmp::Reverse(split)))?;
-                (count >= MIN_RULE_USES).then_some((at, split))
-            })
-            .collect();
-        chosen.sort_unstable_by_key(|&(at, _)| at);
-        derive.table_of_context = vec![0; derive.contexts.len()];
+        counts
+    }
+
+    fn register_rules(&mut self, chosen: Vec<(RuleSite, Split<'a>)>) {
+        self.table_of_context = vec![0; self.contexts.len()];
         let mut rule_index: SmallKeyMap<(u8, &[u8]), u16> = SmallKeyMap::default();
         let mut table = 0u16;
         let mut current: Option<u32> = None;
@@ -163,9 +168,9 @@ impl<'a> Derive<'a> {
             let known = rule_index.get(&split).copied();
             let rule = match known {
                 Some(rule) => rule,
-                None if derive.rule_list.len() < MAX_RULES => {
-                    let rule = derive.rule_list.len() as u16;
-                    derive.rule_list.push((split.0, split.1.to_vec()));
+                None if self.rule_list.len() < MAX_RULES => {
+                    let rule = self.rule_list.len() as u16;
+                    self.rule_list.push((split.0, split.1.to_vec()));
                     rule_index.insert(split, rule);
                     rule
                 }
@@ -174,15 +179,13 @@ impl<'a> Derive<'a> {
             if current != Some(id) {
                 current = Some(id);
                 table += 1;
-                derive.table_of_context[id as usize] = table;
-                derive.group_starts.push(derive.entries.len() as u32);
+                self.table_of_context[id as usize] = table;
+                self.group_starts.push(self.entries.len() as u32);
             }
-            derive.rules.insert((table, last), rule);
-            derive
-                .entries
+            self.rules.insert((table, last), rule);
+            self.entries
                 .push(last as u32 | u32::from(rule) << RULE_CHAR_BITS);
         }
-        derive
     }
 
     pub(super) fn groups(&self) -> u32 {
@@ -275,4 +278,20 @@ impl<'a> Planner<'_, 'a> {
         ops.iter()
             .any(|op| matches!(op, Some(TextOp::Key | TextOp::Derive)))
     }
+}
+
+fn choose_splits(
+    counts: SmallKeyMap<RuleSite, SmallKeyMap<Split<'_>, u32>>,
+) -> Vec<(RuleSite, Split<'_>)> {
+    let mut chosen: Vec<(RuleSite, Split)> = counts
+        .into_iter()
+        .filter_map(|(at, uses)| {
+            let (split, count) = uses
+                .into_iter()
+                .max_by_key(|&(split, count)| (count, std::cmp::Reverse(split)))?;
+            (count >= MIN_RULE_USES).then_some((at, split))
+        })
+        .collect();
+    chosen.sort_unstable_by_key(|&(at, _)| at);
+    chosen
 }

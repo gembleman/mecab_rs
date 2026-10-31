@@ -10,6 +10,8 @@ use crate::wire::{fnv1a64, get_varint, put_varint, u32_at, u64_at, unzigzag, zig
 const MAGIC: &[u8; 4] = b"MRIT";
 const VERSION: u32 = 1;
 const DIGEST_LEN: usize = 8;
+const STREAM_COUNT: usize = 6;
+const TEXT_STREAM: usize = 5;
 
 struct Cursor<'a> {
     bytes: &'a [u8],
@@ -170,35 +172,23 @@ impl IntContext {
     }
 }
 
-fn encode_streams(
-    templates: &IntTemplates,
-    context: &IntContext,
-    path: &Path,
-) -> Result<Streams, Error> {
-    if templates.parts().len() != context.universe.len() {
-        return Err(Error::rebuild(
-            path,
-            "the templates do not match feature.def",
-        ));
-    }
-    let mut streams = Streams::default();
-    for (part, (left, right)) in templates.parts().iter().zip(&context.universe) {
-        let part = expand(part, left, right, path)?;
-        for key in 0..part.right_count {
-            let span = part.indptr[key] as usize..part.indptr[key + 1] as usize;
-            put_varint(&mut streams.counts, span.len() as u64);
-            let mut previous = None;
-            for &left_key in &part.left_index[span] {
-                let coded =
-                    previous.map_or(u64::from(left_key), |p: u16| u64::from(left_key - p - 1));
-                put_varint(&mut streams.lefts, coded);
-                previous = Some(left_key);
-            }
-        }
-        for &weight in &part.weight {
-            put_varint(&mut streams.weights, zigzag(i64::from(weight)));
+fn encode_part(streams: &mut Streams, part: &IntPart) {
+    for key in 0..part.right_count {
+        let span = part.indptr[key] as usize..part.indptr[key + 1] as usize;
+        put_varint(&mut streams.counts, span.len() as u64);
+        let mut previous = None;
+        for &left_key in &part.left_index[span] {
+            let coded = previous.map_or(u64::from(left_key), |p: u16| u64::from(left_key - p - 1));
+            put_varint(&mut streams.lefts, coded);
+            previous = Some(left_key);
         }
     }
+    for &weight in &part.weight {
+        put_varint(&mut streams.weights, zigzag(i64::from(weight)));
+    }
+}
+
+fn encode_exceptions(streams: &mut Streams, templates: &IntTemplates) {
     let left_size = templates.left_size();
     let mut previous = None;
     for (cell, value) in templates.exceptions() {
@@ -214,9 +204,10 @@ fn encode_streams(
             zigzag(i64::from(value) - i64::from(computed)),
         );
     }
+}
+
+fn write_header(streams: &mut Streams, templates: &IntTemplates, context: &IntContext) {
     let text = template_text(&context.bigrams);
-    let header = &mut streams.header;
-    header.extend_from_slice(MAGIC);
     let lengths = [
         streams.counts.len(),
         streams.lefts.len(),
@@ -225,6 +216,8 @@ fn encode_streams(
         streams.exception_values.len(),
         text.len(),
     ];
+    let header = &mut streams.header;
+    header.extend_from_slice(MAGIC);
     for value in [
         VERSION,
         templates.cost_factor(),
@@ -241,6 +234,25 @@ fn encode_streams(
     }
     header.extend_from_slice(&projection_digest(&context.universe).to_le_bytes());
     header.extend_from_slice(text.as_bytes());
+}
+
+fn encode_streams(
+    templates: &IntTemplates,
+    context: &IntContext,
+    path: &Path,
+) -> Result<Streams, Error> {
+    if templates.parts().len() != context.universe.len() {
+        return Err(Error::rebuild(
+            path,
+            "the templates do not match feature.def",
+        ));
+    }
+    let mut streams = Streams::default();
+    for (part, (left, right)) in templates.parts().iter().zip(&context.universe) {
+        encode_part(&mut streams, &expand(part, left, right, path)?);
+    }
+    encode_exceptions(&mut streams, templates);
+    write_header(&mut streams, templates, context);
     Ok(streams)
 }
 
@@ -252,12 +264,22 @@ pub fn encode_payload(
     Ok(encode_streams(templates, context, path)?.payload())
 }
 
-pub fn decode_payload(
-    payload: &[u8],
-    left_id_def: &str,
-    right_id_def: &str,
-    path: &Path,
-) -> Result<IntTemplates, Error> {
+struct Header {
+    cost_factor: u32,
+    shift: u32,
+    left_size: usize,
+    right_size: usize,
+    part_count: usize,
+    exception_count: usize,
+    lengths: [usize; STREAM_COUNT],
+    projection_hash: u64,
+}
+
+fn too_big(path: &Path) -> Error {
+    Error::rebuild(path, "a decoded value is out of range")
+}
+
+fn verified_body<'a>(payload: &'a [u8], path: &Path) -> Result<&'a [u8], Error> {
     let body_length = payload
         .len()
         .checked_sub(DIGEST_LEN)
@@ -266,11 +288,10 @@ pub fn decode_payload(
     if fnv1a64(body) != u64_at(digest, 0) {
         return Err(Error::rebuild(path, "the FNV digest does not match"));
     }
-    let mut cursor = Cursor {
-        bytes: body,
-        position: 0,
-        path,
-    };
+    Ok(body)
+}
+
+fn read_header(cursor: &mut Cursor, path: &Path) -> Result<Header, Error> {
     if cursor.take(MAGIC.len())? != MAGIC || cursor.word()? != VERSION {
         return Err(Error::rebuild(
             path,
@@ -283,96 +304,187 @@ pub fn decode_payload(
     let right_size = cursor.word()? as usize;
     let part_count = cursor.word()? as usize;
     let exception_count = cursor.word()? as usize;
-    let mut lengths = [0usize; 6];
+    let mut lengths = [0usize; STREAM_COUNT];
     for length in &mut lengths {
         *length = cursor.word()? as usize;
     }
     let projection_hash = u64_at(cursor.take(8)?, 0);
-    let text = std::str::from_utf8(cursor.take(lengths[5])?)
+    Ok(Header {
+        cost_factor,
+        shift,
+        left_size,
+        right_size,
+        part_count,
+        exception_count,
+        lengths,
+        projection_hash,
+    })
+}
+
+fn read_context(
+    cursor: &mut Cursor,
+    header: &Header,
+    left_id_def: &str,
+    right_id_def: &str,
+    path: &Path,
+) -> Result<IntContext, Error> {
+    let text = std::str::from_utf8(cursor.take(header.lengths[TEXT_STREAM])?)
         .map_err(|_| Error::rebuild(path, "the template text is not UTF-8"))?;
     let bigrams = parse_template_text(text, path)?;
     let context = IntContext::new(bigrams, left_id_def, right_id_def, path)?;
-    if context.universe.len() != part_count
-        || projection_digest(&context.universe) != projection_hash
+    if context.universe.len() != header.part_count
+        || projection_digest(&context.universe) != header.projection_hash
     {
         return Err(Error::rebuild(
             path,
             "the id definitions do not match the data",
         ));
     }
-    let mut stream = |length: usize| -> Result<Cursor<'_>, Error> {
-        Ok(Cursor {
-            bytes: cursor.take(length)?,
-            position: 0,
-            path,
-        })
-    };
-    let mut counts = stream(lengths[0])?;
-    let mut lefts = stream(lengths[1])?;
-    let mut weights = stream(lengths[2])?;
-    let mut exception_cells = stream(lengths[3])?;
-    let mut exception_values = stream(lengths[4])?;
-    if cursor.position != body.len() {
-        return Err(Error::rebuild(path, "the data has trailing bytes"));
-    }
-    let too_big = || Error::rebuild(path, "a decoded value is out of range");
-    let mut parts = Vec::with_capacity(part_count);
-    for (left, right) in &context.universe {
-        let mut indptr = Vec::with_capacity(right.count + 1);
-        indptr.push(0u32);
-        let mut left_index = Vec::new();
-        for _ in 0..right.count {
-            let count = usize::try_from(counts.varint()?).map_err(|_| too_big())?;
-            let mut previous: Option<u64> = None;
-            for _ in 0..count {
-                let coded = lefts.varint()?;
-                let key = previous.map_or(Some(coded), |p| p.checked_add(coded)?.checked_add(1));
-                let key = key
-                    .filter(|&key| key < left.count as u64)
-                    .ok_or_else(too_big)?;
-                left_index.push(key as u16);
-                previous = Some(key);
-            }
-            indptr.push(u32::try_from(left_index.len()).map_err(|_| too_big())?);
+    Ok(context)
+}
+
+struct Inputs<'a> {
+    counts: Cursor<'a>,
+    lefts: Cursor<'a>,
+    weights: Cursor<'a>,
+    exception_cells: Cursor<'a>,
+    exception_values: Cursor<'a>,
+}
+
+impl<'a> Inputs<'a> {
+    fn split(cursor: &mut Cursor<'a>, lengths: &[usize], path: &'a Path) -> Result<Self, Error> {
+        let mut stream = |length: usize| -> Result<Cursor<'a>, Error> {
+            Ok(Cursor {
+                bytes: cursor.take(length)?,
+                position: 0,
+                path,
+            })
+        };
+        let inputs = Self {
+            counts: stream(lengths[0])?,
+            lefts: stream(lengths[1])?,
+            weights: stream(lengths[2])?,
+            exception_cells: stream(lengths[3])?,
+            exception_values: stream(lengths[4])?,
+        };
+        if cursor.position != cursor.bytes.len() {
+            return Err(Error::rebuild(path, "the data has trailing bytes"));
         }
-        let weight = (0..left_index.len())
-            .map(|_| i32::try_from(unzigzag(weights.varint()?)).map_err(|_| too_big()))
-            .collect::<Result<Vec<_>, _>>()?;
-        parts.push(
-            IntPart {
-                left_count: left.count,
-                right_count: right.count,
-                left_projection: left.projection.clone(),
-                right_projection: right.projection.clone(),
-                indptr,
-                left_index,
-                weight,
-            }
-            .compacted(),
-        );
+        Ok(inputs)
     }
-    let plain = IntTemplates::new(cost_factor, shift, left_size, right_size, parts, Vec::new())?;
-    let mut exceptions = Vec::with_capacity(exception_count);
+
+    fn check_ends(&self, path: &Path) -> Result<(), Error> {
+        let streams = [
+            &self.counts,
+            &self.lefts,
+            &self.weights,
+            &self.exception_cells,
+            &self.exception_values,
+        ];
+        if streams
+            .iter()
+            .all(|stream| stream.position == stream.bytes.len())
+        {
+            Ok(())
+        } else {
+            Err(Error::rebuild(path, "a stream has trailing bytes"))
+        }
+    }
+}
+
+fn next_key(previous: Option<u64>, coded: u64) -> Option<u64> {
+    previous.map_or(Some(coded), |p| p.checked_add(coded)?.checked_add(1))
+}
+
+fn decode_part(
+    left: &UniverseSide,
+    right: &UniverseSide,
+    inputs: &mut Inputs,
+    path: &Path,
+) -> Result<IntPart, Error> {
+    let mut indptr = Vec::with_capacity(right.count + 1);
+    indptr.push(0u32);
+    let mut left_index = Vec::new();
+    for _ in 0..right.count {
+        let count = usize::try_from(inputs.counts.varint()?).map_err(|_| too_big(path))?;
+        let mut previous: Option<u64> = None;
+        for _ in 0..count {
+            let key = next_key(previous, inputs.lefts.varint()?)
+                .filter(|&key| key < left.count as u64)
+                .ok_or_else(|| too_big(path))?;
+            left_index.push(key as u16);
+            previous = Some(key);
+        }
+        indptr.push(u32::try_from(left_index.len()).map_err(|_| too_big(path))?);
+    }
+    let weight = (0..left_index.len())
+        .map(|_| i32::try_from(unzigzag(inputs.weights.varint()?)).map_err(|_| too_big(path)))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(IntPart {
+        left_count: left.count,
+        right_count: right.count,
+        left_projection: left.projection.clone(),
+        right_projection: right.projection.clone(),
+        indptr,
+        left_index,
+        weight,
+    }
+    .compacted())
+}
+
+fn decode_exceptions(
+    plain: &IntTemplates,
+    header: &Header,
+    inputs: &mut Inputs,
+    path: &Path,
+) -> Result<Vec<(u32, i16)>, Error> {
+    let left_size = header.left_size;
+    let mut exceptions = Vec::with_capacity(header.exception_count);
     let mut previous: Option<u64> = None;
-    for _ in 0..exception_count {
-        let coded = exception_cells.varint()?;
-        let cell = previous.map_or(Some(coded), |p| p.checked_add(coded)?.checked_add(1));
-        let cell = cell
-            .filter(|&cell| cell < (left_size * right_size) as u64)
-            .ok_or_else(too_big)?;
+    for _ in 0..header.exception_count {
+        let cell = next_key(previous, inputs.exception_cells.varint()?)
+            .filter(|&cell| cell < (left_size * header.right_size) as u64)
+            .ok_or_else(|| too_big(path))?;
         previous = Some(cell);
         let (column, row) = (cell as usize % left_size, cell as usize / left_size);
         let computed = plain.computed_cost(column as u16, row as u16);
-        let value = i64::from(computed) + unzigzag(exception_values.varint()?);
-        exceptions.push((cell as u32, i16::try_from(value).map_err(|_| too_big())?));
+        let value = i64::from(computed) + unzigzag(inputs.exception_values.varint()?);
+        exceptions.push((
+            cell as u32,
+            i16::try_from(value).map_err(|_| too_big(path))?,
+        ));
     }
-    if counts.position != counts.bytes.len()
-        || lefts.position != lefts.bytes.len()
-        || weights.position != weights.bytes.len()
-        || exception_cells.position != exception_cells.bytes.len()
-        || exception_values.position != exception_values.bytes.len()
-    {
-        return Err(Error::rebuild(path, "a stream has trailing bytes"));
+    Ok(exceptions)
+}
+
+pub fn decode_payload(
+    payload: &[u8],
+    left_id_def: &str,
+    right_id_def: &str,
+    path: &Path,
+) -> Result<IntTemplates, Error> {
+    let body = verified_body(payload, path)?;
+    let mut cursor = Cursor {
+        bytes: body,
+        position: 0,
+        path,
+    };
+    let header = read_header(&mut cursor, path)?;
+    let context = read_context(&mut cursor, &header, left_id_def, right_id_def, path)?;
+    let mut inputs = Inputs::split(&mut cursor, &header.lengths, path)?;
+    let mut parts = Vec::with_capacity(header.part_count);
+    for (left, right) in &context.universe {
+        parts.push(decode_part(left, right, &mut inputs, path)?);
     }
+    let plain = IntTemplates::new(
+        header.cost_factor,
+        header.shift,
+        header.left_size,
+        header.right_size,
+        parts,
+        Vec::new(),
+    )?;
+    let exceptions = decode_exceptions(&plain, &header, &mut inputs, path)?;
+    inputs.check_ends(path)?;
     plain.with_exceptions(exceptions)
 }

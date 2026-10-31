@@ -130,28 +130,21 @@ impl Model {
         self.finish_runtime(self.encode_lexicon_sections()?)
     }
 
-    pub(super) fn encode_lexicon_sections(&self) -> Result<LexiconSections, Error> {
-        let table = self.code_table()?;
-        let code_count = table.iter().max().map_or(1, |&max| u32::from(max) + 1);
+    fn check_token_counts(&self) -> Result<(), Error> {
         let counted: usize = self.counts.iter().map(|&count| usize::from(count)).sum();
         if counted != self.token_params.len() || counted != self.token_features.len() {
             return Err(Error::Unsupported(
                 "token counts that do not match the tokens",
             ));
         }
-        let layout = order::by_word_cost(self);
-        let (cells, encoded) = std::thread::scope(|scope| {
-            let encoded = scope.spawn(|| self.encode_features(&layout));
-            let cells = self.trie_cells(&table, &layout);
-            (cells, encoded.join().expect("the feature encoder panicked"))
-        });
-        let (cells, encoded) = (cells?, encoded?);
-        let (system_starts, unknown_starts) = encoded.starts.split_at(self.token_features.len());
-        let mut sections: [Cow<'static, [u8]>; SECTIONS] = Default::default();
-        let (index, blocks) = char_map(&table);
-        sections[CHAR_INDEX] = le_bytes(&index, u16::to_le_bytes).into();
-        sections[CHAR_BLOCKS] = le_bytes(&blocks, u16::to_le_bytes).into();
-        sections[CELLS] = encode_cells(&cells).into();
+        Ok(())
+    }
+
+    fn token_widths(
+        layout: &order::Layout,
+        system_starts: &[u32],
+        unknown_starts: &[u32],
+    ) -> Result<(u32, u32), Error> {
         let param_bits = width_of(
             (layout.token_params.iter().chain(&layout.unknown_params))
                 .copied()
@@ -169,6 +162,28 @@ impl Model {
                 "a token needs more than 56 bits for its parameter set and feature",
             ));
         }
+        Ok((param_bits, feature_bits))
+    }
+
+    pub(super) fn encode_lexicon_sections(&self) -> Result<LexiconSections, Error> {
+        let table = self.code_table()?;
+        let code_count = table.iter().max().map_or(1, |&max| u32::from(max) + 1);
+        self.check_token_counts()?;
+        let layout = order::by_word_cost(self);
+        let (cells, encoded) = std::thread::scope(|scope| {
+            let encoded = scope.spawn(|| self.encode_features(&layout));
+            let cells = self.trie_cells(&table, &layout);
+            (cells, encoded.join().expect("the feature encoder panicked"))
+        });
+        let (cells, encoded) = (cells?, encoded?);
+        let (system_starts, unknown_starts) = encoded.starts.split_at(self.token_features.len());
+        let mut sections: [Cow<'static, [u8]>; SECTIONS] = Default::default();
+        let (index, blocks) = char_map(&table);
+        sections[CHAR_INDEX] = le_bytes(&index, u16::to_le_bytes).into();
+        sections[CHAR_BLOCKS] = le_bytes(&blocks, u16::to_le_bytes).into();
+        sections[CELLS] = encode_cells(&cells).into();
+        let (param_bits, feature_bits) =
+            Self::token_widths(&layout, system_starts, unknown_starts)?;
         sections[TOKENS] = encode_tokens(
             &layout.token_params,
             system_starts,
@@ -176,18 +191,7 @@ impl Model {
             feature_bits,
         )
         .into();
-        sections[PARAMS] = layout
-            .params
-            .iter()
-            .flat_map(|param| {
-                let [a, b] = param.left_id.to_le_bytes();
-                let [c, d] = param.right_id.to_le_bytes();
-                let [e, f] = param.pos_id.to_le_bytes();
-                let [g, h] = param.word_cost.to_le_bytes();
-                [a, b, c, d, e, f, g, h]
-            })
-            .collect::<Vec<u8>>()
-            .into();
+        sections[PARAMS] = encode_params(&layout.params).into();
         sections[FEATURES] = encoded.bytes.into();
         sections[UNKNOWN_STARTS] = le_bytes(&self.unknown_starts, u32::to_le_bytes).into();
         sections[UNKNOWN_TOKENS] = encode_tokens(
@@ -205,39 +209,33 @@ impl Model {
         })
     }
 
-    pub(super) fn finish_runtime(&self, lexicon: LexiconSections) -> Result<Runtime<'_>, Error> {
-        let LexiconSections {
-            sections,
-            code_count,
-            param_bits,
-            feature_bits,
-        } = lexicon;
-        let mut sections: [Cow<'_, [u8]>; SECTIONS] = sections;
-        sections[MATRIX] = Cow::Borrowed(&self.matrix);
-        sections[TEMPLATES] = if !self.templates.is_empty() && !is_runtime_form(&self.templates) {
-            let (_, _, shape) = HotShape::parse(&self.matrix)
-                .map_err(|reason| Error::format(Path::new(MATRIX_HOT_FILE), reason))?;
-            match runtime_form_of(&self.templates, &shape) {
-                Ok(bytes) => bytes.into(),
-                Err(Error::Unsupported(_)) => {
-                    return Err(Error::Unsupported(
-                        "the integer templates have no runtime form (they have no clusters, or an exception differs from the computed cost by more than 1)",
-                    ));
-                }
-                Err(error) => return Err(error),
-            }
-        } else {
-            Cow::Borrowed(&self.templates)
-        };
-        sections[CHAR_TABLE] = Cow::Borrowed(&self.char_table);
+    fn templates_section(&self) -> Result<Cow<'_, [u8]>, Error> {
+        if self.templates.is_empty() || is_runtime_form(&self.templates) {
+            return Ok(Cow::Borrowed(&self.templates));
+        }
+        let (_, _, shape) = HotShape::parse(&self.matrix)
+            .map_err(|reason| Error::format(Path::new(MATRIX_HOT_FILE), reason))?;
+        match runtime_form_of(&self.templates, &shape) {
+            Ok(bytes) => Ok(bytes.into()),
+            Err(Error::Unsupported(_)) => Err(Error::Unsupported(
+                "the integer templates have no runtime form (they have no clusters, or an exception differs from the computed cost by more than 1)",
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn dicrc_section(&self) -> Vec<u8> {
         let unknown = self.unknown_feature.as_deref().unwrap_or_default();
         let mut dicrc = Vec::new();
         dicrc.extend_from_slice(&(self.bos_feature.len() as u32).to_le_bytes());
         dicrc.extend_from_slice(&(unknown.len() as u32).to_le_bytes());
         dicrc.extend_from_slice(self.bos_feature.as_bytes());
         dicrc.extend_from_slice(unknown.as_bytes());
-        sections[DICRC] = dicrc.into();
+        dicrc
+    }
 
+    fn runtime_header(&self, widths: (u32, u32, u32), sections: &[Cow<'_, [u8]>]) -> Vec<u8> {
+        let (code_count, param_bits, feature_bits) = widths;
         let mut out = vec![0u8; HEADER_BYTES];
         out[..MAGIC_BYTES].copy_from_slice(MAGIC);
         let flags = u32::from(!self.templates.is_empty()) * (FLAG_HOT_MATRIX | FLAG_INT_TEMPLATES);
@@ -265,11 +263,40 @@ impl Model {
                 .copy_from_slice(&(section.len() as u64).to_le_bytes());
             offset += section.len().next_multiple_of(SECTION_ALIGNMENT);
         }
+        out
+    }
+
+    pub(super) fn finish_runtime(&self, lexicon: LexiconSections) -> Result<Runtime<'_>, Error> {
+        let LexiconSections {
+            sections,
+            code_count,
+            param_bits,
+            feature_bits,
+        } = lexicon;
+        let mut sections: [Cow<'_, [u8]>; SECTIONS] = sections;
+        sections[MATRIX] = Cow::Borrowed(&self.matrix);
+        sections[TEMPLATES] = self.templates_section()?;
+        sections[CHAR_TABLE] = Cow::Borrowed(&self.char_table);
+        sections[DICRC] = self.dicrc_section().into();
+        let header = self.runtime_header((code_count, param_bits, feature_bits), &sections);
         Ok(Runtime {
-            header: out,
+            header,
             sections: sections.into(),
         })
     }
+}
+
+fn encode_params(params: &[Param]) -> Vec<u8> {
+    params
+        .iter()
+        .flat_map(|param| {
+            let [a, b] = param.left_id.to_le_bytes();
+            let [c, d] = param.right_id.to_le_bytes();
+            let [e, f] = param.pos_id.to_le_bytes();
+            let [g, h] = param.word_cost.to_le_bytes();
+            [a, b, c, d, e, f, g, h]
+        })
+        .collect()
 }
 
 fn encode_cells(cells: &[u64]) -> Vec<u8> {

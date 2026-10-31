@@ -9,6 +9,113 @@ pub(super) struct Records {
     pub(super) starts: Vec<u32>,
 }
 
+struct RecordWriter<'a, 'p> {
+    set: &'a ProgramSet<'p>,
+    recoded: &'a Recoded,
+    stored: &'a [Stored],
+    blob_offsets: Vec<u32>,
+    writer: BitWriter,
+    template_bits: u32,
+    shape_bits: u32,
+    ref_bits: u32,
+    blob_bits: u32,
+    next_reference: usize,
+    next_inline: usize,
+    next_number: usize,
+    next_blob: usize,
+}
+
+impl<'a, 'p> RecordWriter<'a, 'p> {
+    fn new(
+        set: &'a ProgramSet<'p>,
+        recoded: &'a Recoded,
+        blob: Option<&Blob>,
+        stored: &'a [Stored],
+    ) -> Self {
+        let blob_offsets: Vec<u32> = set
+            .blob_ids
+            .iter()
+            .map(|&id| {
+                let blob = blob.expect("a blob id needs a blob");
+                recoded.blob_starts[blob.entry_of(id)]
+            })
+            .collect();
+        Self {
+            set,
+            recoded,
+            stored,
+            blob_offsets,
+            writer: BitWriter::default(),
+            template_bits: bits_for(set.template_list.len() as u64),
+            shape_bits: bits_for(set.shape_list.len() as u64),
+            ref_bits: bits_for(recoded.area.len() as u64),
+            blob_bits: bits_for(recoded.blob.len() as u64),
+            next_reference: 0,
+            next_inline: 0,
+            next_number: 0,
+            next_blob: 0,
+        }
+    }
+
+    fn next_number(&mut self) -> (u64, u32) {
+        let number = self.set.numbers[self.next_number];
+        self.next_number += 1;
+        number
+    }
+
+    fn write_op(&mut self, op: u8) {
+        match op {
+            OP_REF => {
+                let reference = self.recoded.references[self.next_reference];
+                self.writer.put(u64::from(reference), self.ref_bits);
+                self.next_reference += 1;
+            }
+            OP_INLINE => {
+                self.writer
+                    .put_bytes(&self.recoded.inline[self.next_inline]);
+                self.next_inline += 1;
+            }
+            OP_BLOB => {
+                let offset = self.blob_offsets[self.next_blob];
+                self.writer.put(u64::from(offset), self.blob_bits);
+                self.next_blob += 1;
+            }
+            OP_NUMB..=OP_NUMB_MAX => {
+                let (_, index) = self.next_number();
+                let spec = &self.stored[usize::from(op - OP_NUMB)].spec;
+                self.writer.put(u64::from(index), spec.lo_bits);
+            }
+            OP_NUM..=OP_NUM_MAX => {
+                let (high, index) = self.next_number();
+                let spec = &self.stored[usize::from(op - OP_NUM)].spec;
+                self.writer.put(high, spec.hi_bits);
+                self.writer.put(u64::from(index), spec.lo_bits);
+            }
+            _ => {}
+        }
+    }
+
+    fn write_entry(&mut self, entry: usize) -> Result<u32, Error> {
+        let start = self.writer.bytes.len();
+        let start_offset = u32::try_from(start)
+            .map_err(|_| Error::Unsupported("feature records of more than 4 GiB"))?;
+        self.writer.put(
+            u64::from(self.set.entry_template[entry]),
+            self.template_bits,
+        );
+        self.writer
+            .put(u64::from(self.set.entry_shape[entry]), self.shape_bits);
+        for &op in &self.set.shape_list[self.set.entry_shape[entry] as usize] {
+            self.write_op(op);
+        }
+        self.writer.finish_record();
+        if self.writer.bytes.len() == start {
+            self.writer.bytes.push(0);
+        }
+        Ok(start_offset)
+    }
+}
+
 pub(super) fn write_records(
     set: &ProgramSet,
     recoded: &Recoded,
@@ -16,66 +123,13 @@ pub(super) fn write_records(
     stored: &[Stored],
 ) -> Result<Records, Error> {
     let variant_count = set.entry_template.len();
-    let template_bits = bits_for(set.template_list.len() as u64);
-    let shape_bits = bits_for(set.shape_list.len() as u64);
-    let ref_bits = bits_for(recoded.area.len() as u64);
-    let blob_bits = bits_for(recoded.blob.len() as u64);
-    let blob_offsets: Vec<u32> = set
-        .blob_ids
-        .iter()
-        .map(|&id| {
-            let blob = blob.expect("a blob id needs a blob");
-            recoded.blob_starts[blob.entry_of(id)]
-        })
-        .collect();
-    let mut writer = BitWriter::default();
+    let mut records = RecordWriter::new(set, recoded, blob, stored);
     let mut starts: Vec<u32> = Vec::with_capacity(variant_count);
-    let (mut next_reference, mut next_inline, mut next_number, mut next_blob) = (0, 0, 0, 0);
     for entry in 0..variant_count {
-        let start = writer.bytes.len();
-        starts.push(
-            u32::try_from(start)
-                .map_err(|_| Error::Unsupported("feature records of more than 4 GiB"))?,
-        );
-        writer.put(u64::from(set.entry_template[entry]), template_bits);
-        writer.put(u64::from(set.entry_shape[entry]), shape_bits);
-        for &op in &set.shape_list[set.entry_shape[entry] as usize] {
-            match op {
-                OP_REF => {
-                    writer.put(u64::from(recoded.references[next_reference]), ref_bits);
-                    next_reference += 1;
-                }
-                OP_INLINE => {
-                    writer.put_bytes(&recoded.inline[next_inline]);
-                    next_inline += 1;
-                }
-                OP_BLOB => {
-                    writer.put(u64::from(blob_offsets[next_blob]), blob_bits);
-                    next_blob += 1;
-                }
-                OP_NUMB..=OP_NUMB_MAX => {
-                    let (_, index) = set.numbers[next_number];
-                    next_number += 1;
-                    let spec = &stored[usize::from(op - OP_NUMB)].spec;
-                    writer.put(u64::from(index), spec.lo_bits);
-                }
-                OP_NUM..=OP_NUM_MAX => {
-                    let (high, index) = set.numbers[next_number];
-                    next_number += 1;
-                    let spec = &stored[usize::from(op - OP_NUM)].spec;
-                    writer.put(high, spec.hi_bits);
-                    writer.put(u64::from(index), spec.lo_bits);
-                }
-                _ => {}
-            }
-        }
-        writer.finish_record();
-        if writer.bytes.len() == start {
-            writer.bytes.push(0);
-        }
+        starts.push(records.write_entry(entry)?);
     }
     Ok(Records {
-        bytes: writer.bytes,
+        bytes: records.writer.bytes,
         starts,
     })
 }

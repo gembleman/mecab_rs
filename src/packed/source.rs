@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::model::{Model, Param};
 use crate::Error;
@@ -68,20 +68,17 @@ struct RawKey {
     count: u32,
 }
 
-fn read_keys(path: &Path) -> Result<Vec<RawKey>, Error> {
-    let bytes = fs::read(path).map_err(io_error(path))?;
-    let end = HEADER_SIZE + u32_at(&bytes, ARRAY_BYTES_AT) as usize;
-    let cells: Vec<[u32; 2]> = bytes[HEADER_SIZE..end]
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|cell| [u32_at(cell, 0), u32_at(cell, 4)])
-        .collect();
-    let length = cells.len();
-    let is_child = |index: usize, check: u32| {
-        check != 0 && index > check as usize && index - check as usize <= MAX_ROOT_FANOUT as usize
-    };
-    let mut start = vec![0u32; length + 2];
+struct ChildIndex {
+    start: Vec<u32>,
+    children: Vec<u32>,
+}
+
+fn is_child(index: usize, check: u32) -> bool {
+    check != 0 && index > check as usize && index - check as usize <= MAX_ROOT_FANOUT as usize
+}
+
+fn child_index(cells: &[[u32; 2]]) -> ChildIndex {
+    let mut start = vec![0u32; cells.len() + 2];
     for (index, &[_, check]) in cells.iter().enumerate() {
         if is_child(index, check) {
             start[check as usize + 1] += 1;
@@ -91,64 +88,92 @@ fn read_keys(path: &Path) -> Result<Vec<RawKey>, Error> {
         start[at] += start[at - 1];
     }
     let mut fill = start.clone();
-    let mut children = vec![0u32; start[length + 1] as usize];
+    let mut children = vec![0u32; start[cells.len() + 1] as usize];
     for (index, &[_, check]) in cells.iter().enumerate() {
         if is_child(index, check) {
             children[fill[check as usize] as usize] = index as u32;
             fill[check as usize] += 1;
         }
     }
-    let Some(&[root, _]) = cells.first() else {
-        return Ok(Vec::new());
-    };
-    let terminal_value = |base: u32| {
-        cells
-            .get(base as usize)
-            .filter(|&&[value, check]| check == base && value.cast_signed() < 0)
-            .map(|&[value, _]| !value)
-    };
+    ChildIndex { start, children }
+}
+
+fn terminal_value(cells: &[[u32; 2]], base: u32) -> Option<u32> {
+    cells
+        .get(base as usize)
+        .filter(|&&[value, check]| check == base && value.cast_signed() < 0)
+        .map(|&[value, _]| !value)
+}
+
+fn visit_terminal(
+    cells: &[[u32; 2]],
+    base: u32,
+    spelling: &[u8],
+    keys: &mut Vec<RawKey>,
+) -> Result<(), Error> {
+    if let Some(value) = terminal_value(cells, base) {
+        let key = String::from_utf8(spelling.to_vec())
+            .map_err(|_| Error::Unsupported("a sys.dic key that is not UTF-8"))?;
+        keys.push(RawKey {
+            key,
+            first_token: value >> VALUE_SIZE_BITS,
+            count: value & MAX_KEY_TOKENS,
+        });
+    }
+    Ok(())
+}
+
+fn walk_trie(cells: &[[u32; 2]], index: &ChildIndex, root: u32) -> Result<Vec<RawKey>, Error> {
+    let ChildIndex { start, children } = index;
     let mut keys = Vec::new();
     let mut spelling: Vec<u8> = Vec::new();
     let mut stack: Vec<(u32, u32, usize)> = Vec::new();
-    let visit = |base: u32, spelling: &[u8], keys: &mut Vec<RawKey>| -> Result<(), Error> {
-        if let Some(value) = terminal_value(base) {
-            let key = String::from_utf8(spelling.to_vec())
-                .map_err(|_| Error::Unsupported("a sys.dic key that is not UTF-8"))?;
-            keys.push(RawKey {
-                key,
-                first_token: value >> VALUE_SIZE_BITS,
-                count: value & MAX_KEY_TOKENS,
-            });
-        }
-        Ok(())
-    };
-    visit(root, &spelling, &mut keys)?;
+    visit_terminal(cells, root, &spelling, &mut keys)?;
     stack.push((root, start[root as usize], 0));
     while let Some(top) = stack.last_mut() {
         let (base, cursor, key_length) = *top;
-        if base as usize >= length || cursor >= start[base as usize + 1] {
+        if base as usize >= cells.len() || cursor >= start[base as usize + 1] {
             stack.pop();
             continue;
         }
         top.1 += 1;
-        let index = children[cursor as usize];
+        let child_cell = children[cursor as usize];
         spelling.truncate(key_length);
-        spelling.push((index - base - 1) as u8);
-        let child = cells[index as usize][0];
+        spelling.push((child_cell - base - 1) as u8);
+        let child = cells[child_cell as usize][0];
         if child.cast_signed() < 0 {
             continue;
         }
-        visit(child, &spelling, &mut keys)?;
+        visit_terminal(cells, child, &spelling, &mut keys)?;
         stack.push((child, start[child as usize], spelling.len()));
     }
-    let terminals = cells
+    Ok(keys)
+}
+
+fn count_terminals(cells: &[[u32; 2]]) -> usize {
+    cells
         .iter()
         .enumerate()
         .filter(|&(index, &[value, check])| {
             index != 0 && check as usize == index && value.cast_signed() < 0
         })
-        .count();
-    if terminals != keys.len() {
+        .count()
+}
+
+fn read_keys(path: &Path) -> Result<Vec<RawKey>, Error> {
+    let bytes = fs::read(path).map_err(io_error(path))?;
+    let end = HEADER_SIZE + u32_at(&bytes, ARRAY_BYTES_AT) as usize;
+    let cells: Vec<[u32; 2]> = bytes[HEADER_SIZE..end]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|cell| [u32_at(cell, 0), u32_at(cell, 4)])
+        .collect();
+    let Some(&[root, _]) = cells.first() else {
+        return Ok(Vec::new());
+    };
+    let keys = walk_trie(&cells, &child_index(&cells), root)?;
+    if count_terminals(&cells) != keys.len() {
         return Err(Error::format(
             path,
             "the double array has keys that are not reachable",
@@ -157,27 +182,47 @@ fn read_keys(path: &Path) -> Result<Vec<RawKey>, Error> {
     Ok(keys)
 }
 
-pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
-    let (bos_feature, unknown_feature) = dicrc_features(&directory.join(DICRC_FILE))?;
-    let system_path = directory.join(SYS_DIC_FILE);
-    let system = SystemDictionary::open(&system_path, DictionaryKind::System)?;
-    let unknown_path = directory.join(UNK_DIC_FILE);
-    let unknown = SystemDictionary::open(&unknown_path, DictionaryKind::Unknown)?;
-    let chars = CharProperty::open(&directory.join(CHAR_TABLE_FILE))?;
+struct MatrixFiles {
+    path: PathBuf,
+    matrix: Vec<u8>,
+    templates: Vec<u8>,
+    left_size: usize,
+    right_size: usize,
+}
+
+fn plain_matrix_sizes(path: &Path, matrix: &[u8]) -> Result<(usize, usize), Error> {
+    let size = |at: usize| {
+        matrix
+            .get(at..at + 2)
+            .map(|pair| usize::from(u16_at(pair, 0)))
+    };
+    let (Some(left_size), Some(right_size)) = (size(0), size(2)) else {
+        return Err(Error::format(path, "the file is shorter than its header"));
+    };
+    if left_size == 0 || right_size == 0 || 4 + left_size * right_size * 2 != matrix.len() {
+        return Err(Error::format(
+            path,
+            "the file size does not match the header",
+        ));
+    }
+    Ok((left_size, right_size))
+}
+
+fn load_matrix(directory: &Path) -> Result<MatrixFiles, Error> {
     let hot_path = directory.join(MATRIX_HOT_FILE);
     let int_templates_path = directory.join(MATRIX_ITP_FILE);
     let hot = hot_path.exists() && int_templates_path.exists();
-    let matrix_path = if hot {
+    let path = if hot {
         hot_path
     } else {
         directory.join(MATRIX_BIN_FILE)
     };
-    if !hot && !matrix_path.exists() {
+    if !hot && !path.exists() {
         return Err(Error::Unsupported(
             "a dictionary without matrix.bin or matrix.hot and matrix.itp",
         ));
     }
-    let matrix = fs::read(&matrix_path).map_err(io_error(&matrix_path))?;
+    let matrix = fs::read(&path).map_err(io_error(&path))?;
     let templates = if hot {
         fs::read(&int_templates_path).map_err(io_error(&int_templates_path))?
     } else {
@@ -185,27 +230,10 @@ pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
     };
     let (left_size, right_size) = if hot {
         let (left_size, right_size, _) =
-            HotShape::parse(&matrix).map_err(|reason| Error::format(&matrix_path, reason))?;
+            HotShape::parse(&matrix).map_err(|reason| Error::format(&path, reason))?;
         (left_size, right_size)
     } else {
-        let size = |at: usize| {
-            matrix
-                .get(at..at + 2)
-                .map(|pair| usize::from(u16_at(pair, 0)))
-        };
-        let (Some(left_size), Some(right_size)) = (size(0), size(2)) else {
-            return Err(Error::format(
-                &matrix_path,
-                "the file is shorter than its header",
-            ));
-        };
-        if left_size == 0 || right_size == 0 || 4 + left_size * right_size * 2 != matrix.len() {
-            return Err(Error::format(
-                &matrix_path,
-                "the file size does not match the header",
-            ));
-        }
-        (left_size, right_size)
+        plain_matrix_sizes(&path, &matrix)?
     };
     if hot {
         let mapped = MappedIntTemplates::open(&int_templates_path)?;
@@ -216,20 +244,102 @@ pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
             ));
         }
     }
-    let matches_matrix = |dictionary: &SystemDictionary| {
-        dictionary.left_size() == left_size && dictionary.right_size() == right_size
-    };
-    if !matches_matrix(&system) || !matches_matrix(&unknown) {
-        return Err(Error::format(
-            &matrix_path,
-            "the matrix size does not match sys.dic or unk.dic",
-        ));
-    }
-
-    let raw_keys = read_keys(&system_path)?;
-    let mut model = Model {
+    Ok(MatrixFiles {
+        path,
         matrix,
         templates,
+        left_size,
+        right_size,
+    })
+}
+
+fn check_sizes(
+    files: &MatrixFiles,
+    system: &SystemDictionary,
+    unknown: &SystemDictionary,
+) -> Result<(), Error> {
+    let matches_matrix = |dictionary: &SystemDictionary| {
+        dictionary.left_size() == files.left_size && dictionary.right_size() == files.right_size
+    };
+    if matches_matrix(system) && matches_matrix(unknown) {
+        Ok(())
+    } else {
+        Err(Error::format(
+            &files.path,
+            "the matrix size does not match sys.dic or unk.dic",
+        ))
+    }
+}
+
+fn check_key_order(raw_keys: &[RawKey], system_path: &Path) -> Result<(), Error> {
+    let mut position = 0u32;
+    for raw in raw_keys {
+        if raw.first_token != position || raw.count == 0 || raw.count > MAX_KEY_TOKENS {
+            return Err(Error::format(
+                system_path,
+                "the tokens are not in key order, or a key has no token",
+            ));
+        }
+        position += raw.count;
+    }
+    if position as usize != system_token_count(system_path)? {
+        return Err(Error::format(system_path, "some tokens belong to no key"));
+    }
+    Ok(())
+}
+
+fn intern_system_tokens<'a>(
+    model: &mut Model,
+    interner: &mut Interner<'a>,
+    system: &'a SystemDictionary,
+    raw_keys: Vec<RawKey>,
+) {
+    for raw in raw_keys {
+        model.counts.push(raw.count as u8);
+        for index in raw.first_token..raw.first_token + raw.count {
+            let (param, feature) = interner.intern(model, system, system.token(index as usize));
+            model.token_params.push(param);
+            model.token_features.push(feature);
+        }
+        model.keys.push(raw.key);
+    }
+}
+
+fn intern_unknown_tokens<'a>(
+    model: &mut Model,
+    interner: &mut Interner<'a>,
+    unknown: &'a SystemDictionary,
+    chars: &CharProperty,
+    unknown_path: &Path,
+) -> Result<(), Error> {
+    model.unknown_starts.push(0);
+    for category in 0..chars.category_count() {
+        let run = unknown.exact_match(chars.name(category)).ok_or_else(|| {
+            Error::format(unknown_path, "a character category of char.uni is missing")
+        })?;
+        for index in run {
+            let (param, feature) = interner.intern(model, unknown, unknown.token(index));
+            model.unknown_params.push(param);
+            model.unknown_features.push(feature);
+        }
+        model.unknown_starts.push(model.unknown_params.len() as u32);
+    }
+    Ok(())
+}
+
+pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
+    let (bos_feature, unknown_feature) = dicrc_features(&directory.join(DICRC_FILE))?;
+    let system_path = directory.join(SYS_DIC_FILE);
+    let system = SystemDictionary::open(&system_path, DictionaryKind::System)?;
+    let unknown_path = directory.join(UNK_DIC_FILE);
+    let unknown = SystemDictionary::open(&unknown_path, DictionaryKind::Unknown)?;
+    let chars = CharProperty::open(&directory.join(CHAR_TABLE_FILE))?;
+    let files = load_matrix(directory)?;
+    check_sizes(&files, &system, &unknown)?;
+    let raw_keys = read_keys(&system_path)?;
+    let mut model = Model {
+        matrix: files.matrix,
+        templates: files.templates,
         char_table: fs::read(directory.join(CHAR_TABLE_FILE))
             .map_err(io_error(&directory.join(CHAR_TABLE_FILE)))?,
         bos_feature,
@@ -240,41 +350,9 @@ pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
         params: HashMap::new(),
         features: HashMap::new(),
     };
-    let mut position = 0u32;
-    for raw in &raw_keys {
-        if raw.first_token != position || raw.count == 0 || raw.count > MAX_KEY_TOKENS {
-            return Err(Error::format(
-                &system_path,
-                "the tokens are not in key order, or a key has no token",
-            ));
-        }
-        position += raw.count;
-    }
-    if position as usize != system_token_count(&system_path)? {
-        return Err(Error::format(&system_path, "some tokens belong to no key"));
-    }
-    for raw in raw_keys {
-        model.counts.push(raw.count as u8);
-        for index in raw.first_token..raw.first_token + raw.count {
-            let (param, feature) =
-                interner.intern(&mut model, &system, system.token(index as usize));
-            model.token_params.push(param);
-            model.token_features.push(feature);
-        }
-        model.keys.push(raw.key);
-    }
-    model.unknown_starts.push(0);
-    for category in 0..chars.category_count() {
-        let run = unknown.exact_match(chars.name(category)).ok_or_else(|| {
-            Error::format(&unknown_path, "a character category of char.uni is missing")
-        })?;
-        for index in run {
-            let (param, feature) = interner.intern(&mut model, &unknown, unknown.token(index));
-            model.unknown_params.push(param);
-            model.unknown_features.push(feature);
-        }
-        model.unknown_starts.push(model.unknown_params.len() as u32);
-    }
+    check_key_order(&raw_keys, &system_path)?;
+    intern_system_tokens(&mut model, &mut interner, &system, raw_keys);
+    intern_unknown_tokens(&mut model, &mut interner, &unknown, &chars, &unknown_path)?;
     Ok(model)
 }
 
