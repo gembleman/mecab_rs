@@ -1,14 +1,14 @@
 use super::{
     BLOCK_CODES, BLOCK_COUNT, CATEGORY_COUNT_AT, CELLS, CELLS_PADDING, CHAR_BLOCKS, CHAR_INDEX,
     CHAR_TABLE, CHAR_TABLE_HEADER_BYTES, CHAR_TABLE_MAGIC, CODE_COUNT_AT, DICRC, Error,
-    FEATURE_BITS_AT, FLAG_HOT_MATRIX, FLAG_INT_TEMPLATES, FLAGS_AT, HEADER_BYTES, HOT_ROWS_BYTES,
-    HotShape, MAGIC, MAGIC_BYTES, MATRIX, MATRIX_HEADER_BYTES, MAX_RECORD_BITS, MAX_UNITS,
-    PARAM_BITS_AT, PARAM_BYTES, PARAM_COUNT_AT, PARAMS, Path, ROW_START_BYTES, Range,
+    FEATURE_BITS_AT, FEATURES, FLAG_HOT_MATRIX, FLAG_INT_TEMPLATES, FLAGS_AT, HEADER_BYTES,
+    HOT_ROWS_BYTES, HotShape, MAGIC, MAGIC_BYTES, MATRIX, MATRIX_HEADER_BYTES, MAX_RECORD_BITS,
+    MAX_UNITS, PARAM_BITS_AT, PARAM_BYTES, PARAM_COUNT_AT, PARAMS, Path, ROW_START_BYTES, Range,
     SECTION_ALIGNMENT, SECTION_ENTRY_BYTES, SECTION_LENGTH_IN_ENTRY, SECTION_OFFSET_IN_ENTRY,
     SECTION_TABLE_AT, SECTIONS, Source, TEMPLATE_HEADER_PEEK_BYTES, TEMPLATES, TOKEN_COUNT_AT,
     TOKENS, TokenFormat, UNIT_BYTES, UNKNOWN_STARTS, UNKNOWN_TOKENS, VERSION, VERSION_AT,
-    check_tokens, feature_check, header_sizes, is_runtime_form, section_bytes, u16_at, u16_values,
-    u32_at, u32_values, u64_at,
+    check_cells, check_tokens, feature_check, header_sizes, is_runtime_form, section_bytes, u16_at,
+    u16_values, u32_at, u32_values, u64_at,
 };
 
 const KNOWN_FLAGS: u32 = FLAG_HOT_MATRIX | FLAG_INT_TEMPLATES;
@@ -115,7 +115,7 @@ pub(super) fn parse_sections(
     Ok(sections)
 }
 
-pub(super) fn check_section_sizes(source: &Source, header: &Header) -> Result<(), Error> {
+fn check_section_sizes(source: &Source, header: &Header) -> Result<(), Error> {
     let length = |section: usize| source.section_length(section);
     let cell_bytes = length(CELLS).saturating_sub(CELLS_PADDING);
     let sized = length(CHAR_INDEX) == BLOCK_COUNT * BLOCK_ENTRY_BYTES
@@ -188,7 +188,7 @@ fn check_templates(
     Ok(())
 }
 
-pub(super) fn check_matrix(source: &Source, header: &Header) -> Result<(usize, usize), Error> {
+fn check_matrix(source: &Source, header: &Header) -> Result<(usize, usize), Error> {
     if source.section_length(MATRIX) < MATRIX_HEADER_BYTES {
         return Err(source.broken("the matrix is shorter than its header"));
     }
@@ -204,7 +204,7 @@ pub(super) fn check_matrix(source: &Source, header: &Header) -> Result<(usize, u
     Ok((left_size, right_size))
 }
 
-pub(super) fn check_char_table(source: &Source, category_count: usize) -> Result<(), Error> {
+fn check_char_table(source: &Source, category_count: usize) -> Result<(), Error> {
     if source.section_length(CHAR_TABLE) < CHAR_TABLE_HEADER_BYTES {
         return Err(source.broken("the character table is shorter than its header"));
     }
@@ -220,7 +220,7 @@ pub(super) fn check_char_table(source: &Source, category_count: usize) -> Result
     Ok(())
 }
 
-pub(super) fn check_char_codes(source: &Source, code_count: usize) -> Result<(), Error> {
+fn check_char_codes(source: &Source, code_count: usize) -> Result<(), Error> {
     let index = source.read_all(CHAR_INDEX)?;
     let block_count = source.section_length(CHAR_BLOCKS) / (BLOCK_CODES * BLOCK_ENTRY_BYTES);
     if u16_values(&index).any(|block| usize::from(block) >= block_count) {
@@ -234,11 +234,7 @@ pub(super) fn check_char_codes(source: &Source, code_count: usize) -> Result<(),
     )
 }
 
-pub(super) fn check_params(
-    source: &Source,
-    left_size: usize,
-    right_size: usize,
-) -> Result<(), Error> {
+fn check_params(source: &Source, left_size: usize, right_size: usize) -> Result<(), Error> {
     source.chunks(
         PARAMS,
         PARAM_BYTES,
@@ -252,7 +248,7 @@ pub(super) fn check_params(
     )
 }
 
-pub(super) fn check_unknown_starts(source: &Source, header: &Header) -> Result<usize, Error> {
+fn check_unknown_starts(source: &Source, header: &Header) -> Result<usize, Error> {
     let unknown_starts = source.read_all(UNKNOWN_STARTS)?;
     let unknown_starts: Vec<u32> = u32_values(&unknown_starts).collect();
     let broken = || source.broken("the unknown tokens of the categories do not add up");
@@ -268,7 +264,7 @@ pub(super) fn check_unknown_starts(source: &Source, header: &Header) -> Result<u
     Ok(unknown_count)
 }
 
-pub(super) fn check_token_sections(
+fn check_token_sections(
     source: &Source,
     header: &Header,
     unknown_count: usize,
@@ -302,7 +298,7 @@ pub(super) struct Dicrc {
     pub(super) unknown_length: usize,
 }
 
-pub(super) fn check_dicrc(source: &Source) -> Result<Dicrc, Error> {
+fn check_dicrc(source: &Source) -> Result<Dicrc, Error> {
     let dicrc = source.read_all(DICRC)?;
     if dicrc.len() < DICRC_HEADER_BYTES {
         return Err(source.broken("dicrc is shorter than its header"));
@@ -319,5 +315,26 @@ pub(super) fn check_dicrc(source: &Source) -> Result<Dicrc, Error> {
     Ok(Dicrc {
         bos_length,
         unknown_length,
+    })
+}
+
+pub(super) fn run(source: &Source, header: Header, cells: &[u8]) -> Result<Validated, Error> {
+    check_section_sizes(source, &header)?;
+    let (left_size, right_size) = check_matrix(source, &header)?;
+    check_char_table(source, header.category_count)?;
+    check_char_codes(source, header.code_count)?;
+    let checked = feature_check::check(source, FEATURES)?;
+    check_params(source, left_size, right_size)?;
+    let unknown_count = check_unknown_starts(source, &header)?;
+    check_token_sections(source, &header, unknown_count, &checked)?;
+    check_cells(source, cells, header.token_count)?;
+    let dicrc = check_dicrc(source)?;
+    Ok(Validated {
+        header,
+        left_size,
+        right_size,
+        unknown_count,
+        checked,
+        dicrc,
     })
 }

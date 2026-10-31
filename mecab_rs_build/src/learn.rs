@@ -76,6 +76,17 @@ impl Config {
 
 const SIGNIFICANT_DIGITS: i32 = 6;
 const LOWEST_FIXED_EXPONENT: i32 = -4;
+const MANTISSA_DECIMALS: usize = 5;
+const SCIENTIFIC_HAS_EXPONENT: &str = "scientific notation always has an exponent";
+const SCIENTIFIC_EXPONENT_IS_INTEGER: &str = "a scientific exponent is an integer";
+const FIXED_DECIMALS_NOT_NEGATIVE: &str = "a fixed exponent is below the significant digits";
+
+fn split_scientific(value: f64) -> (String, i32) {
+    let scientific = format!("{value:.MANTISSA_DECIMALS$e}");
+    let (mantissa, exponent) = scientific.split_once('e').expect(SCIENTIFIC_HAS_EXPONENT);
+    let exponent = exponent.parse().expect(SCIENTIFIC_EXPONENT_IS_INTEGER);
+    (mantissa.to_owned(), exponent)
+}
 
 pub(crate) fn format_g(value: f64) -> String {
     if value == 0.0 {
@@ -91,22 +102,18 @@ pub(crate) fn format_g(value: f64) -> String {
         }
         .to_owned();
     }
-    let scientific = format!(
-        "{value:.*e}",
-        usize::try_from(SIGNIFICANT_DIGITS - 1).expect("at least 0")
-    );
-    let (mantissa, exponent) = scientific.split_once('e').expect("an exponent");
-    let exponent: i32 = exponent.parse().expect("a number");
+    let (mantissa, exponent) = split_scientific(value);
     if !(LOWEST_FIXED_EXPONENT..SIGNIFICANT_DIGITS).contains(&exponent) {
         let mantissa = if mantissa.contains('.') {
             mantissa.trim_end_matches('0').trim_end_matches('.')
         } else {
-            mantissa
+            &mantissa
         };
         let sign = if exponent < 0 { '-' } else { '+' };
         return format!("{mantissa}e{sign}{:02}", exponent.abs());
     }
-    let decimals = usize::try_from(SIGNIFICANT_DIGITS - 1 - exponent).expect("at least 0");
+    let decimals =
+        usize::try_from(SIGNIFICANT_DIGITS - 1 - exponent).expect(FIXED_DECIMALS_NOT_NEGATIVE);
     let fixed = format!("{value:.decimals$}");
     if fixed.contains('.') {
         fixed.trim_end_matches('0').trim_end_matches('.').to_owned()

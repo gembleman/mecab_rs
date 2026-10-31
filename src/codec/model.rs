@@ -13,7 +13,7 @@ const TAG_LID: u8 = 4;
 const MAX_COLS: usize = 1 << 20;
 const CANONICAL_I64_LIMIT: u64 = 1 << 61;
 const CANONICAL_U64_LIMIT: u64 = 1 << 62;
-pub const LID_MODE_COUNT: usize = 5;
+const LID_MODE_COUNT: usize = 5;
 const KNOWN_SEGMENT_COST: f64 = 2.0;
 const NEW_SEGMENT_BASE_COST: f64 = 5.0;
 const NEW_SEGMENT_COST_PER_CHAR: f64 = 6.0;
@@ -21,6 +21,8 @@ const MAX_SEGMENT_LEN: usize = 8;
 const EX_ALIGNED: u32 = 1000;
 const EX_DOMAIN: u64 = 1001;
 const MAX_RECENT: usize = 8;
+const EX_REF_OFFSET: u32 = 1;
+const NO_PREVIOUS: u64 = 0;
 pub const FIXED_COLS: usize = 4;
 const IRREGULAR_FLAG_LIMIT: u32 = 30000;
 const LO_BITS_MAX: u8 = 24;
@@ -36,12 +38,202 @@ pub struct LidSpec {
     pub low_col: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NumMode {
+    Plain = 0,
+    Surface = 1,
+    LidLinked = 2,
+    SurfacePrevious = 3,
+}
+
+impl TryFrom<u8> for NumMode {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, ()> {
+        match value {
+            0 => Ok(NumMode::Plain),
+            1 => Ok(NumMode::Surface),
+            2 => Ok(NumMode::LidLinked),
+            3 => Ok(NumMode::SurfacePrevious),
+            _ => Err(()),
+        }
+    }
+}
+
+impl NumMode {
+    fn uses_surface(self) -> bool {
+        matches!(self, NumMode::Surface | NumMode::SurfacePrevious)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LidMode {
+    Seen,
+    Range,
+    OrderDelta,
+    Direct,
+    LastNewDelta,
+}
+
+impl LidMode {
+    fn from_symbol(symbol: u32) -> LidMode {
+        match symbol {
+            0 => LidMode::Seen,
+            1 => LidMode::Range,
+            2 => LidMode::OrderDelta,
+            4 => LidMode::LastNewDelta,
+            _ => LidMode::Direct,
+        }
+    }
+
+    fn to_symbol(self) -> u32 {
+        match self {
+            LidMode::Seen => 0,
+            LidMode::Range => 1,
+            LidMode::OrderDelta => 2,
+            LidMode::Direct => 3,
+            LidMode::LastNewDelta => 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LidStats {
+    pub mode: f64,
+    pub seen: f64,
+    pub range: f64,
+    pub order: f64,
+    pub direct: f64,
+    pub low: f64,
+}
+
+impl LidStats {
+    fn add_id_bits(&mut self, mode: LidMode, bits: f64) {
+        match mode {
+            LidMode::Seen => self.seen += bits,
+            LidMode::Range => self.range += bits,
+            LidMode::OrderDelta => self.order += bits,
+            LidMode::Direct | LidMode::LastNewDelta => self.direct += bits,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LidModeCounts {
+    pub seen: u64,
+    pub range: u64,
+    pub order_delta: u64,
+    pub direct: u64,
+    pub last_new_delta: u64,
+}
+
+impl LidModeCounts {
+    fn bump(&mut self, mode: LidMode) {
+        match mode {
+            LidMode::Seen => self.seen += 1,
+            LidMode::Range => self.range += 1,
+            LidMode::OrderDelta => self.order_delta += 1,
+            LidMode::Direct => self.direct += 1,
+            LidMode::LastNewDelta => self.last_new_delta += 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LidReport {
+    pub stats: LidStats,
+    pub mode_counts: LidModeCounts,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AlignStats {
+    pub hit_bits: f64,
+    pub hits: f64,
+    pub miss_bits: f64,
+    pub misses: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColumnAlign {
+    pub col: usize,
+    pub stats: AlignStats,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NumNovel {
+    pub bits: f64,
+    pub count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SourceRef {
+    index: usize,
+    to_katakana: bool,
+}
+
+impl SourceRef {
+    fn to_symbol(self) -> u32 {
+        (self.index * 2 + usize::from(self.to_katakana)) as u32
+    }
+
+    fn from_symbol(symbol: u32) -> SourceRef {
+        SourceRef {
+            index: (symbol / 2) as usize,
+            to_katakana: symbol % 2 == 1,
+        }
+    }
+
+    fn to_ex(self) -> u32 {
+        EX_REF_OFFSET + self.to_symbol()
+    }
+
+    fn from_ex(ex: u32) -> SourceRef {
+        SourceRef::from_symbol(ex - EX_REF_OFFSET)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RefChoice {
+    source: SourceRef,
+    trim: usize,
+    append_from: usize,
+}
+
+#[derive(Clone, Copy)]
+struct GroupPlan {
+    exact: u32,
+    choice: RefChoice,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct RefCandidate {
+    append_len: usize,
+    trim: usize,
+    index: usize,
+    to_katakana: bool,
+    common_prefix: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Run {
+    kana: bool,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Span {
+    start: usize,
+    end: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
     Cat,
     Str { align: bool, recent: u8 },
     Lid(LidSpec),
-    Num { mode: u8 },
+    Num { mode: NumMode },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,7 +289,7 @@ impl Plan {
                 }
                 Kind::Num { mode } => {
                     out.push(TAG_NUM);
-                    out.push(*mode);
+                    out.push(*mode as u8);
                 }
                 Kind::Lid(spec) => {
                     out.push(TAG_LID);
@@ -140,7 +332,7 @@ impl Plan {
                     }
                 }
                 TAG_NUM => {
-                    let mode = read_u8(bytes, pos)?;
+                    let mode = NumMode::try_from(read_u8(bytes, pos)?).ok()?;
                     Kind::Num { mode }
                 }
                 TAG_LID => {
@@ -259,9 +451,9 @@ struct StrState {
     read_chars: CharModel,
     recent: Vec<String>,
     limit: usize,
-    group_plan: Option<(u32, Cand)>,
+    group_plan: Option<GroupPlan>,
     group_exact: u32,
-    align_stats: [f64; 4],
+    align_stats: AlignStats,
     seg_ppm: Ppm,
     segs: Interner,
     known: HashSet<u64>,
@@ -279,8 +471,8 @@ struct LidState {
     irregular: Flag,
     partner_bad: Flag,
     last_new: u64,
-    stats: [f64; 6],
-    mode_count: [u64; LID_MODE_COUNT],
+    stats: LidStats,
+    mode_counts: LidModeCounts,
 }
 
 struct NumState {
@@ -292,7 +484,7 @@ struct NumState {
     d_intern: Interner,
     d_uint: UintModel,
     refs: FastMap<u64, (i64, i64)>,
-    pub novel: (f64, u64),
+    pub novel: NumNovel,
 }
 
 enum StepState {
@@ -326,8 +518,8 @@ struct RowState {
     prev_cat_group_id: u32,
     row_irregular: bool,
     rebuilt: String,
-    script_runs: Vec<(bool, usize, usize)>,
-    reading_spans: Vec<(usize, usize)>,
+    script_runs: Vec<Run>,
+    reading_spans: Vec<Span>,
 }
 
 pub struct Model {
@@ -407,7 +599,7 @@ impl Model {
                         recent: Vec::new(),
                         group_plan: None,
                         group_exact: 0,
-                        align_stats: [0.0; 4],
+                        align_stats: AlignStats::default(),
                         seg_ppm: Ppm::default(),
                         segs: Interner::default(),
                         known: HashSet::default(),
@@ -427,8 +619,8 @@ impl Model {
                     irregular: Flag::default(),
                     partner_bad: Flag::default(),
                     last_new: 0,
-                    stats: [0.0; 6],
-                    mode_count: [0; LID_MODE_COUNT],
+                    stats: LidStats::default(),
+                    mode_counts: LidModeCounts::default(),
                 })),
                 Kind::Num { .. } => StepState::Num(Box::new(NumState {
                     ppm: Ppm::default(),
@@ -439,7 +631,7 @@ impl Model {
                     d_intern: Interner::default(),
                     d_uint: UintModel::default(),
                     refs: FastMap::default(),
-                    novel: (0.0, 0),
+                    novel: NumNovel::default(),
                 })),
             });
         }
@@ -528,27 +720,33 @@ impl Model {
         }
     }
 
-    pub fn lid_stats(&self) -> Option<([f64; 6], [u64; LID_MODE_COUNT])> {
+    pub fn lid_stats(&self) -> Option<LidReport> {
         self.steps.iter().find_map(|s| match s {
-            StepState::Lid(l) => Some((l.stats, l.mode_count)),
+            StepState::Lid(l) => Some(LidReport {
+                stats: l.stats,
+                mode_counts: l.mode_counts,
+            }),
             _ => None,
         })
     }
 
-    pub fn align_stats(&self) -> Vec<(usize, [f64; 4])> {
+    pub fn align_stats(&self) -> Vec<ColumnAlign> {
         self.steps
             .iter()
             .zip(&self.plan.steps)
             .filter_map(|(s, p)| match s {
-                StepState::Str(st) if st.align_stats[1] + st.align_stats[3] > 0.0 => {
-                    Some((p.col, st.align_stats))
+                StepState::Str(st) if st.align_stats.hits + st.align_stats.misses > 0.0 => {
+                    Some(ColumnAlign {
+                        col: p.col,
+                        stats: st.align_stats,
+                    })
                 }
                 _ => None,
             })
             .collect()
     }
 
-    pub fn num_stats(&self) -> Vec<(f64, u64)> {
+    pub fn num_stats(&self) -> Vec<NumNovel> {
         self.steps
             .iter()
             .filter_map(|s| match s {
@@ -653,7 +851,7 @@ impl Model {
             match (&mut self.steps[si], &step.kind) {
                 (StepState::Cat(st), Kind::Cat) => {
                     if !bundle {
-                        code_cat(st, row, coder, step.col, 0);
+                        code_cat(st, row, coder, step.col, NO_PREVIOUS);
                     } else if si == self.cat_group.steps[0] {
                         code_cat_group(
                             &mut self.cat_group,
@@ -825,7 +1023,7 @@ fn code_cat(st: &mut CatState, row: &mut RowState, coder: &mut Coder, col: usize
     let dec = coder.is_decoder();
     let mut ctxs = [0u64; 4];
     let mut ctx_count = 0;
-    if prev != 0 {
+    if prev != NO_PREVIOUS {
         ctxs[ctx_count] = mix(mix(1, row.pos_hash), prev);
         ctx_count += 1;
     }
@@ -893,7 +1091,7 @@ fn code_cat_group(
     let id = if let Some(id) = g.ppm.code(coder, ctxs, sym) {
         id
     } else {
-        let mut prev = 0u64;
+        let mut prev = NO_PREVIOUS;
         for &si in &g.steps {
             let col = plan_steps[si].col;
             if let StepState::Cat(st) = &mut steps[si] {
@@ -919,31 +1117,40 @@ fn code_cat_group(
     }
 }
 
-fn split_script_runs(s: &str, out: &mut Vec<(bool, usize, usize)>) {
+fn split_script_runs(s: &str, out: &mut Vec<Run>) {
     out.clear();
     for (i, ch) in s.char_indices() {
         let kana = is_kana(ch);
         match out.last_mut() {
-            Some(last) if last.0 == kana => last.2 = i + ch.len_utf8(),
-            _ => out.push((kana, i, i + ch.len_utf8())),
+            Some(last) if last.kana == kana => last.end = i + ch.len_utf8(),
+            _ => out.push(Run {
+                kana,
+                start: i,
+                end: i + ch.len_utf8(),
+            }),
         }
     }
 }
 
 fn match_reading(
     surface: &str,
-    script_runs: &[(bool, usize, usize)],
+    script_runs: &[Run],
     target: &str,
-    reading_spans: &mut Vec<(usize, usize)>,
+    reading_spans: &mut Vec<Span>,
 ) -> bool {
     fn rec(
         surface: &str,
-        script_runs: &[(bool, usize, usize)],
+        script_runs: &[Run],
         target: &str,
         pos: usize,
-        reading_spans: &mut Vec<(usize, usize)>,
+        reading_spans: &mut Vec<Span>,
     ) -> bool {
-        let Some(&(is_kana_run, run_start, run_end)) = script_runs.first() else {
+        let Some(&Run {
+            kana: is_kana_run,
+            start: run_start,
+            end: run_end,
+        }) = script_runs.first()
+        else {
             return pos == target.len();
         };
         if is_kana_run {
@@ -960,7 +1167,7 @@ fn match_reading(
         let mut end = pos;
         for ch in target[pos..].chars() {
             end += ch.len_utf8();
-            reading_spans.push((pos, end));
+            reading_spans.push(Span { start: pos, end });
             if rec(surface, &script_runs[1..], target, end, reading_spans) {
                 return true;
             }
@@ -1004,9 +1211,7 @@ fn apply_ref(src: &str, to_kata: bool, trim: usize, append: &str, out: &mut Stri
     out.push_str(append);
 }
 
-type Cand = (usize, usize, usize, usize);
-
-fn plan_str(st: &StrState, row: &mut RowState, col: usize, align: bool) -> (u32, Cand) {
+fn plan_str(st: &StrState, row: &mut RowState, col: usize, align: bool) -> (u32, RefChoice) {
     if align {
         split_script_runs(&row.fields[0], &mut row.script_runs);
         if match_reading(
@@ -1015,46 +1220,63 @@ fn plan_str(st: &StrState, row: &mut RowState, col: usize, align: bool) -> (u32,
             &row.fields[col],
             &mut row.reading_spans,
         ) {
-            return (EX_ALIGNED, (0, 0, 0, 0));
+            return (EX_ALIGNED, RefChoice::default());
         }
     }
     let nsrc = st.srcs.len();
     let target = &row.fields[col];
     let tlen = target.chars().count();
-    let mut best: Option<(usize, usize, usize, usize, usize)> = None;
-    let mut consider = |cand: (usize, usize, usize, usize, usize)| {
-        if best.is_none_or(|b| (cand.0, cand.1, cand.2, cand.3) < (b.0, b.1, b.2, b.3)) {
-            best = Some(cand);
-        }
-    };
-    for (j, &sc) in st.srcs.iter().enumerate() {
+    let from_sources = st.srcs.iter().enumerate().flat_map(|(index, &sc)| {
         let src = &row.fields[sc];
         let has_hira = src.chars().any(|ch| kata(ch) != ch);
         let slen = src.chars().count();
-        for t in 0..=usize::from(has_hira) {
-            let cp = if t == 0 {
+        (0..=usize::from(has_hira)).map(move |t| {
+            let common_prefix = if t == 0 {
                 common_prefix_len(src.chars(), target.chars())
             } else {
                 common_prefix_len(src.chars().map(kata), target.chars())
             };
-            consider((tlen - cp, slen - cp, j, t, cp));
+            RefCandidate {
+                append_len: tlen - common_prefix,
+                trim: slen - common_prefix,
+                index,
+                to_katakana: t == 1,
+                common_prefix,
+            }
+        })
+    });
+    let from_recent = st.recent.iter().enumerate().map(|(r, src)| {
+        let common_prefix = common_prefix_len(src.chars(), target.chars());
+        RefCandidate {
+            append_len: tlen - common_prefix,
+            trim: src.chars().count() - common_prefix,
+            index: nsrc + r,
+            to_katakana: false,
+            common_prefix,
         }
-    }
-    for (r, src) in st.recent.iter().enumerate() {
-        let cp = common_prefix_len(src.chars(), target.chars());
-        consider((tlen - cp, src.chars().count() - cp, nsrc + r, 0, cp));
-    }
-    let (alen, trim, j, t, cp) = best.unwrap_or((0, 0, 0, 0, 0));
-    let app = target
+    });
+    let best = from_sources.chain(from_recent).min().unwrap_or_default();
+    let append_from = target
         .char_indices()
-        .nth(cp)
+        .nth(best.common_prefix)
         .map_or(target.len(), |(i, _)| i);
-    let ex = if alen == 0 && trim == 0 {
-        1 + (j * 2 + t) as u32
+    let source = SourceRef {
+        index: best.index,
+        to_katakana: best.to_katakana,
+    };
+    let ex = if best.append_len == 0 && best.trim == 0 {
+        source.to_ex()
     } else {
         0
     };
-    (ex, (j, t, trim, app))
+    (
+        ex,
+        RefChoice {
+            source,
+            trim: best.trim,
+            append_from,
+        },
+    )
 }
 
 fn remember_value(st: &mut StrState, v: &str) {
@@ -1081,8 +1303,8 @@ fn code_str_group(
             if let (StepState::Str(st), Kind::Str { align, .. }) =
                 (&mut steps[si], &plan_steps[si].kind)
             {
-                let (ex, cand) = plan_str(st, row, plan_steps[si].col, *align);
-                st.group_plan = Some((ex, cand));
+                let (ex, choice) = plan_str(st, row, plan_steps[si].col, *align);
+                st.group_plan = Some(GroupPlan { exact: ex, choice });
                 row.key_buf.extend_from_slice(&(ex as u16).to_le_bytes());
             }
         }
@@ -1107,9 +1329,9 @@ fn code_str_group(
         row.key_buf.clear();
         for &si in &g.steps {
             if let StepState::Str(st) = &mut steps[si] {
-                let want = st.group_plan.map_or(0, |p| p.0);
+                let want = st.group_plan.map_or(0, |p| p.exact);
                 let ex = code_ex(st, row, coder, want);
-                st.group_plan = st.group_plan.map(|p| (ex, p.1));
+                st.group_plan = st.group_plan.map(|p| GroupPlan { exact: ex, ..p });
                 st.group_exact = ex;
                 row.key_buf.extend_from_slice(&(ex as u16).to_le_bytes());
             }
@@ -1176,28 +1398,31 @@ fn code_str(
 ) {
     let dec = coder.is_decoder();
     let pending = st.group_plan.take();
-    let (ex, cand) = if options.grouped {
-        (st.group_exact, pending.map_or((0, 0, 0, 0), |p| p.1))
+    let (ex, choice) = if options.grouped {
+        (
+            st.group_exact,
+            pending.map_or(RefChoice::default(), |p| p.choice),
+        )
     } else {
-        let (want, cand) = if dec {
-            (0, (0, 0, 0, 0))
+        let (want, choice) = if dec {
+            (0, RefChoice::default())
         } else {
             plan_str(st, row, col, options.align)
         };
-        (code_ex(st, row, coder, want), cand)
+        (code_ex(st, row, coder, want), choice)
     };
     row.str_shape = mix(row.str_shape, u64::from(ex));
     if ex == EX_ALIGNED && options.align {
         code_aligned(st, row, coder, col);
     } else if ex != 0 && ex != EX_ALIGNED {
         if dec {
-            let (j, t) = (((ex - 1) / 2) as usize, ((ex - 1) % 2) as usize);
-            let src = resolve_source(st, &row.fields, j);
-            apply_ref(src, t == 1, 0, "", &mut row.rebuilt);
+            let source = SourceRef::from_ex(ex);
+            let src = resolve_source(st, &row.fields, source.index);
+            apply_ref(src, source.to_katakana, 0, "", &mut row.rebuilt);
             std::mem::swap(&mut row.fields[col], &mut row.rebuilt);
         }
     } else {
-        code_ref(st, row, coder, col, cand);
+        code_ref(st, row, coder, col, choice);
     }
     remember_value(st, &row.fields[col]);
 }
@@ -1210,7 +1435,7 @@ fn pair_hash(ch: char, seg: &[char]) -> u64 {
     h
 }
 
-fn segment_reading(st: &StrState, chars: &[char], reading: &[char]) -> Vec<(usize, usize)> {
+fn segment_reading(st: &StrState, chars: &[char], reading: &[char]) -> Vec<Span> {
     let (char_count, reading_len) = (chars.len(), reading.len());
     let stride = reading_len + 1;
     let unreachable_cost = f64::MAX / 4.0;
@@ -1246,11 +1471,14 @@ fn segment_reading(st: &StrState, chars: &[char], reading: &[char]) -> Vec<(usiz
             }
         }
     }
-    let mut out = vec![(0, 0); char_count];
+    let mut out = vec![Span { start: 0, end: 0 }; char_count];
     let mut reading_pos = reading_len;
     for i in (0..char_count).rev() {
         let len = segment_len_at[(i + 1) * stride + reading_pos];
-        out[i] = (reading_pos - len, reading_pos);
+        out[i] = Span {
+            start: reading_pos - len,
+            end: reading_pos,
+        };
         reading_pos -= len;
     }
     out
@@ -1271,7 +1499,7 @@ fn code_segments(st: &mut StrState, coder: &mut Coder, run: &str, reading: &str,
         let (seg, sym) = if dec {
             (&[][..], NOVEL)
         } else {
-            let seg = &rchars[ranges[i].0..ranges[i].1];
+            let seg = &rchars[ranges[i].start..ranges[i].end];
             piece.clear();
             piece.extend(seg.iter());
             (seg, st.segs.find(piece.as_bytes()).unwrap_or(NOVEL))
@@ -1306,7 +1534,12 @@ fn code_aligned(st: &mut StrState, row: &mut RowState, coder: &mut Coder, col: u
     }
     row.rebuilt.clear();
     let mut gi = 0;
-    for &(is_kana_run, run_start, run_end) in &row.script_runs {
+    for &Run {
+        kana: is_kana_run,
+        start: run_start,
+        end: run_end,
+    } in &row.script_runs
+    {
         if is_kana_run {
             row.rebuilt
                 .extend(row.fields[0][run_start..run_end].chars().map(kata));
@@ -1316,7 +1549,7 @@ fn code_aligned(st: &mut StrState, row: &mut RowState, coder: &mut Coder, col: u
         let reading = if dec {
             ""
         } else {
-            &row.fields[col][row.reading_spans[gi].0..row.reading_spans[gi].1]
+            &row.fields[col][row.reading_spans[gi].start..row.reading_spans[gi].end]
         };
         gi += 1;
         let sym = if dec {
@@ -1330,15 +1563,15 @@ fn code_aligned(st: &mut StrState, row: &mut RowState, coder: &mut Coder, col: u
             .code(coder, &[mix(12, hash_bytes(run.as_bytes()))], sym);
         let b1 = coder.bits;
         if hit.is_some() {
-            st.align_stats[0] += b1 - b0;
-            st.align_stats[1] += 1.0;
+            st.align_stats.hit_bits += b1 - b0;
+            st.align_stats.hits += 1.0;
         }
         let id = if let Some(id) = hit {
             id
         } else {
             code_segments(st, coder, run, reading, &mut row.coded_text);
-            st.align_stats[2] += coder.bits - b0;
-            st.align_stats[3] += 1.0;
+            st.align_stats.miss_bits += coder.bits - b0;
+            st.align_stats.misses += 1.0;
             st.run_readings.find_or_add(row.coded_text.as_bytes())
         };
         st.run_ppm.update(id);
@@ -1350,22 +1583,27 @@ fn code_aligned(st: &mut StrState, row: &mut RowState, coder: &mut Coder, col: u
     }
 }
 
-fn code_ref(st: &mut StrState, row: &mut RowState, coder: &mut Coder, col: usize, cand: Cand) {
+fn code_ref(
+    st: &mut StrState,
+    row: &mut RowState,
+    coder: &mut Coder,
+    col: usize,
+    choice: RefChoice,
+) {
     let dec = coder.is_decoder();
     let nsrc = st.srcs.len();
-    let (bj, bt, btrim, bapp) = cand;
-    let make_key = |key: &mut Vec<u8>, j: usize, t: usize, trim: usize, app: &str| {
+    let make_key = |key: &mut Vec<u8>, source: SourceRef, trim: usize, app: &str| {
         key.clear();
-        key.push(j as u8);
-        key.push(t as u8);
+        key.push(source.index as u8);
+        key.push(u8::from(source.to_katakana));
         put_varint(key, trim as u64);
         key.extend_from_slice(app.as_bytes());
     };
     let sym = if dec {
         NOVEL
     } else {
-        let app = &row.fields[col][bapp..];
-        make_key(&mut row.key_buf, bj, bt, btrim, app);
+        let app = &row.fields[col][choice.append_from..];
+        make_key(&mut row.key_buf, choice.source, choice.trim, app);
         st.tuples.find(&row.key_buf).unwrap_or(NOVEL)
     };
     let ctxs = [
@@ -1382,7 +1620,7 @@ fn code_ref(st: &mut StrState, row: &mut RowState, coder: &mut Coder, col: usize
     let id = if let Some(id) = st.tuple_ppm.code(coder, ctxs, sym) {
         id
     } else {
-        let rsym = (bj * 2 + bt) as u32;
+        let rsym = choice.source.to_symbol();
         let r = match st
             .ref_ppm
             .code(coder, &[mix(23, row.pos_first_hash), 24], rsym)
@@ -1391,12 +1629,15 @@ fn code_ref(st: &mut StrState, row: &mut RowState, coder: &mut Coder, col: usize
             None => coder.uniform(u64::from(rsym), 2 * (nsrc + MAX_RECENT) as u64) as u32,
         };
         st.ref_ppm.update(r);
-        let trim = st.trim.code(coder, btrim as u64) as usize;
-        let app = if dec { "" } else { &row.fields[col][bapp..] };
+        let trim = st.trim.code(coder, choice.trim as u64) as usize;
+        let app = if dec {
+            ""
+        } else {
+            &row.fields[col][choice.append_from..]
+        };
         st.chars.code_str(coder, &[], app, &mut row.coded_text);
-        let (j, t) = ((r / 2) as usize, (r % 2) as usize);
         let tmp = std::mem::take(&mut row.coded_text);
-        make_key(&mut row.key_buf, j, t, trim, &tmp);
+        make_key(&mut row.key_buf, SourceRef::from_symbol(r), trim, &tmp);
         row.coded_text = tmp;
         st.tuples.find_or_add(&row.key_buf)
     };
@@ -1405,16 +1646,19 @@ fn code_ref(st: &mut StrState, row: &mut RowState, coder: &mut Coder, col: usize
         return;
     }
     let key = st.tuples.get(id);
-    let (j, t) = (key[0] as usize, key[1] as usize);
+    let source = SourceRef {
+        index: key[0] as usize,
+        to_katakana: key[1] == 1,
+    };
     let mut pos = 2;
     let trim = get_varint(key, &mut pos).unwrap_or(0) as usize;
     let app = std::str::from_utf8(&key[pos..]).unwrap_or("");
-    let src = resolve_source(st, &row.fields, j);
-    apply_ref(src, t == 1, trim, app, &mut row.rebuilt);
+    let src = resolve_source(st, &row.fields, source.index);
+    apply_ref(src, source.to_katakana, trim, app, &mut row.rebuilt);
     std::mem::swap(&mut row.fields[col], &mut row.rebuilt);
 }
 
-fn code_num(st: &mut NumState, row: &mut RowState, coder: &mut Coder, col: usize, mode: u8) {
+fn code_num(st: &mut NumState, row: &mut RowState, coder: &mut Coder, col: usize, mode: NumMode) {
     let dec = coder.is_decoder();
     let parsed = if dec {
         None
@@ -1433,7 +1677,7 @@ fn code_num(st: &mut NumState, row: &mut RowState, coder: &mut Coder, col: usize
         }
         return;
     }
-    let reference = if mode == 2 && row.lid_ref_key != 0 {
+    let reference = if mode == NumMode::LidLinked && row.lid_ref_key != 0 {
         st.refs.get(&row.lid_ref_key).copied()
     } else {
         None
@@ -1455,8 +1699,8 @@ fn code_num(st: &mut NumState, row: &mut RowState, coder: &mut Coder, col: usize
         } else {
             let b0 = coder.bits;
             let d = unzigzag(st.d_uint.code(coder, zigzag(want)));
-            st.novel.0 += coder.bits - b0;
-            st.novel.1 += 1;
+            st.novel.bits += coder.bits - b0;
+            st.novel.count += 1;
             st.d_intern.find_or_add(&d.to_le_bytes())
         };
         st.d_ppm.update(id);
@@ -1472,11 +1716,11 @@ fn code_num(st: &mut NumState, row: &mut RowState, coder: &mut Coder, col: usize
     let ctxs: [u64; 6];
     let n;
     match mode {
-        0 => {
+        NumMode::Plain => {
             ctxs = [mix(50, row.pos_first_hash), 51, 0, 0, 0, 0];
             n = 2;
         }
-        2 => {
+        NumMode::LidLinked => {
             ctxs = [
                 mix(mix(60, row.prev_num as u64), row.pos_hash),
                 mix(61, row.pos_first_two_hash),
@@ -1487,7 +1731,7 @@ fn code_num(st: &mut NumState, row: &mut RowState, coder: &mut Coder, col: usize
             ];
             n = 3;
         }
-        1 => {
+        NumMode::Surface => {
             let base = mix(u64::from(row.pos_sym), u64::from(row.cat_group_id));
             ctxs = [
                 mix(mix(70, base), row.surf_hash),
@@ -1499,7 +1743,7 @@ fn code_num(st: &mut NumState, row: &mut RowState, coder: &mut Coder, col: usize
             ];
             n = 5;
         }
-        _ => {
+        NumMode::SurfacePrevious => {
             let base = mix(
                 mix(u64::from(row.pos_sym), u64::from(row.cat_group_id)),
                 row.prev_num as u64,
@@ -1515,7 +1759,7 @@ fn code_num(st: &mut NumState, row: &mut RowState, coder: &mut Coder, col: usize
             n = 6;
         }
     }
-    let skip = usize::from((mode == 1 || mode == 3) && st.ppm.distinct(ctxs[1]) < 2);
+    let skip = usize::from(mode.uses_surface() && st.ppm.distinct(ctxs[1]) < 2);
     let ctxs = &ctxs[skip..n];
     let sym = match parsed {
         Some(v) => st.intern.find(&v.to_le_bytes()).unwrap_or(NOVEL),
@@ -1526,13 +1770,13 @@ fn code_num(st: &mut NumState, row: &mut RowState, coder: &mut Coder, col: usize
     } else {
         let b0 = coder.bits;
         let v = unzigzag(st.uint.code(coder, zigzag(parsed.unwrap_or(0))));
-        st.novel.0 += coder.bits - b0;
-        st.novel.1 += 1;
+        st.novel.bits += coder.bits - b0;
+        st.novel.count += 1;
         st.intern.find_or_add(&v.to_le_bytes())
     };
     st.ppm.update(id);
     let v = i64::from_le_bytes(st.intern.get(id).try_into().unwrap_or([0; 8]));
-    if mode == 2 && row.lid_ref_key != 0 {
+    if mode == NumMode::LidLinked && row.lid_ref_key != 0 {
         st.refs.insert(row.lid_ref_key, (v, row.prev_num));
     }
     note_num(row, v);
@@ -1634,20 +1878,20 @@ fn code_lid(st: &mut LidState, row: &mut RowState, coder: &mut Coder, col: usize
         let seen = st.seen.get(&kh).copied();
         let mut near = (None, None);
         let want_mode = if seen == Some(id) {
-            0
+            LidMode::Seen
         } else {
             if !dec && let Some(o) = order {
                 near = neighbours(&st.order, row.fields[o].as_bytes());
             }
             let bits = |x: u64| 64 - u64::from(x.leading_zeros());
             if near.0.is_some() {
-                2
+                LidMode::OrderDelta
             } else if near.1.is_some_and(|(lo, hi)| lo <= id && id < hi) {
-                1
+                LidMode::Range
             } else if 2 * bits(id.abs_diff(st.last_new)) + 1 < bits(id) + 2 {
-                4
+                LidMode::LastNewDelta
             } else {
-                3
+                LidMode::Direct
             }
         };
         let b0 = coder.bits;
@@ -1656,44 +1900,45 @@ fn code_lid(st: &mut LidState, row: &mut RowState, coder: &mut Coder, col: usize
             mix(30, row.pos_first_hash),
             31,
         ];
-        let mode = match st.mode_ppm.code(coder, &ctxs, want_mode) {
+        let mode_symbol = match st.mode_ppm.code(coder, &ctxs, want_mode.to_symbol()) {
             Some(m) => m,
-            None => coder.uniform(u64::from(want_mode), LID_MODE_COUNT as u64) as u32,
+            None => coder.uniform(u64::from(want_mode.to_symbol()), LID_MODE_COUNT as u64) as u32,
         };
-        st.mode_ppm.update(mode);
+        st.mode_ppm.update(mode_symbol);
+        let mode = LidMode::from_symbol(mode_symbol);
         let b1 = coder.bits;
-        st.stats[0] += b1 - b0;
-        st.mode_count[mode as usize % LID_MODE_COUNT] += 1;
+        st.stats.mode += b1 - b0;
+        st.mode_counts.bump(mode);
         if dec
-            && (mode == 1 || mode == 2)
+            && matches!(mode, LidMode::Range | LidMode::OrderDelta)
             && let Some(o) = order
         {
             near = neighbours(&st.order, row.fields[o].as_bytes());
         }
         let new_id = match mode {
-            0 => seen.unwrap_or(0),
-            1 => {
+            LidMode::Seen => seen.unwrap_or(0),
+            LidMode::Range => {
                 let (lo, hi) = near.1.unwrap_or((0, 1));
                 lo + coder.uniform(id.wrapping_sub(lo), hi - lo)
             }
-            2 => {
+            LidMode::OrderDelta => {
                 let a = near.0.unwrap_or(0) as i64;
                 a.wrapping_add(unzigzag(
                     st.delta.code(coder, zigzag((id as i64).wrapping_sub(a))),
                 )) as u64
             }
-            4 => {
+            LidMode::LastNewDelta => {
                 let a = st.last_new as i64;
                 a.wrapping_add(unzigzag(
                     st.from_last
                         .code(coder, zigzag((id as i64).wrapping_sub(a))),
                 )) as u64
             }
-            _ => st.direct.code(coder, id),
+            LidMode::Direct => st.direct.code(coder, id),
         };
-        st.stats[1 + (mode as usize % LID_MODE_COUNT).min(3)] += coder.bits - b1;
+        st.stats.add_id_bits(mode, coder.bits - b1);
         let b2 = coder.bits;
-        if mode != 0 {
+        if mode != LidMode::Seen {
             st.last_new = new_id;
         }
         st.seen.insert(kh, new_id);
@@ -1744,7 +1989,7 @@ fn code_lid(st: &mut LidState, row: &mut RowState, coder: &mut Coder, col: usize
             low |= u64::from(hi) << split;
         }
         row.lid_ref_key = mix(mix(77, new_id), low >> LO_BITS_MAX) | 1;
-        st.stats[5] += coder.bits - b2;
+        st.stats.low += coder.bits - b2;
         if dec {
             set_u64(&mut row.fields[col], (new_id << shift) | low);
         }

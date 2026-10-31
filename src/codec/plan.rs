@@ -1,10 +1,12 @@
 use super::coder::Coder;
 use super::model::{
-    FIXED_COLS, Kind, LidSpec, MAX_STR_STEPS, Model, Plan, Step, canonical_i64, canonical_u64,
+    FIXED_COLS, Kind, LidSpec, MAX_STR_STEPS, Model, NumMode, Plan, Step, canonical_i64,
+    canonical_u64,
 };
 use super::table::{Lexicon, Parsed};
 use super::text::is_kana;
 use std::collections::HashSet;
+use std::ops::Range;
 
 type Sample = Vec<(u32, bool)>;
 
@@ -19,15 +21,21 @@ const LID_ORDER_CANDIDATES: usize = 3;
 const MAX_POS_COLS: usize = 6;
 const LID_SHIFT_SEARCH_END: u8 = 62;
 
-fn build_sample(parsed: &Parsed, groups: &[(usize, usize)], target: usize) -> Sample {
+struct ShiftPair {
+    full_col: usize,
+    partner_col: usize,
+    shift: u8,
+}
+
+fn build_sample(parsed: &Parsed, groups: &[Range<usize>], target: usize) -> Sample {
     let rows = parsed.order.len();
     let stride = (rows / target.max(1)).max(1);
     let mut out = Vec::new();
-    for (gi, &(a, b)) in groups.iter().enumerate() {
+    for (gi, group) in groups.iter().enumerate() {
         if gi % stride != 0 {
             continue;
         }
-        for (k, &r) in parsed.order[a..b].iter().enumerate() {
+        for (k, &r) in parsed.order[group.clone()].iter().enumerate() {
             out.push((r, k == 0));
         }
     }
@@ -91,7 +99,7 @@ fn col_info(lex: &Lexicon, sample: &Sample, col: usize) -> ColInfo {
     }
 }
 
-fn find_shift_pair(lex: &Lexicon, sample: &Sample, cols: &[usize]) -> Option<(usize, usize, u8)> {
+fn find_shift_pair(lex: &Lexicon, sample: &Sample, cols: &[usize]) -> Option<ShiftPair> {
     for &a in cols {
         for &b in cols {
             if a == b {
@@ -115,7 +123,11 @@ fn find_shift_pair(lex: &Lexicon, sample: &Sample, cols: &[usize]) -> Option<(us
                     varies |= *first.get_or_insert(y) != y;
                 }
                 if nonzero && varies {
-                    return Some((a, b, s));
+                    return Some(ShiftPair {
+                        full_col: a,
+                        partner_col: b,
+                        shift: s,
+                    });
                 }
             }
         }
@@ -183,7 +195,7 @@ fn lid_trial(
     specs[best].clone()
 }
 
-pub fn choose_plan(parsed: &Parsed, groups: &[(usize, usize)]) -> Plan {
+pub fn choose_plan(parsed: &Parsed, groups: &[Range<usize>]) -> Plan {
     let lex = &parsed.lex;
     let n = lex.n_cols;
     let mut plan = Plan {
@@ -213,15 +225,21 @@ pub fn choose_plan(parsed: &Parsed, groups: &[(usize, usize)]) -> Plan {
     if n >= FIXED_COLS && (1..FIXED_COLS).all(|c| info[c].all_int) {
         num_steps.push(Step {
             col: 1,
-            kind: Kind::Num { mode: 1 },
+            kind: Kind::Num {
+                mode: NumMode::Surface,
+            },
         });
         num_steps.push(Step {
             col: 2,
-            kind: Kind::Num { mode: 3 },
+            kind: Kind::Num {
+                mode: NumMode::SurfacePrevious,
+            },
         });
         num_steps.push(Step {
             col: 3,
-            kind: Kind::Num { mode: 2 },
+            kind: Kind::Num {
+                mode: NumMode::LidLinked,
+            },
         });
         taken[1..FIXED_COLS].fill(true);
     }
@@ -230,8 +248,8 @@ pub fn choose_plan(parsed: &Parsed, groups: &[(usize, usize)]) -> Plan {
     let u64_cols: Vec<usize> = rest.iter().copied().filter(|&c| info[c].all_u64).collect();
     let lid = find_shift_pair(lex, &sample, &u64_cols);
     let mut cands: Vec<usize> = rest.clone();
-    if let Some((a, b, _)) = lid {
-        cands.retain(|&c| c != a && c != b);
+    if let Some(pair) = &lid {
+        cands.retain(|&c| c != pair.full_col && c != pair.partner_col);
     }
 
     let mut alt_cost: Vec<(usize, Kind, f64)> = Vec::new();
@@ -253,9 +271,16 @@ pub fn choose_plan(parsed: &Parsed, groups: &[(usize, usize)]) -> Plan {
             if info[c].all_int {
                 probe.steps.push(Step {
                     col: c,
-                    kind: Kind::Num { mode: 0 },
+                    kind: Kind::Num {
+                        mode: NumMode::Plain,
+                    },
                 });
-                kinds.push((c, Kind::Num { mode: 0 }));
+                kinds.push((
+                    c,
+                    Kind::Num {
+                        mode: NumMode::Plain,
+                    },
+                ));
             }
         }
         let active: Vec<usize> = (0..probe.steps.len()).collect();
@@ -452,7 +477,12 @@ pub fn choose_plan(parsed: &Parsed, groups: &[(usize, usize)]) -> Plan {
         }
     }
 
-    if let Some((a, b, shift)) = lid {
+    if let Some(ShiftPair {
+        full_col: a,
+        partner_col: b,
+        shift,
+    }) = lid
+    {
         let srcs: Vec<usize> = plan
             .steps
             .iter()

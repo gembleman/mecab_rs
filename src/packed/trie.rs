@@ -1,6 +1,6 @@
 use super::{
-    INLINE_COUNT_MASK, INLINE_COUNT_SHIFT, INLINE_FLAG, MAX_UNITS, ROOT_LABEL, TERMINAL_FLAG,
-    UNUSED_LABEL, VALUE_MASK, label_of, unit,
+    DATA_LABEL, INLINE_COUNT_MASK, INLINE_COUNT_SHIFT, INLINE_FLAG, MAX_UNITS, ROOT_LABEL,
+    TERMINAL_FLAG, UNUSED_LABEL, Unit, VALUE_MASK, unit,
 };
 use crate::Error;
 
@@ -62,7 +62,7 @@ struct Units {
 
 impl Units {
     fn is_free(&self, index: usize) -> bool {
-        index >= self.cells.len() || label_of(self.cells[index]) == UNUSED_LABEL
+        index >= self.cells.len() || Unit::from_bits(self.cells[index]).label() == UNUSED_LABEL
     }
 
     fn base_is_taken(&self, base: usize) -> bool {
@@ -151,7 +151,7 @@ pub(super) fn build(entries: &[Entry]) -> Result<Vec<u64>, Error> {
         units.set_value(parent as usize, base as u32);
         if nodes[id].needs_data_unit() {
             let node = &nodes[id];
-            units.take(base, unit(node.first_token, 0, node.count));
+            units.take(base, unit(node.first_token, DATA_LABEL, node.count));
         }
         for &child in &children {
             let node = &mut nodes[child as usize];

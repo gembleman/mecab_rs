@@ -38,6 +38,12 @@ pub(super) fn push_code(rank: usize, out: &mut Vec<u8>) {
     }
 }
 
+#[inline(always)]
+fn rank_of(first: u8, second: u8) -> usize {
+    debug_assert!(first >= FIRST_LEAD && second != 0);
+    SINGLE_CODES + usize::from(first - FIRST_LEAD) * SECOND_CODES + usize::from(second) - 1
+}
+
 pub(super) fn rank_at(codes: &[u8], at: usize) -> Option<(usize, usize)> {
     let first = *codes.get(at)?;
     if first == 0 {
@@ -49,8 +55,7 @@ pub(super) fn rank_at(codes: &[u8], at: usize) -> Option<(usize, usize)> {
         if second == 0 {
             return None;
         }
-        let pair = usize::from(first - FIRST_LEAD) * SECOND_CODES + usize::from(second) - 1;
-        Some((SINGLE_CODES + pair, at + 2))
+        Some((rank_of(first, second), at + 2))
     }
 }
 
@@ -105,7 +110,7 @@ pub(super) unsafe fn decode_unchecked(table: &[u8], codes: &[u8], target: *mut u
             let second = unsafe { *codes.get_unchecked(at + 1) };
             debug_assert!(second != 0);
             at += 2;
-            SINGLE_CODES + usize::from(first - FIRST_LEAD) * SECOND_CODES + usize::from(second) - 1
+            rank_of(first, second)
         };
         debug_assert!((rank + 1) * ENTRY_BYTES <= table.len());
         let entry = u64::from_le(unsafe {

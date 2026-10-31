@@ -310,6 +310,31 @@ impl Layout {
         Some(layout)
     }
 
+    pub(super) fn ends_within(&self, length: usize) -> bool {
+        [
+            &self.positions,
+            &self.piece_offsets,
+            &self.pool,
+            &self.entries,
+            &self.shape_offsets,
+            &self.shapes,
+            &self.specs,
+            &self.lo,
+            &self.chars,
+            &self.sync,
+            &self.strings,
+            &self.blob_sync,
+            &self.blob,
+            &self.template_groups,
+            &self.group_starts,
+            &self.rule_entries,
+            &self.rules,
+            &self.records,
+        ]
+        .iter()
+        .all(|range| range.start <= range.end && range.end <= length)
+    }
+
     pub(super) fn moved(&self, base: usize) -> Self {
         let shift = |range: &Range<usize>| range.start + base..range.end + base;
         Self {
@@ -668,15 +693,63 @@ pub(crate) struct FeatureView<'a> {
     pub(super) id_bytes: usize,
 }
 
+impl<'a> FeatureView<'a> {
+    #[inline(always)]
+    pub(super) fn new(map: &'a [u8], mapped: &check::MappedLayout, specs: &'a [NumSpec]) -> Self {
+        let layout = mapped.layout();
+        let part = |range: &Range<usize>| {
+            debug_assert!(range.start <= range.end && range.end <= map.len());
+            unsafe { map.get_unchecked(range.start..range.end) }
+        };
+        Self {
+            positions: part(&layout.positions),
+            piece_offsets: part(&layout.piece_offsets),
+            pool: part(&layout.pool),
+            entries: part(&layout.entries),
+            entry_bits: layout.counts.entry_bits,
+            shape_offsets: part(&layout.shape_offsets),
+            shapes: part(&layout.shapes),
+            lo: part(&layout.lo),
+            chars: part(&layout.chars),
+            strings: part(&layout.strings),
+            blob: part(&layout.blob),
+            template_groups: part(&layout.template_groups),
+            group_starts: part(&layout.group_starts),
+            rule_entries: part(&layout.rule_entries),
+            rules: part(&layout.rules),
+            records: part(&layout.records),
+            specs,
+            template_bits: layout.template_bits,
+            shape_bits: layout.shape_bits,
+            ref_bits: layout.ref_bits,
+            blob_bits: layout.blob_bits,
+            id_bytes: layout.counts.id_bytes as usize,
+        }
+    }
+}
+
 #[inline(always)]
 unsafe fn text_of(bytes: &[u8]) -> &str {
     unsafe { str::from_utf8_unchecked(bytes) }
 }
 
-const IN_RECORD: usize = 1 << 62;
-const IN_BLOB: usize = 1 << 61;
-const IN_DERIVED: usize = 1 << 60;
+const RECORD_REGION_BIT: u32 = 62;
+const BLOB_REGION_BIT: u32 = 61;
+const DERIVED_REGION_BIT: u32 = 60;
+const IN_RECORD: usize = 1 << RECORD_REGION_BIT;
+const IN_BLOB: usize = 1 << BLOB_REGION_BIT;
+const IN_DERIVED: usize = 1 << DERIVED_REGION_BIT;
 const REGION_FLAGS: usize = IN_RECORD | IN_BLOB | IN_DERIVED;
+
+#[inline(always)]
+const fn region_of(position: usize) -> usize {
+    position & REGION_FLAGS
+}
+
+#[inline(always)]
+const fn offset_of(position: usize) -> usize {
+    position & !REGION_FLAGS
+}
 
 impl FeatureView<'_> {
     #[inline(always)]
@@ -784,17 +857,17 @@ impl FeatureView<'_> {
                 }
                 OP_COPY..=OP_COPY_MAX => {
                     let (start, length) = slots[usize::from(op - OP_COPY)];
-                    let region = match start & REGION_FLAGS {
+                    let region = match region_of(start) {
                         0 => self.strings,
                         IN_RECORD => record,
                         IN_BLOB => self.blob,
                         _ => {
-                            let rule = start & !REGION_FLAGS;
+                            let rule = offset_of(start);
                             unsafe { self.put_derived::<TRUSTED, S>(sink, key, rule, length)? };
                             continue;
                         }
                     };
-                    let start = start & !REGION_FLAGS;
+                    let start = offset_of(start);
                     let codes = access::range::<TRUSTED>(region, start..start + length);
                     unsafe { sink.put_coded(self.chars, codes)? };
                 }

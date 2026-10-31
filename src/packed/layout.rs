@@ -35,15 +35,18 @@ pub const CHAR_TABLE: usize = 10;
 pub const DICRC: usize = 11;
 
 pub const UNIT_BYTES: usize = 6;
-pub const VALUE_MASK: u64 = 0x00FF_FFFF;
-pub const LABEL_SHIFT: u32 = 24;
+pub const VALUE_BITS: u32 = 24;
+pub const VALUE_MASK: u64 = (1 << VALUE_BITS) - 1;
+pub const LABEL_SHIFT: u32 = VALUE_BITS;
 pub const FLAGS_SHIFT: u32 = 40;
 pub const UNUSED_LABEL: u16 = u16::MAX;
 pub const ROOT_LABEL: u16 = UNUSED_LABEL;
+pub const DATA_LABEL: u16 = 0;
 pub const TERMINAL_FLAG: u8 = 1;
 pub const INLINE_FLAG: u8 = 2;
 pub const INLINE_COUNT_SHIFT: u32 = 2;
 pub const INLINE_COUNT_MASK: u8 = 0x1F;
+pub const INLINE_FLAGS_END_SHIFT: u32 = INLINE_COUNT_SHIFT + INLINE_COUNT_MASK.count_ones();
 pub const MAX_UNITS: usize = VALUE_MASK as usize;
 pub const CELLS_PADDING: usize = 2;
 
@@ -51,6 +54,48 @@ pub const fn unit(value: u32, label: u16, flags: u8) -> u64 {
     value as u64 | (label as u64) << LABEL_SHIFT | (flags as u64) << FLAGS_SHIFT
 }
 
-pub const fn label_of(unit: u64) -> u16 {
-    (unit >> LABEL_SHIFT) as u16
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct Unit(u64);
+
+impl Unit {
+    #[inline(always)]
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    #[inline(always)]
+    pub const fn value(self) -> u32 {
+        (self.0 & VALUE_MASK) as u32
+    }
+
+    #[inline(always)]
+    pub const fn label(self) -> u16 {
+        (self.0 >> LABEL_SHIFT) as u16
+    }
+
+    #[inline(always)]
+    pub const fn flags(self) -> u8 {
+        (self.0 >> FLAGS_SHIFT) as u8
+    }
+
+    #[inline(always)]
+    pub const fn is_terminal(self) -> bool {
+        self.flags() & TERMINAL_FLAG != 0
+    }
+
+    #[inline(always)]
+    pub const fn is_inline(self) -> bool {
+        self.flags() & INLINE_FLAG != 0
+    }
+
+    #[inline(always)]
+    pub const fn inline_count(self) -> u8 {
+        (self.flags() >> INLINE_COUNT_SHIFT) & INLINE_COUNT_MASK
+    }
+
+    #[inline(always)]
+    pub const fn has_unused_flag_bits(self) -> bool {
+        self.flags() >> INLINE_FLAGS_END_SHIFT != 0
+    }
 }

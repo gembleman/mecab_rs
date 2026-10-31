@@ -30,7 +30,26 @@ pub(in crate::packed) struct Checked {
     records: usize,
 }
 
+pub(in crate::packed) struct MappedLayout(Layout);
+
+impl MappedLayout {
+    #[inline(always)]
+    pub(in crate::packed) fn layout(&self) -> &Layout {
+        &self.0
+    }
+}
+
 impl Checked {
+    pub(in crate::packed) fn into_mapped(
+        self,
+        section: &Range<usize>,
+        map_length: usize,
+    ) -> Option<(MappedLayout, Vec<NumSpec>)> {
+        let layout = self.layout.moved(section.start);
+        (section.end <= map_length && layout.ends_within(section.end))
+            .then_some((MappedLayout(layout), self.specs))
+    }
+
     #[inline]
     pub(in crate::packed) fn is_record(&self, offset: usize) -> bool {
         offset < self.records
@@ -134,11 +153,10 @@ fn read_range(source: &Source, section: usize, range: &Range<usize>) -> Result<V
     Ok(bytes)
 }
 
-struct Tables {
+struct Tables<'a> {
     templates: usize,
     positions: usize,
-    operations: Vec<u32>,
-    specs: Vec<NumSpec>,
+    specs: &'a [NumSpec],
     string_boundaries: Vec<u64>,
     blob_starts: Vec<u64>,
     blob_bytes: usize,
@@ -198,7 +216,6 @@ pub(in crate::packed) fn check(source: &Source, section: usize) -> Result<Checke
         shape_bytes.len(),
     )
     .ok_or_else(|| invalid("the feature shapes are not delimited correctly"))?;
-    let mut operations = Vec::with_capacity(shape_offsets.len());
     let mut shape_ops = Vec::with_capacity(shape_offsets.len());
     for pair in shape_offsets.windows(2) {
         let ops = &shape_bytes[pair[0]..pair[1]];
@@ -237,7 +254,6 @@ pub(in crate::packed) fn check(source: &Source, section: usize) -> Result<Checke
                 }
             }
         }
-        operations.push(ops.len() as u32);
         shape_ops.push(ops.to_vec());
     }
     drop(shape_bytes);
@@ -248,8 +264,7 @@ pub(in crate::packed) fn check(source: &Source, section: usize) -> Result<Checke
     let tables = Tables {
         templates: counts.templates as usize,
         positions: counts.positions as usize,
-        operations,
-        specs: specs.clone(),
+        specs: &specs,
         string_boundaries,
         blob_starts,
         blob_bytes: counts.blob_bytes as usize,
@@ -328,6 +343,7 @@ fn check_rules(source: &Source, section: usize, layout: &Layout) -> Result<(), E
         }
     }
     let rules = read_range(source, section, &layout.rules)?;
+    debug_assert!(rules.len() >= RULE_BYTES * counts.rule_count as usize);
     let rules = &rules[..RULE_BYTES * counts.rule_count as usize];
     for rule in rules.as_chunks::<RULE_BYTES>().0 {
         let length = usize::from(rule[1]);
@@ -737,8 +753,8 @@ fn parse_record(record: &[u8], tables: &Tables) -> Result<usize, Fail> {
     bit += tables.template_bits as usize;
     let shape = read(bit, tables.shape_bits)? as usize;
     bit += tables.shape_bits as usize;
-    let Some(&operations) = tables
-        .operations
+    let Some(shape_ops) = tables
+        .shape_ops
         .get(shape)
         .filter(|_| template < tables.templates)
     else {
@@ -746,12 +762,12 @@ fn parse_record(record: &[u8], tables: &Tables) -> Result<usize, Fail> {
             "a feature record names a template or a shape that does not exist",
         ));
     };
-    if operations as usize >= tables.positions {
+    if shape_ops.len() >= tables.positions {
         return Err(Fail::Invalid(
             "a feature record joins a template and a shape that do not fit",
         ));
     }
-    for &op in &tables.shape_ops[shape] {
+    for &op in shape_ops {
         match op {
             OP_REF => {
                 let target = read(bit, tables.ref_bits)? as usize;

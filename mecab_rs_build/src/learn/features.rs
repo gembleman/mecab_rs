@@ -31,12 +31,61 @@ impl Hasher for Fnv {
     }
 }
 
+pub(super) const fn widen(value: u32) -> usize {
+    value as usize
+}
+
+pub(super) fn weight_index(id: i32) -> usize {
+    debug_assert!(id >= 0, "the id list end is never a weight index");
+    usize::try_from(id).expect("feature ids are not negative")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct FeatureId(u32);
+
+impl FeatureId {
+    fn next_after(count: usize) -> Option<Self> {
+        u32::try_from(count).ok().map(Self)
+    }
+
+    fn index(self) -> usize {
+        widen(self.0)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct PoolOffset(u32);
+
+impl PoolOffset {
+    pub(super) const NONE: Self = Self(u32::MAX);
+
+    fn at_end_of(pool: &[i32]) -> Option<Self> {
+        u32::try_from(pool.len()).ok().map(Self)
+    }
+
+    fn index(self) -> usize {
+        widen(self.0)
+    }
+}
+
+pub(super) fn ids_from(pool: &[i32], start: PoolOffset) -> impl Iterator<Item = usize> + '_ {
+    pool[start.index()..]
+        .iter()
+        .take_while(|&&id| id != ID_LIST_END)
+        .map(|&id| weight_index(id))
+}
+
+const TOO_MANY_FEATURES: &str = "there are too many distinct features";
+const TOO_MANY_IDS: &str = "there are too many feature ids";
+const REWRITTEN_BEFORE_USE: &str = "build_feature rewrites a feature before reading it";
+const FEATURE_COUNT_FITS_I32: &str = "the feature count fits an i32";
+
 pub(super) type Settings = Vec<(String, String)>;
 
 pub(super) type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fnv>>;
 
 pub(super) struct Features {
-    ids: Map<Vec<u8>, u32>,
+    ids: Map<Vec<u8>, FeatureId>,
     list: Vec<Vec<u8>>,
     rewritten: Vec<Option<Rewritten>>,
     rewriter: Rewriter,
@@ -55,25 +104,26 @@ impl Features {
         })
     }
 
-    pub(super) fn intern(&mut self, feature: &[u8]) -> u32 {
+    pub(super) fn intern(&mut self, feature: &[u8]) -> Result<FeatureId, Error> {
         if let Some(&id) = self.ids.get(feature) {
-            return id;
+            return Ok(id);
         }
-        let id = u32::try_from(self.list.len()).expect("fewer than 2^32 distinct features");
+        let id = FeatureId::next_after(self.list.len())
+            .ok_or_else(|| Error::learn(&self.rewrite_def, TOO_MANY_FEATURES))?;
         self.ids.insert(feature.to_vec(), id);
         self.list.push(feature.to_vec());
         self.rewritten.push(None);
-        id
+        Ok(id)
     }
 
-    pub(super) fn get(&self, id: u32) -> &[u8] {
-        &self.list[id as usize]
+    pub(super) fn get(&self, id: FeatureId) -> &[u8] {
+        &self.list[id.index()]
     }
 
-    pub(super) fn rewrite(&mut self, id: u32) -> Result<(), Error> {
-        let slot = &mut self.rewritten[id as usize];
+    pub(super) fn rewrite(&mut self, id: FeatureId) -> Result<(), Error> {
+        let slot = &mut self.rewritten[id.index()];
         if slot.is_none() {
-            let feature = &self.list[id as usize];
+            let feature = &self.list[id.index()];
             let (matched, rewritten) = self.rewriter.rewrite(feature, &self.rewrite_def)?;
             if !matched {
                 return Err(Error::learn(
@@ -89,10 +139,10 @@ impl Features {
         Ok(())
     }
 
-    pub(super) fn rewritten(&self, id: u32) -> &Rewritten {
-        self.rewritten[id as usize]
+    pub(super) fn rewritten(&self, id: FeatureId) -> &Rewritten {
+        self.rewritten[id.index()]
             .as_ref()
-            .expect("the feature is rewritten")
+            .expect(REWRITTEN_BEFORE_USE)
     }
 
     pub(super) fn clear_rewrites(&mut self) {
@@ -104,7 +154,7 @@ pub(super) const ID_LIST_END: i32 = -1;
 const DROPPED: i32 = -1;
 
 struct Cached {
-    start: u32,
+    start: PoolOffset,
     times: usize,
 }
 
@@ -118,14 +168,19 @@ pub(super) struct FeatureIndex {
     scratch: Vec<i32>,
 }
 
-fn id_of(dic: &mut Map<Vec<u8>, i32>, maxid: &mut usize, key: &[u8]) -> i32 {
+fn id_of(
+    dic: &mut Map<Vec<u8>, i32>,
+    maxid: &mut usize,
+    key: &[u8],
+    feature_def: &Path,
+) -> Result<i32, Error> {
     if let Some(&id) = dic.get(key) {
-        return id;
+        return Ok(id);
     }
-    let id = i32::try_from(*maxid).expect("fewer than 2^31 features");
+    let id = i32::try_from(*maxid).map_err(|_| Error::learn(feature_def, TOO_MANY_IDS))?;
     *maxid += 1;
     dic.insert(key.to_vec(), id);
-    id
+    Ok(id)
 }
 
 fn cut_at_nul(key: &mut Vec<u8>) {
@@ -136,7 +191,7 @@ fn cut_at_nul(key: &mut Vec<u8>) {
 
 fn identity_renumbering(size: usize) -> Vec<i32> {
     (0..size)
-        .map(|id| i32::try_from(id).expect("fewer than 2^31 features"))
+        .map(|id| i32::try_from(id).expect(FEATURE_COUNT_FITS_I32))
         .collect()
 }
 
@@ -159,7 +214,7 @@ pub(super) fn remap_weights(old: &[f64], renumbered: &[i32], size: usize) -> Vec
     let mut remapped = vec![0.0; size];
     for (&weight, &new) in old.iter().zip(renumbered) {
         if new >= 0 {
-            remapped[new as usize] = weight;
+            remapped[weight_index(new)] = weight;
         }
     }
     remapped
@@ -192,7 +247,7 @@ impl FeatureIndex {
         ufeature: &[u8],
         char_type: u8,
         surface: &[u8],
-    ) -> Result<u32, Error> {
+    ) -> Result<PoolOffset, Error> {
         let mut key = Vec::with_capacity(ufeature.len() + 2);
         key.extend_from_slice(ufeature);
         key.push(b' ');
@@ -214,7 +269,7 @@ impl FeatureIndex {
         &mut self,
         key: Vec<u8>,
         build: impl FnOnce(&Templates, &Path, &mut dyn FnMut(&[u8])) -> Result<(), Error>,
-    ) -> Result<u32, Error> {
+    ) -> Result<PoolOffset, Error> {
         if let Some(entry) = self.cache.get_mut(&key) {
             entry.times += 1;
             return Ok(entry.start);
@@ -229,17 +284,29 @@ impl FeatureIndex {
             cache,
         } = self;
         scratch.clear();
-        build(templates, feature_def, &mut |key| {
-            scratch.push(id_of(dic, maxid, key));
-        })?;
-        let start = u32::try_from(pool.len()).expect("fewer than 2^32 ids");
+        let mut overflow = None;
+        build(
+            templates,
+            feature_def,
+            &mut |key| match id_of(dic, maxid, key, feature_def) {
+                Ok(id) => scratch.push(id),
+                Err(error) => {
+                    overflow.get_or_insert(error);
+                }
+            },
+        )?;
+        if let Some(error) = overflow {
+            return Err(error);
+        }
+        let start =
+            PoolOffset::at_end_of(pool).ok_or_else(|| Error::learn(feature_def, TOO_MANY_IDS))?;
         pool.extend_from_slice(scratch);
         pool.push(ID_LIST_END);
         cache.insert(key, Cached { start, times: 1 });
         Ok(start)
     }
 
-    pub(super) fn bigram(&mut self, rfeature: &[u8], lfeature: &[u8]) -> Result<u32, Error> {
+    pub(super) fn bigram(&mut self, rfeature: &[u8], lfeature: &[u8]) -> Result<PoolOffset, Error> {
         let mut key = Vec::with_capacity(rfeature.len() + lfeature.len() + 1);
         key.extend_from_slice(rfeature);
         key.push(b' ');
@@ -253,10 +320,8 @@ impl FeatureIndex {
     pub(super) fn shrink(&mut self, freq: usize, observed: &mut Vec<f64>) -> Vec<i32> {
         let mut counts = vec![0usize; self.maxid];
         for cached in self.cache.values() {
-            let mut at = cached.start as usize;
-            while self.pool[at] != ID_LIST_END {
-                counts[self.pool[at] as usize] += cached.times;
-                at += 1;
+            for id in ids_from(&self.pool, cached.start) {
+                counts[id] += cached.times;
             }
         }
         if freq <= 1 {
@@ -267,16 +332,16 @@ impl FeatureIndex {
         self.maxid = renumbered.iter().filter(|&&new| new != DROPPED).count();
 
         self.dic.retain(|_, id| {
-            let new = renumbered[*id as usize];
+            let new = renumbered[weight_index(*id)];
             *id = new;
             new >= 0
         });
 
         for cached in self.cache.values() {
-            let mut to = cached.start as usize;
-            let mut at = cached.start as usize;
+            let mut to = cached.start.index();
+            let mut at = cached.start.index();
             while self.pool[at] != ID_LIST_END {
-                let new = renumbered[self.pool[at] as usize];
+                let new = renumbered[weight_index(self.pool[at])];
                 if new >= 0 {
                     self.pool[to] = new;
                     to += 1;
@@ -349,7 +414,7 @@ impl FeatureIndex {
             if found.len() != 2 {
                 return Err(Error::learn(path, format!("format error: {shown}")));
             }
-            let id = i32::try_from(self.maxid).expect("fewer than 2^31 features");
+            let id = i32::try_from(self.maxid).map_err(|_| Error::learn(path, TOO_MANY_IDS))?;
             self.dic.entry(cstr(line, found[1]).to_vec()).or_insert(id);
             self.maxid += 1;
             alpha.push(atof(cstr(line, found[0])));
@@ -374,7 +439,7 @@ impl FeatureIndex {
             let mut line = Vec::new();
             for (key, id) in entries {
                 line.clear();
-                write!(line, "{:.16}\t", alpha[id as usize])?;
+                write!(line, "{:.16}\t", alpha[weight_index(id)])?;
                 line.extend_from_slice(key);
                 line.push(b'\n');
                 file.write_all(&line)?;

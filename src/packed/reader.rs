@@ -6,15 +6,16 @@ use std::sync::Arc;
 use memmap2::Mmap;
 
 use super::bits::{MAX_RECORD_BITS, mask_of, section_bytes};
-use super::features::{FeatureView, Layout as FeatureLayout, NumSpec, check as feature_check};
+use super::features::check::MappedLayout;
+use super::features::{FeatureView, NumSpec, check as feature_check};
 use super::{
     BLOCK_CODES, BLOCK_COUNT, CATEGORY_COUNT_AT, CELLS, CELLS_PADDING, CHAR_BLOCKS, CHAR_INDEX,
-    CHAR_TABLE, CODE_COUNT_AT, DICRC, FEATURE_BITS_AT, FEATURES, FLAG_HOT_MATRIX,
-    FLAG_INT_TEMPLATES, FLAGS_AT, FLAGS_SHIFT, HEADER_BYTES, INLINE_COUNT_MASK, INLINE_COUNT_SHIFT,
-    INLINE_FLAG, MAGIC, MAGIC_BYTES, MATRIX, MAX_UNITS, PARAM_BITS_AT, PARAM_COUNT_AT, PARAMS,
-    SECTION_ALIGNMENT, SECTION_ENTRY_BYTES, SECTION_LENGTH_IN_ENTRY, SECTION_OFFSET_IN_ENTRY,
-    SECTION_TABLE_AT, SECTIONS, TEMPLATES, TERMINAL_FLAG, TOKEN_COUNT_AT, TOKENS, UNIT_BYTES,
-    UNKNOWN_STARTS, UNKNOWN_TOKENS, UNUSED_LABEL, VALUE_MASK, VERSION, VERSION_AT, label_of,
+    CHAR_TABLE, CODE_COUNT_AT, DATA_LABEL, DICRC, FEATURE_BITS_AT, FEATURES, FLAG_HOT_MATRIX,
+    FLAG_INT_TEMPLATES, FLAGS_AT, HEADER_BYTES, MAGIC, MAGIC_BYTES, MATRIX, MAX_UNITS,
+    PARAM_BITS_AT, PARAM_COUNT_AT, PARAMS, SECTION_ALIGNMENT, SECTION_ENTRY_BYTES,
+    SECTION_LENGTH_IN_ENTRY, SECTION_OFFSET_IN_ENTRY, SECTION_TABLE_AT, SECTIONS, TEMPLATES,
+    TERMINAL_FLAG, TOKEN_COUNT_AT, TOKENS, UNIT_BYTES, UNKNOWN_STARTS, UNKNOWN_TOKENS,
+    UNUSED_LABEL, Unit, VALUE_BITS, VERSION, VERSION_AT,
 };
 use crate::char_property::SentenceChars;
 use crate::char_table::{CHAR_TABLE_HEADER_BYTES, MAGIC as CHAR_TABLE_MAGIC};
@@ -123,7 +124,7 @@ pub struct PackedDictionary {
     ascii: [u16; 128],
     bos_feature: Range<usize>,
     unknown_feature: Option<Range<usize>>,
-    features: FeatureLayout,
+    features: MappedLayout,
     numbers: Box<[NumSpec]>,
 }
 
@@ -147,24 +148,7 @@ impl PackedDictionary {
         if map.len() as u64 != file_length {
             return Err(Error::format(path, "the file changed while it was opened"));
         }
-        validate::check_section_sizes(&source, &header)?;
-        let (left_size, right_size) = validate::check_matrix(&source, &header)?;
-        validate::check_char_table(&source, header.category_count)?;
-        validate::check_char_codes(&source, header.code_count)?;
-        let checked = feature_check::check(&source, FEATURES)?;
-        validate::check_params(&source, left_size, right_size)?;
-        let unknown_count = validate::check_unknown_starts(&source, &header)?;
-        validate::check_token_sections(&source, &header, unknown_count, &checked)?;
-        check_cells(&source, &map[sections[CELLS].clone()], header.token_count)?;
-        let dicrc = validate::check_dicrc(&source)?;
-        let validated = validate::Validated {
-            header,
-            left_size,
-            right_size,
-            unknown_count,
-            checked,
-            dicrc,
-        };
+        let validated = validate::run(&source, header, &map[sections[CELLS].clone()])?;
         Self::from_validated(path, map, sections, validated)
     }
 
@@ -182,6 +166,9 @@ impl PackedDictionary {
             checked,
             dicrc,
         } = validated;
+        let (features, numbers) = checked
+            .into_mapped(&sections[FEATURES], map.len())
+            .ok_or_else(|| Error::format(path, "the feature section is outside the file"))?;
         let view_error = || Error::format(path, "a section is misaligned");
         let char_index = Section::new(&map, sections[CHAR_INDEX].clone()).ok_or_else(view_error)?;
         let char_blocks =
@@ -205,8 +192,8 @@ impl PackedDictionary {
             unknown_feature: (unknown_length > 0)
                 .then(|| dicrc_start + bos_length..dicrc_start + bos_length + unknown_length),
             ascii: [0; 128],
-            features: checked.layout.moved(sections[FEATURES].start),
-            numbers: checked.specs.into(),
+            features,
+            numbers: numbers.into(),
             sections,
         };
         dictionary.ascii = std::array::from_fn(|byte| dictionary.code_of(char::from(byte as u8)));
@@ -267,33 +254,7 @@ impl PackedDictionary {
 
     #[inline]
     pub(crate) fn feature_view(&self) -> FeatureView<'_> {
-        let layout = &self.features;
-        let map = &self.map[..];
-        let part = |range: &Range<usize>| unsafe { map.get_unchecked(range.start..range.end) };
-        FeatureView {
-            positions: part(&layout.positions),
-            piece_offsets: part(&layout.piece_offsets),
-            pool: part(&layout.pool),
-            entries: part(&layout.entries),
-            entry_bits: layout.counts.entry_bits,
-            shape_offsets: part(&layout.shape_offsets),
-            shapes: part(&layout.shapes),
-            lo: part(&layout.lo),
-            chars: part(&layout.chars),
-            strings: part(&layout.strings),
-            blob: part(&layout.blob),
-            template_groups: part(&layout.template_groups),
-            group_starts: part(&layout.group_starts),
-            rule_entries: part(&layout.rule_entries),
-            rules: part(&layout.rules),
-            records: part(&layout.records),
-            specs: &self.numbers,
-            template_bits: layout.template_bits,
-            shape_bits: layout.shape_bits,
-            ref_bits: layout.ref_bits,
-            blob_bits: layout.blob_bits,
-            id_bytes: layout.counts.id_bytes as usize,
-        }
+        FeatureView::new(&self.map[..], &self.features, &self.numbers)
     }
 
     #[inline]
@@ -349,12 +310,12 @@ enum Step {
     Key(u32, u32),
 }
 
-const NO_CHILDREN: usize = 1 << 25;
+const NO_CHILDREN: usize = 1 << (VALUE_BITS + 1);
 
 #[inline(always)]
-fn unit_at(cells: &[u8], index: usize) -> Option<u64> {
+fn unit_at(cells: &[u8], index: usize) -> Option<Unit> {
     let bytes = cells.get(index * UNIT_BYTES..index * UNIT_BYTES + 8)?;
-    Some(u64::from_le_bytes(*bytes.first_chunk()?))
+    Some(Unit::from_bits(u64::from_le_bytes(*bytes.first_chunk()?)))
 }
 
 struct Cursor<'a> {
@@ -367,7 +328,7 @@ impl<'a> Cursor<'a> {
     fn new(cells: &'a [u8]) -> Self {
         Self {
             cells,
-            base: unit_at(cells, 0).map_or(NO_CHILDREN, |root| (root & VALUE_MASK) as usize),
+            base: unit_at(cells, 0).map_or(NO_CHILDREN, |root| root.value() as usize),
         }
     }
 
@@ -379,35 +340,38 @@ impl<'a> Cursor<'a> {
         let Some(unit) = unit_at(self.cells, self.base + usize::from(code)) else {
             return Step::Stop;
         };
-        if label_of(unit) != code {
+        if unit.label() != code {
             return Step::Stop;
         }
-        let value = (unit & VALUE_MASK) as u32;
-        let flags = (unit >> FLAGS_SHIFT) as u8;
+        let value = unit.value();
         self.base = value as usize;
-        if flags & TERMINAL_FLAG == 0 {
+        if !unit.is_terminal() {
             Step::Inner
-        } else if flags & INLINE_FLAG != 0 {
+        } else if unit.is_inline() {
             self.base = NO_CHILDREN;
-            Step::Key(
-                value,
-                u32::from((flags >> INLINE_COUNT_SHIFT) & INLINE_COUNT_MASK),
-            )
+            Step::Key(value, u32::from(unit.inline_count()))
         } else if let Some(data) = unit_at(self.cells, value as usize) {
-            Step::Key(
-                (data & VALUE_MASK) as u32,
-                u32::from((data >> FLAGS_SHIFT) as u8),
-            )
+            Step::Key(data.value(), u32::from(data.flags()))
         } else {
             Step::Stop
         }
     }
 }
 
+const ASCII_LIMIT: u8 = 0x80;
+const LEAD_PAYLOAD_MASK: u8 = 0x7F;
+const CONTINUATION_PAYLOAD_BITS: u32 = 6;
+const CONTINUATION_PAYLOAD_MASK: u8 = (1 << CONTINUATION_PAYLOAD_BITS) - 1;
+
+#[inline(always)]
+fn lead_payload_mask(width: usize) -> u32 {
+    u32::from(LEAD_PAYLOAD_MASK >> width)
+}
+
 #[inline]
 fn decode(bytes: &[u8]) -> Option<(char, usize)> {
     let &first = bytes.first()?;
-    if first < 0x80 {
+    if first < ASCII_LIMIT {
         return Some((char::from(first), 1));
     }
     let (width, minimum) = match first {
@@ -417,12 +381,12 @@ fn decode(bytes: &[u8]) -> Option<(char, usize)> {
         _ => return None,
     };
     let tail = bytes.get(1..width)?;
-    let mut scalar = u32::from(first) & (0x7F >> width);
+    let mut scalar = u32::from(first) & lead_payload_mask(width);
     for &byte in tail {
         if !is_continuation(byte) {
             return None;
         }
-        scalar = scalar << 6 | u32::from(byte & 0x3F);
+        scalar = scalar << CONTINUATION_PAYLOAD_BITS | u32::from(byte & CONTINUATION_PAYLOAD_MASK);
     }
     if scalar < minimum {
         return None;
@@ -459,7 +423,7 @@ impl PackedView<'_> {
     #[inline]
     pub(crate) fn trie_code_of(&self, scalar: u32) -> u16 {
         match u8::try_from(scalar) {
-            Ok(byte) if byte < 0x80 => self.ascii[usize::from(byte)],
+            Ok(byte) if byte < ASCII_LIMIT => self.ascii[usize::from(byte)],
             _ => {
                 let scalar = scalar as usize;
                 let block = usize::from(self.char_index[scalar / BLOCK_CODES]);
@@ -499,7 +463,7 @@ impl PackedView<'_> {
         let mut cursor = Cursor::new(self.cells);
         let mut at = 0;
         while let Some(&first) = key.get(at) {
-            let (code, width) = if first < 0x80 {
+            let (code, width) = if first < ASCII_LIMIT {
                 (self.ascii[usize::from(first)], 1)
             } else {
                 let Some((char, width)) = decode(&key[at..]) else {
@@ -548,8 +512,8 @@ impl PackedView<'_> {
         unsafe {
             let word = u64::from_le(bytes.as_ptr().add(bit >> 3).cast::<u64>().read_unaligned())
                 >> (bit & 7);
-            let param = (word & format.param_mask) as usize;
-            let feature = ((word >> format.param_bits) & format.feature_mask) as u32;
+            let (param, feature) = format.split(word);
+            let (param, feature) = (param as usize, feature as u32);
             let record = self.params.as_ptr().add(param * PARAM_BYTES);
             let word = |at: usize| u16::from_le(record.add(at).cast::<u16>().read_unaligned());
             TokenRecord {
@@ -572,6 +536,14 @@ struct TokenFormat {
 }
 
 impl TokenFormat {
+    #[inline(always)]
+    fn split(self, word: u64) -> (u64, u64) {
+        (
+            word & self.param_mask,
+            (word >> self.param_bits) & self.feature_mask,
+        )
+    }
+
     fn new(param_bits: u32, feature_bits: u32) -> Self {
         Self {
             param_bits,
@@ -606,8 +578,7 @@ fn check_tokens(
                 .and_then(|rest| rest.first_chunk())
                 .map_or(0, |&word| u64::from_le_bytes(word))
                 >> (at & 7);
-            let param = word & format.param_mask;
-            let feature = (word >> format.param_bits) & format.feature_mask;
+            let (param, feature) = format.split(word);
             if !valid(param, feature) {
                 return Err(source.broken(reason));
             }
@@ -623,30 +594,26 @@ fn check_cells(source: &Source, bytes: &[u8], token_count: usize) -> Result<(), 
     let valid_range = |first: u32, count: usize| count > 0 && first as usize + count <= token_count;
     let decode = |chunk: &[u8; UNIT_BYTES]| {
         let [a, b, c, d, e, f] = *chunk;
-        u64::from_le_bytes([a, b, c, d, e, f, 0, 0])
+        Unit::from_bits(u64::from_le_bytes([a, b, c, d, e, f, 0, 0]))
     };
     for chunk in units {
         let unit = decode(chunk);
-        let label = label_of(unit);
-        let value = (unit & VALUE_MASK) as u32;
-        let flags = (unit >> FLAGS_SHIFT) as u8;
+        let label = unit.label();
+        let value = unit.value();
+        let flags = unit.flags();
         let valid = if label == UNUSED_LABEL {
             true
-        } else if label == 0 {
+        } else if label == DATA_LABEL {
             valid_range(value, usize::from(flags))
-        } else if flags & TERMINAL_FLAG == 0 {
+        } else if !unit.is_terminal() {
             flags == 0
-        } else if flags & INLINE_FLAG != 0 {
-            flags >> 7 == 0
-                && valid_range(
-                    value,
-                    usize::from((flags >> INLINE_COUNT_SHIFT) & INLINE_COUNT_MASK),
-                )
+        } else if unit.is_inline() {
+            !unit.has_unused_flag_bits() && valid_range(value, usize::from(unit.inline_count()))
         } else {
             flags == TERMINAL_FLAG
                 && units
                     .get(value as usize)
-                    .is_some_and(|data| label_of(decode(data)) == 0)
+                    .is_some_and(|data| decode(data).label() == DATA_LABEL)
         };
         if !valid {
             return Err(source.broken(reason));
