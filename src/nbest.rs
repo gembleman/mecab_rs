@@ -18,9 +18,11 @@ pub(super) struct LinkSpan {
 
 impl LinkSpan {
     pub(super) fn new(start: usize, end: usize) -> Self {
-        let start = u32::try_from(start).expect("path links fit in u32");
-        let len = u32::try_from(end - start as usize).expect("path links fit in u32");
-        Self { start, len }
+        debug_assert!(start <= end && end <= crate::lattice::MAX_PATH_LINKS);
+        Self {
+            start: start as u32,
+            len: (end - start) as u32,
+        }
     }
 
     pub(super) fn range(self) -> Range<usize> {

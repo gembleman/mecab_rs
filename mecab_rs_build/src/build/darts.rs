@@ -25,6 +25,13 @@ struct BaseSearch {
     taken_cells_skipped: usize,
 }
 
+struct Frame {
+    siblings: Vec<TrieNode>,
+    begin: usize,
+    next_sibling: usize,
+    parent_cell: Option<usize>,
+}
+
 struct Builder<'a> {
     array: Vec<Unit>,
     begin_taken: Vec<u8>,
@@ -142,22 +149,40 @@ impl Builder<'_> {
         }
     }
 
-    fn place_siblings(&mut self, siblings: &[TrieNode]) -> usize {
-        let search = self.find_base(siblings);
-        self.commit_base(siblings, &search);
-        let begin = search.begin;
-        for sibling in siblings {
+    fn open_frame(&mut self, siblings: Vec<TrieNode>, parent_cell: Option<usize>) -> Frame {
+        let search = self.find_base(&siblings);
+        self.commit_base(&siblings, &search);
+        Frame {
+            siblings,
+            begin: search.begin,
+            next_sibling: 0,
+            parent_cell,
+        }
+    }
+
+    fn place_siblings(&mut self, siblings: Vec<TrieNode>) {
+        let first = self.open_frame(siblings, None);
+        let mut stack = vec![first];
+        while let Some(frame) = stack.last_mut() {
+            let Some(sibling) = frame.siblings.get(frame.next_sibling) else {
+                let finished = stack.pop().expect("the stack is not empty");
+                if let Some(cell) = finished.parent_cell {
+                    self.array[cell].base = finished.begin as i32;
+                }
+                continue;
+            };
+            let cell = frame.begin + sibling.label as usize;
+            let first_key = sibling.first_key;
             let children = self.children_of(sibling);
-            let cell = begin + sibling.label as usize;
+            frame.next_sibling += 1;
             if children.is_empty() {
-                self.array[cell].base = -self.values[sibling.first_key] - 1;
+                self.array[cell].base = -self.values[first_key] - 1;
                 self.keys_placed += 1;
             } else {
-                let child_begin = self.place_siblings(&children);
-                self.array[cell].base = child_begin as i32;
+                let child = self.open_frame(children, Some(cell));
+                stack.push(child);
             }
         }
-        begin
     }
 }
 
@@ -186,14 +211,19 @@ pub(crate) fn build(keys: &[&[u8]], values: &[i32]) -> Vec<u8> {
         end_key: keys.len(),
     };
     let siblings = builder.children_of(&root);
-    builder.place_siblings(&siblings);
+    builder.place_siblings(siblings);
+    builder.into_bytes()
+}
 
-    let used_units = builder.used_units + TERMINAL_PADDING_UNITS;
-    builder.grow_to(used_units);
-    let mut bytes = Vec::with_capacity(used_units * UNIT_BYTES);
-    for unit in &builder.array[..used_units] {
-        bytes.extend_from_slice(&unit.base.to_le_bytes());
-        bytes.extend_from_slice(&unit.check.to_le_bytes());
+impl Builder<'_> {
+    fn into_bytes(mut self) -> Vec<u8> {
+        let used_units = self.used_units + TERMINAL_PADDING_UNITS;
+        self.grow_to(used_units);
+        let mut bytes = Vec::with_capacity(used_units * UNIT_BYTES);
+        for unit in &self.array[..used_units] {
+            bytes.extend_from_slice(&unit.base.to_le_bytes());
+            bytes.extend_from_slice(&unit.check.to_le_bytes());
+        }
+        bytes
     }
-    bytes
 }

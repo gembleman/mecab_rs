@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -192,6 +193,19 @@ fn validate<'a>(
     }
 }
 
+impl fmt::Debug for IntView<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IntView")
+            .field("cost_factor", &self.cost_factor)
+            .field("shift", &self.shift)
+            .field("left_size", &self.left_size)
+            .field("right_size", &self.right_size)
+            .field("parts", &self.parts.len())
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct IntView<'a> {
     pub(crate) cost_factor: u32,
     pub(crate) shift: u32,
@@ -260,6 +274,14 @@ impl IntView<'_> {
                 bytes
             },
         )
+    }
+}
+
+impl fmt::Debug for IntRowScratch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IntRowScratch")
+            .finish_non_exhaustive()
     }
 }
 

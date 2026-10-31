@@ -232,6 +232,16 @@ impl SentenceChars {
     }
 }
 
+impl std::fmt::Debug for CharProperty {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CharProperty")
+            .field("category_count", &self.category_count)
+            .field("palette_entries", &self.palette.len())
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct CharProperty {
     map: MappedBytes,
     category_count: usize,

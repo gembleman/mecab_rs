@@ -55,7 +55,7 @@ pub const fn unit(value: u32, label: u16, flags: u8) -> u64 {
     value as u64 | (label as u64) << LABEL_SHIFT | (flags as u64) << FLAGS_SHIFT
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
 pub struct Unit(u64);
 

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::File;
 use std::io;
 use std::ops::Range;
@@ -29,7 +30,7 @@ pub const CHARSET_BYTES: usize = HEADER_SIZE - CHARSET_AT;
 const CHARSET: Range<usize> = CHARSET_AT..HEADER_SIZE;
 const UTF8_NAMES: [&[u8]; 2] = [b"utf-8", b"utf8"];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DictionaryKind {
     System = 0,
     User = 1,
@@ -74,7 +75,7 @@ impl PrefixHit {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct TokenRecord {
     pub left_id: u16,
     pub right_id: u16,
@@ -160,6 +161,17 @@ fn check_last_feature_byte(file: &File, header: &Header, path: &Path) -> Result<
         ));
     }
     Ok(())
+}
+
+impl fmt::Debug for SystemDictionary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SystemDictionary")
+            .field("map_bytes", &self.map.len())
+            .field("left_size", &self.left_size)
+            .field("right_size", &self.right_size)
+            .finish_non_exhaustive()
+    }
 }
 
 pub struct SystemDictionary {

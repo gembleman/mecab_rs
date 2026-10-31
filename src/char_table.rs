@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::ops::RangeInclusive;
@@ -54,6 +55,17 @@ pub struct CharTable {
     names: Vec<Vec<u8>>,
     palette: Vec<Entry>,
     table: Vec<u8>,
+}
+
+impl fmt::Debug for CharTable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CharTable")
+            .field("categories", &self.names.len())
+            .field("palette_entries", &self.palette.len())
+            .field("table_bytes", &self.table.len())
+            .finish_non_exhaustive()
+    }
 }
 
 fn atoi(text: &[u8]) -> u32 {

@@ -53,6 +53,16 @@ pub(crate) struct LexiconSections {
     feature_bits: u32,
 }
 
+impl std::fmt::Debug for Runtime<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Runtime")
+            .field("header_bytes", &self.header.len())
+            .field("sections", &self.sections.len())
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct Runtime<'a> {
     header: Vec<u8>,
     sections: Vec<Cow<'a, [u8]>>,

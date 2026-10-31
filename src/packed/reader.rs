@@ -113,6 +113,20 @@ impl Source<'_> {
     }
 }
 
+impl std::fmt::Debug for PackedDictionary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PackedDictionary")
+            .field("token_count", &self.token_count)
+            .field("unknown_count", &self.unknown_count)
+            .field("left_size", &self.left_size)
+            .field("right_size", &self.right_size)
+            .field("category_count", &self.category_count)
+            .field("hot", &self.hot)
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct PackedDictionary {
     map: Arc<MappedFile>,
     sections: [Range<usize>; SECTIONS],
@@ -400,6 +414,15 @@ fn decode(bytes: &[u8]) -> Option<(char, usize)> {
         return None;
     }
     char::from_u32(scalar).map(|char| (char, width))
+}
+
+impl std::fmt::Debug for PackedView<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PackedView")
+            .field("token_count", &self.token_count)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy)]

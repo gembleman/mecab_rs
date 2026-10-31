@@ -277,6 +277,28 @@ const EOS_END_PAST_LAST_FILLED: usize = 1;
 pub(crate) const MAX_TEXT_LEN: usize =
     u32::MAX as usize - END_SLOTS_PAST_TEXT - EOS_END_PAST_LAST_FILLED;
 
+const RETAINED_MIN_ENTRIES: usize = 4096;
+
+const RETAINED_ENTRIES_PER_BYTE: usize = 256;
+
+fn retained_capacity(sentence_len: usize) -> usize {
+    RETAINED_MIN_ENTRIES.max(sentence_len.saturating_mul(RETAINED_ENTRIES_PER_BYTE))
+}
+
+fn shrink_over<T>(buffer: &mut Vec<T>, keep: usize) {
+    if buffer.capacity() > keep {
+        buffer.shrink_to(keep);
+    }
+}
+
+pub(crate) const MAX_PATH_LINKS: usize = u32::MAX as usize;
+
+fn links_fit(existing: usize, added: usize) -> bool {
+    existing
+        .checked_add(added)
+        .is_some_and(|total| total <= MAX_PATH_LINKS)
+}
+
 #[cfg(feature = "pair-stats")]
 fn record_pairs(nodes: &[BestNode], lefts: &[LeftCandidate]) {
     for node in nodes {
@@ -375,10 +397,25 @@ impl Lattice {
             ending.clear();
         }
         let slots = sentence_len + END_SLOTS_PAST_TEXT;
+        self.shrink_oversized(sentence_len, slots);
         if self.ends.len() < slots {
             self.ends.resize_with(slots, EndSlot::default);
         }
         self.ends_used = slots;
+    }
+
+    fn shrink_oversized(&mut self, sentence_len: usize, slots: usize) {
+        let keep = retained_capacity(sentence_len);
+        shrink_over(&mut self.nodes, keep);
+        shrink_over(&mut self.best_nodes, keep);
+        shrink_over(&mut self.hits, keep);
+        shrink_over(&mut self.path, keep);
+        shrink_over(&mut self.links, keep);
+        let keep_slots = RETAINED_MIN_ENTRIES.max(slots);
+        if self.ends.len() > keep_slots {
+            self.ends.truncate(keep_slots);
+            self.ends.shrink_to(keep_slots);
+        }
     }
 
     fn build<const NBEST: bool>(
@@ -413,12 +450,12 @@ impl Lattice {
             }
             let begun =
                 self.lookup::<false>(dictionary, system, &view, unknown, sentence, position)?;
-            self.connect::<NBEST>(dictionary, position, begun);
+            self.connect::<NBEST>(dictionary, position, begun)?;
         }
         let last_filled_end = self.last_filled_end_slot(sentence_len);
         let eos_index = self.push_eos::<false>(sentence_len, 0);
         if let Some(position) = last_filled_end {
-            self.connect::<NBEST>(dictionary, position, eos_index..eos_index + 1);
+            self.connect::<NBEST>(dictionary, position, eos_index..eos_index + 1)?;
         }
         Ok(NodeId::from_index(eos_index))
     }
@@ -710,7 +747,13 @@ impl Lattice {
         dictionary: &Dictionary,
         position: usize,
         begun: Range<usize>,
-    ) {
+    ) -> Result<(), Error> {
+        if NBEST {
+            let added = begun.len().saturating_mul(self.ends[position].lefts.len());
+            if !links_fit(self.links.len(), added) {
+                return Err(Error::TextTooLong);
+            }
+        }
         let mut lefts = std::mem::take(&mut self.ends[position]);
         self.connect_rights::<NBEST>(dictionary, position, begun, &lefts.lefts, lefts.widest);
         let added = &mut self.ends[position];
@@ -718,6 +761,7 @@ impl Lattice {
             lefts.absorb(added);
         }
         std::mem::swap(added, &mut lefts);
+        Ok(())
     }
 
     fn connect_rights<const NBEST: bool>(

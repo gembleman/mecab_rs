@@ -65,6 +65,17 @@ pub(crate) fn parse_line(line: &str, buf: &mut Vec<u8>, ends: &mut Vec<u32>) -> 
     }
 }
 
+impl std::fmt::Debug for Lexicon {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Lexicon")
+            .field("n_cols", &self.n_cols)
+            .field("rows", &self.ends.len())
+            .field("bytes", &self.data.len())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Default)]
 pub struct Lexicon {
     pub n_cols: usize,

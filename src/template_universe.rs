@@ -11,6 +11,7 @@ use crate::error::{IoAction, io_error};
 #[cfg(feature = "xz")]
 const NO_FIRE_LIMIT: usize = 0xFFFF;
 
+#[derive(Debug)]
 pub enum Piece {
     Text(String),
     Field { optional: bool, index: usize },

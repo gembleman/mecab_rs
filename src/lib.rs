@@ -1,3 +1,5 @@
+#![warn(missing_debug_implementations)]
+
 #[doc(hidden)]
 pub mod __private;
 mod char_layout;

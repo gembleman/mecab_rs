@@ -1,3 +1,4 @@
+use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
@@ -43,6 +44,16 @@ pub struct Dictionary {
     pub(crate) bos_feature: String,
     pub(crate) unknown_feature: Option<String>,
     pub(crate) max_grouping_size: NonZeroUsize,
+}
+
+impl fmt::Debug for Dictionary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Dictionary")
+            .field("user_dictionaries", &self.users.len())
+            .field("max_grouping_size", &self.max_grouping_size)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Dictionary {

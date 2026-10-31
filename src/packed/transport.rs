@@ -20,6 +20,17 @@ const VERSION: u32 = 3;
 
 pub use matrix::encode as matrix_part;
 
+impl std::fmt::Debug for Part {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Part")
+            .field("name", &self.name)
+            .field("encoding", &self.encoding)
+            .field("bytes", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct Part {
     pub name: &'static str,
     pub encoding: u32,

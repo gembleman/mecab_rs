@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::Path;
 
 use super::{MAX_PARTS, RuntimeInputs, TemplateHeader, int_cost, validate};
@@ -7,6 +8,19 @@ use crate::mapped_file::MappedFile;
 use crate::part::{MappedPart, total_of};
 use crate::section::{Section, SectionSource};
 use crate::templates::TemplateReader;
+
+impl<S> fmt::Debug for MappedIntTemplates<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MappedIntTemplates")
+            .field("cost_factor", &self.cost_factor)
+            .field("shift", &self.shift)
+            .field("left_size", &self.left_size)
+            .field("right_size", &self.right_size)
+            .field("parts", &self.parts.len())
+            .finish_non_exhaustive()
+    }
+}
 
 pub struct MappedIntTemplates<S = MappedFile> {
     map: S,

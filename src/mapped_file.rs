@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::File;
 use std::ops::Deref;
 use std::path::Path;
@@ -15,6 +16,15 @@ pub(crate) fn open_unwritable(path: &Path) -> std::io::Result<File> {
     #[cfg(windows)]
     std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, SHARE_READ_AND_DELETE);
     options.open(path)
+}
+
+impl fmt::Debug for MappedFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MappedFile")
+            .field("bytes", &self.map.len())
+            .finish_non_exhaustive()
+    }
 }
 
 pub struct MappedFile {

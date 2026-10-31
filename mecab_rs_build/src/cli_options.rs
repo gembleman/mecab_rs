@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 const LONG_PREFIX: &str = "--";
+const END_OF_OPTIONS: &str = "--";
 const SHORT_PREFIX: char = '-';
 const FLAG_ON: &str = "1";
 const FLAG_OFF: &str = "0";
@@ -58,6 +59,12 @@ impl<'a> Cursor<'a> {
         Some(argument)
     }
 
+    fn take_remaining(&mut self) -> &'a [String] {
+        let remaining = &self.arguments[self.index..];
+        self.index = self.arguments.len();
+        remaining
+    }
+
     fn next_if(&mut self, accept: impl Fn(&str) -> bool) -> Option<&'a String> {
         let argument = self.arguments.get(self.index)?;
         accept(argument).then(|| {
@@ -98,11 +105,10 @@ impl Options {
         let mut options = Self::with_defaults(specs);
         let mut cursor = Cursor::new(arguments);
         while let Some(argument) = cursor.next() {
-            if let Some(long) = argument.strip_prefix(LONG_PREFIX) {
+            if argument == END_OF_OPTIONS {
+                options.rest.extend_from_slice(cursor.take_remaining());
+            } else if let Some(long) = argument.strip_prefix(LONG_PREFIX) {
                 let (key, inline) = split_long(long);
-                if key.is_empty() {
-                    break;
-                }
                 options.parse_long(argument, (key, inline), specs, &mut cursor)?;
             } else if argument.len() > 1 && argument.starts_with(SHORT_PREFIX) {
                 options.parse_short(argument, specs, &mut cursor)?;
@@ -121,6 +127,10 @@ impl Options {
         let mut options = Self::default();
         let mut cursor = Cursor::new(arguments);
         while let Some(argument) = cursor.next() {
+            if argument == END_OF_OPTIONS {
+                options.rest.extend_from_slice(cursor.take_remaining());
+                continue;
+            }
             if !argument.starts_with(LONG_PREFIX) {
                 options.rest.push(argument.clone());
                 continue;

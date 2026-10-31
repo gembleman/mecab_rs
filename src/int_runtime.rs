@@ -1,3 +1,4 @@
+use std::fmt;
 use std::mem::size_of;
 use std::path::Path;
 
@@ -356,6 +357,19 @@ impl RuntimeArrays {
             return Err(reader.broken("a cluster key is out of range"));
         }
         Ok(())
+    }
+}
+
+impl<S> fmt::Debug for RuntimeIntTemplates<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeIntTemplates")
+            .field("cost_factor", &self.cost_factor)
+            .field("shift", &self.shift)
+            .field("left_size", &self.left_size)
+            .field("right_size", &self.right_size)
+            .field("cluster_count", &self.cluster_count)
+            .finish_non_exhaustive()
     }
 }
 

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::ops::Range;
 use std::slice;
 use std::sync::Arc;
@@ -65,6 +66,15 @@ impl DictionaryHandle for Arc<Dictionary> {
 pub struct Tagger<D> {
     dictionary: D,
     lattice: Lattice,
+}
+
+impl<D: fmt::Debug> fmt::Debug for Tagger<D> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Tagger")
+            .field("dictionary", &self.dictionary)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<D: DictionaryHandle> Tagger<D> {
@@ -169,6 +179,15 @@ pub struct NBest<'t, 'x> {
     text: &'x str,
 }
 
+impl fmt::Debug for NBest<'_, '_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NBest")
+            .field("text", &self.text)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'x> NBest<'_, 'x> {
     pub fn next_path(&mut self) -> Option<Path<'_, 'x>> {
         if !self.lattice.next_nbest_path() {
@@ -198,6 +217,18 @@ struct Frame<'t, 'x> {
 pub struct LatticeView<'t, 'x> {
     frame: Frame<'t, 'x>,
     lattice: &'t Lattice,
+}
+
+impl fmt::Debug for LatticeView<'_, '_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LatticeView")
+            .field("text", &self.frame.text)
+            .field("nodes", &self.lattice.nodes().len())
+            .field("best_path_len", &self.lattice.path().len())
+            .field("z", &self.z())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'t, 'x> LatticeView<'t, 'x> {
@@ -321,6 +352,17 @@ pub struct Path<'t, 'x> {
     cost: i64,
 }
 
+impl fmt::Debug for Path<'_, '_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Path")
+            .field("text", &self.frame.text)
+            .field("cost", &self.cost)
+            .field("remaining", &self.order.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Path<'_, '_> {
     pub fn cost(&self) -> i64 {
         self.cost
@@ -349,6 +391,23 @@ impl ExactSizeIterator for Path<'_, '_> {}
 pub struct Node<'t, 'x> {
     frame: Frame<'t, 'x>,
     raw: &'t RawNode,
+}
+
+impl fmt::Debug for Node<'_, '_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Node")
+            .field("kind", &self.kind())
+            .field("surface", &self.surface())
+            .field("surface_range", &self.surface_range())
+            .field("feature", &self.feature())
+            .field("feature_id", &self.feature_id())
+            .field("left_id", &self.left_id())
+            .field("right_id", &self.right_id())
+            .field("word_cost", &self.word_cost())
+            .field("cost", &self.cost())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'x> Node<'_, 'x> {
