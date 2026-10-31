@@ -8,7 +8,7 @@ use crate::build::model::CostModel;
 use crate::build::rewrite::Rewriter;
 use crate::build::text::{BUF_SIZE, Lines, cstr, escape_csv_element, tokenize_csv};
 use crate::build::{BuildOptions, compile_system, csv_files};
-use mecab_rs::__private::to_cost;
+use crate::connection_templates::to_cost;
 use mecab_rs::__private::{DictionaryKind, SystemDictionary};
 use mecab_rs::__private::{write_file, write_file_with};
 use mecab_rs::Error;

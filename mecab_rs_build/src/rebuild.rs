@@ -11,13 +11,15 @@ use mecab_rs::__private::{HEADER_SIZE, MAGIC_ID, TOKEN_SIZE};
 use mecab_rs::__private::{write_file, write_file_with};
 use mecab_rs::{Dictionary, Error, Tagger};
 
+mod hot_pairs;
 pub mod int_matrix;
 mod runtime;
 mod templates;
 
-pub use mecab_rs::__private::{MAX_HOT_THREADS, default_threads};
+pub use hot_pairs::{PAIR_COUNT_BYTES, PairCount, hot_shape_from_pair_counts};
+pub use mecab_rs::__private::default_threads;
 pub use runtime::{RuntimeOptions, RuntimeReport, StatsSource, build_runtime};
-pub use templates::{DEFAULT_HOT_CELLS, DEFAULT_HOT_LEFT, DEFAULT_HOT_RIGHT, compile_templates};
+pub use templates::{DEFAULT_HOT_CELLS, compile_templates};
 
 const CONTEXT_FILES: [&str; 2] = ["sys.dic", "unk.dic"];
 const ID_DEF_FILES: [&str; 2] = ["left-id.def", "right-id.def"];

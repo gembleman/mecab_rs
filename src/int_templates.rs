@@ -660,14 +660,6 @@ impl<S: SectionSource> MappedIntTemplates<S> {
     }
 
     pub fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
-        self.cost_with(left_node_rc, right_node_lc, true)
-    }
-
-    pub fn cost_from_templates(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
-        self.cost_with(left_node_rc, right_node_lc, false)
-    }
-
-    fn cost_with(&self, left_node_rc: u16, right_node_lc: u16, use_clusters: bool) -> i16 {
         let row = usize::from(right_node_lc);
         let cell = row * self.left_size + usize::from(left_node_rc);
         let span = self.exception_rows[row] as usize..self.exception_rows[row + 1] as usize;
@@ -680,9 +672,7 @@ impl<S: SectionSource> MappedIntTemplates<S> {
         };
         exception.unwrap_or_else(|| {
             let total = match &self.clusters {
-                Some(clusters) if use_clusters => {
-                    clusters.sum(&self.map, left_node_rc, right_node_lc)
-                }
+                Some(clusters) => clusters.sum(&self.map, left_node_rc, right_node_lc),
                 _ => total_of(
                     self.parts.iter().map(|part| part.slices(&self.map)),
                     left_node_rc,

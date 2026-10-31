@@ -19,21 +19,6 @@ pub(crate) use reader::{PackedDictionary, PackedView};
 #[cfg(feature = "xz")]
 pub use transport::expand;
 
-pub const SECTION_NAMES: [&str; SECTIONS] = [
-    "char index",
-    "char blocks",
-    "double array",
-    "tokens",
-    "params",
-    "features",
-    "unknown starts",
-    "unknown tokens",
-    "matrix",
-    "templates",
-    "char table",
-    "dicrc",
-];
-
 pub fn write_runtime(dict_dir: &Path, out_file: &Path) -> Result<(), Error> {
     let model = source::read_dictionary(dict_dir)?;
     let runtime = model.encode_runtime()?;

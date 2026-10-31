@@ -8,7 +8,7 @@ use super::matrix::{self, MatrixSize};
 use super::model::CostModel;
 use super::rewrite::{ContextIds, PosIds, Rewriter};
 use super::text::{BUF_SIZE, Lines, atoi, cstr, escape_csv_element, failure, tokenize_csv};
-use mecab_rs::__private::to_cost;
+use crate::connection_templates::to_cost;
 use mecab_rs::__private::write_file;
 use mecab_rs::__private::{
     DIC_VERSION, DictionaryKind, HEADER_SIZE, MAGIC_ID, TOKEN_SIZE, VALUE_SIZE_BITS,

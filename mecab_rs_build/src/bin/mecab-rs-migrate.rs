@@ -5,8 +5,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use mecab_rs::__private::HotShape;
 use mecab_rs::CharTable;
 use mecab_rs_build::rebuild;
+use mecab_rs_build::rebuild::{PAIR_COUNT_BYTES, PairCount, hot_shape_from_pair_counts};
 
 const USAGE: &str = "usage: mecab-rs-migrate <dictionary-directory> [--char-def <file>]
 
@@ -17,25 +19,25 @@ the built-in defaults; the other files of the directory are not touched.";
 const REBUILD_USAGE: &str = "
 dictionary rebuilding:
   mecab-rs-migrate pack <dict-dir> <out.mrd>
-  mecab-rs-migrate pack-transport <dict-dir> <out.mrd.xz>  (feature xz)
-  mecab-rs-migrate expand <in.mrd.xz> <out.mrd>           (feature xz)
+  mecab-rs-migrate pack-transport <dict-dir> <out.mrd.xz>
+  mecab-rs-migrate expand <in.mrd.xz> <out.mrd>
       Writes a packed runtime dictionary, or packs and expands its transport form.
   mecab-rs-migrate check-runtime-int <matrix.itp> <runtime> [<matrix.bin>] [--threads N]
       Compares every cell of the runtime form of matrix.itp (what pack puts into the .mrd file)
       outside of its hot block with matrix.itp and, if given, with the dense matrix.bin.
-  mecab-rs-migrate pair-stats <mrd> <corpus>... -o <file>                  (feature pair-stats)
+  mecab-rs-migrate pair-stats <mrd> <corpus>... -o <file>  (feature pair-stats)
       Parses every line of the corpora with max grouping size 10 and writes how often the lattice
       asked for each (right node left id, left node right id) pair of the hot matrix as records
       of row u16, column u16, count u32 (little endian), for rebuild --pairs.
   mecab-rs-migrate rebuild <unidic-full-dir> <out-dir> (--stats <dir> | --corpus <file>...)
-                         [--keep <fields>] [--threads N] [--int]
+                         [--keep <fields>] [--threads N]
                          [--hot L R | --pairs <file> [--hot-cells N]]
                          [--matrix-bin]
       One-shot build of the runtime files only (dicrc, char.bin, char.uni, license/, sys.dic,
       unk.dic, left-id.def, right-id.def, right.tsv, left.tsv, matrix.itp, matrix.hot): renumbers
       by the stats (given, or counted from the corpora), slims with --keep, and compiles the
       integer templates matrix.itp (grid 2^-20, every cell exact) instead of writing matrix.bin;
-      --int is accepted and changes nothing. --matrix-bin also writes the permuted dense
+      --matrix-bin also writes the permuted dense
       matrix.bin. --hot L R makes the hot part a rectangle; --pairs with --hot-cells N makes it a
       staircase of at most N cells (default 14,000,000) whose row lengths follow the pair counts.";
 
@@ -98,7 +100,6 @@ fn parse_matrix_args(command: &str, args: &[std::ffi::OsString]) -> Result<Matri
             }
             Some("--threads") => parsed.threads = Some(number(iterator.next(), "--threads")?),
             Some("--pairs") => parsed.pairs = Some(text(iterator.next(), "--pairs")?),
-            Some("--int") => {}
             Some("--matrix-bin") => parsed.matrix_bin = true,
             Some(flag) if flag.starts_with("--") => {
                 return Err(format!("{command}: unknown option {flag}"));
@@ -189,23 +190,23 @@ fn positional<'a, const COUNT: usize>(
         .map_err(|_| format!("{command}: expected {usage}"))
 }
 
-fn read_pair_counts(path: &Path) -> Result<Vec<mecab_rs::PairCount>, String> {
+fn read_pair_counts(path: &Path) -> Result<Vec<PairCount>, String> {
     let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let (chunks, rest) = bytes.as_chunks::<{ mecab_rs::PAIR_COUNT_BYTES }>();
+    let (chunks, rest) = bytes.as_chunks::<{ PAIR_COUNT_BYTES }>();
     if !rest.is_empty() {
         return Err(format!("{}: not a list of pair counts", path.display()));
     }
     Ok(chunks
         .iter()
-        .map(|&chunk| mecab_rs::PairCount::from_bytes(chunk))
+        .map(|&chunk| PairCount::from_bytes(chunk))
         .collect())
 }
 
-fn hot_shape_of(parsed: &MatrixArgs) -> Result<Option<mecab_rs::HotShape>, String> {
+fn hot_shape_of(parsed: &MatrixArgs) -> Result<Option<HotShape>, String> {
     match (&parsed.pairs, parsed.hot_cells, parsed.hot) {
         (Some(pairs), cells, None) => {
             let cells = cells.unwrap_or(rebuild::DEFAULT_HOT_CELLS);
-            let shape = mecab_rs::HotShape::from_pair_counts(&read_pair_counts(pairs)?, cells);
+            let shape = hot_shape_from_pair_counts(&read_pair_counts(pairs)?, cells);
             println!(
                 "hot shape from pair counts: {} cells in {} rows, inscribed rectangle {:?}",
                 shape.cells(),
@@ -214,9 +215,7 @@ fn hot_shape_of(parsed: &MatrixArgs) -> Result<Option<mecab_rs::HotShape>, Strin
             );
             Ok(Some(shape))
         }
-        (None, None, hot) => {
-            Ok(hot.map(|(left, right)| mecab_rs::HotShape::rectangle(left, right)))
-        }
+        (None, None, hot) => Ok(hot.map(|(left, right)| HotShape::rectangle(left, right))),
         _ => Err("rebuild: give --pairs <file> with --hot-cells <N>, or --hot L R".into()),
     }
 }
@@ -225,8 +224,44 @@ fn threads_of(parsed: &MatrixArgs) -> usize {
     parsed.threads.unwrap_or_else(rebuild::default_threads)
 }
 
+struct CheckArgs {
+    positional: Vec<PathBuf>,
+    threads: Option<usize>,
+}
+
+fn parse_check_args(args: &Args) -> Result<CheckArgs, String> {
+    let mut parsed = CheckArgs {
+        positional: Vec::new(),
+        threads: None,
+    };
+    let mut iterator = args.iter();
+    while let Some(argument) = iterator.next() {
+        match argument.to_str() {
+            Some("--threads") => {
+                parsed.threads = Some(
+                    iterator
+                        .next()
+                        .and_then(|value| value.to_str())
+                        .and_then(|value| value.parse().ok())
+                        .ok_or("check-runtime-int: --threads needs a number")?,
+                );
+            }
+            Some(flag) if flag.starts_with("--") => {
+                return Err(format!("check-runtime-int: unknown option {flag}"));
+            }
+            _ => parsed.positional.push(argument.into()),
+        }
+    }
+    Ok(parsed)
+}
+
+fn read_templates(path: &Path) -> Result<mecab_rs::__private::IntTemplates, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    mecab_rs::__private::IntTemplates::from_file_bytes(&bytes, path).map_err(shown)
+}
+
 fn check_runtime_int(args: &Args) -> Result<(), String> {
-    let parsed = parse_matrix_args("check-runtime-int", args)?;
+    let parsed = parse_check_args(args)?;
     let usage = "<matrix.itp> <runtime.itp> [<matrix.bin>]";
     let (full, runtime, dense) = match parsed.positional.as_slice() {
         [full, runtime] => (full, runtime, None),
@@ -234,8 +269,9 @@ fn check_runtime_int(args: &Args) -> Result<(), String> {
         _ => return Err(format!("check-runtime-int: expected {usage}")),
     };
     let dense = dense.map(|path| read_dense(path)).transpose()?;
-    let full = mecab_rs::MappedIntTemplates::open(full).map_err(shown)?;
-    let runtime = mecab_rs::RuntimeIntTemplates::open(runtime).map_err(shown)?;
+    let templates = read_templates(full)?;
+    let full = mecab_rs::__private::MappedIntTemplates::open(full).map_err(shown)?;
+    let runtime = mecab_rs::__private::RuntimeIntTemplates::open(runtime).map_err(shown)?;
     let (left_size, right_size) = (full.left_size(), full.right_size());
     if (left_size, right_size) != (runtime.left_size(), runtime.right_size()) {
         return Err("the two files have different sizes".into());
@@ -247,29 +283,33 @@ fn check_runtime_int(args: &Args) -> Result<(), String> {
         return Err("the dense matrix does not have the size of the templates".into());
     }
     let comparison = Comparison::default();
-    compare_row_chunks(right_size, threads_of(&parsed), |rows| {
-        for row in rows {
-            for column in 0..left_size {
-                if row < hot_right && column < hot_left {
-                    continue;
-                }
-                let (column_id, row_id) = (column as u16, row as u16);
-                let expected = full.cost(column_id, row_id);
-                let found = runtime.cost(column_id, row_id);
-                let by_templates = (row * 31 + column) % 61 == 0;
-                let real = dense
-                    .as_ref()
-                    .is_none_or(|dense| dense_cell(dense, left_size, column, row) == found);
-                comparison.compared_cell();
-                if !real
-                    || found != expected
-                    || (by_templates && full.cost_from_templates(column_id, row_id) != found)
-                {
-                    comparison.mismatch(column, row, expected, found);
+    compare_row_chunks(
+        right_size,
+        parsed.threads.unwrap_or_else(rebuild::default_threads),
+        |rows| {
+            for row in rows {
+                for column in 0..left_size {
+                    if row < hot_right && column < hot_left {
+                        continue;
+                    }
+                    let (column_id, row_id) = (column as u16, row as u16);
+                    let expected = full.cost(column_id, row_id);
+                    let found = runtime.cost(column_id, row_id);
+                    let by_templates = (row * 31 + column) % 61 == 0;
+                    let real = dense
+                        .as_ref()
+                        .is_none_or(|dense| dense_cell(dense, left_size, column, row) == found);
+                    comparison.compared_cell();
+                    if !real
+                        || found != expected
+                        || (by_templates && templates.cost(column_id, row_id) != found)
+                    {
+                        comparison.mismatch(column, row, expected, found);
+                    }
                 }
             }
-        }
-    });
+        },
+    );
     let compared = comparison.compared.load(Ordering::Relaxed);
     let mismatches = comparison.mismatch_count();
     println!(
@@ -317,8 +357,11 @@ fn pair_stats(args: &Args) -> Result<(), String> {
             sentences += 1;
         }
     }
-    let pairs = mecab_rs::pair_stats::take();
-    let mut bytes = Vec::with_capacity(pairs.len() * mecab_rs::PAIR_COUNT_BYTES);
+    let pairs: Vec<PairCount> = mecab_rs::__private::take_pair_counts()
+        .into_iter()
+        .map(|(row, column, count)| PairCount { row, column, count })
+        .collect();
+    let mut bytes = Vec::with_capacity(pairs.len() * PAIR_COUNT_BYTES);
     for pair in &pairs {
         bytes.extend_from_slice(&pair.to_bytes());
     }

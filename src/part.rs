@@ -13,15 +13,6 @@ pub(crate) trait Weight: Plain + Default + PartialEq {
     fn widen(self) -> Self::Sum;
 }
 
-impl Weight for f64 {
-    type Sum = f64;
-
-    #[inline]
-    fn widen(self) -> f64 {
-        self
-    }
-}
-
 impl Weight for i32 {
     type Sum = i64;
 
@@ -42,7 +33,6 @@ pub struct Part<W> {
     pub weight: Vec<W>,
 }
 
-pub type TemplatePart = Part<f64>;
 pub type IntPart = Part<i32>;
 
 impl<W: Copy> Part<W> {

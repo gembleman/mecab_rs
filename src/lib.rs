@@ -22,7 +22,7 @@ mod matrix;
 mod nbest;
 pub mod packed;
 #[cfg(feature = "pair-stats")]
-pub mod pair_stats;
+mod pair_stats;
 mod part;
 mod partial;
 mod section;
@@ -38,8 +38,5 @@ pub use constraint::{BoundaryKind, Constraint};
 pub use dictionary::Dictionary;
 pub use error::Error;
 pub use feature_text::FeatureText;
-pub use hot_shape::{HotShape, PAIR_COUNT_BYTES, PairCount};
-pub use int_runtime::RuntimeIntTemplates;
-pub use int_templates::MappedIntTemplates;
 pub use partial::PartialInput;
 pub use tagger::{DEFAULT_THETA, FeatureId, LatticeView, NBest, Node, NodeKind, Path, Tagger};

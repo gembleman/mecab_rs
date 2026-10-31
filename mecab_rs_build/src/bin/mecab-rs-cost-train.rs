@@ -99,7 +99,6 @@ fn run() -> Result<ExitCode, String> {
         eta: options.number("eta"),
         threads: options.number("thread"),
         crlf: options.flag("crlf"),
-        ..TrainOptions::default()
     };
     let stdout = std::io::stdout();
     let mut log = stdout.lock();

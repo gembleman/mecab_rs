@@ -4,9 +4,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use super::bad;
-use mecab_rs::__private::ExactRows;
-use mecab_rs::__private::{ConnectionTemplates, IntPart, IntTemplates};
-use mecab_rs::{Error, HotShape};
+use crate::connection_templates::{ConnectionTemplates, ExactRows};
+use mecab_rs::__private::HotShape;
+use mecab_rs::__private::{IntPart, IntTemplates};
+use mecab_rs::Error;
 
 pub const RUNTIME_SHIFT: u32 = 20;
 
@@ -70,54 +71,49 @@ pub fn quantize(
 
 pub fn find_exceptions(
     exact: &ConnectionTemplates,
-    candidates: &[IntTemplates],
+    candidate: &IntTemplates,
     threads: usize,
-) -> Result<Vec<Vec<(u32, i16)>>, Error> {
+) -> Result<Vec<(u32, i16)>, Error> {
     let (left_size, right_size) = (exact.left_size(), exact.right_size());
     if u32::try_from(left_size * right_size).is_err()
-        || candidates
-            .iter()
-            .any(|c| c.left_size() != left_size || c.right_size() != right_size)
+        || candidate.left_size() != left_size
+        || candidate.right_size() != right_size
     {
-        return Err(Error::Corrupt("the candidates do not fit the matrix"));
+        return Err(Error::Corrupt("the candidate does not fit the matrix"));
     }
-    let views: Vec<_> = candidates.iter().map(IntTemplates::view).collect();
+    let view = candidate.view();
     let next_row = AtomicUsize::new(0);
-    let found = Mutex::new(vec![Vec::new(); candidates.len()]);
+    let found = Mutex::new(Vec::new());
     thread::scope(|scope| {
         for _ in 0..threads.max(1) {
             scope.spawn(|| {
                 let mut exact_rows = ExactRows::new(exact);
-                let mut scratch = views.iter().map(|view| view.scratch()).collect::<Vec<_>>();
+                let mut scratch = view.scratch();
                 let mut real = vec![0i16; left_size];
                 let mut computed = vec![0i16; left_size];
-                let mut local: Vec<Vec<(u32, i16)>> = vec![Vec::new(); views.len()];
+                let mut local: Vec<(u32, i16)> = Vec::new();
                 loop {
                     let row = next_row.fetch_add(1, Ordering::Relaxed);
                     if row >= right_size {
                         break;
                     }
                     exact_rows.render(row, &mut real);
-                    for ((view, scratch), list) in views.iter().zip(&mut scratch).zip(&mut local) {
-                        view.render_computed_row(row, scratch, &mut computed);
-                        for (column, (&a, &b)) in computed.iter().zip(&real).enumerate() {
-                            if a != b {
-                                list.push(((row * left_size + column) as u32, b));
-                            }
+                    view.render_computed_row(row, &mut scratch, &mut computed);
+                    for (column, (&a, &b)) in computed.iter().zip(&real).enumerate() {
+                        if a != b {
+                            local.push(((row * left_size + column) as u32, b));
                         }
                     }
                 }
-                let mut found = found.lock().expect("an exception worker panicked");
-                for (all, list) in found.iter_mut().zip(local) {
-                    all.extend(list);
-                }
+                found
+                    .lock()
+                    .expect("an exception worker panicked")
+                    .extend(local);
             });
         }
     });
     let mut found = found.into_inner().expect("an exception worker panicked");
-    for list in &mut found {
-        list.sort_unstable_by_key(|&(cell, _)| cell);
-    }
+    found.sort_unstable_by_key(|&(cell, _)| cell);
     Ok(found)
 }
 
@@ -128,9 +124,7 @@ pub fn exact_int_templates(
     path: &Path,
 ) -> Result<IntTemplates, Error> {
     let plain = quantize(templates, shift, path)?;
-    let exceptions = find_exceptions(templates, std::slice::from_ref(&plain), threads)?
-        .pop()
-        .expect("one candidate gives one exception list");
+    let exceptions = find_exceptions(templates, &plain, threads)?;
     plain.with_exceptions(exceptions)
 }
 

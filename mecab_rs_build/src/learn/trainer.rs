@@ -20,8 +20,6 @@ pub struct TrainOptions {
     pub freq: usize,
     pub eta: f64,
     pub threads: usize,
-    pub eval_size: Option<usize>,
-    pub unk_eval_size: Option<usize>,
     pub crlf: bool,
 }
 
@@ -34,8 +32,6 @@ impl Default for TrainOptions {
             freq: 1,
             eta: 0.00005,
             threads: 1,
-            eval_size: None,
-            unk_eval_size: None,
             crlf: false,
         }
     }
@@ -44,10 +40,6 @@ impl Default for TrainOptions {
 #[derive(Clone, Debug)]
 pub struct TrainReport {
     pub sentences: usize,
-    pub features: usize,
-    pub iterations: usize,
-    pub objective: f64,
-    pub charset: String,
 }
 
 #[derive(Default)]
@@ -100,12 +92,6 @@ pub fn train(
     config.set("eta", &options.eta.to_string(), true);
     config.set("freq", &options.freq.to_string(), true);
     config.set("thread", &options.threads.to_string(), true);
-    if let Some(size) = options.eval_size {
-        config.set("eval-size", &size.to_string(), true);
-    }
-    if let Some(size) = options.unk_eval_size {
-        config.set("unk-eval-size", &size.to_string(), true);
-    }
     config.load(&dic_dir.join("dicrc"))?;
 
     let mut tokenizer = Tokenizer::open(dic_dir, &config)?;
@@ -220,8 +206,6 @@ pub fn train(
     let mut stable_iterations = 0;
     let mut previous = 0.0;
     let mut lbfgs = Lbfgs::default();
-    let mut iterations = 0;
-    let mut objective_value = 0.0;
 
     for iteration in 0.. {
         let mut objective = 0.0;
@@ -287,8 +271,6 @@ pub fn train(
             1.0 * errors as f64 / sentence_count as f64
         );
         previous = objective;
-        iterations = iteration + 1;
-        objective_value = objective;
 
         if diff < eta {
             stable_iterations += 1;
@@ -319,9 +301,5 @@ pub fn train(
 
     Ok(TrainReport {
         sentences: sentence_count,
-        features: size,
-        iterations,
-        objective: objective_value,
-        charset: tokenizer.charset,
     })
 }

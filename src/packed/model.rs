@@ -218,7 +218,7 @@ impl Model {
                 Ok(bytes) => bytes.into(),
                 Err(Error::Unsupported(_)) => {
                     return Err(Error::Unsupported(
-                        "the integer templates have no runtime form (they have no clusters, or an exception differs from the computed cost by more than 1); run rebuild without --int or with a fitting shift",
+                        "the integer templates have no runtime form (they have no clusters, or an exception differs from the computed cost by more than 1)",
                     ));
                 }
                 Err(error) => return Err(error),

@@ -5,7 +5,8 @@ use super::templates::compile_templates;
 use super::{
     ContextStats, Keep, Renumbering, SlimReport, collect_stats, copy_entries, prepare_output,
 };
-use mecab_rs::{CharTable, Error, HotShape};
+use mecab_rs::__private::HotShape;
+use mecab_rs::{CharTable, Error};
 
 pub enum StatsSource<'a> {
     Directory(&'a Path),

@@ -4,13 +4,14 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use super::{bad, read_file};
+use crate::connection_templates::{ConnectionTemplates, TemplatePart};
+use mecab_rs::__private::HotShape;
 use mecab_rs::__private::io_error;
-use mecab_rs::__private::{ConnectionTemplates, TemplatePart};
 use mecab_rs::__private::{id_rows, parse_side, project, read_bigrams, side_keys};
-use mecab_rs::{Error, HotShape};
+use mecab_rs::Error;
 
-pub const DEFAULT_HOT_LEFT: usize = 4480;
-pub const DEFAULT_HOT_RIGHT: usize = 3136;
+pub(crate) const DEFAULT_HOT_LEFT: usize = 4480;
+pub(crate) const DEFAULT_HOT_RIGHT: usize = 3136;
 pub const DEFAULT_HOT_CELLS: usize = 14_000_000;
 
 const MODEL_HEADER_LINES: usize = 7;
