@@ -1,5 +1,6 @@
 use crate::error::Error;
 use crate::feature_match::partial_match;
+use crate::lattice::{RETAINED_MIN_ENTRIES, shrink_over};
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 enum Boundary {
@@ -108,8 +109,6 @@ impl<'t> Constraints<'t> {
     }
 }
 
-const RETAINED_MIN_ENTRIES: usize = 4096;
-
 #[derive(Default)]
 pub(crate) struct ConstraintSet {
     boundary: Vec<Boundary>,
@@ -124,10 +123,11 @@ impl ConstraintSet {
     pub(crate) fn load(&mut self, text_len: usize, constraints: &[Constraint<'_>]) {
         self.boundary.clear();
         self.next_boundary.clear();
-        self.shrink_oversized(text_len);
         self.feature_at.clear();
+        self.shrink_oversized(text_len);
         self.spans.clear();
         self.bytes.clear();
+        self.shrink_feature_storage(constraints);
         for constraint in constraints {
             match *constraint {
                 Constraint::Boundary { position, kind } => {
@@ -173,9 +173,9 @@ impl ConstraintSet {
 
     fn shrink_oversized(&mut self, text_len: usize) {
         let keep = RETAINED_MIN_ENTRIES.max(text_len.saturating_add(1));
-        if self.next_boundary.capacity() > keep {
-            self.next_boundary.shrink_to(keep);
-        }
+        shrink_over(&mut self.boundary, keep);
+        shrink_over(&mut self.next_boundary, keep);
+        shrink_over(&mut self.feature_at, keep);
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -228,6 +228,23 @@ impl ConstraintSet {
             self.boundary.resize(text_len + 1, Boundary::Any);
         }
         self.boundary[position] = boundary;
+    }
+
+    fn shrink_feature_storage(&mut self, constraints: &[Constraint<'_>]) {
+        let (count, byte_total) = constraints.iter().fold(
+            (0usize, 0usize),
+            |(count, bytes), constraint| match *constraint {
+                Constraint::Feature { pattern, .. } => {
+                    (count + 1, bytes.saturating_add(pattern.len()))
+                }
+                Constraint::Boundary { .. } => (count, bytes),
+            },
+        );
+        shrink_over(&mut self.spans, RETAINED_MIN_ENTRIES.max(count));
+        let keep_bytes = RETAINED_MIN_ENTRIES.max(byte_total);
+        if self.bytes.capacity() > keep_bytes {
+            self.bytes.shrink_to(keep_bytes);
+        }
     }
 
     fn set_feature(&mut self, text_len: usize, begin: usize, end: usize, feature: &str) {

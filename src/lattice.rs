@@ -278,7 +278,7 @@ const EOS_END_PAST_LAST_FILLED: usize = 1;
 pub(crate) const MAX_TEXT_LEN: usize =
     u32::MAX as usize - END_SLOTS_PAST_TEXT - EOS_END_PAST_LAST_FILLED;
 
-const RETAINED_MIN_ENTRIES: usize = 4096;
+pub(crate) const RETAINED_MIN_ENTRIES: usize = 4096;
 
 const RETAINED_ENTRIES_PER_BYTE: usize = 256;
 
@@ -286,7 +286,7 @@ fn retained_capacity(sentence_len: usize) -> usize {
     RETAINED_MIN_ENTRIES.max(sentence_len.saturating_mul(RETAINED_ENTRIES_PER_BYTE))
 }
 
-fn shrink_over<T>(buffer: &mut Vec<T>, keep: usize) {
+pub(crate) fn shrink_over<T>(buffer: &mut Vec<T>, keep: usize) {
     if buffer.capacity() > keep {
         buffer.shrink_to(keep);
     }
