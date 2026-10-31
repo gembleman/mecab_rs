@@ -204,6 +204,7 @@ pub(crate) struct Lattice {
     hits: Vec<PrefixHit>,
     path: Vec<NodeId>,
     path_cost: i64,
+    cost_overflow: bool,
     constraints: ConstraintSet,
     links: Vec<PathLink>,
     agenda: Agenda,
@@ -291,6 +292,22 @@ fn shrink_over<T>(buffer: &mut Vec<T>, keep: usize) {
     }
 }
 
+pub(crate) const MAX_NODE_COST: i32 = 1 << 30;
+
+#[cold]
+fn overflow_result(overflow: bool) -> Result<(), Error> {
+    if overflow {
+        Err(Error::TextTooLong)
+    } else {
+        Ok(())
+    }
+}
+
+#[inline(always)]
+fn cost_in_range(cost: i32) -> bool {
+    cost.unsigned_abs() <= MAX_NODE_COST.unsigned_abs()
+}
+
 pub(crate) const MAX_PATH_LINKS: usize = u32::MAX as usize;
 
 fn links_fit(existing: usize, added: usize) -> bool {
@@ -333,9 +350,11 @@ fn store_best(
     index: usize,
     cost_without_word: i32,
     best: NodeId,
+    overflow: &mut bool,
 ) {
     let node = &mut best_nodes[index];
     let cost = cost_without_word + i32::from(node.candidate.word_cost);
+    *overflow |= !cost_in_range(cost);
     node.prev = Some(best);
     node.cost = cost;
     ends[node.candidate.end as usize - position - 1].push(LeftCandidate {
@@ -369,7 +388,7 @@ impl Lattice {
             let eos = self.build::<false>(dictionary, text.as_bytes())?;
             self.collect_best(eos);
         } else {
-            self.build_best(dictionary, text.as_bytes());
+            self.build_best(dictionary, text.as_bytes())?;
         }
         Ok(())
     }
@@ -392,6 +411,7 @@ impl Lattice {
         self.path.clear();
         self.links.clear();
         self.marginals.ready = false;
+        self.cost_overflow = false;
         self.constraints.load(sentence_len, constraints);
         for ending in &mut self.ends[..self.ends_used] {
             ending.clear();
@@ -460,13 +480,13 @@ impl Lattice {
         Ok(NodeId::from_index(eos_index))
     }
 
-    fn build_best(&mut self, dictionary: &Dictionary, sentence: &[u8]) {
+    fn build_best(&mut self, dictionary: &Dictionary, sentence: &[u8]) -> Result<(), Error> {
         self.build_best_with(
             dictionary,
             &dictionary.system,
             &dictionary.unknown,
             sentence,
-        );
+        )
     }
 
     #[inline(always)]
@@ -476,7 +496,7 @@ impl Lattice {
         system: &PackedDictionary,
         unknown: &PackedDictionary,
         sentence: &[u8],
-    ) {
+    ) -> Result<(), Error> {
         let sentence_len = sentence.len();
         let view = system.view();
         self.sentence_chars
@@ -490,14 +510,15 @@ impl Lattice {
                 let found =
                     self.lookup::<true>(dictionary, system, &view, unknown, sentence, position);
                 debug_assert!(found.is_ok());
-                self.connect_best(dictionary, position, first);
+                self.connect_best(dictionary, position, first)?;
             }
             position += sequence_len(lead);
         }
         let last_filled_end = self.last_filled_end_slot(sentence_len).unwrap_or(0);
         let eos = self.push_eos::<true>(sentence_len, last_filled_end);
-        self.connect_best(dictionary, last_filled_end, eos);
+        self.connect_best(dictionary, last_filled_end, eos)?;
         self.collect_best_nodes();
+        Ok(())
     }
 
     #[inline(always)]
@@ -547,9 +568,17 @@ impl Lattice {
         }
     }
 
-    fn connect_best(&mut self, dictionary: &Dictionary, position: usize, first: usize) {
+    fn connect_best(
+        &mut self,
+        dictionary: &Dictionary,
+        position: usize,
+        first: usize,
+    ) -> Result<(), Error> {
         let Self {
-            best_nodes, ends, ..
+            best_nodes,
+            ends,
+            cost_overflow,
+            ..
         } = self;
         let (head, later_ends) = ends.split_at_mut(position + 1);
         let site = BestSite {
@@ -560,12 +589,13 @@ impl Lattice {
         };
         match &dictionary.matrix {
             Matrix::PackedDense(dense) => {
-                Self::connect_best_dense(best_nodes, later_ends, &site, dense);
+                Self::connect_best_dense(best_nodes, later_ends, &site, dense, cost_overflow);
             }
             Matrix::PackedHot(hot) => {
-                Self::connect_best_hot(best_nodes, later_ends, &site, &hot.view());
+                Self::connect_best_hot(best_nodes, later_ends, &site, &hot.view(), cost_overflow);
             }
         }
+        overflow_result(*cost_overflow)
     }
 
     #[inline(always)]
@@ -574,6 +604,7 @@ impl Lattice {
         later_ends: &mut [EndSlot],
         site: &BestSite<'_>,
         dense: &DenseMatrix,
+        overflow: &mut bool,
     ) {
         for index in (site.first..best_nodes.len()).rev() {
             let column = dense.right_column(best_nodes[index].candidate.left_id);
@@ -581,7 +612,15 @@ impl Lattice {
                 debug_assert!(usize::from(id) < column.len());
                 unsafe { *column.get_unchecked(usize::from(id)) }
             });
-            store_best(best_nodes, later_ends, site.position, index, cost, best);
+            store_best(
+                best_nodes,
+                later_ends,
+                site.position,
+                index,
+                cost,
+                best,
+                overflow,
+            );
         }
     }
 
@@ -591,6 +630,7 @@ impl Lattice {
         later_ends: &mut [EndSlot],
         site: &BestSite<'_>,
         hot: &HotView<'_>,
+        overflow: &mut bool,
     ) {
         let BestSite {
             lefts,
@@ -605,7 +645,7 @@ impl Lattice {
         let mut next = best_nodes.len();
         while next > first {
             if next - first >= CONNECT_GROUP_SIZE
-                && Self::connect_group(best_nodes, later_ends, site, hot, next, reaches)
+                && Self::connect_group(best_nodes, later_ends, site, hot, next, reaches, overflow)
             {
                 next -= CONNECT_GROUP_SIZE;
                 continue;
@@ -619,7 +659,7 @@ impl Lattice {
             } else {
                 best_left::<true>(lefts, column.into_cost_fn())
             };
-            store_best(best_nodes, later_ends, position, next, cost, best);
+            store_best(best_nodes, later_ends, position, next, cost, best, overflow);
         }
     }
 
@@ -631,6 +671,7 @@ impl Lattice {
         hot: &HotView<'_>,
         next: usize,
         reaches: impl Fn(&[i16]) -> bool,
+        overflow: &mut bool,
     ) -> bool {
         let indices: [usize; CONNECT_GROUP_SIZE] = std::array::from_fn(|lane| next - 1 - lane);
         let columns = indices.map(|index| {
@@ -642,7 +683,15 @@ impl Lattice {
         }
         let found = best_lefts(site.lefts, columns);
         for (index, (cost, best)) in indices.into_iter().zip(found) {
-            store_best(best_nodes, later_ends, site.position, index, cost, best);
+            store_best(
+                best_nodes,
+                later_ends,
+                site.position,
+                index,
+                cost,
+                best,
+                overflow,
+            );
         }
         true
     }
@@ -756,6 +805,9 @@ impl Lattice {
         }
         let mut lefts = std::mem::take(&mut self.ends[position]);
         self.connect_rights::<NBEST>(dictionary, position, begun, &lefts.lefts, lefts.widest);
+        if self.cost_overflow {
+            return Err(Error::TextTooLong);
+        }
         let added = &mut self.ends[position];
         if !added.lefts.is_empty() {
             lefts.absorb(added);
@@ -843,6 +895,7 @@ impl Lattice {
             (best_cost + word_cost, best)
         };
         let target = right_node.length_with_space as usize + position;
+        self.cost_overflow |= !cost_in_range(best_cost);
         let node = &mut self.nodes[right_id];
         node.prev = Some(best);
         node.cost = best_cost;

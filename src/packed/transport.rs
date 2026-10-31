@@ -17,6 +17,8 @@ use crate::wire::{fnv1a64, u32_at, u64_at};
 
 const MAGIC: &[u8; 4] = b"MRDT";
 const VERSION: u32 = 3;
+const MAX_PAYLOAD: u64 = 256 << 20;
+const MAX_PARTS: usize = 64;
 
 pub use matrix::encode as matrix_part;
 
@@ -139,6 +141,9 @@ pub(super) fn parse_container<'a>(payload: &'a [u8], path: &'a Path) -> Result<P
         ));
     }
     let count = word(take(4)?) as usize;
+    if count > MAX_PARTS {
+        return Err(Error::format(path, "the part count is too large"));
+    }
     let mut parts: Vec<(&str, u32, &[u8])> = Vec::new();
     for _ in 0..count {
         let name_length = usize::from(take(1)?[0]);
@@ -204,17 +209,30 @@ fn runtime_model(parts: &Parts) -> Result<(Model, LexiconSections), Error> {
 pub fn transport_payload(dict_dir: &Path) -> Result<Vec<u8>, Error> {
     let model = read_dictionary(dict_dir)?;
     let matrix = matrix_part(dict_dir, &model)?;
-    Ok(container(&encode_parts(&model, matrix)?))
+    let payload = container(&encode_parts(&model, matrix)?);
+    if payload.len() as u64 > MAX_PAYLOAD {
+        return Err(Error::Unsupported(
+            "the transport payload would exceed 256 MiB; ship the .mrd instead",
+        ));
+    }
+    Ok(payload)
 }
 
 pub fn expand(xz_file: &Path, out_mrd: &Path) -> Result<(), Error> {
     let file = std::fs::File::open(xz_file).map_err(io_error(IoAction::Open, xz_file))?;
     let mut payload = Vec::new();
     XzReader::new(std::io::BufReader::new(file), false)
+        .take(MAX_PAYLOAD + 1)
         .read_to_end(&mut payload)
         .map_err(|cause| {
             Error::format(xz_file, "the xz stream cannot be decoded").caused_by(cause)
         })?;
+    if payload.len() as u64 > MAX_PAYLOAD {
+        return Err(Error::format(
+            xz_file,
+            "the payload inside the xz stream is larger than any dictionary",
+        ));
+    }
     let (model, sections) = runtime_model(&parse_container(&payload, xz_file)?)?;
     drop(payload);
     let runtime = model.finish_runtime(sections)?;

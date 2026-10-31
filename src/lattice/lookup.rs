@@ -92,12 +92,8 @@ impl Lattice {
 
     #[inline(always)]
     fn partial_end<const BEST: bool>(&self, sentence_len: usize, begin: usize) -> usize {
-        if !BEST
-            && self.constraints.is_active()
-            && let Some(boundary) = (begin + 1..sentence_len)
-                .find(|&position| self.constraints.is_token_boundary(position))
-        {
-            return boundary;
+        if !BEST && self.constraints.is_active() {
+            return self.constraints.next_token_boundary(begin);
         }
         sentence_len
     }

@@ -16,6 +16,7 @@ const STALE_LEFTOVER_AGE: Duration = Duration::from_secs(3600);
 const XZ_SUFFIX: &str = ".xz";
 const RUNTIME_SUFFIX: &str = ".mrd";
 const LEGACY_MARKER_SUFFIX: &str = ".src";
+const BAD_SUFFIX: &str = "bad";
 const LOCK_SUFFIX: &str = ".lock";
 const VERSION_MARK: &str = ".v";
 
@@ -28,6 +29,7 @@ pub(crate) enum Expansion {
 pub(crate) struct Cache {
     pub(crate) path: PathBuf,
     pub(crate) expansion: Expansion,
+    judged: Option<Fingerprint>,
 }
 
 pub(crate) fn is_xz(path: &Path) -> bool {
@@ -195,27 +197,72 @@ fn remove_legacy_cache(xz: &Path) {
     }
 }
 
-pub(crate) fn ensure(xz: &Path) -> Result<Cache, Error> {
-    let identity = identify(xz)?;
-    let base = base_name(xz);
-    let path = xz.with_file_name(cache_name(&base, identity));
-    remove_leftovers(&path, &base);
-    remove_legacy_cache(xz);
-    let expansion = if path.is_file() {
-        Expansion::Reused
-    } else {
-        expand_exclusively(xz, &path)?
-    };
-    Ok(Cache { path, expansion })
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Fingerprint {
+    length: u64,
+    modified: SystemTime,
 }
 
-pub(crate) fn discard_damaged(cache: &Path) -> Result<(), Error> {
-    match fs::remove_file(cache) {
-        Err(source) if source.kind() != io::ErrorKind::NotFound => {
-            Err(Error::io(IoAction::Remove, cache, source))
-        }
-        _ => Ok(()),
+fn fingerprint(path: &Path) -> Option<Fingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(Fingerprint {
+        length: metadata.len(),
+        modified: metadata.modified().ok()?,
+    })
+}
+
+fn cache_at(path: PathBuf, expansion: Expansion) -> Cache {
+    let judged = fingerprint(&path);
+    Cache {
+        path,
+        expansion,
+        judged,
     }
+}
+
+pub(crate) fn ensure(xz: &Path) -> Result<Cache, Error> {
+    let identity = identify(xz)?;
+    let path = xz.with_file_name(cache_name(&base_name(xz), identity));
+    if path.is_file() {
+        return Ok(cache_at(path, Expansion::Reused));
+    }
+    let _held = lock_exclusively(&lock_path(&path))?;
+    let expansion = expand_holding_lock(xz, &path)?;
+    if expansion == Expansion::Expanded {
+        clean_around(xz, &path);
+    }
+    Ok(cache_at(path, expansion))
+}
+
+pub(crate) fn replace_damaged(xz: &Path, damaged: &Cache) -> Result<Cache, Error> {
+    let _held = lock_exclusively(&lock_path(&damaged.path))?;
+    let still_the_judged_file =
+        damaged.judged.is_some() && fingerprint(&damaged.path) == damaged.judged;
+    if still_the_judged_file {
+        quarantine(&damaged.path)?;
+    }
+    let expansion = expand_holding_lock(xz, &damaged.path)?;
+    if expansion == Expansion::Expanded {
+        clean_around(xz, &damaged.path);
+    }
+    Ok(cache_at(damaged.path.clone(), expansion))
+}
+
+fn quarantine(cache: &Path) -> Result<(), Error> {
+    let quarantined = temporary_path(cache, BAD_SUFFIX);
+    match fs::rename(cache, &quarantined) {
+        Ok(()) => {
+            let _ = fs::remove_file(&quarantined);
+            Ok(())
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(Error::io(IoAction::Rename, cache, source)),
+    }
+}
+
+fn clean_around(xz: &Path, cache: &Path) {
+    remove_leftovers(cache, &base_name(xz));
+    remove_legacy_cache(xz);
 }
 
 fn lock_path(cache: &Path) -> PathBuf {
@@ -235,34 +282,11 @@ fn lock_exclusively(lock: &Path) -> Result<File, Error> {
     Ok(file)
 }
 
-fn expand_exclusively(xz: &Path, cache: &Path) -> Result<Expansion, Error> {
-    let _held = lock_exclusively(&lock_path(cache))?;
-    expand_holding_lock(xz, cache)
-}
-
 fn expand_holding_lock(xz: &Path, cache: &Path) -> Result<Expansion, Error> {
     if cache.is_file() {
         return Ok(Expansion::Reused);
     }
-    let temporary = temporary_path(cache, "mrd");
-    let installed = expand(xz, &temporary)
-        .and_then(|()| flush_to_disk(&temporary))
-        .and_then(|()| fs::rename(&temporary, cache).map_err(io_error(IoAction::Rename, cache)));
-    match installed {
-        Ok(()) => Ok(Expansion::Expanded),
-        Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            Err(error)
-        }
-    }
-}
-
-fn flush_to_disk(file: &Path) -> Result<(), Error> {
-    let handle = OpenOptions::new()
-        .write(true)
-        .open(file)
-        .map_err(io_error(IoAction::Open, file))?;
-    handle.sync_all().map_err(io_error(IoAction::Sync, file))
+    expand(xz, cache).map(|()| Expansion::Expanded)
 }
 
 #[cfg(feature = "xz")]

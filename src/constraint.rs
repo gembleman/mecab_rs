@@ -108,9 +108,12 @@ impl<'t> Constraints<'t> {
     }
 }
 
+const RETAINED_MIN_ENTRIES: usize = 4096;
+
 #[derive(Default)]
 pub(crate) struct ConstraintSet {
     boundary: Vec<Boundary>,
+    next_boundary: Vec<u32>,
     feature_at: Vec<Option<u32>>,
     spans: Vec<(usize, usize)>,
     bytes: String,
@@ -120,6 +123,8 @@ pub(crate) struct ConstraintSet {
 impl ConstraintSet {
     pub(crate) fn load(&mut self, text_len: usize, constraints: &[Constraint<'_>]) {
         self.boundary.clear();
+        self.next_boundary.clear();
+        self.shrink_oversized(text_len);
         self.feature_at.clear();
         self.spans.clear();
         self.bytes.clear();
@@ -146,6 +151,30 @@ impl ConstraintSet {
         if self.is_active() {
             self.set_boundary(text_len, 0, Boundary::Token);
             self.set_boundary(text_len, text_len, Boundary::Token);
+            self.fill_next_boundary(text_len);
+        }
+    }
+
+    pub(crate) fn next_token_boundary(&self, begin: usize) -> usize {
+        self.next_boundary[begin] as usize
+    }
+
+    fn fill_next_boundary(&mut self, text_len: usize) {
+        debug_assert!(u32::try_from(text_len).is_ok());
+        self.next_boundary.resize(text_len + 1, 0);
+        let mut next = text_len as u32;
+        for position in (0..=text_len).rev() {
+            self.next_boundary[position] = next;
+            if self.boundary[position] == Boundary::Token {
+                next = position as u32;
+            }
+        }
+    }
+
+    fn shrink_oversized(&mut self, text_len: usize) {
+        let keep = RETAINED_MIN_ENTRIES.max(text_len.saturating_add(1));
+        if self.next_boundary.capacity() > keep {
+            self.next_boundary.shrink_to(keep);
         }
     }
 

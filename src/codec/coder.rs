@@ -26,6 +26,8 @@ pub(crate) struct Coder<'a> {
     unit: u32,
     input: &'a [u8],
     pos: usize,
+    symbol_budget: u64,
+    over_budget: bool,
     pub bits: f64,
     track: bool,
 }
@@ -43,6 +45,8 @@ impl<'a> Coder<'a> {
             unit: 0,
             input: &[],
             pos: 0,
+            symbol_budget: u64::MAX,
+            over_budget: false,
             bits: 0.0,
             track: false,
         }
@@ -81,8 +85,23 @@ impl<'a> Coder<'a> {
         b
     }
 
+    pub(crate) fn limit_symbols(&mut self, budget: u64) {
+        self.symbol_budget = budget;
+    }
+
+    #[inline]
+    pub(crate) fn spend_symbol(&mut self) -> bool {
+        if let Some(left) = self.symbol_budget.checked_sub(1) {
+            self.symbol_budget = left;
+            true
+        } else {
+            self.over_budget = true;
+            false
+        }
+    }
+
     pub(crate) fn overrun(&self) -> bool {
-        self.pos > self.input.len() + 8
+        self.over_budget || self.pos > self.input.len() + 8
     }
 
     fn shift_low(&mut self) {

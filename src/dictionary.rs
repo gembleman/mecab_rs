@@ -89,8 +89,7 @@ impl Dictionary {
         match PackedDictionary::open(&cache.path) {
             Ok(packed) => Self::open_packed(&cache.path, packed, user_dictionaries),
             Err(Error::Format { .. }) if cache.expansion == Expansion::Reused => {
-                expand_cache::discard_damaged(&cache.path)?;
-                let cache = expand_cache::ensure(path)?;
+                let cache = expand_cache::replace_damaged(path, &cache)?;
                 let packed = PackedDictionary::open(&cache.path)?;
                 Self::open_packed(&cache.path, packed, user_dictionaries)
             }

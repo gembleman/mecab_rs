@@ -95,7 +95,7 @@ impl CharModel {
                 wanted.next().unwrap_or(END)
             };
             let got = self.code_sym(coder, &hist, want);
-            if got == END || coder.overrun() {
+            if got == END || coder.overrun() || !coder.spend_symbol() {
                 break;
             }
             emit(got);

@@ -27,6 +27,8 @@ pub(crate) use table::Lexicon;
 const MAX_KEY_COUNT: usize = 1 << 31;
 const PREALLOC_KEY_LIMIT: usize = 1 << 24;
 const IRREGULAR_CHAR_ORDER: usize = 2;
+const SYMBOLS_PER_TEXT_BYTE: u64 = 2;
+const SYMBOL_SLACK: u64 = 1 << 16;
 
 #[derive(Clone, Default)]
 pub(crate) struct EncodeOptions {
@@ -323,6 +325,11 @@ fn decode_coded(
     plan: &Plan,
 ) -> Result<Lexicon, Undecodable> {
     let mut coder = Coder::decoder(&data[h.payload..]);
+    coder.limit_symbols(
+        h.text_len
+            .saturating_mul(SYMBOLS_PER_TEXT_BYTE)
+            .saturating_add(SYMBOL_SLACK),
+    );
     let n_cols = plan.n_cols;
     let mut lex = Lexicon::new(n_cols);
     lex.no_final_newline = h.no_final_newline;
