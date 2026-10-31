@@ -56,6 +56,12 @@ pub(super) struct Found {
     pub(super) feature: FeatureSource,
 }
 
+struct Span {
+    begin: usize,
+    begin2: usize,
+    cinfo: u32,
+}
+
 struct Seek {
     at: usize,
     stop_info: u32,
@@ -162,38 +168,51 @@ impl Tokenizer {
         } else {
             end
         };
-        let Seek {
-            at: begin2,
-            stop_info: cinfo,
-            stop_width,
-            ..
-        } = self.seek_to_other_type(text, begin, end, self.space);
+        let seek = self.seek_to_other_type(text, begin, end, self.space);
+        let span = Span {
+            begin,
+            begin2: seek.at,
+            cinfo: seek.stop_info,
+        };
+        self.add_known(found, text, &span, end);
+        if !found.is_empty() && !invoke(span.cinfo) {
+            return;
+        }
+        self.add_unknown_candidates(found, text, &span, seek.at + seek.stop_width, end);
+    }
 
+    fn add_known(&mut self, found: &mut Vec<Found>, text: &[u8], span: &Span, end: usize) {
         self.system
-            .common_prefix_search(&text[begin2..end], &mut self.hits);
+            .common_prefix_search(&text[span.begin2..end], &mut self.hits);
         for hit in &self.hits {
             for index in hit.tokens() {
                 let token = self.system.token(index);
                 found.push(Found {
-                    position: begin2,
+                    position: span.begin2,
                     length: hit.length(),
-                    rlength: begin2 - begin + hit.length(),
+                    rlength: span.begin2 - span.begin + hit.length(),
                     kind: NORMAL,
-                    char_type: default_type(cinfo) as u8,
+                    char_type: default_type(span.cinfo) as u8,
                     feature: FeatureSource::System(token.feature),
                 });
             }
         }
+    }
 
-        if !found.is_empty() && !invoke(cinfo) {
-            return;
-        }
-
-        let mut begin3 = begin2 + stop_width;
+    fn add_unknown_candidates(
+        &self,
+        found: &mut Vec<Found>,
+        text: &[u8],
+        span: &Span,
+        first_end: usize,
+        end: usize,
+    ) {
+        let cinfo = span.cinfo;
+        let mut begin3 = first_end;
         let mut group_begin3 = None;
 
         if begin3 > end {
-            self.add_unknown(found, cinfo, begin, begin2, begin3);
+            self.add_unknown(found, span, begin3);
             if !found.is_empty() {
                 return;
             }
@@ -204,7 +223,7 @@ impl Tokenizer {
             let grouped = self.seek_to_other_type(text, begin3, end, cinfo);
             begin3 = grouped.at;
             if grouped.chars_passed <= self.max_grouping_size {
-                self.add_unknown(found, cinfo, begin, begin2, begin3);
+                self.add_unknown(found, span, begin3);
             }
             group_begin3 = Some(begin3);
             begin3 = tmp;
@@ -217,7 +236,7 @@ impl Tokenizer {
             if Some(begin3) == group_begin3 {
                 continue;
             }
-            self.add_unknown(found, cinfo, begin, begin2, begin3);
+            self.add_unknown(found, span, begin3);
             let (info, width) = self.chars.char_info(text, begin3, end);
             if !is_kind_of(cinfo, info) {
                 break;
@@ -226,26 +245,19 @@ impl Tokenizer {
         }
 
         if found.is_empty() {
-            self.add_unknown(found, cinfo, begin, begin2, begin3);
+            self.add_unknown(found, span, begin3);
         }
     }
 
-    fn add_unknown(
-        &self,
-        found: &mut Vec<Found>,
-        cinfo: u32,
-        begin: usize,
-        begin2: usize,
-        begin3: usize,
-    ) {
-        let category = default_type(cinfo);
+    fn add_unknown(&self, found: &mut Vec<Found>, span: &Span, begin3: usize) {
+        let category = default_type(span.cinfo);
         let tokens = self.unknown_tokens.get(category).cloned().unwrap_or(0..0);
         for index in tokens {
             let token = self.unknown.token(index);
             found.push(Found {
-                position: begin2,
-                length: (begin3 - begin2) & U16_MASK,
-                rlength: (begin3 - begin) & U16_MASK,
+                position: span.begin2,
+                length: (begin3 - span.begin2) & U16_MASK,
+                rlength: (begin3 - span.begin) & U16_MASK,
                 kind: UNKNOWN,
                 char_type: category as u8,
                 feature: if self.unknown_feature.is_some() {

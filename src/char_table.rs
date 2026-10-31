@@ -115,80 +115,136 @@ struct CharDef {
     ranges: Vec<DefRange>,
 }
 
-fn parse_char_def(bytes: &[u8], file: &Path) -> Result<CharDef, Error> {
-    let fail = |line: usize, reason: String| Error::CharDef {
-        file: file.to_path_buf(),
-        line,
-        reason,
-    };
-    let mut categories: HashMap<&[u8], (u32, u32, u32, u32)> = HashMap::new();
-    let mut names: Vec<Vec<u8>> = Vec::new();
-    let mut ranges = Vec::new();
-    for (index, raw) in bytes.split(|&byte| byte == b'\n').enumerate() {
-        let number = index + 1;
+#[derive(Clone, Copy)]
+struct Category {
+    id: u32,
+    invoke: u32,
+    group: u32,
+    length: u32,
+}
+
+struct CharDefParser<'a> {
+    file: &'a Path,
+    categories: HashMap<&'a [u8], Category>,
+    names: Vec<Vec<u8>>,
+    ranges: Vec<DefRange>,
+}
+
+impl<'a> CharDefParser<'a> {
+    fn new(file: &'a Path) -> Self {
+        Self {
+            file,
+            categories: HashMap::new(),
+            names: Vec::new(),
+            ranges: Vec::new(),
+        }
+    }
+
+    fn fail(&self, line: usize, reason: impl Into<String>) -> Error {
+        Error::CharDef {
+            file: self.file.to_path_buf(),
+            line,
+            reason: reason.into(),
+        }
+    }
+
+    fn read_line(&mut self, number: usize, raw: &'a [u8]) -> Result<(), Error> {
         let line = raw.strip_suffix(b"\r").unwrap_or(raw);
         if line.is_empty() || line[0] == b'#' {
-            continue;
+            return Ok(());
         }
         let columns: Vec<&[u8]> = line
             .split(|&byte| byte == b'\t' || byte == b' ')
             .filter(|column| !column.is_empty())
             .collect();
         if columns.len() < 2 {
-            return Err(fail(number, "format error".into()));
+            return Err(self.fail(number, "format error"));
         }
         if columns[0].starts_with(b"0x") {
-            let (low, high) = match columns[0].windows(2).position(|pair| pair == b"..") {
-                Some(at) => (&columns[0][..at], &columns[0][at + 2..]),
-                None => (columns[0], columns[0]),
-            };
-            let low = atohex(low).map_err(|reason| fail(number, reason.into()))?;
-            let high = atohex(high).map_err(|reason| fail(number, reason.into()))?;
-            if low > high {
-                return Err(fail(number, format!("range error: low={low} high={high}")));
-            }
-            let mut chosen = Vec::new();
-            for &column in columns[1..].iter().take_while(|column| column[0] != b'#') {
-                let Some(&category) = categories.get(column) else {
-                    let name = String::from_utf8_lossy(column);
-                    return Err(fail(number, format!("category [{name}] is undefined")));
-                };
-                chosen.push(category);
-            }
-            let Some(&(id, invoke, group, length)) = chosen.first() else {
-                return Err(fail(number, "category size is empty".into()));
-            };
-            let type_mask = chosen
-                .iter()
-                .fold(0u32, |mask, category| mask.wrapping_add(1 << category.0));
-            ranges.push(DefRange {
-                low,
-                high,
-                info: pack_char_info(type_mask, id, length, group, invoke),
-            });
+            self.read_range(number, &columns)
         } else {
-            if columns.len() < 4 {
-                return Err(fail(number, "format error".into()));
-            }
-            if categories.contains_key(columns[0]) {
-                return Err(fail(number, "category is already defined".into()));
-            }
-            let id = names.len() as u32;
-            let (invoke, group, length) = (atoi(columns[1]), atoi(columns[2]), atoi(columns[3]));
-            categories.insert(columns[0], (id, invoke, group, length));
-            names.push(columns[0].to_vec());
+            self.read_category(number, &columns)
         }
     }
-    if names.len() >= MAX_CATEGORIES {
-        return Err(fail(0, "too many categories(>= 18)".into()));
-    }
-    for required in [&b"DEFAULT"[..], b"SPACE"] {
-        if !categories.contains_key(required) {
-            let name = String::from_utf8_lossy(required);
-            return Err(fail(0, format!("category [{name}] is undefined")));
+
+    fn read_range(&mut self, number: usize, columns: &[&[u8]]) -> Result<(), Error> {
+        let (low, high) = match columns[0].windows(2).position(|pair| pair == b"..") {
+            Some(at) => (&columns[0][..at], &columns[0][at + 2..]),
+            None => (columns[0], columns[0]),
+        };
+        let low = atohex(low).map_err(|reason| self.fail(number, reason))?;
+        let high = atohex(high).map_err(|reason| self.fail(number, reason))?;
+        if low > high {
+            return Err(self.fail(number, format!("range error: low={low} high={high}")));
         }
+        let chosen = self.chosen_categories(number, &columns[1..])?;
+        let Some(first) = chosen.first() else {
+            return Err(self.fail(number, "category size is empty"));
+        };
+        let type_mask = chosen
+            .iter()
+            .fold(0u32, |mask, category| mask.wrapping_add(1 << category.id));
+        self.ranges.push(DefRange {
+            low,
+            high,
+            info: pack_char_info(type_mask, first.id, first.length, first.group, first.invoke),
+        });
+        Ok(())
     }
-    Ok(CharDef { names, ranges })
+
+    fn chosen_categories(&self, number: usize, columns: &[&[u8]]) -> Result<Vec<Category>, Error> {
+        let mut chosen = Vec::new();
+        for &column in columns.iter().take_while(|column| column[0] != b'#') {
+            let Some(&category) = self.categories.get(column) else {
+                let name = String::from_utf8_lossy(column);
+                return Err(self.fail(number, format!("category [{name}] is undefined")));
+            };
+            chosen.push(category);
+        }
+        Ok(chosen)
+    }
+
+    fn read_category(&mut self, number: usize, columns: &[&'a [u8]]) -> Result<(), Error> {
+        if columns.len() < 4 {
+            return Err(self.fail(number, "format error"));
+        }
+        if self.categories.contains_key(columns[0]) {
+            return Err(self.fail(number, "category is already defined"));
+        }
+        let category = Category {
+            id: self.names.len() as u32,
+            invoke: atoi(columns[1]),
+            group: atoi(columns[2]),
+            length: atoi(columns[3]),
+        };
+        self.categories.insert(columns[0], category);
+        self.names.push(columns[0].to_vec());
+        Ok(())
+    }
+
+    fn finish(self) -> Result<CharDef, Error> {
+        if self.names.len() >= MAX_CATEGORIES {
+            return Err(self.fail(0, "too many categories(>= 18)"));
+        }
+        for required in [&b"DEFAULT"[..], b"SPACE"] {
+            if !self.categories.contains_key(required) {
+                let name = String::from_utf8_lossy(required);
+                return Err(self.fail(0, format!("category [{name}] is undefined")));
+            }
+        }
+        Ok(CharDef {
+            names: self.names,
+            ranges: self.ranges,
+        })
+    }
+}
+
+fn parse_char_def(bytes: &[u8], file: &Path) -> Result<CharDef, Error> {
+    let mut parser = CharDefParser::new(file);
+    for (index, raw) in bytes.split(|&byte| byte == b'\n').enumerate() {
+        parser.read_line(index + 1, raw)?;
+    }
+    parser.finish()
 }
 
 struct Interner {
@@ -209,89 +265,123 @@ impl Interner {
     }
 }
 
+fn read_names(bin: &[u8], bin_path: &Path) -> Result<(Vec<Vec<u8>>, usize), Error> {
+    let broken = |reason| Error::format(bin_path, reason);
+    let Some(&count) = bin.first_chunk() else {
+        return Err(broken("the file is shorter than its header"));
+    };
+    let categories = u32::from_le_bytes(count) as usize;
+    let table_start = categories
+        .checked_mul(CATEGORY_NAME_BYTES)
+        .and_then(|names| names.checked_add(CHAR_BIN_COUNT_BYTES))
+        .ok_or_else(|| broken("the file size does not match the header"))?;
+    if table_start.checked_add(CHAR_BIN_ENTRY_BYTES * CHAR_BIN_ENTRIES) != Some(bin.len()) {
+        return Err(broken("the file size does not match the header"));
+    }
+    if categories == 0 {
+        return Err(broken("the file has no character categories"));
+    }
+    let names: Vec<Vec<u8>> = bin[CHAR_BIN_COUNT_BYTES..table_start]
+        .as_chunks::<CATEGORY_NAME_BYTES>()
+        .0
+        .iter()
+        .map(|name| {
+            let length = name.iter().position(|&byte| byte == 0);
+            name[..length.unwrap_or(CATEGORY_NAME_BYTES)].to_vec()
+        })
+        .collect();
+    if names.iter().any(|name| name.len() >= CATEGORY_NAME_BYTES) {
+        return Err(broken("a category name has no terminating NUL"));
+    }
+    Ok((names, table_start))
+}
+
+fn fill_bin_table(
+    entries: &[u8],
+    interner: &mut Interner,
+    bin_path: &Path,
+) -> Result<Vec<u8>, Error> {
+    let mut table = vec![0u8; CODE_POINTS];
+    for (code, &entry) in entries
+        .as_chunks::<CHAR_BIN_ENTRY_BYTES>()
+        .0
+        .iter()
+        .enumerate()
+    {
+        let info = u32::from_le_bytes(entry);
+        table[code] = interner.intern(Entry { info, flags: 0 }, bin_path)?;
+    }
+    table[CHAR_BIN_ENTRIES] = interner.intern(Entry { info: 0, flags: 0 }, bin_path)?;
+    Ok(table)
+}
+
+fn fill_unicode_defaults(table: &mut [u8]) {
+    let default = table[DEFAULT_CODE];
+    table[BMP_LEN..].fill(default);
+    let ideograph = table[IDEOGRAPH_CODE];
+    table[IDEOGRAPHIC_PLANES].fill(ideograph);
+    let compatibility = table[COMPATIBILITY_IDEOGRAPH_CODE];
+    table[COMPATIBILITY_IDEOGRAPHS_SUPPLEMENT].fill(compatibility);
+    for code in KANA_BLOCKS {
+        let is_katakana = KATAKANA_RANGES.iter().any(|range| range.contains(&code));
+        table[code] = table[if is_katakana {
+            KATAKANA_CODE
+        } else {
+            HIRAGANA_CODE
+        }];
+    }
+}
+
+fn apply_char_def(
+    table: &mut [u8],
+    interner: &mut Interner,
+    names: &[Vec<u8>],
+    (bytes, def_path): (&[u8], &Path),
+    bin_path: &Path,
+) -> Result<(), Error> {
+    let def = parse_char_def(bytes, def_path)?;
+    if def.names != names {
+        return Err(Error::format(
+            def_path,
+            "the categories differ from those of char.bin",
+        ));
+    }
+    for range in &def.ranges {
+        let entry = Entry {
+            info: range.info,
+            flags: 0,
+        };
+        let entry = interner.intern(entry, bin_path)?;
+        let low = (range.low as usize).max(BMP_LEN);
+        if low <= range.high as usize {
+            table[low..=range.high as usize].fill(entry);
+        }
+    }
+    Ok(())
+}
+
+fn mark_extenders(table: &mut [u8], interner: &mut Interner, bin_path: &Path) -> Result<(), Error> {
+    for code in EXTENDER_RANGES.into_iter().flatten() {
+        let mut entry = interner.palette[usize::from(table[code])];
+        entry.flags |= EXTENDER_FLAG;
+        table[code] = interner.intern(entry, bin_path)?;
+    }
+    Ok(())
+}
+
 impl CharTable {
     fn build(bin: &[u8], bin_path: &Path, def: Option<(&[u8], &Path)>) -> Result<Self, Error> {
-        let broken = |reason| Error::format(bin_path, reason);
-        let Some(&count) = bin.first_chunk() else {
-            return Err(broken("the file is shorter than its header"));
-        };
-        let categories = u32::from_le_bytes(count) as usize;
-        let table_start = categories
-            .checked_mul(CATEGORY_NAME_BYTES)
-            .and_then(|names| names.checked_add(CHAR_BIN_COUNT_BYTES))
-            .ok_or_else(|| broken("the file size does not match the header"))?;
-        if table_start.checked_add(CHAR_BIN_ENTRY_BYTES * CHAR_BIN_ENTRIES) != Some(bin.len()) {
-            return Err(broken("the file size does not match the header"));
-        }
-        if categories == 0 {
-            return Err(broken("the file has no character categories"));
-        }
-        let names: Vec<Vec<u8>> = bin[CHAR_BIN_COUNT_BYTES..table_start]
-            .as_chunks::<CATEGORY_NAME_BYTES>()
-            .0
-            .iter()
-            .map(|name| {
-                let length = name.iter().position(|&byte| byte == 0);
-                name[..length.unwrap_or(CATEGORY_NAME_BYTES)].to_vec()
-            })
-            .collect();
-        if names.iter().any(|name| name.len() >= CATEGORY_NAME_BYTES) {
-            return Err(broken("a category name has no terminating NUL"));
-        }
+        let (names, table_start) = read_names(bin, bin_path)?;
         let mut interner = Interner {
             palette: Vec::new(),
             index: HashMap::new(),
         };
-        let mut table = vec![0u8; CODE_POINTS];
-        for (code, &entry) in bin[table_start..]
-            .as_chunks::<CHAR_BIN_ENTRY_BYTES>()
-            .0
-            .iter()
-            .enumerate()
-        {
-            let info = u32::from_le_bytes(entry);
-            table[code] = interner.intern(Entry { info, flags: 0 }, bin_path)?;
+        let mut table = fill_bin_table(&bin[table_start..], &mut interner, bin_path)?;
+        fill_unicode_defaults(&mut table);
+        if let Some(def) = def {
+            apply_char_def(&mut table, &mut interner, &names, def, bin_path)?;
         }
-        table[CHAR_BIN_ENTRIES] = interner.intern(Entry { info: 0, flags: 0 }, bin_path)?;
-        let default = table[DEFAULT_CODE];
-        table[BMP_LEN..].fill(default);
-        let ideograph = table[IDEOGRAPH_CODE];
-        table[IDEOGRAPHIC_PLANES].fill(ideograph);
-        let compatibility = table[COMPATIBILITY_IDEOGRAPH_CODE];
-        table[COMPATIBILITY_IDEOGRAPHS_SUPPLEMENT].fill(compatibility);
-        for code in KANA_BLOCKS {
-            let is_katakana = KATAKANA_RANGES.iter().any(|range| range.contains(&code));
-            table[code] = table[if is_katakana {
-                KATAKANA_CODE
-            } else {
-                HIRAGANA_CODE
-            }];
-        }
-        if let Some((bytes, def_path)) = def {
-            let def = parse_char_def(bytes, def_path)?;
-            if def.names != names {
-                return Err(Error::format(
-                    def_path,
-                    "the categories differ from those of char.bin",
-                ));
-            }
-            for range in &def.ranges {
-                let entry = Entry {
-                    info: range.info,
-                    flags: 0,
-                };
-                let entry = interner.intern(entry, bin_path)?;
-                let low = (range.low as usize).max(BMP_LEN);
-                if low <= range.high as usize {
-                    table[low..=range.high as usize].fill(entry);
-                }
-            }
-        }
-        for code in EXTENDER_RANGES.into_iter().flatten() {
-            let mut entry = interner.palette[usize::from(table[code])];
-            entry.flags |= EXTENDER_FLAG;
-            table[code] = interner.intern(entry, bin_path)?;
-        }
+        mark_extenders(&mut table, &mut interner, bin_path)?;
         Ok(Self {
             names,
             palette: interner.palette,

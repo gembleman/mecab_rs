@@ -11,7 +11,6 @@ mod eval;
 mod features;
 mod lattice;
 mod lbfgs;
-pub mod options;
 mod tokenizer;
 mod trainer;
 

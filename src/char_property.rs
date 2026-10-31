@@ -62,15 +62,39 @@ struct Class {
 }
 
 #[derive(Clone, Copy, Default)]
+struct Chain {
+    end: u32,
+    count: u32,
+    last: u32,
+}
+
+impl Chain {
+    #[inline(always)]
+    fn extended(self) -> Self {
+        Self {
+            count: self.count + 1,
+            ..self
+        }
+    }
+
+    #[inline(always)]
+    fn starting_at(position: usize, next: usize) -> Self {
+        Self {
+            end: next as u32,
+            count: 1,
+            last: position as u32,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
 struct Entry {
     info: CharInfo,
     extender: bool,
-    single: u8,
+    scalar_len: u8,
     trie_code: u16,
-    width: u32,
-    chain_end: u32,
-    chain_count: u32,
-    chain_last: u32,
+    cluster_width: u32,
+    chain: Chain,
 }
 
 const ENTRY_BYTES: usize = 24;
@@ -98,8 +122,8 @@ impl SentenceChars {
         }
         self.entries[length] = Entry {
             info: chars.class_of_table_code(table, 0).info,
-            single: 1,
-            width: 1,
+            scalar_len: 1,
+            cluster_width: 1,
             ..Entry::default()
         };
         debug_assert!(std::str::from_utf8(text).is_ok());
@@ -111,32 +135,29 @@ impl SentenceChars {
                 }
                 continue;
             }
-            let (code, single) = decode_utf8(text, position, length - position);
+            let (code, scalar_len) = decode_utf8(text, position, length - position);
             let class = chars.class_of_table_code(table, code);
-            let following = *self.entry(position + single);
-            let width = single as u32
+            let following = *self.entry(position + scalar_len);
+            let cluster_width = scalar_len as u32
                 + if following.extender {
-                    following.width
+                    following.cluster_width
                 } else {
                     0
                 };
-            let next = position + width as usize;
+            let next = position + cluster_width as usize;
             let after = *self.entry(next);
-            let (chain_end, chain_count, chain_last) =
-                if next < length && class.info.is_kind_of(after.info) {
-                    (after.chain_end, after.chain_count + 1, after.chain_last)
-                } else {
-                    (next as u32, 1, position as u32)
-                };
+            let chain = if next < length && class.info.is_kind_of(after.info) {
+                after.chain.extended()
+            } else {
+                Chain::starting_at(position, next)
+            };
             self.entries[position] = Entry {
                 info: class.info,
                 extender: class.extender,
-                single: single as u8,
+                scalar_len: scalar_len as u8,
                 trie_code: trie_code_of(code),
-                width,
-                chain_end,
-                chain_count,
-                chain_last,
+                cluster_width,
+                chain,
             };
         }
     }
@@ -144,14 +165,14 @@ impl SentenceChars {
     #[inline]
     fn entry(&self, position: usize) -> &Entry {
         let entry = &self.entries[position];
-        debug_assert!(entry.single != 0, "entry read at a continuation byte");
+        debug_assert!(entry.scalar_len != 0, "entry read at a continuation byte");
         entry
     }
 
     #[inline]
     pub(crate) fn trie_step(&self, position: usize) -> (u16, usize) {
         let entry = self.entry(position);
-        (entry.trie_code, usize::from(entry.single))
+        (entry.trie_code, usize::from(entry.scalar_len))
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -160,7 +181,7 @@ impl SentenceChars {
 
     pub(crate) fn char_info(&self, position: usize) -> (CharInfo, usize) {
         let entry = self.entry(position);
-        (entry.info, entry.width as usize)
+        (entry.info, entry.cluster_width as usize)
     }
 
     pub(crate) fn seek_other_type(&self, begin: usize, start: CharInfo) -> (usize, Scan) {
@@ -172,21 +193,21 @@ impl SentenceChars {
         if !start.is_kind_of(entry.info) {
             let scan = Scan {
                 info: entry.info,
-                width: entry.width as usize,
+                width: entry.cluster_width as usize,
                 count: 0,
             };
             return (begin, scan);
         }
-        let chain_end = entry.chain_end as usize;
+        let chain_end = entry.chain.end as usize;
         let described = self.entry(if chain_end < length {
             chain_end
         } else {
-            entry.chain_last as usize
+            entry.chain.last as usize
         });
         let scan = Scan {
             info: described.info,
-            width: described.width as usize,
-            count: entry.chain_count as usize,
+            width: described.cluster_width as usize,
+            count: entry.chain.count as usize,
         };
         (chain_end, scan)
     }
@@ -199,11 +220,11 @@ impl SentenceChars {
         while position < length {
             let entry = self.entry(position);
             scan.info = entry.info;
-            scan.width = entry.width as usize;
+            scan.width = entry.cluster_width as usize;
             if !current.is_kind_of(entry.info) {
                 break;
             }
-            position += usize::from(entry.single);
+            position += usize::from(entry.scalar_len);
             scan.count += 1;
             current = entry.info;
         }

@@ -19,6 +19,12 @@ struct TrieNode {
     end_key: usize,
 }
 
+struct BaseSearch {
+    begin: usize,
+    candidate_cell: usize,
+    taken_cells_skipped: usize,
+}
+
 struct Builder<'a> {
     array: Vec<Unit>,
     begin_taken: Vec<u8>,
@@ -70,10 +76,22 @@ impl Builder<'_> {
         siblings
     }
 
-    fn place_siblings(&mut self, siblings: &[TrieNode]) -> usize {
+    fn grow_for_base(&mut self, begin: usize, last_label: usize) {
+        if self.array.len() <= begin + last_label {
+            let length = self.array.len();
+            let factor = if self.keys_placed == 0 {
+                MIN_GROWTH_FACTOR
+            } else {
+                (self.keys.len() as f64 / self.keys_placed as f64)
+                    .clamp(MIN_GROWTH_FACTOR, MAX_GROWTH_FACTOR)
+            };
+            self.grow_to(((length as f64 * factor) as usize).max(begin + last_label + 1));
+        }
+    }
+
+    fn find_base(&mut self, siblings: &[TrieNode]) -> BaseSearch {
         let first_label = siblings[0].label as usize;
         let last_label = siblings[siblings.len() - 1].label as usize;
-        let mut begin;
         let mut candidate_cell = (first_label + 1).max(self.next_check_pos) - 1;
         let mut taken_cells_skipped = 0usize;
         let mut found_first_free = false;
@@ -89,17 +107,8 @@ impl Builder<'_> {
                 self.next_check_pos = candidate_cell;
                 found_first_free = true;
             }
-            begin = candidate_cell - first_label;
-            if self.array.len() <= begin + last_label {
-                let length = self.array.len();
-                let factor = if self.keys_placed == 0 {
-                    MIN_GROWTH_FACTOR
-                } else {
-                    (self.keys.len() as f64 / self.keys_placed as f64)
-                        .clamp(MIN_GROWTH_FACTOR, MAX_GROWTH_FACTOR)
-                };
-                self.grow_to(((length as f64 * factor) as usize).max(begin + last_label + 1));
-            }
+            let begin = candidate_cell - first_label;
+            self.grow_for_base(begin, last_label);
             if self.begin_taken[begin] != 0 {
                 continue;
             }
@@ -108,21 +117,35 @@ impl Builder<'_> {
                     continue 'search;
                 }
             }
-            break;
+            return BaseSearch {
+                begin,
+                candidate_cell,
+                taken_cells_skipped,
+            };
         }
+    }
 
-        let scanned_since_first_free = candidate_cell
+    fn commit_base(&mut self, siblings: &[TrieNode], search: &BaseSearch) {
+        let begin = search.begin;
+        let last_label = siblings[siblings.len() - 1].label as usize;
+        let scanned_since_first_free = search
+            .candidate_cell
             .wrapping_sub(self.next_check_pos)
             .wrapping_add(1);
-        if taken_cells_skipped as f64 / scanned_since_first_free as f64 >= DENSE_SCAN_RATIO {
-            self.next_check_pos = candidate_cell;
+        if search.taken_cells_skipped as f64 / scanned_since_first_free as f64 >= DENSE_SCAN_RATIO {
+            self.next_check_pos = search.candidate_cell;
         }
-
         self.begin_taken[begin] = 1;
         self.used_units = self.used_units.max(begin + last_label + 1);
         for sibling in siblings {
             self.array[begin + sibling.label as usize].check = begin as u32;
         }
+    }
+
+    fn place_siblings(&mut self, siblings: &[TrieNode]) -> usize {
+        let search = self.find_base(siblings);
+        self.commit_base(siblings, &search);
+        let begin = search.begin;
         for sibling in siblings {
             let children = self.children_of(sibling);
             let cell = begin + sibling.label as usize;

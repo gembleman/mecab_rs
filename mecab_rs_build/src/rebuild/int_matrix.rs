@@ -1,6 +1,6 @@
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::thread;
 
 use crate::connection_templates::{ConnectionTemplates, ExactRows};
@@ -116,12 +116,12 @@ pub fn find_exceptions(
                 }
                 found
                     .lock()
-                    .expect("an exception worker panicked")
+                    .unwrap_or_else(PoisonError::into_inner)
                     .extend(local);
             });
         }
     });
-    let mut found = found.into_inner().expect("an exception worker panicked");
+    let mut found = found.into_inner().unwrap_or_else(PoisonError::into_inner);
     found.sort_unstable_by_key(|&(cell, _)| cell);
     Ok(found)
 }

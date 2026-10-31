@@ -113,37 +113,24 @@ impl Dictionary {
         user_dictionaries: &[P],
     ) -> Result<Self, Error> {
         let packed = Arc::new(packed);
-        let matrix = match packed.templates_mapped() {
-            Some(templates) => Matrix::open_hot_bytes(path, packed.matrix_mapped(), templates)?,
-            None => Matrix::open_dense_bytes(path, packed.matrix_mapped())?,
-        };
+        let matrix = Self::open_matrix(path, &packed)?;
         let chars = CharProperty::open_bytes(path, packed.char_table_mapped())?;
-        let users = user_dictionaries
+        let users = Self::open_users(user_dictionaries)?;
+        let sizes = (matrix.left_size(), matrix.right_size());
+        let user_sizes = users
             .iter()
-            .map(|user| SystemDictionary::open(user.as_ref(), DictionaryKind::User))
-            .collect::<Result<Vec<_>, _>>()?;
-        let matches_matrix = |dictionary: &PackedDictionary| {
-            dictionary.left_size() == matrix.left_size()
-                && dictionary.right_size() == matrix.right_size()
-        };
-        if !matches_matrix(&packed)
-            || !users.iter().all(|user| {
-                user.left_size() == matrix.left_size() && user.right_size() == matrix.right_size()
-            })
+            .map(|user| (user.left_size(), user.right_size()));
+        let dictionary_sizes = std::iter::once((packed.left_size(), packed.right_size()));
+        if !dictionary_sizes
+            .chain(user_sizes)
+            .all(|found| found == sizes)
         {
             return Err(Error::format(
                 path,
                 "the matrix size does not match the packed dictionary or a user dictionary",
             ));
         }
-        let unknown_tokens = (0..packed.category_count())
-            .map(|category| {
-                packed
-                    .unknown_tokens(category)
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice()
-            })
-            .collect();
+        let unknown_tokens = Self::collect_unknown_tokens(&packed);
         let bos_feature = packed.bos_feature().to_owned();
         let unknown_feature = packed.unknown_feature().map(str::to_owned);
         Ok(Self {
@@ -157,5 +144,30 @@ impl Dictionary {
             unknown_feature,
             max_grouping_size: DEFAULT_MAX_GROUPING_SIZE,
         })
+    }
+
+    fn open_matrix(path: &Path, packed: &PackedDictionary) -> Result<Matrix, Error> {
+        match packed.templates_mapped() {
+            Some(templates) => Matrix::open_hot_bytes(path, packed.matrix_mapped(), templates),
+            None => Matrix::open_dense_bytes(path, packed.matrix_mapped()),
+        }
+    }
+
+    fn open_users<P: AsRef<Path>>(user_dictionaries: &[P]) -> Result<Vec<SystemDictionary>, Error> {
+        user_dictionaries
+            .iter()
+            .map(|user| SystemDictionary::open(user.as_ref(), DictionaryKind::User))
+            .collect()
+    }
+
+    fn collect_unknown_tokens(packed: &PackedDictionary) -> Vec<Box<[TokenRecord]>> {
+        (0..packed.category_count())
+            .map(|category| {
+                packed
+                    .unknown_tokens(category)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            })
+            .collect()
     }
 }

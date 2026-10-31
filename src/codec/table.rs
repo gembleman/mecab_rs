@@ -1,44 +1,55 @@
 use crate::wire::{FNV_OFFSET, fnv1a};
 use std::collections::HashMap;
 
+fn read_quoted_field(bytes: &[u8], mut i: usize, buf: &mut Vec<u8>) -> Option<usize> {
+    let start = buf.len();
+    i += 1;
+    loop {
+        let p = bytes[i..].iter().position(|&x| x == b'"')?;
+        buf.extend_from_slice(&bytes[i..i + p]);
+        i += p + 1;
+        if i < bytes.len() && bytes[i] == b'"' {
+            buf.push(b'"');
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if !buf[start..].iter().any(|&x| x == b',' || x == b'"') {
+        return None;
+    }
+    if i < bytes.len() && bytes[i] != b',' {
+        return None;
+    }
+    Some(i)
+}
+
+fn read_plain_field(bytes: &[u8], i: usize, buf: &mut Vec<u8>) -> Option<usize> {
+    let p = bytes[i..]
+        .iter()
+        .position(|&x| x == b',')
+        .unwrap_or(bytes.len() - i);
+    let field = &bytes[i..i + p];
+    if field.contains(&b'"') {
+        return None;
+    }
+    buf.extend_from_slice(field);
+    Some(i + p)
+}
+
 pub(crate) fn parse_line(line: &str, buf: &mut Vec<u8>, ends: &mut Vec<u32>) -> bool {
     let bytes = line.as_bytes();
     let mut i = 0;
     loop {
-        let start = buf.len();
-        if i < bytes.len() && bytes[i] == b'"' {
-            i += 1;
-            loop {
-                let Some(p) = bytes[i..].iter().position(|&x| x == b'"') else {
-                    return false;
-                };
-                buf.extend_from_slice(&bytes[i..i + p]);
-                i += p + 1;
-                if i < bytes.len() && bytes[i] == b'"' {
-                    buf.push(b'"');
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            if !buf[start..].iter().any(|&x| x == b',' || x == b'"') {
-                return false;
-            }
-            if i < bytes.len() && bytes[i] != b',' {
-                return false;
-            }
+        let next = if i < bytes.len() && bytes[i] == b'"' {
+            read_quoted_field(bytes, i, buf)
         } else {
-            let p = bytes[i..]
-                .iter()
-                .position(|&x| x == b',')
-                .unwrap_or(bytes.len() - i);
-            let field = &bytes[i..i + p];
-            if field.contains(&b'"') {
-                return false;
-            }
-            buf.extend_from_slice(field);
-            i += p;
-        }
+            read_plain_field(bytes, i, buf)
+        };
+        let Some(next) = next else {
+            return false;
+        };
+        i = next;
         if buf.len() > u32::MAX as usize {
             return false;
         }
@@ -187,6 +198,68 @@ pub(crate) struct Parsed {
     pub already_grouped: bool,
 }
 
+fn parse_utf8_line(line: &[u8], buf: &mut Vec<u8>, ends: &mut Vec<u32>) -> bool {
+    let Ok(s) = std::str::from_utf8(line) else {
+        return false;
+    };
+    buf.clear();
+    ends.clear();
+    parse_line(s, buf, ends)
+}
+
+fn dominant_col_count<'a>(
+    lines: impl Iterator<Item = &'a [u8]>,
+    buf: &mut Vec<u8>,
+    ends: &mut Vec<u32>,
+) -> usize {
+    let mut lines_by_col_count: HashMap<usize, usize> = HashMap::new();
+    for line in lines {
+        if parse_utf8_line(line, buf, ends) {
+            *lines_by_col_count.entry(ends.len()).or_insert(0) += 1;
+        }
+    }
+    lines_by_col_count
+        .iter()
+        .max_by_key(|&(&k, &v)| (v, k))
+        .map_or(0, |(&k, _)| k)
+}
+
+impl Lexicon {
+    fn append_parsed_row(&mut self, buf: &[u8], ends: &[u32]) {
+        let mut start = 0usize;
+        for &e in ends {
+            self.data.extend_from_slice(&buf[start..e as usize]);
+            start = e as usize;
+            self.ends.push(self.data.len() as u32);
+        }
+    }
+}
+
+fn fill_lexicon<'a>(
+    lex: &mut Lexicon,
+    lines: impl Iterator<Item = &'a [u8]>,
+    buf: &mut Vec<u8>,
+    ends: &mut Vec<u32>,
+) {
+    for line in lines {
+        if parse_utf8_line(line, buf, ends) && ends.len() == lex.n_cols {
+            lex.append_parsed_row(buf, ends);
+        } else {
+            lex.push_irregular(line.to_vec());
+        }
+    }
+}
+
+fn sorted_order(lex: &Lexicon) -> (Vec<u32>, bool) {
+    let mut order: Vec<u32> = (0..lex.rows() as u32).collect();
+    order.sort_by(|&a, &b| {
+        lex.field_bytes(a as usize, 0)
+            .cmp(lex.field_bytes(b as usize, 0))
+    });
+    let sorted = order.iter().enumerate().all(|(i, &r)| i as u32 == r);
+    (order, sorted)
+}
+
 pub(crate) fn parse_text(text: &[u8]) -> Parsed {
     let no_final_newline = text.last().is_some_and(|&last| last != b'\n');
     let body = if text.last() == Some(&b'\n') {
@@ -194,56 +267,17 @@ pub(crate) fn parse_text(text: &[u8]) -> Parsed {
     } else {
         text
     };
-    let lines = || body.split(|&b| b == b'\n');
-    let mut lines_by_col_count: HashMap<usize, usize> = HashMap::new();
+    let lines = || body.split(|&b| b == b'\n').filter(|_| !text.is_empty());
     let mut buf = Vec::new();
     let mut ends = Vec::new();
-    for line in lines().filter(|_| !text.is_empty()) {
-        if let Ok(s) = std::str::from_utf8(line) {
-            buf.clear();
-            ends.clear();
-            if parse_line(s, &mut buf, &mut ends) {
-                *lines_by_col_count.entry(ends.len()).or_insert(0) += 1;
-            }
-        }
-    }
-    let n_cols = lines_by_col_count
-        .iter()
-        .max_by_key(|&(&k, &v)| (v, k))
-        .map_or(0, |(&k, _)| k);
+    let n_cols = dominant_col_count(lines(), &mut buf, &mut ends);
     let mut lex = Lexicon::new(n_cols);
     lex.no_final_newline = no_final_newline;
-    if !text.is_empty() {
-        for line in lines() {
-            let mut ok = false;
-            if let Ok(s) = std::str::from_utf8(line) {
-                buf.clear();
-                ends.clear();
-                if parse_line(s, &mut buf, &mut ends) && ends.len() == n_cols {
-                    ok = true;
-                    let mut start = 0usize;
-                    for &e in &ends {
-                        lex.data.extend_from_slice(&buf[start..e as usize]);
-                        start = e as usize;
-                        lex.ends.push(lex.data.len() as u32);
-                    }
-                }
-            }
-            if !ok {
-                lex.push_irregular(line.to_vec());
-            }
-        }
-    }
-    let rows = lex.rows();
-    let mut order: Vec<u32> = (0..rows as u32).collect();
-    order.sort_by(|&a, &b| {
-        lex.field_bytes(a as usize, 0)
-            .cmp(lex.field_bytes(b as usize, 0))
-    });
-    let sorted = order.iter().enumerate().all(|(i, &r)| i as u32 == r);
+    fill_lexicon(&mut lex, lines(), &mut buf, &mut ends);
+    let (order, already_grouped) = sorted_order(&lex);
     Parsed {
         lex,
         order,
-        already_grouped: sorted,
+        already_grouped,
     }
 }

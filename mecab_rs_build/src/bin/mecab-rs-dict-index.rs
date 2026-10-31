@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use mecab_rs_build::build::{self, BuildOptions, BuildReport};
+use mecab_rs_build::cli_options::{OptionSpec, Options, lossy_arguments};
 
 const USAGE: &str = "usage: mecab-rs-dict-index [options] [files]
 
@@ -45,126 +46,88 @@ enum Parsed {
     Exit,
 }
 
-const OPTIONS: [(&str, Option<char>, bool); 17] = [
-    ("dicdir", Some('d'), true),
-    ("outdir", Some('o'), true),
-    ("model", Some('m'), true),
-    ("userdic", Some('u'), true),
-    ("assign-user-dictionary-costs", Some('a'), false),
-    ("build-unknown", Some('U'), false),
-    ("build-model", Some('M'), false),
-    ("build-charcategory", Some('C'), false),
-    ("build-sysdic", Some('s'), false),
-    ("build-matrix", None, false),
-    ("charset", Some('c'), true),
-    ("dictionary-charset", Some('f'), true),
-    ("wakati", Some('w'), false),
-    ("posid", Some('p'), false),
-    ("node-format", Some('F'), true),
-    ("version", Some('v'), false),
-    ("help", Some('h'), false),
+const fn flag(name: &'static str, short: Option<char>) -> OptionSpec {
+    OptionSpec {
+        name,
+        short,
+        takes_value: false,
+        default: None,
+    }
+}
+
+const fn valued(name: &'static str, short: Option<char>) -> OptionSpec {
+    OptionSpec {
+        name,
+        short,
+        takes_value: true,
+        default: None,
+    }
+}
+
+const SPECS: [OptionSpec; 18] = [
+    valued("dicdir", Some('d')),
+    valued("outdir", Some('o')),
+    valued("model", Some('m')),
+    valued("userdic", Some('u')),
+    flag("assign-user-dictionary-costs", Some('a')),
+    flag("build-unknown", Some('U')),
+    flag("build-model", Some('M')),
+    flag("build-charcategory", Some('C')),
+    flag("build-sysdic", Some('s')),
+    flag("build-matrix", None),
+    valued("charset", Some('c')),
+    valued("charset", Some('t')),
+    valued("dictionary-charset", Some('f')),
+    flag("wakati", Some('w')),
+    flag("posid", Some('p')),
+    valued("node-format", Some('F')),
+    flag("version", Some('v')),
+    flag("help", Some('h')),
 ];
 
+fn apply(parsed: &mut Arguments, name: &str, text: &str) -> Result<Option<Parsed>, String> {
+    let parts = &mut parsed.options.parts;
+    match name {
+        "dicdir" => parsed.dic_dir = PathBuf::from(text),
+        "outdir" => parsed.out_dir = PathBuf::from(text),
+        "model" => parsed.options.model = Some(PathBuf::from(text)),
+        "userdic" => parsed.user = Some(PathBuf::from(text)),
+        "assign-user-dictionary-costs" => parsed.assign = true,
+        "build-unknown" => parts.unknown = true,
+        "build-model" => parts.model = true,
+        "build-charcategory" => parts.char_category = true,
+        "build-sysdic" => parts.system = true,
+        "build-matrix" => parts.matrix = true,
+        "charset" => text.clone_into(&mut parsed.options.charset),
+        "dictionary-charset" => text.clone_into(&mut parsed.options.dictionary_charset),
+        "wakati" => parsed.options.wakati = true,
+        "posid" => {}
+        "node-format" => return Err("-F (node-format) is not supported".to_owned()),
+        "version" => {
+            println!("mecab-rs-dict-index of {}", env!("CARGO_PKG_VERSION"));
+            return Ok(Some(Parsed::Exit));
+        }
+        _ => {
+            println!("{USAGE}");
+            return Ok(Some(Parsed::Exit));
+        }
+    }
+    Ok(None)
+}
+
 fn parse(arguments: &[OsString]) -> Result<Parsed, String> {
+    let options = Options::parse(&lossy_arguments(arguments), &SPECS)?;
     let mut parsed = Arguments {
         dic_dir: PathBuf::from("."),
         out_dir: PathBuf::from("."),
         user: None,
         assign: false,
-        rest: Vec::new(),
+        rest: options.rest.iter().map(PathBuf::from).collect(),
         options: BuildOptions::default(),
     };
-    let strings: Vec<String> = arguments
-        .iter()
-        .map(|argument| argument.to_string_lossy().into_owned())
-        .collect();
-    let mut index = 0;
-    while index < strings.len() {
-        let argument = &strings[index];
-        index += 1;
-        let mut value: Option<String> = None;
-        let entry;
-        if let Some(long) = argument.strip_prefix("--") {
-            let (key, inline) = match long.split_once('=') {
-                Some((key, inline)) => (key, Some(inline.to_owned())),
-                None => (long, None),
-            };
-            if key.is_empty() {
-                break;
-            }
-            entry = OPTIONS
-                .iter()
-                .find(|entry| entry.0 == key)
-                .ok_or_else(|| format!("unrecognized option `{argument}`"))?;
-            if entry.2 {
-                value = Some(if let Some(inline) = inline {
-                    inline
-                } else {
-                    index += 1;
-                    strings
-                        .get(index - 1)
-                        .cloned()
-                        .ok_or_else(|| format!("`{argument}` requires an argument"))?
-                });
-            } else if inline.is_some() {
-                return Err(format!("`{argument}` doesn't allow an argument"));
-            }
-        } else if argument.starts_with('-') && argument.len() > 1 {
-            let short = if argument.starts_with("-t") {
-                'c'
-            } else {
-                argument.chars().nth(1).expect("longer than one character")
-            };
-            entry = OPTIONS
-                .iter()
-                .find(|entry| entry.1 == Some(short))
-                .ok_or_else(|| format!("unrecognized option `{argument}`"))?;
-            let attached = &argument[2..];
-            if entry.2 {
-                value = Some(if attached.is_empty() {
-                    index += 1;
-                    strings
-                        .get(index - 1)
-                        .cloned()
-                        .ok_or_else(|| format!("`{argument}` requires an argument"))?
-                } else {
-                    attached.to_owned()
-                });
-            } else if !attached.is_empty() {
-                return Err(format!("`{argument}` doesn't allow an argument"));
-            }
-        } else if argument.starts_with('-') {
-            continue;
-        } else {
-            parsed.rest.push(PathBuf::from(argument));
-            continue;
-        }
-        let text = value.unwrap_or_default();
-        let parts = &mut parsed.options.parts;
-        match entry.0 {
-            "dicdir" => parsed.dic_dir = PathBuf::from(text),
-            "outdir" => parsed.out_dir = PathBuf::from(text),
-            "model" => parsed.options.model = Some(PathBuf::from(text)),
-            "userdic" => parsed.user = Some(PathBuf::from(text)),
-            "assign-user-dictionary-costs" => parsed.assign = true,
-            "build-unknown" => parts.unknown = true,
-            "build-model" => parts.model = true,
-            "build-charcategory" => parts.char_category = true,
-            "build-sysdic" => parts.system = true,
-            "build-matrix" => parts.matrix = true,
-            "charset" => parsed.options.charset = text,
-            "dictionary-charset" => parsed.options.dictionary_charset = text,
-            "wakati" => parsed.options.wakati = true,
-            "posid" => {}
-            "node-format" => return Err("-F (node-format) is not supported".to_owned()),
-            "version" => {
-                println!("mecab-rs-dict-index of {}", env!("CARGO_PKG_VERSION"));
-                return Ok(Parsed::Exit);
-            }
-            _ => {
-                println!("{USAGE}");
-                return Ok(Parsed::Exit);
-            }
+    for occurrence in options.occurrences() {
+        if let Some(exit) = apply(&mut parsed, occurrence.name, occurrence.value)? {
+            return Ok(exit);
         }
     }
     Ok(Parsed::Run(Box::new(parsed)))

@@ -1,6 +1,4 @@
 use std::cmp::Ordering;
-use std::io::Write;
-
 use std::path::Path as FilePath;
 
 use super::features::{FeatureId, FeatureIndex, Features, PoolOffset, ids_from, widen};
@@ -127,6 +125,74 @@ pub(super) struct Reader<'a> {
     pub(super) eval_size: usize,
     pub(super) unk_eval_size: usize,
     pub(super) found: Vec<Found>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct EvalSizes {
+    pub(super) eval_size: usize,
+    pub(super) unk_eval_size: usize,
+}
+
+#[derive(Default)]
+pub(super) struct Tally {
+    pub(super) correct: usize,
+    pub(super) precision: usize,
+    pub(super) recall: usize,
+}
+
+struct Alignment {
+    result: NodeId,
+    answer: NodeId,
+    result_end: usize,
+    answer_end: usize,
+}
+
+pub(super) struct ReadSentence {
+    pub(super) sentence: Sentence,
+    pub(super) virtual_features: Vec<Vec<u8>>,
+}
+
+struct AnswerWords {
+    words: Vec<Word>,
+    text: Vec<u8>,
+}
+
+fn read_words(lines: &mut Lines, path: &FilePath) -> Result<Option<AnswerWords>, Error> {
+    let mut words: Vec<Word> = Vec::new();
+    let mut text = Vec::new();
+    loop {
+        let Some(line) = lines.next_line()? else {
+            if words.is_empty() {
+                return Ok(None);
+            }
+            return Err(Error::learn(path, "missing EOS at the end of the corpus"));
+        };
+        let line = cstr(line, 0);
+        if line == b"EOS" || line.is_empty() {
+            break;
+        }
+        let Some((surface, feature)) = surface_and_feature(line) else {
+            return Err(Error::learn(
+                path,
+                format!("format error: {}", String::from_utf8_lossy(line)),
+            ));
+        };
+        if surface.len() > usize::from(u16::MAX) {
+            return Err(Error::learn(path, "a surface is longer than 65535 bytes"));
+        }
+        text.extend_from_slice(surface);
+        words.push(Word {
+            surface: surface.to_vec(),
+            feature: feature.to_vec(),
+        });
+    }
+    if text.is_empty() {
+        return Err(Error::learn(path, "empty sentence"));
+    }
+    if u32::try_from(text.len()).is_err() {
+        return Err(Error::learn(path, SENTENCE_TOO_LONG));
+    }
+    Ok(Some(AnswerWords { words, text }))
 }
 
 pub(super) struct Sentence {
@@ -302,52 +368,10 @@ impl Sentence {
         Ok(())
     }
 
-    pub(super) fn read(
-        reader: &mut Reader,
-        lines: &mut Lines,
-        observed: &mut Vec<f64>,
-        log: &mut dyn Write,
-    ) -> Result<Option<Self>, Error> {
-        let path = lines.path().to_path_buf();
-        let mut words: Vec<Word> = Vec::new();
-        let mut sentence = Vec::new();
-        loop {
-            let Some(line) = lines.next_line()? else {
-                if words.is_empty() {
-                    return Ok(None);
-                }
-                return Err(Error::learn(&path, "missing EOS at the end of the corpus"));
-            };
-            let text = cstr(line, 0);
-            if text == b"EOS" || text.is_empty() {
-                break;
-            }
-            let Some((surface, feature)) = surface_and_feature(text) else {
-                return Err(Error::learn(
-                    &path,
-                    format!("format error: {}", String::from_utf8_lossy(text)),
-                ));
-            };
-            if surface.len() > usize::from(u16::MAX) {
-                return Err(Error::learn(&path, "a surface is longer than 65535 bytes"));
-            }
-            sentence.extend_from_slice(surface);
-            words.push(Word {
-                surface: surface.to_vec(),
-                feature: feature.to_vec(),
-            });
-        }
-        if sentence.is_empty() {
-            return Err(Error::learn(&path, "empty sentence"));
-        }
-        if u32::try_from(sentence.len()).is_err() {
-            return Err(Error::learn(&path, SENTENCE_TOO_LONG));
-        }
-
-        let length = sentence.len();
-        let mut text = sentence;
+    fn with_text(mut text: Vec<u8>) -> Self {
+        let length = text.len();
         text.extend_from_slice(&[0; TEXT_PADDING]);
-        let mut this = Self {
+        Self {
             text,
             length,
             nodes: Vec::new(),
@@ -355,99 +379,168 @@ impl Sentence {
             begin_list: vec![NodeId::NIL; length + TEXT_PADDING],
             end_list: vec![NodeId::NIL; length + TEXT_PADDING],
             answer: Vec::new(),
-        };
-        let bos_feature = reader.features.intern(&reader.tokenizer.bos_feature)?;
-        let bos = this.node(Node::new(BOS, bos_feature), &path)?;
-        let eos = this.node(Node::new(EOS, bos_feature), &path)?;
-        this.end_list[0] = bos;
-        this.begin_list[length] = eos;
+        }
+    }
 
-        let mut position = 0;
-        for word in &words {
-            let mut node = this.lookup(reader, position, &path)?;
-            let mut found = false;
-            while node != NodeId::NIL {
-                if this.matches(reader, word, node) {
-                    found = true;
-                    break;
-                }
-                node = this.nodes[node.index()].bnext;
+    fn add_boundary_nodes(&mut self, reader: &mut Reader, source: &FilePath) -> Result<(), Error> {
+        let bos_feature = reader.features.intern(&reader.tokenizer.bos_feature)?;
+        let bos = self.node(Node::new(BOS, bos_feature), source)?;
+        let eos = self.node(Node::new(EOS, bos_feature), source)?;
+        self.end_list[0] = bos;
+        self.begin_list[self.length] = eos;
+        Ok(())
+    }
+
+    fn has_matching_node(
+        &mut self,
+        reader: &mut Reader,
+        word: &Word,
+        position: usize,
+        source: &FilePath,
+    ) -> Result<bool, Error> {
+        let mut node = self.lookup(reader, position, source)?;
+        while node != NodeId::NIL {
+            if self.matches(reader, word, node) {
+                return Ok(true);
             }
-            if !found {
-                let mut node = Node::new(NORMAL, reader.features.intern(&word.feature)?);
-                node.position = offset(position);
-                node.length = offset(word.surface.len());
-                node.rlength = offset(word.surface.len());
-                node.bnext = this.begin_list[position];
-                let node = this.node(node, &path)?;
-                this.begin_list[position] = node;
-                let _ = writeln!(
-                    log,
-                    "adding virtual node: {}",
-                    String::from_utf8_lossy(&word.feature)
-                );
+            node = self.nodes[node.index()].bnext;
+        }
+        Ok(false)
+    }
+
+    fn add_virtual_node(
+        &mut self,
+        reader: &mut Reader,
+        word: &Word,
+        position: usize,
+        source: &FilePath,
+    ) -> Result<(), Error> {
+        let mut node = Node::new(NORMAL, reader.features.intern(&word.feature)?);
+        node.position = offset(position);
+        node.length = offset(word.surface.len());
+        node.rlength = offset(word.surface.len());
+        node.bnext = self.begin_list[position];
+        let node = self.node(node, source)?;
+        self.begin_list[position] = node;
+        Ok(())
+    }
+
+    fn add_virtual_nodes(
+        &mut self,
+        reader: &mut Reader,
+        words: &[Word],
+        source: &FilePath,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        let mut virtual_features = Vec::new();
+        let mut position = 0;
+        for word in words {
+            if !self.has_matching_node(reader, word, position, source)? {
+                self.add_virtual_node(reader, word, position, source)?;
+                virtual_features.push(word.feature.clone());
             }
             position += word.surface.len();
         }
+        Ok(virtual_features)
+    }
 
-        this.build_lattice(reader, &path)?;
-
-        let mut prev = this.end_list[0];
-        this.nodes[prev.index()].anext = NodeId::NIL;
-        position = 0;
-        for index in 0..=words.len() {
-            let is_eos = index == words.len();
-            let mut right = NodeId::NIL;
-            let mut node = this.begin_list[position];
-            while node != NodeId::NIL {
-                if is_eos || this.matches(reader, &words[index], node) {
-                    right = node;
-                }
-                node = this.nodes[node.index()].bnext;
+    fn find_answer_node(&self, reader: &Reader, word: Option<&Word>, position: usize) -> NodeId {
+        let mut right = NodeId::NIL;
+        let mut node = self.begin_list[position];
+        while node != NodeId::NIL {
+            if word.is_none_or(|word| self.matches(reader, word, node)) {
+                right = node;
             }
-            if right == NodeId::NIL {
-                return Err(Error::learn(&path, "no node for a word of the answer"));
-            }
-            let mut left_path = PathId::NIL;
-            let mut candidate = this.nodes[right.index()].lpath;
-            while candidate != PathId::NIL {
-                if this.paths[candidate.index()].lnode == prev {
-                    left_path = candidate;
-                    break;
-                }
-                candidate = this.paths[candidate.index()].lnext;
-            }
-            if left_path == PathId::NIL {
-                return Err(Error::learn(&path, "lpath is NULL"));
-            }
-
-            let pool = reader.index.pool();
-            let mut count = |start: PoolOffset| {
-                for id in ids_from(pool, start) {
-                    if id >= observed.len() {
-                        observed.resize(id + 1, 0.0);
-                    }
-                    observed[id] += 1.0;
-                }
-            };
-            count(this.paths[left_path.index()].fvector);
-            if this.nodes[right.index()].kind != EOS {
-                count(this.nodes[right.index()].fvector);
-            }
-
-            this.answer.push(left_path);
-            this.nodes[prev.index()].anext = right;
-            prev = right;
-            if is_eos {
-                break;
-            }
-            position += words[index].surface.len();
+            node = self.nodes[node.index()].bnext;
         }
+        right
+    }
 
-        let eos_head = this.begin_list[length];
-        this.nodes[prev.index()].anext = eos_head;
-        this.nodes[eos_head.index()].anext = NodeId::NIL;
-        Ok(Some(this))
+    fn find_left_path(&self, right: NodeId, left: NodeId) -> PathId {
+        let mut candidate = self.nodes[right.index()].lpath;
+        while candidate != PathId::NIL {
+            if self.paths[candidate.index()].lnode == left {
+                return candidate;
+            }
+            candidate = self.paths[candidate.index()].lnext;
+        }
+        PathId::NIL
+    }
+
+    fn count_observed(
+        &self,
+        reader: &Reader,
+        left_path: PathId,
+        right: NodeId,
+        observed: &mut Vec<f64>,
+    ) {
+        let pool = reader.index.pool();
+        let mut count = |start: PoolOffset| {
+            for id in ids_from(pool, start) {
+                if id >= observed.len() {
+                    observed.resize(id + 1, 0.0);
+                }
+                observed[id] += 1.0;
+            }
+        };
+        count(self.paths[left_path.index()].fvector);
+        if self.nodes[right.index()].kind != EOS {
+            count(self.nodes[right.index()].fvector);
+        }
+    }
+
+    fn link_answer(
+        &mut self,
+        reader: &Reader,
+        words: &[Word],
+        observed: &mut Vec<f64>,
+        source: &FilePath,
+    ) -> Result<(), Error> {
+        let mut prev = self.end_list[0];
+        self.nodes[prev.index()].anext = NodeId::NIL;
+        let mut position = 0;
+        for index in 0..=words.len() {
+            let word = words.get(index);
+            let right = self.find_answer_node(reader, word, position);
+            if right == NodeId::NIL {
+                return Err(Error::learn(source, "no node for a word of the answer"));
+            }
+            let left_path = self.find_left_path(right, prev);
+            if left_path == PathId::NIL {
+                return Err(Error::learn(source, "lpath is NULL"));
+            }
+            self.count_observed(reader, left_path, right, observed);
+            self.answer.push(left_path);
+            self.nodes[prev.index()].anext = right;
+            prev = right;
+            let Some(word) = word else {
+                break;
+            };
+            position += word.surface.len();
+        }
+        let eos_head = self.begin_list[self.length];
+        self.nodes[prev.index()].anext = eos_head;
+        self.nodes[eos_head.index()].anext = NodeId::NIL;
+        Ok(())
+    }
+
+    pub(super) fn read(
+        reader: &mut Reader,
+        lines: &mut Lines,
+        observed: &mut Vec<f64>,
+    ) -> Result<Option<ReadSentence>, Error> {
+        let path = lines.path().to_path_buf();
+        let Some(AnswerWords { words, text }) = read_words(lines, &path)? else {
+            return Ok(None);
+        };
+        let mut sentence = Self::with_text(text);
+        sentence.add_boundary_nodes(reader, &path)?;
+        let virtual_features = sentence.add_virtual_nodes(reader, &words, &path)?;
+        sentence.build_lattice(reader, &path)?;
+        sentence.link_answer(reader, &words, observed, &path)?;
+        Ok(Some(ReadSentence {
+            sentence,
+            virtual_features,
+        }))
     }
 
     fn matches(&self, reader: &Reader, word: &Word, node: NodeId) -> bool {
@@ -601,70 +694,82 @@ impl Sentence {
         z
     }
 
-    pub(super) fn eval(
-        &self,
-        features: &Features,
-        eval_size: usize,
-        unk_eval_size: usize,
-        correct: &mut usize,
-        precision: &mut usize,
-        recall: &mut usize,
-    ) -> usize {
-        let mut zero_one = 0;
-        let start = &self.nodes[self.end_list[0].index()];
-        let (mut result, mut answer) = (start.next, start.anext);
-        if result == NodeId::NIL || answer == NodeId::NIL {
-            return 1;
-        }
-        let (mut result_end, mut answer_end) = (0usize, 0usize);
-        let node = |index: NodeId| &self.nodes[index.index()];
+    fn node_at(&self, index: NodeId) -> &Node {
+        &self.nodes[index.index()]
+    }
 
-        while node(answer).anext != NodeId::NIL && node(result).next != NodeId::NIL {
-            match result_end.cmp(&answer_end) {
-                Ordering::Equal => {
-                    let (a, r) = (node(answer), node(result));
-                    if same_node(
-                        self.surface(answer),
-                        features.get(a.feature),
-                        self.surface(result),
-                        features.get(r.feature),
-                        r.kind == UNKNOWN,
-                        eval_size,
-                        unk_eval_size,
-                    ) {
-                        *correct += 1;
-                    } else {
-                        zero_one = 1;
-                    }
-                    *precision += 1;
-                    *recall += 1;
-                    result = r.next;
-                    answer = a.anext;
-                    result_end += widen(node(result).rlength);
-                    answer_end += widen(node(answer).rlength);
-                }
-                Ordering::Less => {
-                    result = node(result).next;
-                    result_end += widen(node(result).rlength);
-                    zero_one = 1;
-                    *recall += 1;
-                }
-                Ordering::Greater => {
-                    answer = node(answer).anext;
-                    answer_end += widen(node(answer).rlength);
-                    zero_one = 1;
-                    *precision += 1;
-                }
+    fn advance_alignment(
+        &self,
+        alignment: &mut Alignment,
+        features: &Features,
+        sizes: EvalSizes,
+        tally: &mut Tally,
+    ) -> bool {
+        match alignment.result_end.cmp(&alignment.answer_end) {
+            Ordering::Equal => {
+                let (a, r) = (
+                    self.node_at(alignment.answer),
+                    self.node_at(alignment.result),
+                );
+                let agree = same_node(
+                    self.surface(alignment.answer),
+                    features.get(a.feature),
+                    self.surface(alignment.result),
+                    features.get(r.feature),
+                    r.kind == UNKNOWN,
+                    sizes.eval_size,
+                    sizes.unk_eval_size,
+                );
+                tally.correct += usize::from(agree);
+                tally.precision += 1;
+                tally.recall += 1;
+                alignment.result = r.next;
+                alignment.answer = a.anext;
+                alignment.result_end += widen(self.node_at(alignment.result).rlength);
+                alignment.answer_end += widen(self.node_at(alignment.answer).rlength);
+                !agree
+            }
+            Ordering::Less => {
+                alignment.result = self.node_at(alignment.result).next;
+                alignment.result_end += widen(self.node_at(alignment.result).rlength);
+                tally.recall += 1;
+                true
+            }
+            Ordering::Greater => {
+                alignment.answer = self.node_at(alignment.answer).anext;
+                alignment.answer_end += widen(self.node_at(alignment.answer).rlength);
+                tally.precision += 1;
+                true
             }
         }
+    }
 
-        while node(answer).anext != NodeId::NIL {
-            *precision += 1;
-            answer = node(answer).anext;
+    pub(super) fn eval(&self, features: &Features, sizes: EvalSizes, tally: &mut Tally) -> usize {
+        let start = self.node_at(self.end_list[0]);
+        let mut alignment = Alignment {
+            result: start.next,
+            answer: start.anext,
+            result_end: 0,
+            answer_end: 0,
+        };
+        if alignment.result == NodeId::NIL || alignment.answer == NodeId::NIL {
+            return 1;
         }
-        while node(result).next != NodeId::NIL {
-            *recall += 1;
-            result = node(result).next;
+        let mut zero_one = 0;
+        while self.node_at(alignment.answer).anext != NodeId::NIL
+            && self.node_at(alignment.result).next != NodeId::NIL
+        {
+            if self.advance_alignment(&mut alignment, features, sizes, tally) {
+                zero_one = 1;
+            }
+        }
+        while self.node_at(alignment.answer).anext != NodeId::NIL {
+            tally.precision += 1;
+            alignment.answer = self.node_at(alignment.answer).anext;
+        }
+        while self.node_at(alignment.result).next != NodeId::NIL {
+            tally.recall += 1;
+            alignment.result = self.node_at(alignment.result).next;
         }
         zero_one
     }

@@ -79,6 +79,33 @@ impl CharModel {
         }
     }
 
+    #[inline]
+    fn code_symbols(
+        &mut self,
+        coder: &mut Coder,
+        tail: &[u32],
+        mut wanted: impl Iterator<Item = u32>,
+        mut emit: impl FnMut(u32),
+    ) {
+        let mut hist: Vec<u32> = tail.to_vec();
+        loop {
+            let want = if coder.is_decoder() {
+                NOVEL
+            } else {
+                wanted.next().unwrap_or(END)
+            };
+            let got = self.code_sym(coder, &hist, want);
+            if got == END || coder.overrun() {
+                break;
+            }
+            emit(got);
+            hist.push(got);
+            if hist.len() > self.order + HIST_SLACK {
+                hist.drain(..hist.len() - self.order);
+            }
+        }
+    }
+
     pub(crate) fn code_str(
         &mut self,
         coder: &mut Coder,
@@ -87,48 +114,16 @@ impl CharModel {
         out: &mut String,
     ) {
         out.clear();
-        let mut hist: Vec<u32> = tail.to_vec();
-        let mut it = text.chars();
-        loop {
-            let want = if coder.is_decoder() {
-                NOVEL
-            } else {
-                it.next().map_or(END, |ch| ch as u32)
-            };
-            let got = self.code_sym(coder, &hist, want);
-            if got == END || coder.overrun() {
-                break;
-            }
-            out.push(char::from_u32(got).unwrap_or('\u{FFFD}'));
-            hist.push(got);
-            if hist.len() > self.order + HIST_SLACK {
-                hist.drain(..hist.len() - self.order);
-            }
-        }
+        self.code_symbols(coder, tail, text.chars().map(|ch| ch as u32), |got| {
+            out.push(char::from_u32(got).unwrap_or(char::REPLACEMENT_CHARACTER));
+        });
     }
-}
 
-impl CharModel {
     pub(crate) fn code_bytes(&mut self, coder: &mut Coder, text: &[u8], out: &mut Vec<u8>) {
         out.clear();
-        let mut hist: Vec<u32> = Vec::new();
-        let mut it = text.iter();
-        loop {
-            let want = if coder.is_decoder() {
-                NOVEL
-            } else {
-                it.next().map_or(END, |&b| u32::from(b))
-            };
-            let got = self.code_sym(coder, &hist, want);
-            if got == END || coder.overrun() {
-                break;
-            }
+        self.code_symbols(coder, &[], text.iter().map(|&b| u32::from(b)), |got| {
             out.push(got as u8);
-            hist.push(got);
-            if hist.len() > self.order + HIST_SLACK {
-                hist.drain(..hist.len() - self.order);
-            }
-        }
+        });
     }
 }
 

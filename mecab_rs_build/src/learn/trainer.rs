@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::features::{FeatureIndex, Features, remap_weights};
-use super::lattice::{Reader, Sentence};
+use super::lattice::{EvalSizes, Reader, Sentence, Tally};
 use super::lbfgs::Lbfgs;
 use super::tokenizer::Tokenizer;
 use super::{Config, Existing, LineEnding, format_g, open_lines};
@@ -48,36 +48,24 @@ struct Partial {
     expected: Vec<f64>,
     objective: f64,
     errors: usize,
-    correct: usize,
-    precision: usize,
-    recall: usize,
+    tally: Tally,
 }
 
 struct Shared<'a> {
     pool: &'a [i32],
     alpha: &'a [f64],
     features: &'a Features,
-    eval_size: usize,
-    unk_eval_size: usize,
+    sizes: EvalSizes,
 }
 
 fn run_group(group: &mut [Sentence], shared: &Shared, partial: &mut Partial) {
-    partial.correct = 0;
-    partial.precision = 0;
-    partial.recall = 0;
+    partial.tally = Tally::default();
     partial.errors = 0;
     partial.objective = 0.0;
     partial.expected.fill(0.0);
     for sentence in group {
         partial.objective += sentence.gradient(shared.pool, shared.alpha, &mut partial.expected);
-        partial.errors += sentence.eval(
-            shared.features,
-            shared.eval_size,
-            shared.unk_eval_size,
-            &mut partial.correct,
-            &mut partial.precision,
-            &mut partial.recall,
-        );
+        partial.errors += sentence.eval(shared.features, shared.sizes, &mut partial.tally);
     }
 }
 
@@ -162,9 +150,18 @@ pub fn train(
             found: Vec::new(),
         };
         loop {
-            let sentence = Sentence::read(&mut reader, &mut lines, &mut observed, log)?;
-            let done = sentence.is_none();
-            sentences.extend(sentence);
+            let read = Sentence::read(&mut reader, &mut lines, &mut observed)?;
+            let done = read.is_none();
+            if let Some(read) = read {
+                for feature in &read.virtual_features {
+                    let _ = writeln!(
+                        log,
+                        "adding virtual node: {}",
+                        String::from_utf8_lossy(feature)
+                    );
+                }
+                sentences.push(read.sentence);
+            }
             if sentences.len().is_multiple_of(PROGRESS_INTERVAL) {
                 let _ = write!(log, "{}... ", sentences.len());
             }
@@ -222,8 +219,10 @@ pub fn train(
             pool: index.pool(),
             alpha: &alpha,
             features: &features,
-            eval_size,
-            unk_eval_size,
+            sizes: EvalSizes {
+                eval_size,
+                unk_eval_size,
+            },
         };
         if threads > 1 {
             std::thread::scope(|scope| {
@@ -236,9 +235,9 @@ pub fn train(
             for partial in &partials {
                 objective += partial.objective;
                 errors += partial.errors;
-                micro_r += partial.recall;
-                micro_p += partial.precision;
-                micro_c += partial.correct;
+                micro_r += partial.tally.recall;
+                micro_p += partial.tally.precision;
+                micro_c += partial.tally.correct;
                 for (total, value) in expected.iter_mut().zip(&partial.expected) {
                     *total += value;
                 }
@@ -249,9 +248,9 @@ pub fn train(
             expected.copy_from_slice(&partial.expected);
             objective = partial.objective;
             errors = partial.errors;
-            micro_r = partial.recall;
-            micro_p = partial.precision;
-            micro_c = partial.correct;
+            micro_r = partial.tally.recall;
+            micro_p = partial.tally.precision;
+            micro_c = partial.tally.correct;
         }
 
         let precision = 1.0 * micro_c as f64 / micro_p as f64;

@@ -2,20 +2,20 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use memmap2::Mmap;
-
 use crate::clusters::{
-    ClusterPlan, ClusterShape, MappedClusters, fill_cells, interleaved_ids, left_ids,
-    plan_clusters, right_ids, write_cluster_layout,
+    ClusterPlan, ClusterShape, fill_cells, interleaved_ids, left_ids, plan_clusters, right_ids,
+    write_cluster_layout,
 };
-use crate::dictionary::map_file;
 use crate::error::Error;
 use crate::hot_shape::{CELL_SUM_BOUND, HotShape, MAX_KEYS};
 #[cfg(feature = "xz")]
 use crate::int_runtime::runtime_form_from;
-use crate::part::{IntPart, MappedPart, PartSlices, RowScratch, total_of};
-use crate::section::{Section, SectionSource};
+use crate::part::{IntPart, PartSlices, RowScratch, total_of};
 use crate::templates::{TemplateReader, write_array};
+
+mod mapped;
+
+pub use mapped::MappedIntTemplates;
 
 pub(crate) const MAGIC: &[u8; 4] = b"MXIT";
 const VERSION: u32 = 1;
@@ -93,6 +93,47 @@ impl IntPart {
                 .collect(),
             weight: self.weight.clone(),
         }
+    }
+}
+
+pub(crate) struct TemplateHeader {
+    pub(crate) cost_factor: u32,
+    pub(crate) shift: u32,
+    pub(crate) left_size: usize,
+    pub(crate) right_size: usize,
+    pub(crate) part_count: usize,
+    pub(crate) exception_count: usize,
+    pub(crate) cluster_count: usize,
+}
+
+fn read_word(reader: &mut TemplateReader) -> Result<u32, Error> {
+    u32::try_from(reader.count()?).map_err(|_| reader.broken("a header value is too large"))
+}
+
+impl TemplateHeader {
+    pub(crate) fn read(reader: &mut TemplateReader) -> Result<Self, Error> {
+        if reader.bytes::<4>()? != *MAGIC || u32::from_le_bytes(reader.bytes()?) != VERSION {
+            return Err(reader.broken("the file is not an integer template file of this version"));
+        }
+        let cost_factor = read_word(reader)?;
+        let shift = read_word(reader)?;
+        let left_size = reader.count()?;
+        let right_size = reader.count()?;
+        let part_count = reader.count()?;
+        let exception_count = reader.count()?;
+        let cluster_count = reader.count()?;
+        if left_size == 0 || right_size == 0 || left_size > MAX_KEYS || right_size > MAX_KEYS {
+            return Err(reader.broken("the template matrix size is out of range"));
+        }
+        Ok(Self {
+            cost_factor,
+            shift,
+            left_size,
+            right_size,
+            part_count,
+            exception_count,
+            cluster_count,
+        })
     }
 }
 
@@ -266,24 +307,13 @@ impl IntTemplates {
 
     pub fn from_file_bytes(file: &[u8], path: &Path) -> Result<Self, Error> {
         let mut reader = TemplateReader::new(file, path);
-        if reader.bytes::<4>()? != *MAGIC || u32::from_le_bytes(reader.bytes()?) != VERSION {
-            return Err(reader.broken("the file is not an integer template file of this version"));
-        }
-        let cost_factor = reader.count()? as u32;
-        let shift = reader.count()? as u32;
-        let left_size = reader.count()?;
-        let right_size = reader.count()?;
-        let part_count = reader.count()?;
-        let exception_count = reader.count()?;
-        reader.count()?;
-        if left_size == 0 || right_size == 0 || left_size > MAX_KEYS || right_size > MAX_KEYS {
-            return Err(reader.broken("the template matrix size is out of range"));
-        }
-        if part_count > MAX_PARTS {
+        let header = TemplateHeader::read(&mut reader)?;
+        if header.part_count > MAX_PARTS {
             return Err(reader.broken("too many template parts"));
         }
-        let mut parts = Vec::with_capacity(part_count);
-        for _ in 0..part_count {
+        let (left_size, right_size) = (header.left_size, header.right_size);
+        let mut parts = Vec::with_capacity(header.part_count);
+        for _ in 0..header.part_count {
             let left_count = reader.count()?;
             let right_count = reader.count()?;
             let entries = reader.count()?;
@@ -301,11 +331,11 @@ impl IntTemplates {
                 weight: reader.copied(entries, i32::from_le_bytes)?,
             });
         }
-        let cells = reader.copied(exception_count, u32::from_le_bytes)?;
-        let values = reader.copied(exception_count, i16::from_le_bytes)?;
+        let cells = reader.copied(header.exception_count, u32::from_le_bytes)?;
+        let values = reader.copied(header.exception_count, i16::from_le_bytes)?;
         Self::new(
-            cost_factor,
-            shift,
+            header.cost_factor,
+            header.shift,
             left_size,
             right_size,
             parts,
@@ -552,147 +582,4 @@ pub(crate) struct RuntimeInputs<'a> {
     pub(crate) tables: &'a [i32],
     pub(crate) exception_cells: &'a [u32],
     pub(crate) exception_values: &'a [i16],
-}
-
-pub struct MappedIntTemplates<S = Mmap> {
-    map: S,
-    cost_factor: u32,
-    shift: u32,
-    left_size: usize,
-    right_size: usize,
-    parts: Vec<MappedPart<i32>>,
-    exception_cells: Section<u32>,
-    exception_values: Section<i16>,
-    clusters: Option<MappedClusters<i32>>,
-    exception_rows: Vec<u32>,
-}
-
-impl MappedIntTemplates<Mmap> {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let path = path.as_ref();
-        Self::from_source(map_file(path)?, path)
-    }
-}
-
-#[allow(private_bounds, reason = "the section source bound is crate internal")]
-impl<S: SectionSource> MappedIntTemplates<S> {
-    pub(crate) fn from_source(map: S, path: &Path) -> Result<Self, Error> {
-        let mut reader = TemplateReader::new(map.all_bytes(), path);
-        if reader.bytes::<4>()? != *MAGIC || u32::from_le_bytes(reader.bytes()?) != VERSION {
-            return Err(reader.broken("the file is not an integer template file of this version"));
-        }
-        let cost_factor = reader.count()? as u32;
-        let shift = reader.count()? as u32;
-        let left_size = reader.count()?;
-        let right_size = reader.count()?;
-        let part_count = reader.count()?;
-        let exception_count = reader.count()?;
-        let cluster_count = reader.count()?;
-        if left_size == 0 || right_size == 0 || left_size > MAX_KEYS || right_size > MAX_KEYS {
-            return Err(reader.broken("the template matrix size is out of range"));
-        }
-        let mut parts = Vec::with_capacity(part_count.min(MAX_PARTS));
-        for _ in 0..part_count {
-            parts.push(MappedPart::read(&mut reader, left_size, right_size)?);
-        }
-        let exception_cells = reader.section(exception_count)?;
-        let exception_values = reader.section(exception_count)?;
-        let clusters = match cluster_count {
-            0 => None,
-            count => Some(MappedClusters::read(
-                &mut reader,
-                count,
-                left_size,
-                right_size,
-            )?),
-        };
-        if !reader.at_end() {
-            return Err(reader.broken("the file has trailing bytes"));
-        }
-        validate(
-            parts.iter().map(|part| part.slices(&map)),
-            cost_factor,
-            shift,
-            left_size,
-            right_size,
-            exception_cells.view_source(&map),
-        )
-        .map_err(|_| reader.broken("the integer templates are inconsistent"))?;
-        let mut exception_rows = Vec::with_capacity(right_size + 1);
-        let mut next = 0usize;
-        for row in 0..=right_size {
-            let first_of_row = row * left_size;
-            let cells = exception_cells.view_source(&map);
-            while next < cells.len() && (cells[next] as usize) < first_of_row {
-                next += 1;
-            }
-            exception_rows.push(next as u32);
-        }
-        Ok(Self {
-            map,
-            cost_factor,
-            shift,
-            left_size,
-            right_size,
-            parts,
-            exception_cells,
-            exception_values,
-            clusters,
-            exception_rows,
-        })
-    }
-
-    pub fn left_size(&self) -> usize {
-        self.left_size
-    }
-
-    pub fn right_size(&self) -> usize {
-        self.right_size
-    }
-
-    pub(crate) fn runtime_inputs(&self) -> Option<RuntimeInputs<'_>> {
-        let clusters = self.clusters.as_ref()?;
-        Some(RuntimeInputs {
-            cost_factor: self.cost_factor,
-            shift: self.shift,
-            left_size: self.left_size,
-            right_size: self.right_size,
-            shapes: &clusters.shapes,
-            left_keys: clusters.left_keys.view_source(&self.map),
-            right_keys: clusters.right_keys.view_source(&self.map),
-            tables: clusters.tables.view_source(&self.map),
-            exception_cells: self.exception_cells.view_source(&self.map),
-            exception_values: self.exception_values.view_source(&self.map),
-        })
-    }
-
-    pub fn try_cost(&self, left_node_rc: u16, right_node_lc: u16) -> Option<i16> {
-        let inside = usize::from(left_node_rc) < self.left_size
-            && usize::from(right_node_lc) < self.right_size;
-        inside.then(|| self.cost(left_node_rc, right_node_lc))
-    }
-
-    fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
-        let row = usize::from(right_node_lc);
-        let cell = row * self.left_size + usize::from(left_node_rc);
-        let span = self.exception_rows[row] as usize..self.exception_rows[row + 1] as usize;
-        let exception = if span.is_empty() {
-            None
-        } else {
-            let cells = &self.exception_cells.view_source(&self.map)[span.clone()];
-            let found = cells.binary_search(&(cell as u32)).ok();
-            found.map(|at| self.exception_values.view_source(&self.map)[span.start + at])
-        };
-        exception.unwrap_or_else(|| {
-            let total = match &self.clusters {
-                Some(clusters) => clusters.sum(&self.map, left_node_rc, right_node_lc),
-                _ => total_of(
-                    self.parts.iter().map(|part| part.slices(&self.map)),
-                    left_node_rc,
-                    right_node_lc,
-                ),
-            };
-            int_cost(total, self.cost_factor, self.shift)
-        })
-    }
 }

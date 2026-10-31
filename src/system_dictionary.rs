@@ -110,6 +110,60 @@ const _: () = assert!(size_of::<RawToken>() == TOKEN_SIZE);
 
 unsafe impl Plain for RawToken {}
 
+struct Header {
+    left_size: usize,
+    right_size: usize,
+    array_end: usize,
+    tokens_end: usize,
+    features_end: usize,
+}
+
+impl Header {
+    fn parse(bytes: &[u8], kind: DictionaryKind, path: &Path) -> Result<Self, Error> {
+        let broken = |reason| Error::format(path, reason);
+        if bytes.len() < HEADER_SIZE
+            || (u32_at(bytes, 0) ^ MAGIC_ID) as usize != bytes.len()
+            || u32_at(bytes, VERSION_AT) != DIC_VERSION
+        {
+            return Err(broken("the header, magic number or version is not valid"));
+        }
+        if u32_at(bytes, KIND_AT) != kind as u32 {
+            return Err(broken("the dictionary type is not the expected one"));
+        }
+        if !is_utf8_charset(charset_name(bytes)) {
+            return Err(Error::Unsupported("a dictionary charset other than UTF-8"));
+        }
+        let ends = section_ends(bytes);
+        let Some((array_end, tokens_end, features_end)) = ends.filter(|ends| ends.2 == bytes.len())
+        else {
+            return Err(broken("the section sizes do not add up to the file size"));
+        };
+        Ok(Self {
+            left_size: u32_at(bytes, LEFT_SIZE_AT) as usize,
+            right_size: u32_at(bytes, RIGHT_SIZE_AT) as usize,
+            array_end,
+            tokens_end,
+            features_end,
+        })
+    }
+}
+
+fn check_last_feature_byte(file: &File, header: &Header, path: &Path) -> Result<(), Error> {
+    if header.features_end <= header.tokens_end {
+        return Ok(());
+    }
+    let mut last_feature_byte = [0];
+    read_exact_at(file, &mut last_feature_byte, header.features_end as u64 - 1)
+        .map_err(io_error(path))?;
+    if last_feature_byte[0] != 0 {
+        return Err(Error::format(
+            path,
+            "the features do not end with a NUL byte",
+        ));
+    }
+    Ok(())
+}
+
 pub struct SystemDictionary {
     map: Mmap,
     left_size: usize,
@@ -134,54 +188,29 @@ impl SystemDictionary {
         let map = map_open_file(&file, path)?;
         let broken = |reason| Error::format(path, reason);
         let bytes = &map[..];
-        if bytes.len() < HEADER_SIZE
-            || (u32_at(bytes, 0) ^ MAGIC_ID) as usize != bytes.len()
-            || u32_at(bytes, VERSION_AT) != DIC_VERSION
-        {
-            return Err(broken("the header, magic number or version is not valid"));
-        }
-        if u32_at(bytes, KIND_AT) != kind as u32 {
-            return Err(broken("the dictionary type is not the expected one"));
-        }
-        if !is_utf8_charset(charset_name(bytes)) {
-            return Err(Error::Unsupported("a dictionary charset other than UTF-8"));
-        }
-        let ends = section_ends(bytes);
-        let Some((array_end, tokens_end, features_end)) = ends.filter(|ends| ends.2 == bytes.len())
-        else {
-            return Err(broken("the section sizes do not add up to the file size"));
-        };
-        let left_size = u32_at(bytes, LEFT_SIZE_AT) as usize;
-        let right_size = u32_at(bytes, RIGHT_SIZE_AT) as usize;
-        let cells = Section::new(bytes, HEADER_SIZE..array_end)
+        let header = Header::parse(bytes, kind, path)?;
+        let cells = Section::new(bytes, HEADER_SIZE..header.array_end)
             .ok_or_else(|| broken("the double array is misaligned"))?;
-        let tokens = Section::new(bytes, array_end..tokens_end)
+        let tokens = Section::new(bytes, header.array_end..header.tokens_end)
             .ok_or_else(|| broken("the token table is misaligned"))?;
-        if features_end > tokens_end {
-            let mut last_feature_byte = [0];
-            read_exact_at(&file, &mut last_feature_byte, features_end as u64 - 1)
-                .map_err(&io_error)?;
-            if last_feature_byte[0] != 0 {
-                return Err(broken("the features do not end with a NUL byte"));
-            }
-        }
+        check_last_feature_byte(&file, &header, path)?;
         let checked = Checked {
             file: &file,
-            cells: HEADER_SIZE..array_end,
-            tokens: array_end..tokens_end,
-            features: tokens_end..features_end,
-            left_size,
-            right_size,
+            cells: HEADER_SIZE..header.array_end,
+            tokens: header.array_end..header.tokens_end,
+            features: header.tokens_end..header.features_end,
+            left_size: header.left_size,
+            right_size: header.right_size,
             read_block_bytes,
         };
         checked.run().map_err(&io_error)?.map_err(broken)?;
         Ok(Self {
             map,
-            left_size,
-            right_size,
+            left_size: header.left_size,
+            right_size: header.right_size,
             cells,
             tokens,
-            features: tokens_end..features_end,
+            features: header.tokens_end..header.features_end,
         })
     }
 

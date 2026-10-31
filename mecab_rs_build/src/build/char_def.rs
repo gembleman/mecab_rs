@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::text::{LINE_BUFFER_BYTES, Lines, MAX_DEF_COLUMNS, atoi, cstr, tokenize_csv, tokenize2};
 use mecab_rs::__private::char_layout::{
@@ -154,6 +154,44 @@ fn parse_category(columns: &[usize], line: &[u8], definition_index: usize) -> Ch
     }
 }
 
+const REQUIRED_CATEGORIES: [&str; 2] = ["DEFAULT", "SPACE"];
+
+fn define_category(
+    columns: &[usize],
+    line: &[u8],
+    source: &Path,
+    shown: &str,
+    char_def: &mut CharDef,
+) -> Result<(), Error> {
+    if columns.len() < 4 {
+        return Err(Error::build(source, format!("format error: {shown}")));
+    }
+    let name = cstr(line, columns[0]);
+    if name.len() >= CATEGORY_NAME_BYTES {
+        return Err(Error::build(
+            source,
+            format!(
+                "category name is longer than {} bytes: {}",
+                CATEGORY_NAME_BYTES - 1,
+                String::from_utf8_lossy(name)
+            ),
+        ));
+    }
+    if char_def.categories.contains_key(name) {
+        return Err(Error::build(
+            source,
+            format!(
+                "category {} is already defined",
+                String::from_utf8_lossy(name)
+            ),
+        ));
+    }
+    let info = parse_category(columns, line, char_def.order.len());
+    char_def.categories.insert(name.to_vec(), info);
+    char_def.order.push(name.to_vec());
+    Ok(())
+}
+
 fn read_char_def(char_def: &Path) -> Result<CharDef, Error> {
     let mut lines = if char_def.is_file() {
         Lines::open(char_def, Some(LINE_BUFFER_BYTES))?
@@ -165,9 +203,11 @@ fn read_char_def(char_def: &Path) -> Result<CharDef, Error> {
         Lines::builtin(CHAR_PROPERTY_DEF_DEFAULT, char_def, Some(LINE_BUFFER_BYTES))
     };
     let source = lines.path().to_path_buf();
-    let mut ranges: Vec<CodeRange> = Vec::new();
-    let mut categories: BTreeMap<Vec<u8>, CharInfo> = BTreeMap::new();
-    let mut order: Vec<Vec<u8>> = Vec::new();
+    let mut result = CharDef {
+        ranges: Vec::new(),
+        categories: BTreeMap::new(),
+        order: Vec::new(),
+    };
     while let Some(line) = lines.next_line()? {
         if line[0] == 0 || line[0] == b'#' {
             continue;
@@ -179,52 +219,18 @@ fn read_char_def(char_def: &Path) -> Result<CharDef, Error> {
         }
         let first = cstr(line, columns[0]);
         if first.starts_with(b"0x") {
-            ranges.push(parse_code_range(
-                first,
-                &columns,
-                line,
-                &source,
-                &categories,
-            )?);
+            let range = parse_code_range(first, &columns, line, &source, &result.categories)?;
+            result.ranges.push(range);
         } else {
-            if columns.len() < 4 {
-                return Err(Error::build(&source, format!("format error: {shown}")));
-            }
-            if first.len() >= CATEGORY_NAME_BYTES {
-                return Err(Error::build(
-                    &source,
-                    format!(
-                        "category name is longer than {} bytes: {}",
-                        CATEGORY_NAME_BYTES - 1,
-                        String::from_utf8_lossy(first)
-                    ),
-                ));
-            }
-            if categories.contains_key(first) {
-                return Err(Error::build(
-                    &source,
-                    format!(
-                        "category {} is already defined",
-                        String::from_utf8_lossy(first)
-                    ),
-                ));
-            }
-            let info = parse_category(&columns, line, order.len());
-            categories.insert(first.to_vec(), info);
-            order.push(first.to_vec());
+            define_category(&columns, line, &source, &shown, &mut result)?;
         }
     }
-    Ok(CharDef {
-        ranges,
-        categories,
-        order,
-    })
+    Ok(result)
 }
 
-fn require_categories_complete(
+fn require_core_categories(
     categories: &BTreeMap<Vec<u8>, CharInfo>,
     char_def: &Path,
-    unk_def: &Path,
 ) -> Result<(), Error> {
     if categories.len() >= MAX_CATEGORIES {
         return Err(Error::build(
@@ -232,7 +238,7 @@ fn require_categories_complete(
             format!("too many categories(>= {MAX_CATEGORIES})"),
         ));
     }
-    for required in ["DEFAULT", "SPACE"] {
+    for required in REQUIRED_CATEGORIES {
         if !categories.contains_key(required.as_bytes()) {
             return Err(Error::build(
                 char_def,
@@ -240,7 +246,14 @@ fn require_categories_complete(
             ));
         }
     }
+    Ok(())
+}
 
+fn read_unknown_categories(
+    unk_def: &Path,
+    char_def: &Path,
+    categories: &BTreeMap<Vec<u8>, CharInfo>,
+) -> Result<(HashSet<Vec<u8>>, PathBuf), Error> {
     let mut lines = if unk_def.is_file() {
         Lines::open(unk_def, Some(LINE_BUFFER_BYTES))?
     } else {
@@ -271,6 +284,16 @@ fn require_categories_complete(
         }
         unknown.insert(key.to_vec());
     }
+    Ok((unknown, unk_source))
+}
+
+fn require_categories_complete(
+    categories: &BTreeMap<Vec<u8>, CharInfo>,
+    char_def: &Path,
+    unk_def: &Path,
+) -> Result<(), Error> {
+    require_core_categories(categories, char_def)?;
+    let (unknown, unk_source) = read_unknown_categories(unk_def, char_def, categories)?;
     for name in categories.keys() {
         if !unknown.contains(name) {
             return Err(Error::build(

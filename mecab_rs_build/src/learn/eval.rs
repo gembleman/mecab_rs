@@ -95,6 +95,84 @@ fn print_evaluation(
     )
 }
 
+fn parse_levels(levels: &str, system: &Path) -> Result<Vec<i32>, Error> {
+    if levels.is_empty() {
+        return Err(Error::learn(system, "level_str is NULL"));
+    }
+    let mut buffer = levels.as_bytes().to_vec();
+    buffer.push(0);
+    let levels: Vec<i32> = tokenize2(&mut buffer, b"\t ", LEVEL_TOKEN_LIMIT)
+        .into_iter()
+        .map(|start| atoi(cstr(&buffer, start)))
+        .collect();
+    if levels.is_empty() {
+        return Err(Error::learn(system, "level_str is empty"));
+    }
+    Ok(levels)
+}
+
+struct Scores {
+    correct: Vec<usize>,
+    precision: usize,
+    recall: usize,
+}
+
+impl Scores {
+    fn new(level_count: usize) -> Self {
+        Self {
+            correct: vec![0; level_count],
+            precision: 0,
+            recall: 0,
+        }
+    }
+
+    fn add_pair(&mut self, system: &Sentence, answer: &Sentence) {
+        let (mut i1, mut i2, mut p1, mut p2) = (0, 0, 0, 0);
+        while i1 < system.len() && i2 < answer.len() {
+            match p1.cmp(&p2) {
+                Ordering::Equal => {
+                    for (level, count) in self.correct.iter_mut().enumerate() {
+                        if system[i1][level] == answer[i2][level] {
+                            *count += 1;
+                        }
+                    }
+                    p1 += system[i1][0].len();
+                    p2 += answer[i2][0].len();
+                    i1 += 1;
+                    i2 += 1;
+                    self.precision += 1;
+                    self.recall += 1;
+                }
+                Ordering::Less => {
+                    p1 += system[i1][0].len();
+                    i1 += 1;
+                    self.precision += 1;
+                }
+                Ordering::Greater => {
+                    p2 += answer[i2][0].len();
+                    i2 += 1;
+                    self.recall += 1;
+                }
+            }
+        }
+        self.precision += system.len() - i1;
+        self.recall += answer.len() - i2;
+    }
+
+    fn print(&self, levels: &[i32], out: &mut dyn Write) -> Result<(), Error> {
+        writeln!(out, "              precision          recall         F").map_err(output_error)?;
+        for (level, &count) in levels.iter().zip(&self.correct) {
+            if *level == -1 {
+                write!(out, "LEVEL ALL: ").map_err(output_error)?;
+            } else {
+                write!(out, "LEVEL {level}:    ").map_err(output_error)?;
+            }
+            print_evaluation(out, count, self.precision, self.recall).map_err(output_error)?;
+        }
+        Ok(())
+    }
+}
+
 pub fn evaluate(
     system: &Path,
     answer: &Path,
@@ -109,68 +187,15 @@ pub fn evaluate(
     };
     let mut first = open(system)?;
     let mut second = open(answer)?;
-    if levels.is_empty() {
-        return Err(Error::learn(system, "level_str is NULL"));
-    }
-    let mut buffer = levels.as_bytes().to_vec();
-    buffer.push(0);
-    let levels: Vec<i32> = tokenize2(&mut buffer, b"\t ", LEVEL_TOKEN_LIMIT)
-        .into_iter()
-        .map(|start| atoi(cstr(&buffer, start)))
-        .collect();
-    if levels.is_empty() {
-        return Err(Error::learn(system, "level_str is empty"));
-    }
-    let mut correct = vec![0usize; levels.len()];
-    let mut precision = 0usize;
-    let mut recall = 0usize;
-
+    let levels = parse_levels(levels, system)?;
+    let mut scores = Scores::new(levels.len());
     while let Some(r1) = read_sentence(&mut first, &levels)? {
         let Some(r2) = read_sentence(&mut second, &levels)? else {
             break;
         };
-        let (mut i1, mut i2, mut p1, mut p2) = (0, 0, 0, 0);
-        while i1 < r1.len() && i2 < r2.len() {
-            match p1.cmp(&p2) {
-                Ordering::Equal => {
-                    for (level, count) in correct.iter_mut().enumerate() {
-                        if r1[i1][level] == r2[i2][level] {
-                            *count += 1;
-                        }
-                    }
-                    p1 += r1[i1][0].len();
-                    p2 += r2[i2][0].len();
-                    i1 += 1;
-                    i2 += 1;
-                    precision += 1;
-                    recall += 1;
-                }
-                Ordering::Less => {
-                    p1 += r1[i1][0].len();
-                    i1 += 1;
-                    precision += 1;
-                }
-                Ordering::Greater => {
-                    p2 += r2[i2][0].len();
-                    i2 += 1;
-                    recall += 1;
-                }
-            }
-        }
-        precision += r1.len() - i1;
-        recall += r2.len() - i2;
+        scores.add_pair(&r1, &r2);
     }
-
-    writeln!(out, "              precision          recall         F").map_err(output_error)?;
-    for (level, &count) in levels.iter().zip(&correct) {
-        if *level == -1 {
-            write!(out, "LEVEL ALL: ").map_err(output_error)?;
-        } else {
-            write!(out, "LEVEL {level}:    ").map_err(output_error)?;
-        }
-        print_evaluation(out, count, precision, recall).map_err(output_error)?;
-    }
-    Ok(())
+    scores.print(&levels, out)
 }
 
 pub fn test_sentences(inputs: &[PathBuf], out: &mut dyn Write) -> Result<(), Error> {

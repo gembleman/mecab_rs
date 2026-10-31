@@ -42,22 +42,73 @@ fn to_int(text: &[u8]) -> i32 {
     }
 }
 
+struct Lazy<T>(Option<T>);
+
+impl<T> Lazy<T> {
+    const fn closed() -> Self {
+        Self(None)
+    }
+
+    const fn opened(value: T) -> Self {
+        Self(Some(value))
+    }
+
+    fn get_or_open(&mut self, open: impl FnOnce() -> Result<T, Error>) -> Result<&mut T, Error> {
+        match &mut self.0 {
+            Some(value) => Ok(value),
+            slot @ None => Ok(slot.insert(open()?)),
+        }
+    }
+}
+
 struct Resources<'a> {
     settings: &'a Settings,
-    rewriter: Option<Rewriter>,
-    cost: Option<(CostModel, CharProperty)>,
-    ids: Option<ContextIds>,
+    rewriter: Lazy<Rewriter>,
+    cost: Lazy<(CostModel, CharProperty)>,
+    ids: Lazy<ContextIds>,
     sizes: MatrixSize,
+}
+
+fn open_context_ids(settings: &Settings, sizes: MatrixSize) -> Result<ContextIds, Error> {
+    let dir = &settings.dic_dir;
+    let ids = ContextIds::open(&dir.join(LEFT_ID_DEF_FILE), &dir.join(RIGHT_ID_DEF_FILE))?;
+    if ids.left_size() != sizes.left || ids.right_size() != sizes.right {
+        return Err(Error::build(
+            dir,
+            format!(
+                "Context ID files(left-id.def or right-id.def may be broken: {} {} {} {}",
+                ids.left_size(),
+                sizes.left,
+                ids.right_size(),
+                sizes.right
+            ),
+        ));
+    }
+    Ok(ids)
 }
 
 impl<'a> Resources<'a> {
     fn new(settings: &'a Settings) -> Result<Self, Error> {
         Ok(Self {
             settings,
-            rewriter: None,
-            cost: None,
-            ids: None,
+            rewriter: Lazy::closed(),
+            cost: Lazy::closed(),
+            ids: Lazy::closed(),
             sizes: matrix::sizes(&settings.dic_dir)?,
+        })
+    }
+
+    fn opened(settings: &'a Settings) -> Result<Self, Error> {
+        let sizes = matrix::sizes(&settings.dic_dir)?;
+        let rewriter = Rewriter::open(&settings.dic_dir.join(REWRITE_DEF_FILE))?;
+        let cost = settings.open_cost_model()?;
+        let ids = open_context_ids(settings, sizes)?;
+        Ok(Self {
+            settings,
+            rewriter: Lazy::opened(rewriter),
+            cost: Lazy::opened(cost),
+            ids: Lazy::opened(ids),
+            sizes,
         })
     }
 
@@ -65,61 +116,23 @@ impl<'a> Resources<'a> {
         self.settings.dic_dir.join(REWRITE_DEF_FILE)
     }
 
-    fn open_cost_model(&mut self) -> Result<(), Error> {
-        if self.rewriter.is_none() {
-            self.rewriter = Some(Rewriter::open(&self.rewrite_def())?);
-            self.cost = Some(self.settings.open_cost_model()?);
-        }
-        Ok(())
-    }
-
     fn calc_cost(&mut self, word: &[u8], feature: &[u8]) -> Result<i32, Error> {
         let rewrite_def = self.rewrite_def();
-        let (Some(rewriter), Some((model, property))) = (self.rewriter.as_mut(), &self.cost) else {
-            return Err(Error::build(
-                &self.settings.dic_dir,
-                "cannot open feature index",
-            ));
-        };
+        let settings = self.settings;
+        let rewriter = self.rewriter.get_or_open(|| Rewriter::open(&rewrite_def))?;
+        let (model, property) = self.cost.get_or_open(|| settings.open_cost_model())?;
         let (_, rewritten) = rewriter.rewrite_cached(feature, &rewrite_def)?;
         let weight = model.cost(
             &rewritten.unigram,
             property.default_type(word),
-            &self.settings.dic_dir.join(FEATURE_DEF_FILE),
+            &settings.dic_dir.join(FEATURE_DEF_FILE),
         )?;
-        Ok(i32::from(to_cost(
-            weight,
-            f64::from(self.settings.cost_factor),
-        )))
-    }
-
-    fn open_ids(&mut self) -> Result<(), Error> {
-        if self.ids.is_none() {
-            let dir = &self.settings.dic_dir;
-            let ids = ContextIds::open(&dir.join(LEFT_ID_DEF_FILE), &dir.join(RIGHT_ID_DEF_FILE))?;
-            if ids.left_size() != self.sizes.left || ids.right_size() != self.sizes.right {
-                return Err(Error::build(
-                    dir,
-                    format!(
-                        "Context ID files(left-id.def or right-id.def may be broken: {} {} {} {}",
-                        ids.left_size(),
-                        self.sizes.left,
-                        ids.right_size(),
-                        self.sizes.right
-                    ),
-                ));
-            }
-            self.ids = Some(ids);
-        }
-        Ok(())
+        Ok(i32::from(to_cost(weight, f64::from(settings.cost_factor))))
     }
 
     fn ids_of(&mut self, feature: &[u8]) -> Result<(i32, i32), Error> {
-        if self.rewriter.is_none() {
-            self.rewriter = Some(Rewriter::open(&self.rewrite_def())?);
-        }
         let path = self.rewrite_def();
-        let rewriter = self.rewriter.as_ref().expect("opened above");
+        let rewriter = self.rewriter.get_or_open(|| Rewriter::open(&path))?;
         let (matched, rewritten) = rewriter.rewrite(feature, &path)?;
         if !matched {
             return Err(Error::build(
@@ -127,28 +140,95 @@ impl<'a> Resources<'a> {
                 format!("rewrite failed: {}", String::from_utf8_lossy(feature)),
             ));
         }
-        self.open_ids()?;
-        let ids = self.ids.as_ref().expect("opened above");
+        let (settings, sizes) = (self.settings, self.sizes);
+        let ids = self.ids.get_or_open(|| open_context_ids(settings, sizes))?;
         Ok((
             ids.left_id(&rewritten.left)?,
             ids.right_id(&rewritten.right)?,
         ))
     }
 
-    fn ids_are_valid(&self, left_id: i32, right_id: i32) -> bool {
+    fn require_valid_ids(&self, left_id: i32, right_id: i32) -> Result<(), Error> {
         let left_id_limit = self.sizes.right;
         let right_id_limit = self.sizes.left;
-        left_id >= 0
+        let valid = left_id >= 0
             && right_id >= 0
             && (left_id as usize) < left_id_limit
-            && (right_id as usize) < right_id_limit
+            && (right_id as usize) < right_id_limit;
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::build(
+                &self.settings.dic_dir,
+                format!("invalid ids are found lid={left_id} rid={right_id}"),
+            ))
+        }
     }
 }
 
 const NO_POS_ID: i32 = -1;
 
-fn invalid_ids_error(left: i32, right: i32, dir: &Path) -> Error {
-    Error::build(dir, format!("invalid ids are found lid={left} rid={right}"))
+struct Row {
+    shown: String,
+    word: Vec<u8>,
+    left: i32,
+    right: i32,
+    cost: i32,
+    feature: Vec<u8>,
+}
+
+fn parse_row(line: &mut [u8], input: &Path) -> Result<Row, Error> {
+    let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
+    let columns = tokenize_csv(line, CSV_COLUMNS);
+    if columns.len() != CSV_COLUMNS {
+        return Err(Error::build(input, format!("format error: {shown}")));
+    }
+    Ok(Row {
+        shown,
+        word: cstr(line, columns[SURFACE_COLUMN]).to_vec(),
+        left: to_int(cstr(line, columns[LEFT_ID_COLUMN])),
+        right: to_int(cstr(line, columns[RIGHT_ID_COLUMN])),
+        cost: to_int(cstr(line, columns[COST_COLUMN])),
+        feature: cstr(line, columns[FEATURE_COLUMN]).to_vec(),
+    })
+}
+
+fn read_pos_id(pos_ids: &PosIds, row: &Row, input: &Path) -> Result<u16, Error> {
+    let pos_id = pos_ids.id(&row.feature)?;
+    if !(NO_POS_ID..=i32::from(u16::MAX)).contains(&pos_id) {
+        return Err(Error::build(
+            input,
+            format!("pos id out of range: {pos_id}"),
+        ));
+    }
+    Ok(pos_id as u16)
+}
+
+fn estimate_cost(
+    resources: &mut Resources,
+    kind: DictionaryKind,
+    row: &Row,
+    input: &Path,
+) -> Result<i32, Error> {
+    if row.cost != NO_VALUE {
+        return Ok(row.cost);
+    }
+    if kind != DictionaryKind::User {
+        return Err(Error::build(
+            input,
+            "cost field should not be empty in sys/unk dic.",
+        ));
+    }
+    resources.calc_cost(&row.word, &row.feature)
+}
+
+fn resolve_ids(resources: &mut Resources, row: &Row) -> Result<(i32, i32), Error> {
+    let missing = row.left < 0 || row.right < 0 || row.left == NO_VALUE || row.right == NO_VALUE;
+    if missing {
+        resources.ids_of(&row.feature)
+    } else {
+        Ok((row.left, row.right))
+    }
 }
 
 struct ReadEntries {
@@ -157,19 +237,59 @@ struct ReadEntries {
     counts: Vec<usize>,
 }
 
-fn read_entries(
-    settings: &Settings,
+struct EntryReader<'a, 's> {
     kind: DictionaryKind,
-    inputs: &[PathBuf],
-    resources: &mut Resources,
-    pos_ids: &PosIds,
-) -> Result<ReadEntries, Error> {
-    let dir = &settings.dic_dir;
-    let mut entries: Vec<Entry> = Vec::new();
-    let mut features: Vec<u8> = Vec::new();
-    let mut counts = Vec::new();
-    for input in inputs {
-        let mut lines = if kind == DictionaryKind::Unknown && !input.is_file() {
+    resources: &'a mut Resources<'s>,
+    pos_ids: &'a PosIds,
+    entries: Vec<Entry>,
+    features: Vec<u8>,
+}
+
+impl EntryReader<'_, '_> {
+    fn read_row(&mut self, row: Row, input: &Path) -> Result<bool, Error> {
+        let pos_id = read_pos_id(self.pos_ids, &row, input)?;
+        let cost = estimate_cost(self.resources, self.kind, &row, input)?;
+        let (left, right) = resolve_ids(self.resources, &row)?;
+        self.resources.require_valid_ids(left, right)?;
+        let cost = i16::try_from(cost).map_err(|_| {
+            Error::build(
+                input,
+                format!("cost out of the 16-bit range: {cost}: {}", row.shown),
+            )
+        })?;
+        if row.word.is_empty() {
+            eprintln!("empty word is found, discard this line");
+            return Ok(false);
+        }
+        let feature = self.append_feature(&row, input)?;
+        self.entries.push(Entry {
+            surface: row.word,
+            left_id: left as u16,
+            right_id: right as u16,
+            pos_id,
+            cost,
+            feature,
+        });
+        Ok(true)
+    }
+
+    fn append_feature(&mut self, row: &Row, input: &Path) -> Result<u32, Error> {
+        let offset = self.features.len();
+        if !self.resources.settings.options.wakati {
+            if str::from_utf8(&row.feature).is_err() {
+                return Err(Error::build(
+                    input,
+                    format!("the feature is not valid UTF-8: {}", row.shown),
+                ));
+            }
+            self.features.extend_from_slice(&row.feature);
+            self.features.push(0);
+        }
+        u32::try_from(offset).map_err(|_| Error::build(input, "the features are longer than 4 GiB"))
+    }
+
+    fn read_input(&mut self, input: &Path) -> Result<usize, Error> {
+        let mut lines = if self.kind == DictionaryKind::Unknown && !input.is_file() {
             eprintln!("{} is not found. minimum setting is used.", input.display());
             Lines::builtin(UNK_DEF_DEFAULT, input, Some(LINE_BUFFER_BYTES))
         } else {
@@ -177,78 +297,35 @@ fn read_entries(
         };
         let mut count = 0;
         while let Some(line) = lines.next_line()? {
-            let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
-            let columns = tokenize_csv(line, CSV_COLUMNS);
-            if columns.len() != CSV_COLUMNS {
-                return Err(Error::build(input, format!("format error: {shown}")));
+            let row = parse_row(line, input)?;
+            if self.read_row(row, input)? {
+                count += 1;
             }
-            let word = cstr(line, columns[SURFACE_COLUMN]).to_vec();
-            let mut left = to_int(cstr(line, columns[LEFT_ID_COLUMN]));
-            let mut right = to_int(cstr(line, columns[RIGHT_ID_COLUMN]));
-            let mut cost = to_int(cstr(line, columns[COST_COLUMN]));
-            let feature = cstr(line, columns[FEATURE_COLUMN]).to_vec();
-            let pos_id = pos_ids.id(&feature)?;
-            if pos_id < NO_POS_ID || pos_id > i32::from(u16::MAX) {
-                return Err(Error::build(
-                    input,
-                    format!("pos id out of range: {pos_id}"),
-                ));
-            }
-
-            if cost == NO_VALUE {
-                if kind != DictionaryKind::User {
-                    return Err(Error::build(
-                        input,
-                        "cost field should not be empty in sys/unk dic.",
-                    ));
-                }
-                resources.open_cost_model()?;
-                cost = resources.calc_cost(&word, &feature)?;
-            }
-            if left < 0 || right < 0 || left == NO_VALUE || right == NO_VALUE {
-                (left, right) = resources.ids_of(&feature)?;
-            }
-            if !resources.ids_are_valid(left, right) {
-                return Err(invalid_ids_error(left, right, dir));
-            }
-            if i16::try_from(cost).is_err() {
-                return Err(Error::build(
-                    input,
-                    format!("cost out of the 16-bit range: {cost}: {shown}"),
-                ));
-            }
-            if word.is_empty() {
-                eprintln!("empty word is found, discard this line");
-                continue;
-            }
-
-            let feature_offset = features.len();
-            if !settings.options.wakati {
-                if str::from_utf8(&feature).is_err() {
-                    return Err(Error::build(
-                        input,
-                        format!("the feature is not valid UTF-8: {shown}"),
-                    ));
-                }
-                features.extend_from_slice(&feature);
-                features.push(0);
-            }
-            entries.push(Entry {
-                surface: word,
-                left_id: left as u16,
-                right_id: right as u16,
-                pos_id: pos_id as u16,
-                cost: cost as i16,
-                feature: u32::try_from(feature_offset)
-                    .map_err(|_| Error::build(input, "the features are longer than 4 GiB"))?,
-            });
-            count += 1;
         }
-        counts.push(count);
+        Ok(count)
+    }
+}
+
+fn read_entries(
+    kind: DictionaryKind,
+    inputs: &[PathBuf],
+    resources: &mut Resources,
+    pos_ids: &PosIds,
+) -> Result<ReadEntries, Error> {
+    let mut reader = EntryReader {
+        kind,
+        resources,
+        pos_ids,
+        entries: Vec::new(),
+        features: Vec::new(),
+    };
+    let mut counts = Vec::new();
+    for input in inputs {
+        counts.push(reader.read_input(input)?);
     }
     Ok(ReadEntries {
-        entries,
-        features,
+        entries: reader.entries,
+        features: reader.features,
         counts,
     })
 }
@@ -354,7 +431,7 @@ pub(super) fn compile(
         mut entries,
         mut features,
         counts,
-    } = read_entries(settings, kind, inputs, &mut resources, &pos_ids)?;
+    } = read_entries(kind, inputs, &mut resources, &pos_ids)?;
     if settings.options.wakati {
         features.push(0);
     }
@@ -385,6 +462,30 @@ pub(super) fn compile(
     Ok(counts)
 }
 
+fn assign_input(
+    resources: &mut Resources,
+    input: &Path,
+    text: &mut Vec<u8>,
+) -> Result<usize, Error> {
+    let mut lines = Lines::open(input, Some(LINE_BUFFER_BYTES))?;
+    let mut count = 0;
+    while let Some(line) = lines.next_line()? {
+        let Row {
+            mut word, feature, ..
+        } = parse_row(line, input)?;
+        let cost = resources.calc_cost(&word, &feature)?;
+        let (left, right) = resources.ids_of(&feature)?;
+        resources.require_valid_ids(left, right)?;
+        escape_csv_element(&mut word);
+        text.extend_from_slice(&word);
+        text.extend_from_slice(format!(",{left},{right},{cost},").as_bytes());
+        text.extend_from_slice(&feature);
+        text.push(b'\n');
+        count += 1;
+    }
+    Ok(count)
+}
+
 pub(super) fn assign_costs(
     settings: &Settings,
     inputs: &[PathBuf],
@@ -392,38 +493,11 @@ pub(super) fn assign_costs(
 ) -> Result<Vec<usize>, Error> {
     settings.require_supported()?;
     settings.require_factor()?;
-    let dir = &settings.dic_dir;
-    let mut resources = Resources::new(settings)?;
-    resources.rewriter = Some(Rewriter::open(&resources.rewrite_def())?);
-    resources.cost = Some(settings.open_cost_model()?);
-    resources.open_ids()?;
-
+    let mut resources = Resources::opened(settings)?;
     let mut text = Vec::new();
     let mut counts = Vec::new();
     for input in inputs {
-        let mut lines = Lines::open(input, Some(LINE_BUFFER_BYTES))?;
-        let mut count = 0;
-        while let Some(line) = lines.next_line()? {
-            let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
-            let columns = tokenize_csv(line, CSV_COLUMNS);
-            if columns.len() != CSV_COLUMNS {
-                return Err(Error::build(input, format!("format error: {shown}")));
-            }
-            let mut word = cstr(line, columns[SURFACE_COLUMN]).to_vec();
-            let feature = cstr(line, columns[FEATURE_COLUMN]).to_vec();
-            let cost = resources.calc_cost(&word, &feature)?;
-            let (left, right) = resources.ids_of(&feature)?;
-            if !resources.ids_are_valid(left, right) {
-                return Err(invalid_ids_error(left, right, dir));
-            }
-            escape_csv_element(&mut word);
-            text.extend_from_slice(&word);
-            text.extend_from_slice(format!(",{left},{right},{cost},").as_bytes());
-            text.extend_from_slice(&feature);
-            text.push(b'\n');
-            count += 1;
-        }
-        counts.push(count);
+        counts.push(assign_input(&mut resources, input, &mut text)?);
     }
     write_file(output, |file| file.write_all(&text))?;
     Ok(counts)

@@ -5,16 +5,18 @@ use crate::constraint::{Constraint, ConstraintSet};
 use crate::dictionary::{Dictionary, UserIndex};
 use crate::error::Error;
 use crate::ids::{ElementId, NodeId};
-use crate::matrix::Matrix;
+use crate::matrix::{DenseMatrix, HotView, Matrix};
 use crate::nbest::{Agenda, LinkSpan, PathLink};
 use crate::packed::{PackedDictionary, PackedView};
 use crate::system_dictionary::PrefixHit;
-use crate::system_dictionary::SystemDictionary;
+use crate::system_dictionary::{SystemDictionary, TokenRecord};
 use crate::utf8::sequence_len;
 
+mod best_lefts;
 mod lookup;
 mod nbest;
 
+use best_lefts::best_lefts;
 use nbest::Marginals;
 
 fn newest_first<I: DoubleEndedIterator>(candidates: I) -> std::iter::Rev<I> {
@@ -97,6 +99,41 @@ struct Candidate {
 }
 
 impl Candidate {
+    #[inline(always)]
+    fn from_token(
+        token: &TokenRecord,
+        surface: usize,
+        end: usize,
+        source: NodeSource,
+        char_type: u8,
+    ) -> Self {
+        Self {
+            surface: surface as u32,
+            end: end as u32,
+            feature: token.feature,
+            left_id: token.left_id,
+            right_id: token.right_id,
+            pos_id: token.pos_id,
+            word_cost: token.word_cost,
+            source,
+            char_type,
+        }
+    }
+
+    fn bos() -> Self {
+        Self {
+            surface: 0,
+            end: 0,
+            feature: 0,
+            left_id: 0,
+            right_id: 0,
+            pos_id: 0,
+            word_cost: 0,
+            source: NodeSource::Bos,
+            char_type: 0,
+        }
+    }
+
     fn raw(self, begin: usize) -> RawNode {
         RawNode {
             surface_start: self.surface,
@@ -129,12 +166,32 @@ struct HitSite {
     partial: bool,
     char_type: u8,
     limit: usize,
+    key_end: usize,
+    whole: bool,
 }
 
 struct Span {
     begin: usize,
     surface: usize,
     end: usize,
+}
+
+impl Span {
+    #[inline(always)]
+    fn new(begin: usize, surface: usize, end: usize) -> Self {
+        Self {
+            begin,
+            surface,
+            end,
+        }
+    }
+}
+
+struct BestSite<'a> {
+    lefts: &'a [LeftCandidate],
+    widest: u16,
+    position: usize,
+    first: usize,
 }
 
 #[derive(Default)]
@@ -215,81 +272,30 @@ const CONNECT_GROUP_SIZE: usize = 4;
 
 const END_SLOTS_PAST_TEXT: usize = 2;
 
-#[cfg(not(target_arch = "x86_64"))]
-#[inline(always)]
-fn best_lefts(
-    lefts: &[LeftCandidate],
-    columns: [&[i16]; CONNECT_GROUP_SIZE],
-) -> [(i32, NodeId); CONNECT_GROUP_SIZE] {
-    let mut best = [(i32::MAX, lefts[0].id); CONNECT_GROUP_SIZE];
-    for left in lefts {
-        let right_id = usize::from(left.right_id);
-        for (best, cells) in best.iter_mut().zip(columns) {
-            debug_assert!(right_id < cells.len());
-            let cost = left.cost + i32::from(unsafe { *cells.get_unchecked(right_id) });
-            *best = std::hint::select_unpredictable(cost <= best.0, (cost, left.id), *best);
+#[cfg(feature = "pair-stats")]
+fn record_pairs(nodes: &[BestNode], lefts: &[LeftCandidate]) {
+    for node in nodes {
+        for left in lefts {
+            crate::pair_stats::record(node.candidate.left_id, left.right_id);
         }
     }
-    best
 }
 
-#[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn best_lefts(
+fn prefetch_columns(
+    nodes: &[BestNode],
     lefts: &[LeftCandidate],
-    columns: [&[i16]; CONNECT_GROUP_SIZE],
-) -> [(i32, NodeId); CONNECT_GROUP_SIZE] {
-    use std::arch::x86_64::{
-        __m128i, _mm_add_epi32, _mm_and_si128, _mm_andnot_si128, _mm_cmpgt_epi32, _mm_or_si128,
-        _mm_set1_epi32, _mm_setr_epi16, _mm_setzero_si128, _mm_srai_epi32, _mm_storeu_si128,
-        _mm_unpacklo_epi16,
-    };
-
-    #[inline(always)]
-    fn pick_where_set(mask: __m128i, chosen: __m128i, otherwise: __m128i) -> __m128i {
-        unsafe {
-            _mm_or_si128(
-                _mm_and_si128(mask, chosen),
-                _mm_andnot_si128(mask, otherwise),
-            )
-        }
-    }
-
-    debug_assert!(!lefts.is_empty());
-    debug_assert!(i32::try_from(lefts.len()).is_ok());
-    let mut costs = [0i32; CONNECT_GROUP_SIZE];
-    let mut positions = [0i32; CONNECT_GROUP_SIZE];
-    unsafe {
-        let mut best_cost = _mm_set1_epi32(i32::MAX);
-        let mut best_position = _mm_setzero_si128();
-        let mut position = _mm_setzero_si128();
-        let one = _mm_set1_epi32(1);
-        for left in lefts {
-            let right_id = usize::from(left.right_id);
-            for cells in columns {
-                debug_assert!(right_id < cells.len());
+    hot: &HotView<'_>,
+    reaches: impl Fn(&[i16]) -> bool,
+) {
+    for node in nodes {
+        let cells = hot.right_column(node.candidate.left_id).cells();
+        if reaches(cells) {
+            for left in lefts {
+                prefetch(cells.as_ptr().wrapping_add(usize::from(left.right_id)));
             }
-            let cells = _mm_setr_epi16(
-                *columns[0].get_unchecked(right_id),
-                *columns[1].get_unchecked(right_id),
-                *columns[2].get_unchecked(right_id),
-                *columns[3].get_unchecked(right_id),
-                0,
-                0,
-                0,
-                0,
-            );
-            let widened = _mm_srai_epi32::<16>(_mm_unpacklo_epi16(cells, cells));
-            let cost = _mm_add_epi32(_mm_set1_epi32(left.cost), widened);
-            let worse = _mm_cmpgt_epi32(cost, best_cost);
-            best_cost = pick_where_set(worse, best_cost, cost);
-            best_position = pick_where_set(worse, best_position, position);
-            position = _mm_add_epi32(position, one);
         }
-        _mm_storeu_si128(costs.as_mut_ptr().cast(), best_cost);
-        _mm_storeu_si128(positions.as_mut_ptr().cast(), best_position);
     }
-    std::array::from_fn(|lane| (costs[lane], lefts[positions[lane] as usize].id))
 }
 
 #[inline(always)]
@@ -394,12 +400,7 @@ impl Lattice {
         let view = system.view();
         self.sentence_chars
             .fill(&dictionary.chars, sentence, |code| view.trie_code_of(code));
-        let bos = self.push_node(RawNode::boundary(NodeSource::Bos, 0));
-        self.ends[0].push(LeftCandidate {
-            right_id: 0,
-            cost: 0,
-            id: bos,
-        });
+        self.push_bos::<false>();
         for position in 0..sentence_len {
             if self.ends[position].lefts.is_empty() {
                 continue;
@@ -408,15 +409,12 @@ impl Lattice {
                 self.lookup::<false>(dictionary, system, &view, unknown, sentence, position)?;
             self.connect::<NBEST>(dictionary, position, begun);
         }
-        let eos_index = self.nodes.len();
-        let eos = self.push_node(RawNode::boundary(NodeSource::Eos, sentence_len));
-        let last_filled_end = (0..=sentence_len)
-            .rev()
-            .find(|&at| !self.ends[at].lefts.is_empty());
+        let last_filled_end = self.last_filled_end_slot(sentence_len);
+        let eos_index = self.push_eos::<false>(sentence_len, 0);
         if let Some(position) = last_filled_end {
             self.connect::<NBEST>(dictionary, position, eos_index..eos_index + 1);
         }
-        Ok(eos)
+        Ok(NodeId::from_index(eos_index))
     }
 
     fn build_best(&mut self, dictionary: &Dictionary, sentence: &[u8]) {
@@ -440,27 +438,7 @@ impl Lattice {
         let view = system.view();
         self.sentence_chars
             .fill(&dictionary.chars, sentence, |code| view.trie_code_of(code));
-        let bos_candidate = Candidate {
-            surface: 0,
-            end: 0,
-            feature: 0,
-            left_id: 0,
-            right_id: 0,
-            pos_id: 0,
-            word_cost: 0,
-            source: NodeSource::Bos,
-            char_type: 0,
-        };
-        self.best_nodes.push(BestNode {
-            candidate: bos_candidate,
-            prev: None,
-            cost: 0,
-        });
-        self.ends[0].push(LeftCandidate {
-            right_id: 0,
-            cost: 0,
-            id: NodeId::from_index(0),
-        });
+        self.push_bos::<true>();
         let mut position = 0;
         while position < sentence_len {
             let lead = sentence[position];
@@ -473,23 +451,56 @@ impl Lattice {
             }
             position += sequence_len(lead);
         }
-        let last_filled_end = (0..=sentence_len)
-            .rev()
-            .find(|&at| !self.ends[at].lefts.is_empty())
-            .unwrap_or(0);
-        let eos = self.best_nodes.len();
-        self.best_nodes.push(BestNode {
-            candidate: Candidate {
-                surface: sentence_len as u32,
-                end: last_filled_end as u32 + 1,
-                source: NodeSource::Eos,
-                ..bos_candidate
-            },
-            prev: None,
-            cost: 0,
-        });
+        let last_filled_end = self.last_filled_end_slot(sentence_len).unwrap_or(0);
+        let eos = self.push_eos::<true>(sentence_len, last_filled_end);
         self.connect_best(dictionary, last_filled_end, eos);
         self.collect_best_nodes();
+    }
+
+    #[inline(always)]
+    fn last_filled_end_slot(&self, sentence_len: usize) -> Option<usize> {
+        (0..=sentence_len)
+            .rev()
+            .find(|&at| !self.ends[at].lefts.is_empty())
+    }
+
+    #[inline(always)]
+    fn push_bos<const BEST: bool>(&mut self) {
+        let bos = if BEST {
+            self.best_nodes.push(BestNode {
+                candidate: Candidate::bos(),
+                prev: None,
+                cost: 0,
+            });
+            NodeId::from_index(self.best_nodes.len() - 1)
+        } else {
+            self.push_node(RawNode::boundary(NodeSource::Bos, 0))
+        };
+        self.ends[0].push(LeftCandidate {
+            right_id: 0,
+            cost: 0,
+            id: bos,
+        });
+    }
+
+    #[inline(always)]
+    fn push_eos<const BEST: bool>(&mut self, sentence_len: usize, last_filled_end: usize) -> usize {
+        if BEST {
+            self.best_nodes.push(BestNode {
+                candidate: Candidate {
+                    surface: sentence_len as u32,
+                    end: last_filled_end as u32 + 1,
+                    source: NodeSource::Eos,
+                    ..Candidate::bos()
+                },
+                prev: None,
+                cost: 0,
+            });
+            self.best_nodes.len() - 1
+        } else {
+            self.push_node(RawNode::boundary(NodeSource::Eos, sentence_len))
+                .index()
+        }
     }
 
     fn connect_best(&mut self, dictionary: &Dictionary, position: usize, first: usize) {
@@ -497,102 +508,146 @@ impl Lattice {
             best_nodes, ends, ..
         } = self;
         let (head, later_ends) = ends.split_at_mut(position + 1);
-        let lefts: &[LeftCandidate] = &head[position].lefts;
-        let widest = head[position].widest;
+        let site = BestSite {
+            lefts: &head[position].lefts,
+            widest: head[position].widest,
+            position,
+            first,
+        };
         match &dictionary.matrix {
             Matrix::PackedDense(dense) => {
-                for index in (first..best_nodes.len()).rev() {
-                    let column = dense.right_column(best_nodes[index].candidate.left_id);
-                    let (cost, best) = best_left::<false>(lefts, |id| {
-                        debug_assert!(usize::from(id) < column.len());
-                        unsafe { *column.get_unchecked(usize::from(id)) }
-                    });
-                    store_best(best_nodes, later_ends, position, index, cost, best);
-                }
+                Self::connect_best_dense(best_nodes, later_ends, &site, dense);
             }
             Matrix::PackedHot(hot) => {
-                #[cfg(feature = "pair-stats")]
-                for node in &best_nodes[first..] {
-                    for left in lefts {
-                        crate::pair_stats::record(node.candidate.left_id, left.right_id);
-                    }
-                }
-                let hot = hot.view();
-                let reaches = |cells: &[i16]| cells.len() > usize::from(widest);
-                for node in &best_nodes[first..] {
-                    let cells = hot.right_column(node.candidate.left_id).cells();
-                    if reaches(cells) {
-                        for left in lefts {
-                            prefetch(cells.as_ptr().wrapping_add(usize::from(left.right_id)));
-                        }
-                    }
-                }
-                let mut next = best_nodes.len();
-                while next > first {
-                    if next - first >= CONNECT_GROUP_SIZE {
-                        let indices: [usize; CONNECT_GROUP_SIZE] =
-                            std::array::from_fn(|lane| next - 1 - lane);
-                        let columns = indices.map(|index| {
-                            hot.right_column(best_nodes[index].candidate.left_id)
-                                .cells()
-                        });
-                        if columns.iter().all(|cells| reaches(cells)) {
-                            let found = best_lefts(lefts, columns);
-                            for (index, (cost, best)) in indices.into_iter().zip(found) {
-                                store_best(best_nodes, later_ends, position, index, cost, best);
-                            }
-                            next -= CONNECT_GROUP_SIZE;
-                            continue;
-                        }
-                    }
-                    next -= 1;
-                    let column = hot.right_column(best_nodes[next].candidate.left_id);
-                    let cells = column.cells();
-                    let (cost, best) = if reaches(cells) {
-                        let cost = |id: u16| unsafe { *cells.get_unchecked(usize::from(id)) };
-                        best_left::<true>(lefts, cost)
-                    } else {
-                        best_left::<true>(lefts, column.into_cost_fn())
-                    };
-                    store_best(best_nodes, later_ends, position, next, cost, best);
-                }
+                Self::connect_best_hot(best_nodes, later_ends, &site, &hot.view());
             }
         }
     }
 
-    fn collect_best_nodes(&mut self) {
-        let eos = self.best_nodes.len() - 1;
-        self.path_cost = i64::from(self.best_nodes[eos].cost);
-        let mut count = 0;
-        let mut cursor = Some(NodeId::from_index(eos));
-        while let Some(id) = cursor {
-            count += 1;
-            cursor = self.best_nodes[id].prev;
+    #[inline(always)]
+    fn connect_best_dense(
+        best_nodes: &mut [BestNode],
+        later_ends: &mut [EndSlot],
+        site: &BestSite<'_>,
+        dense: &DenseMatrix,
+    ) {
+        for index in (site.first..best_nodes.len()).rev() {
+            let column = dense.right_column(best_nodes[index].candidate.left_id);
+            let (cost, best) = best_left::<false>(site.lefts, |id| {
+                debug_assert!(usize::from(id) < column.len());
+                unsafe { *column.get_unchecked(usize::from(id)) }
+            });
+            store_best(best_nodes, later_ends, site.position, index, cost, best);
         }
-        self.nodes
-            .resize(count, RawNode::boundary(NodeSource::Bos, 0));
-        self.path.extend((0..count).map(NodeId::from_index));
-        let mut cursor = Some(NodeId::from_index(eos));
-        while let Some(id) = cursor {
-            count -= 1;
-            let best = self.best_nodes[id];
-            let candidate = best.candidate;
-            let mut node = match candidate.source {
-                NodeSource::Bos | NodeSource::Eos => {
-                    RawNode::boundary(candidate.source, candidate.surface as usize)
-                }
-                _ => {
-                    let begin = self.best_nodes[best.prev.expect("a word has a left node")]
-                        .candidate
-                        .end;
-                    candidate.raw(begin as usize)
-                }
+    }
+
+    #[inline(always)]
+    fn connect_best_hot(
+        best_nodes: &mut [BestNode],
+        later_ends: &mut [EndSlot],
+        site: &BestSite<'_>,
+        hot: &HotView<'_>,
+    ) {
+        let BestSite {
+            lefts,
+            widest,
+            position,
+            first,
+        } = *site;
+        #[cfg(feature = "pair-stats")]
+        record_pairs(&best_nodes[first..], lefts);
+        let reaches = |cells: &[i16]| cells.len() > usize::from(widest);
+        prefetch_columns(&best_nodes[first..], lefts, hot, reaches);
+        let mut next = best_nodes.len();
+        while next > first {
+            if next - first >= CONNECT_GROUP_SIZE
+                && Self::connect_group(best_nodes, later_ends, site, hot, next, reaches)
+            {
+                next -= CONNECT_GROUP_SIZE;
+                continue;
+            }
+            next -= 1;
+            let column = hot.right_column(best_nodes[next].candidate.left_id);
+            let cells = column.cells();
+            let (cost, best) = if reaches(cells) {
+                let cost = |id: u16| unsafe { *cells.get_unchecked(usize::from(id)) };
+                best_left::<true>(lefts, cost)
+            } else {
+                best_left::<true>(lefts, column.into_cost_fn())
             };
-            node.cost = best.cost;
-            node.prev = count.checked_sub(1).map(NodeId::from_index);
-            self.nodes[count] = node;
+            store_best(best_nodes, later_ends, position, next, cost, best);
+        }
+    }
+
+    #[inline(always)]
+    fn connect_group(
+        best_nodes: &mut [BestNode],
+        later_ends: &mut [EndSlot],
+        site: &BestSite<'_>,
+        hot: &HotView<'_>,
+        next: usize,
+        reaches: impl Fn(&[i16]) -> bool,
+    ) -> bool {
+        let indices: [usize; CONNECT_GROUP_SIZE] = std::array::from_fn(|lane| next - 1 - lane);
+        let columns = indices.map(|index| {
+            hot.right_column(best_nodes[index].candidate.left_id)
+                .cells()
+        });
+        if !columns.iter().all(|cells| reaches(cells)) {
+            return false;
+        }
+        let found = best_lefts(site.lefts, columns);
+        for (index, (cost, best)) in indices.into_iter().zip(found) {
+            store_best(best_nodes, later_ends, site.position, index, cost, best);
+        }
+        true
+    }
+
+    fn collect_best_nodes(&mut self) {
+        let eos = NodeId::from_index(self.best_nodes.len() - 1);
+        self.path_cost = i64::from(self.best_nodes[eos].cost);
+        let path_len = self.path_len(eos);
+        self.nodes
+            .resize(path_len, RawNode::boundary(NodeSource::Bos, 0));
+        self.path.extend((0..path_len).map(NodeId::from_index));
+        let mut slot = path_len;
+        let mut cursor = Some(eos);
+        while let Some(id) = cursor {
+            slot -= 1;
+            let best = self.best_nodes[id];
+            self.nodes[slot] = self.materialize_node(best, slot);
             cursor = best.prev;
         }
+    }
+
+    #[inline(always)]
+    fn path_len(&self, eos: NodeId) -> usize {
+        let mut len = 0;
+        let mut cursor = Some(eos);
+        while let Some(id) = cursor {
+            len += 1;
+            cursor = self.best_nodes[id].prev;
+        }
+        len
+    }
+
+    #[inline(always)]
+    fn materialize_node(&self, best: BestNode, slot: usize) -> RawNode {
+        let candidate = best.candidate;
+        let mut node = match candidate.source {
+            NodeSource::Bos | NodeSource::Eos => {
+                RawNode::boundary(candidate.source, candidate.surface as usize)
+            }
+            _ => {
+                let begin = self.best_nodes[best.prev.expect("a word has a left node")]
+                    .candidate
+                    .end;
+                candidate.raw(begin as usize)
+            }
+        };
+        node.cost = best.cost;
+        node.prev = slot.checked_sub(1).map(NodeId::from_index);
+        node
     }
 
     pub(crate) fn nodes(&self) -> &[RawNode] {

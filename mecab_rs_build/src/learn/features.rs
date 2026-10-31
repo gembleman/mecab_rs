@@ -221,6 +221,50 @@ pub(super) fn remap_weights(old: &[f64], renumbered: &[i32], size: usize) -> Vec
     remapped
 }
 
+fn read_model_header(lines: &mut Lines, path: &Path) -> Result<(String, Settings), Error> {
+    let mut model_charset = String::new();
+    let mut settings = Vec::new();
+    while let Some(line) = lines.next_line()? {
+        if line[0] == 0 {
+            break;
+        }
+        let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
+        let found = tokenize2(line, b":", 2);
+        if found.len() != 2 {
+            return Err(Error::learn(path, format!("format error: {shown}")));
+        }
+        let key = String::from_utf8_lossy(cstr(line, found[0])).into_owned();
+        let value =
+            String::from_utf8_lossy(cstr(line, found[1]).get(1..).unwrap_or_default()).into_owned();
+        if key == "charset" {
+            model_charset = value;
+        } else {
+            settings.push((key, value));
+        }
+    }
+    if model_charset.is_empty() {
+        return Err(Error::learn(path, "charset is empty"));
+    }
+    Ok((model_charset, settings))
+}
+
+fn require_same_charset(
+    path: &Path,
+    model_charset: &str,
+    dictionary_charset: &str,
+) -> Result<(), Error> {
+    let old_charset = Charset::parse(model_charset).map_err(|reason| Error::learn(path, reason))?;
+    let new_charset =
+        Charset::parse(dictionary_charset).map_err(|reason| Error::learn(path, reason))?;
+    if old_charset != new_charset {
+        return Err(Error::learn(
+            path,
+            format!("cannot create model from={model_charset} to={dictionary_charset}"),
+        ));
+    }
+    Ok(())
+}
+
 impl FeatureIndex {
     pub(super) fn open(dic_dir: &Path) -> Result<Self, Error> {
         let feature_def = dic_dir.join(FEATURE_DEF_FILE);
@@ -375,39 +419,13 @@ impl FeatureIndex {
                 format!("cannot open the old model {}", path.display()),
             )
         })?;
-        let mut model_charset = String::new();
-        let mut settings = Vec::new();
-        while let Some(line) = lines.next_line()? {
-            if line[0] == 0 {
-                break;
-            }
-            let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
-            let found = tokenize2(line, b":", 2);
-            if found.len() != 2 {
-                return Err(Error::learn(path, format!("format error: {shown}")));
-            }
-            let key = String::from_utf8_lossy(cstr(line, found[0])).into_owned();
-            let value = String::from_utf8_lossy(cstr(line, found[1]).get(1..).unwrap_or_default())
-                .into_owned();
-            if key == "charset" {
-                model_charset = value;
-            } else {
-                settings.push((key, value));
-            }
-        }
-        if model_charset.is_empty() {
-            return Err(Error::learn(path, "charset is empty"));
-        }
-        let old_charset =
-            Charset::parse(&model_charset).map_err(|reason| Error::learn(path, reason))?;
-        let new_charset =
-            Charset::parse(dictionary_charset).map_err(|reason| Error::learn(path, reason))?;
-        if old_charset != new_charset {
-            return Err(Error::learn(
-                path,
-                format!("cannot create model from={model_charset} to={dictionary_charset}"),
-            ));
-        }
+        let (model_charset, settings) = read_model_header(&mut lines, path)?;
+        require_same_charset(path, &model_charset, dictionary_charset)?;
+        let alpha = self.read_old_weights(&mut lines, path)?;
+        Ok((alpha, settings))
+    }
+
+    fn read_old_weights(&mut self, lines: &mut Lines, path: &Path) -> Result<Vec<f64>, Error> {
         let mut alpha = Vec::new();
         while let Some(line) = lines.next_line()? {
             let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
@@ -420,7 +438,7 @@ impl FeatureIndex {
             self.maxid += 1;
             alpha.push(atof(cstr(line, found[0])));
         }
-        Ok((alpha, settings))
+        Ok(alpha)
     }
 
     pub(super) fn save(
