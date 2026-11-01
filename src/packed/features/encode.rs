@@ -13,6 +13,7 @@ use crate::Error;
 mod blob;
 mod derive;
 mod numbers;
+mod plans;
 mod program;
 mod records;
 mod scan;
@@ -21,8 +22,9 @@ mod stats;
 use blob::{Blob, Recoded, plan_blob, recode};
 use derive::{Derive, Planner, TextOp};
 use numbers::{Numbers, Stored, plan_numbers};
+use plans::{plan_code, plan_op};
 use program::{ProgramBuilder, ProgramSet};
-use records::{Assembly, dump_strings, write_records};
+use records::{Assembly, write_records};
 pub(in crate::packed) use scan::split_fields;
 use scan::{SmallKeyMap, SmallKeySet, parse_number};
 use stats::{Class, Stat, choose_split};
@@ -115,20 +117,24 @@ fn classify_folds(stats: &mut [Stat], field_counts: &[u16]) -> Vec<Class> {
     classes
 }
 
-struct Variants<'k> {
+struct Variants<'k, 'a> {
     list: Vec<(usize, &'k [u8])>,
     starts_of: Vec<u32>,
+    string_uses: SmallKeyMap<&'a [u8], u32>,
+    plan_codes: Vec<u8>,
 }
 
-fn collect_variants<'k>(
-    entries: &[&[u8]],
+fn collect_variants<'k, 'a>(
+    entries: &[&'a [u8]],
     tokens: &'k [(u32, &'k str)],
-    planner: &Planner,
-) -> Result<Variants<'k>, Error> {
+    planner: &Planner<'_, 'a>,
+) -> Result<Variants<'k, 'a>, Error> {
     let mut planned: Vec<Option<TextOp>> = Vec::new();
     let mut variants: Vec<(usize, &[u8])> = Vec::new();
     let mut variant_of: SmallKeyMap<(u32, &[u8]), u32> = SmallKeyMap::default();
     let mut starts_of: Vec<u32> = Vec::with_capacity(tokens.len());
+    let mut string_uses: SmallKeyMap<&[u8], u32> = SmallKeyMap::default();
+    let mut plan_codes: Vec<u8> = Vec::new();
     let mut slots: Vec<&[u8]> = Vec::new();
     let mut fields = Vec::new();
     for &(feature, key) in tokens {
@@ -145,35 +151,31 @@ fn collect_variants<'k>(
         let number = *variant_of.entry((feature, key)).or_insert(next);
         if number == next {
             variants.push((entry, key));
+            record_plan(text, &fields, &planned, &mut string_uses, &mut plan_codes);
         }
         starts_of.push(number);
     }
     Ok(Variants {
         list: variants,
         starts_of,
+        string_uses,
+        plan_codes,
     })
 }
 
-fn count_new_strings<'a>(
-    entries: &[&'a [u8]],
-    variants: &Variants,
-    planner: &Planner<'_, 'a>,
-) -> SmallKeyMap<&'a [u8], u32> {
-    let mut string_uses: SmallKeyMap<&[u8], u32> = SmallKeyMap::default();
-    let mut planned: Vec<Option<TextOp>> = Vec::new();
-    let mut slots: Vec<&[u8]> = Vec::new();
-    let mut fields = Vec::new();
-    for &(entry, key) in &variants.list {
-        let text = entries[entry];
-        split_fields(text, &mut fields);
-        planner.plan(entry, text, &fields, key, &mut slots, &mut planned);
-        for (&(begin, end), op) in fields.iter().zip(&planned) {
-            if let Some(TextOp::New) = op {
-                *string_uses.entry(&text[begin..end]).or_insert(0) += 1;
-            }
+fn record_plan<'a>(
+    text: &'a [u8],
+    fields: &[(usize, usize)],
+    planned: &[Option<TextOp>],
+    string_uses: &mut SmallKeyMap<&'a [u8], u32>,
+    plan_codes: &mut Vec<u8>,
+) {
+    for (&(begin, end), &op) in fields.iter().zip(planned) {
+        if let Some(TextOp::New) = op {
+            *string_uses.entry(&text[begin..end]).or_insert(0) += 1;
         }
+        plan_codes.push(plan_code(op));
     }
-    string_uses
 }
 
 pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Result<Encoded, Error> {
@@ -196,29 +198,38 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         blob: blob.as_ref(),
     };
     let variants = collect_variants(&entries, tokens, &planner)?;
-    let string_uses = count_new_strings(&entries, &variants, &planner);
-    let mut builder = ProgramBuilder::new(&planner, &entries, &numbers, &string_uses);
-    for &(entry, key) in &variants.list {
-        builder.add_variant(entry, key)?;
+    let Variants {
+        list,
+        starts_of,
+        string_uses,
+        plan_codes,
+    } = variants;
+    let mut builder = ProgramBuilder::new(&planner, &entries, &numbers, &string_uses, plan_codes);
+    for &(entry, _) in &list {
+        builder.add_variant(entry)?;
     }
-    let set = builder.set;
+    let set = builder.finish();
     let recoded = recode(&set.area, &set.references, &set.inline, blob.as_ref())?;
     if recoded.area.len() > u32::MAX as usize {
         return Err(Error::Unsupported("feature strings of more than 4 GiB"));
     }
-    let records = write_records(&set, &recoded, blob.as_ref(), &numbers.stored)?;
-    dump_strings(&recoded);
-    let bytes = Assembly {
+    let assembly = Assembly {
         set: &set,
         recoded: &recoded,
-        records: &records,
         stored: &numbers.stored,
         blob: blob.as_ref(),
         derive: &derive,
-    }
-    .build()?;
-    let starts = variants
-        .starts_of
+    };
+    let parts = assembly.prepare()?;
+    let records = write_records(
+        &set,
+        &recoded,
+        blob.as_ref(),
+        &numbers.stored,
+        parts.records_start,
+    )?;
+    let bytes = assembly.build(&parts, records.bytes, &records.starts)?;
+    let starts = starts_of
         .iter()
         .map(|&variant| records.starts[variant as usize])
         .collect();

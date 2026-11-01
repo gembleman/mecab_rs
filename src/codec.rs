@@ -103,7 +103,7 @@ fn encode_irregular(lex: &Lexicon, coder: &mut Coder) {
 }
 
 fn verified_or_stored(out: Vec<u8>, parsed: &Parsed, text_len: u64) -> Vec<u8> {
-    if decode_lexicon(&out).is_ok() {
+    if decode_digest_checked(&out).is_ok() {
         return out;
     }
     let lex = &parsed.lex;
@@ -145,6 +145,15 @@ pub fn encode_lexicon(csv: &[u8]) -> Vec<u8> {
     encode_irregular(lex, &mut coder);
     out.extend_from_slice(&coder.finish());
     verified_or_stored(out, &parsed, text_len)
+}
+
+fn decode_digest_checked(data: &[u8]) -> Result<Lexicon, Undecodable> {
+    let (lex, h) = decode_unchecked(data)?;
+    let (digest, len) = lex.digest(None);
+    if digest != h.digest || len != h.text_len {
+        return corrupt("digest mismatch");
+    }
+    Ok(lex)
 }
 
 fn decode_stored(data: &[u8], h: &Header) -> Result<Lexicon, Undecodable> {
@@ -309,11 +318,14 @@ fn decode_unchecked(data: &[u8]) -> Result<(Lexicon, Header), Undecodable> {
     Ok((lex, h))
 }
 
-pub fn decode_lexicon(data: &[u8]) -> Result<Vec<u8>, Undecodable> {
+pub fn visit_lexicon_lines(
+    data: &[u8],
+    visit: impl FnMut(&[u8]) -> Result<(), Undecodable>,
+) -> Result<(), Undecodable> {
     let (lex, h) = decode_unchecked(data)?;
-    let text = lex.to_text();
-    if fnv1a(FNV_OFFSET, &text) != h.digest || text.len() as u64 != h.text_len {
+    let (digest, text_len) = lex.for_each_line(visit)?;
+    if digest != h.digest || text_len != h.text_len {
         return corrupt("digest mismatch");
     }
-    Ok(text)
+    Ok(())
 }

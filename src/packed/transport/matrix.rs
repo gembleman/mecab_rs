@@ -72,7 +72,7 @@ fn integer_bytes(hot: &HotShape, definitions: [&str; 2], payload: &[u8]) -> Resu
 }
 
 fn hot_matrix(templates: &IntTemplates, hot: &HotShape, path: &Path) -> Result<Vec<u8>, Error> {
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(hot.matrix_bytes());
     templates
         .write_hot_matrix(hot, default_threads(), &mut bytes)
         .map_err(io_error(IoAction::Write, path))?;

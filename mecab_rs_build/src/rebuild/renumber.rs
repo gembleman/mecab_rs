@@ -194,9 +194,12 @@ impl Renumbering {
             let mut data = read_file(&source)?;
             patch_tokens(&mut data, &source, &self.new_lc, &self.new_rc)?;
             if let (Some(keep), SYS_DIC_FILE) = (keep, name) {
-                let (slimmed, slim_report) = slim_dictionary(&data, &source, keep)?;
-                data = slimmed;
+                let (slimmed, slim_report) = slim_dictionary(&mut data, &source, keep)?;
                 report = Some(slim_report);
+                write_file(&out_dir.join(name), |writer| {
+                    slimmed.write_to(&data, writer)
+                })?;
+                continue;
             }
             write_file(&out_dir.join(name), |writer| writer.write_all(&data))?;
         }

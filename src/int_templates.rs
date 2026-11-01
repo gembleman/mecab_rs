@@ -39,7 +39,7 @@ pub(crate) fn int_cost(total: i64, cost_factor: u32, shift: u32) -> i16 {
 
 impl IntPart {
     #[must_use]
-    pub fn compacted(&self) -> Self {
+    pub fn compacted(self) -> Self {
         let mut left_used = vec![false; self.left_count];
         for &key in &self.left_index {
             left_used[usize::from(key)] = true;
@@ -93,7 +93,7 @@ impl IntPart {
                 .iter()
                 .map(|&key| left_rank[usize::from(key)])
                 .collect(),
-            weight: self.weight.clone(),
+            weight: self.weight,
         }
     }
 }
@@ -181,6 +181,14 @@ fn validate<'a>(
     if u128::from(magnitude) * u128::from(cost_factor) >= CELL_SUM_BOUND {
         return Err(corrupt);
     }
+    validate_exception_cells(exception_cells, left_size, right_size)
+}
+
+fn validate_exception_cells(
+    exception_cells: &[u32],
+    left_size: usize,
+    right_size: usize,
+) -> Result<(), Undecodable> {
     let cells = left_size * right_size;
     let sorted = exception_cells.windows(2).all(|pair| pair[0] < pair[1]);
     let inside = exception_cells
@@ -189,7 +197,15 @@ fn validate<'a>(
     if sorted && inside {
         Ok(())
     } else {
-        Err(corrupt)
+        Err(Undecodable("the integer templates are inconsistent"))
+    }
+}
+
+fn validate_exception_lengths(cells: &[u32], values: &[i16]) -> Result<(), Undecodable> {
+    if cells.len() == values.len() {
+        Ok(())
+    } else {
+        Err(Undecodable("the integer templates are inconsistent"))
     }
 }
 
@@ -260,15 +276,19 @@ impl IntView<'_> {
             output,
             || (self.scratch(), vec![0i16; self.left_size]),
             |(scratch, row_costs), rows| {
-                let mut bytes = Vec::new();
+                let mut bytes = vec![0u8; shape.rows_bytes(rows.clone())];
+                let mut unwritten = bytes.as_mut_slice();
                 for row in rows {
                     let length = shape.row_length(row);
                     if length == 0 {
                         continue;
                     }
                     self.render_row(row, scratch, row_costs);
-                    for cost in &row_costs[..length] {
-                        bytes.extend_from_slice(&cost.to_le_bytes());
+                    let (written, rest) = unwritten.split_at_mut(length * size_of::<i16>());
+                    unwritten = rest;
+                    let cells = written.as_chunks_mut::<2>().0.iter_mut();
+                    for (cell, cost) in cells.zip(&row_costs[..length]) {
+                        *cell = cost.to_le_bytes();
                     }
                 }
                 bytes
@@ -305,19 +325,21 @@ impl IntTemplates {
         left_size: usize,
         right_size: usize,
         parts: Vec<IntPart>,
-        exceptions: Vec<(u32, i16)>,
+        exception_cells: Vec<u32>,
+        exception_values: Vec<i16>,
     ) -> Result<Self, Error> {
-        let (exception_cells, exception_values): (Vec<u32>, Vec<i16>) =
-            exceptions.into_iter().unzip();
-        validate(
-            parts.iter().map(IntPart::slices),
-            cost_factor,
-            shift,
-            left_size,
-            right_size,
-            &exception_cells,
-        )
-        .map_err(|error| error.in_file(Path::new(MATRIX_ITP_FILE)))?;
+        validate_exception_lengths(&exception_cells, &exception_values)
+            .and_then(|()| {
+                validate(
+                    parts.iter().map(IntPart::slices),
+                    cost_factor,
+                    shift,
+                    left_size,
+                    right_size,
+                    &exception_cells,
+                )
+            })
+            .map_err(|error| error.in_file(Path::new(MATRIX_ITP_FILE)))?;
         Ok(Self {
             cost_factor,
             shift,
@@ -363,7 +385,8 @@ impl IntTemplates {
             left_size,
             right_size,
             parts,
-            cells.into_iter().zip(values).collect(),
+            cells,
+            values,
         )
     }
 
@@ -398,15 +421,21 @@ impl IntTemplates {
         self.exception_cells.len()
     }
 
-    pub fn with_exceptions(&self, exceptions: Vec<(u32, i16)>) -> Result<Self, Error> {
-        Self::new(
-            self.cost_factor,
-            self.shift,
-            self.left_size,
-            self.right_size,
-            self.parts.clone(),
-            exceptions,
-        )
+    pub fn with_exceptions(
+        self,
+        exception_cells: Vec<u32>,
+        exception_values: Vec<i16>,
+    ) -> Result<Self, Error> {
+        validate_exception_lengths(&exception_cells, &exception_values)
+            .and_then(|()| {
+                validate_exception_cells(&exception_cells, self.left_size, self.right_size)
+            })
+            .map_err(|error| error.in_file(Path::new(MATRIX_ITP_FILE)))?;
+        Ok(Self {
+            exception_cells,
+            exception_values,
+            ..self
+        })
     }
 
     pub(crate) fn computed_cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
@@ -526,9 +555,10 @@ fn fill_int_table(
     plan: &ClusterPlan,
     parts: &[PartSlices<i32>],
     threads: usize,
-) -> io::Result<Vec<i32>> {
+    table: &mut [i32],
+) -> io::Result<()> {
     let overflow = AtomicBool::new(false);
-    let table = fill_cells(plan, threads, |left, right| {
+    fill_cells(plan, threads, table, |left, right| {
         let total = total_of(plan.parts.iter().map(|&p| parts[p]), left, right);
         i32::try_from(total).unwrap_or_else(|_| {
             overflow.store(true, Ordering::Relaxed);
@@ -540,7 +570,7 @@ fn fill_int_table(
             "a cluster sum does not fit an i32; use a coarser grid or more clusters",
         ));
     }
-    Ok(table)
+    Ok(())
 }
 
 struct ClusterData {
@@ -570,9 +600,12 @@ fn cluster_data(
             shape
         })
         .collect();
-    let mut tables = Vec::with_capacity(table_start);
+    let mut tables = vec![0i32; table_start];
+    let mut unfilled = tables.as_mut_slice();
     for plan in plans {
-        tables.extend(fill_int_table(plan, parts, threads)?);
+        let (table, rest) = unfilled.split_at_mut(plan.cells());
+        fill_int_table(plan, parts, threads, table)?;
+        unfilled = rest;
     }
     Ok(ClusterData {
         shapes,

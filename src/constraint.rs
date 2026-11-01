@@ -1,5 +1,5 @@
 use crate::error::Error;
-use crate::feature_match::partial_match;
+use crate::feature_match::{matches_every_feature, partial_match};
 use crate::lattice::{RETAINED_MIN_ENTRIES, shrink_over};
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
@@ -115,6 +115,7 @@ pub(crate) struct ConstraintSet {
     next_boundary: Vec<u32>,
     feature_at: Vec<Option<u32>>,
     spans: Vec<(usize, usize)>,
+    admits_every_feature: Vec<bool>,
     bytes: String,
     scratch: String,
 }
@@ -126,6 +127,7 @@ impl ConstraintSet {
         self.feature_at.clear();
         self.shrink_oversized(text_len);
         self.spans.clear();
+        self.admits_every_feature.clear();
         self.bytes.clear();
         self.shrink_feature_storage(constraints);
         for constraint in constraints {
@@ -214,6 +216,9 @@ impl ConstraintSet {
         if !self.is_token_boundary(begin) || !self.is_token_boundary(end) {
             return false;
         }
+        if self.admits_every_feature[index as usize] {
+            return true;
+        }
         self.scratch.clear();
         feature(&mut self.scratch);
         partial_match(self.feature_str(index).as_bytes(), self.scratch.as_bytes())
@@ -241,6 +246,10 @@ impl ConstraintSet {
             },
         );
         shrink_over(&mut self.spans, RETAINED_MIN_ENTRIES.max(count));
+        shrink_over(
+            &mut self.admits_every_feature,
+            RETAINED_MIN_ENTRIES.max(count),
+        );
         let keep_bytes = RETAINED_MIN_ENTRIES.max(byte_total);
         if self.bytes.capacity() > keep_bytes {
             self.bytes.shrink_to(keep_bytes);
@@ -263,6 +272,8 @@ impl ConstraintSet {
         let start = self.bytes.len();
         self.bytes.push_str(feature);
         self.spans.push((start, self.bytes.len()));
+        self.admits_every_feature
+            .push(matches_every_feature(feature.as_bytes()));
         self.feature_at[begin] = Some((self.spans.len() - 1) as u32);
     }
 }

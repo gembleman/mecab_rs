@@ -9,12 +9,19 @@ pub(super) struct Records {
     pub(super) starts: Vec<u32>,
 }
 
+fn writer_after(base: usize) -> BitWriter {
+    let mut writer = BitWriter::default();
+    writer.bytes.resize(base, 0);
+    writer
+}
+
 struct RecordWriter<'a, 'p> {
     set: &'a ProgramSet<'p>,
     recoded: &'a Recoded,
     stored: &'a [Stored],
     blob_offsets: Vec<u32>,
     writer: BitWriter,
+    base: usize,
     template_bits: u32,
     shape_bits: u32,
     ref_bits: u32,
@@ -31,6 +38,7 @@ impl<'a, 'p> RecordWriter<'a, 'p> {
         recoded: &'a Recoded,
         blob: Option<&Blob>,
         stored: &'a [Stored],
+        base: usize,
     ) -> Self {
         let blob_offsets: Vec<u32> = set
             .blob_ids
@@ -45,7 +53,8 @@ impl<'a, 'p> RecordWriter<'a, 'p> {
             recoded,
             stored,
             blob_offsets,
-            writer: BitWriter::default(),
+            writer: writer_after(base),
+            base,
             template_bits: bits_for(set.template_list.len() as u64),
             shape_bits: bits_for(set.shape_list.len() as u64),
             ref_bits: bits_for(recoded.area.len() as u64),
@@ -97,7 +106,7 @@ impl<'a, 'p> RecordWriter<'a, 'p> {
 
     fn write_entry(&mut self, entry: usize) -> Result<u32, Error> {
         let start = self.writer.bytes.len();
-        let start_offset = u32::try_from(start)
+        let start_offset = u32::try_from(start - self.base)
             .map_err(|_| Error::Unsupported("feature records of more than 4 GiB"))?;
         self.writer.put(
             u64::from(self.set.entry_template[entry]),
@@ -121,9 +130,10 @@ pub(super) fn write_records(
     recoded: &Recoded,
     blob: Option<&Blob>,
     stored: &[Stored],
+    base: usize,
 ) -> Result<Records, Error> {
     let variant_count = set.entry_template.len();
-    let mut records = RecordWriter::new(set, recoded, blob, stored);
+    let mut records = RecordWriter::new(set, recoded, blob, stored, base);
     let mut starts: Vec<u32> = Vec::with_capacity(variant_count);
     for entry in 0..variant_count {
         starts.push(records.write_entry(entry)?);
@@ -134,18 +144,6 @@ pub(super) fn write_records(
     })
 }
 
-pub(super) fn dump_strings(recoded: &Recoded) {
-    if let Ok(path) = std::env::var("CHARCODE_DUMP") {
-        let _ = std::fs::write(format!("{path}.area"), &recoded.area);
-        let mut joined = Vec::new();
-        for text in &recoded.inline {
-            joined.extend_from_slice(text);
-            joined.push(0);
-        }
-        let _ = std::fs::write(format!("{path}.inline"), &joined);
-    }
-}
-
 pub(super) fn too_big() -> Error {
     Error::Unsupported("a feature table that does not fit the section")
 }
@@ -153,10 +151,16 @@ pub(super) fn too_big() -> Error {
 pub(super) struct Assembly<'s, 'a> {
     pub(super) set: &'s ProgramSet<'a>,
     pub(super) recoded: &'s Recoded,
-    pub(super) records: &'s Records,
     pub(super) stored: &'s [Stored],
     pub(super) blob: Option<&'s Blob<'a>>,
     pub(super) derive: &'s Derive<'a>,
+}
+
+pub(in crate::packed::features) struct Parts {
+    pieces: Pieces,
+    shape_table: ShapeTable,
+    low_values: Vec<u64>,
+    pub(in crate::packed::features) records_start: usize,
 }
 
 pub(super) struct ShapeTable {
@@ -180,6 +184,7 @@ impl Assembly<'_, '_> {
         pieces: &Pieces,
         shape_table: &ShapeTable,
         low_count: usize,
+        records_length: usize,
     ) -> Result<Counts, Error> {
         let (set, recoded, blob, derive) = (self.set, self.recoded, self.blob, self.derive);
         Ok(Counts {
@@ -202,12 +207,12 @@ impl Assembly<'_, '_> {
             blob_fields: blob.map_or(0, |blob| blob.fields.len() as u32),
             blob_number: blob.map_or(0, |blob| blob.number as u32),
             id_bytes: blob.map_or(0, |blob| blob.id_bytes as u32),
-            records: self.records.bytes.len() as u64,
+            records: records_length as u64,
             record_count: set.entry_template.len() as u32,
         })
     }
 
-    pub(super) fn build(&self) -> Result<Vec<u8>, Error> {
+    pub(super) fn prepare(&self) -> Result<Parts, Error> {
         let pieces = super::super::pieces::build(&self.set.template_list).ok_or_else(too_big)?;
         let shape_table = shape_table(&self.set.shape_list)?;
         let low_values: Vec<u64> = self
@@ -215,15 +220,38 @@ impl Assembly<'_, '_> {
             .iter()
             .flat_map(|source| source.low_table.iter().copied())
             .collect();
-        let counts = self.counts(&pieces, &shape_table, low_values.len())?;
+        let counts = self.counts(&pieces, &shape_table, low_values.len(), 0)?;
+        let records_start = Layout::new(counts).ok_or_else(too_big)?.records.start;
+        Ok(Parts {
+            pieces,
+            shape_table,
+            low_values,
+            records_start,
+        })
+    }
+
+    pub(super) fn build(
+        &self,
+        parts: &Parts,
+        mut bytes: Vec<u8>,
+        record_starts: &[u32],
+    ) -> Result<Vec<u8>, Error> {
+        debug_assert!(bytes.len() >= parts.records_start);
+        let records_length = bytes.len() - parts.records_start;
+        let counts = self.counts(
+            &parts.pieces,
+            &parts.shape_table,
+            parts.low_values.len(),
+            records_length,
+        )?;
         let layout = Layout::new(counts).ok_or_else(too_big)?;
-        let mut bytes = vec![0u8; layout.length()];
+        debug_assert_eq!(layout.records.start, parts.records_start);
+        bytes.resize(layout.length(), 0);
         bytes[..super::super::HEADER_BYTES].copy_from_slice(&layout.header());
-        self.put_pieces(&mut bytes, &layout, &pieces, &shape_table);
-        self.put_numbers(&mut bytes, &layout, &low_values);
+        self.put_pieces(&mut bytes, &layout, &parts.pieces, &parts.shape_table);
+        self.put_numbers(&mut bytes, &layout, &parts.low_values, record_starts);
         self.put_strings(&mut bytes, &layout);
         self.put_rules(&mut bytes, &layout);
-        put(&mut bytes, &layout.records, &self.records.bytes);
         Ok(bytes)
     }
 
@@ -251,7 +279,13 @@ impl Assembly<'_, '_> {
         put(bytes, &layout.shapes, &shape_table.bytes);
     }
 
-    pub(super) fn put_numbers(&self, bytes: &mut [u8], layout: &Layout, low_values: &[u64]) {
+    pub(super) fn put_numbers(
+        &self,
+        bytes: &mut [u8],
+        layout: &Layout,
+        low_values: &[u64],
+        record_starts: &[u32],
+    ) {
         let spec_bytes: Vec<u8> = self
             .stored
             .iter()
@@ -260,13 +294,7 @@ impl Assembly<'_, '_> {
         put(bytes, &layout.specs, &spec_bytes);
         let low_bytes: Vec<u8> = low_values.iter().flat_map(|v| v.to_le_bytes()).collect();
         put(bytes, &layout.lo, &low_bytes);
-        let sync: Vec<u32> = self
-            .records
-            .starts
-            .iter()
-            .step_by(SYNC_EVERY)
-            .copied()
-            .collect();
+        let sync: Vec<u32> = record_starts.iter().step_by(SYNC_EVERY).copied().collect();
         put(bytes, &layout.sync, &words(&sync));
     }
 

@@ -3,7 +3,7 @@ use std::io::Write;
 
 use super::{Part, Parts};
 use crate::Error;
-use crate::codec::{MAX_LEXICON_TEXT_LEN, decode_lexicon, encode_lexicon};
+use crate::codec::{MAX_LEXICON_TEXT_LEN, encode_lexicon, visit_lexicon_lines};
 use crate::error::Undecodable;
 use crate::packed::model::{Model, Param};
 use crate::wire::{get_varint, put_varint};

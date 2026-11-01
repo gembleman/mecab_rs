@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 
 use crate::tool_error::rebuild_error;
@@ -93,7 +94,6 @@ pub struct SlimReport {
 
 struct Sections {
     token_start: usize,
-    token_size: usize,
     feature_start: usize,
     feature_size: usize,
 }
@@ -120,7 +120,6 @@ fn read_sections(data: &[u8], path: &Path) -> Result<Sections, Error> {
     }
     Ok(Sections {
         token_start,
-        token_size,
         feature_start,
         feature_size,
     })
@@ -174,38 +173,52 @@ impl SlimFeatures {
     }
 }
 
+pub(super) struct SlimmedDictionary {
+    fixed_len: usize,
+    feature_blob: Vec<u8>,
+}
+
+impl SlimmedDictionary {
+    pub(super) fn write_to(&self, data: &[u8], writer: &mut impl Write) -> std::io::Result<()> {
+        writer.write_all(&data[..self.fixed_len])?;
+        writer.write_all(&self.feature_blob)
+    }
+}
+
+fn write_word(data: &mut [u8], at: usize, value: u32) {
+    data[at..at + WORD_BYTES].copy_from_slice(&value.to_le_bytes());
+}
+
 pub(super) fn slim_dictionary(
-    data: &[u8],
+    data: &mut [u8],
     path: &Path,
     keep: &Keep,
-) -> Result<(Vec<u8>, SlimReport), Error> {
+) -> Result<(SlimmedDictionary, SlimReport), Error> {
     let sections = read_sections(data, path)?;
-    let source_blob = &data[sections.feature_start..];
-    let mut tokens = data[sections.token_start..sections.feature_start].to_vec();
+    let old_file_size = data.len();
+    let (fixed, source_blob) = data.split_at_mut(sections.feature_start);
     let mut features = SlimFeatures::default();
+    let tokens = &mut fixed[sections.token_start..];
     for token in tokens.as_chunks_mut::<TOKEN_SIZE>().0.iter_mut() {
         let offset = u32_at(token, TOKEN_FEATURE_OFFSET);
         let place = features.place_of_offset(source_blob, offset, keep, path)?;
-        token[TOKEN_FEATURE_OFFSET..TOKEN_FEATURE_OFFSET + WORD_BYTES]
-            .copy_from_slice(&place.to_le_bytes());
+        write_word(token, TOKEN_FEATURE_OFFSET, place);
     }
     let unique_features = features.by_text.len();
     features.pad_to_word();
-    let total = sections.token_start + sections.token_size + features.blob.len();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&data[..sections.token_start]);
-    out.extend_from_slice(&tokens);
-    out.extend_from_slice(&features.blob);
-    out[HEADER_MAGIC_AT..HEADER_MAGIC_AT + WORD_BYTES]
-        .copy_from_slice(&(total as u32 ^ MAGIC_ID).to_le_bytes());
-    out[HEADER_FEATURE_SIZE_AT..HEADER_FEATURE_SIZE_AT + WORD_BYTES]
-        .copy_from_slice(&(features.blob.len() as u32).to_le_bytes());
+    let total = sections.feature_start + features.blob.len();
+    write_word(fixed, HEADER_MAGIC_AT, total as u32 ^ MAGIC_ID);
+    write_word(fixed, HEADER_FEATURE_SIZE_AT, features.blob.len() as u32);
     let report = SlimReport {
         old_feature_size: sections.feature_size,
         new_feature_size: features.blob.len(),
         unique_features,
-        old_file_size: data.len(),
+        old_file_size,
         new_file_size: total,
     };
-    Ok((out, report))
+    let slimmed = SlimmedDictionary {
+        fixed_len: sections.feature_start,
+        feature_blob: features.blob,
+    };
+    Ok((slimmed, report))
 }

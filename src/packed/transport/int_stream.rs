@@ -463,12 +463,13 @@ fn decode_exceptions(
     header: &Header,
     inputs: &mut Inputs,
     path: &Path,
-) -> Result<Vec<(u32, i16)>, Error> {
+) -> Result<(Vec<u32>, Vec<i16>), Error> {
     let left_size = header.left_size;
     if header.exception_count > inputs.exception_cells.remaining_bytes() {
         return Err(too_big(path));
     }
-    let mut exceptions = Vec::with_capacity(header.exception_count);
+    let mut cells = Vec::with_capacity(header.exception_count);
+    let mut values = Vec::with_capacity(header.exception_count);
     let mut previous: Option<u64> = None;
     for _ in 0..header.exception_count {
         let cell = next_key(previous, inputs.exception_cells.varint()?)
@@ -480,12 +481,10 @@ fn decode_exceptions(
         let value = i64::from(computed)
             .checked_add(unzigzag(inputs.exception_values.varint()?))
             .ok_or_else(|| too_big(path))?;
-        exceptions.push((
-            cell as u32,
-            i16::try_from(value).map_err(|_| too_big(path))?,
-        ));
+        cells.push(cell as u32);
+        values.push(i16::try_from(value).map_err(|_| too_big(path))?);
     }
-    Ok(exceptions)
+    Ok((cells, values))
 }
 
 pub fn decode_payload(
@@ -514,8 +513,9 @@ pub fn decode_payload(
         header.right_size,
         parts,
         Vec::new(),
+        Vec::new(),
     )?;
-    let exceptions = decode_exceptions(&plain, &header, &mut inputs, path)?;
+    let (cells, values) = decode_exceptions(&plain, &header, &mut inputs, path)?;
     inputs.check_ends(path)?;
-    plain.with_exceptions(exceptions)
+    plain.with_exceptions(cells, values)
 }

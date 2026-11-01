@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::{Config, LineEnding, LineEnds, open_lines};
 use crate::build::char_def::CharProperty;
-use crate::build::model::CostModel;
+use crate::build::model::{CostModel, CutFeature};
 use crate::build::rewrite::Rewriter;
 use crate::build::text::{LINE_BUFFER_BYTES, Lines, cstr, escape_csv_element, tokenize_csv};
 use crate::build::{BuildOptions, compile_system, csv_files};
@@ -314,8 +314,12 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
             return Err(learn_error(dic_dir, "right id size is empty"));
         }
         writeln!(file, "{} {}", ids.right.len(), ids.left.len()).map_err(&io)?;
+        let plan = model.bigram_plan();
+        let left_cuts: Vec<CutFeature> = ids.left.keys().map(|key| CutFeature::cut(key)).collect();
+        let mut key = Vec::new();
         let mut row = 0;
         for (right_key, right_id) in &ids.right {
+            let right_cut = CutFeature::cut(right_key);
             row += 1;
             progress_bar(
                 log,
@@ -324,8 +328,14 @@ pub fn generate(options: &GenerateOptions, log: &mut dyn Write) -> Result<(), Er
                 ids.right.len(),
                 &mut previous,
             );
-            for (left_key, left_id) in &ids.left {
-                let weight = model.connection_cost(right_key, left_key, &feature_def)?;
+            for (left_cut, left_id) in left_cuts.iter().zip(ids.left.values()) {
+                let weight = model.connection_cost_cut(
+                    &plan,
+                    &right_cut,
+                    left_cut,
+                    &mut key,
+                    &feature_def,
+                )?;
                 writeln!(
                     file,
                     "{right_id} {left_id} {}",

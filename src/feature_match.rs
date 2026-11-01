@@ -2,8 +2,12 @@ const WILDCARD: &[u8] = b"*";
 const QUOTE: u8 = b'"';
 const SEPARATOR: u8 = b',';
 
+pub(super) fn matches_every_feature(constraint: &[u8]) -> bool {
+    constraint == WILDCARD
+}
+
 pub(super) fn partial_match(constraint: &[u8], feature: &[u8]) -> bool {
-    if constraint == WILDCARD {
+    if matches_every_feature(constraint) {
         return true;
     }
     Columns::new(constraint)

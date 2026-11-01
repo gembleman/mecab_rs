@@ -52,8 +52,9 @@ impl Checked {
                 .is_some_and(|word| word >> (offset & 63) & 1 != 0)
     }
 }
-fn offsets_of(bytes: &[u8], blob_length: usize) -> Option<Vec<usize>> {
-    let offsets: Vec<usize> = u32_values(bytes).map(|word| word as usize).collect();
+fn offsets_of(bytes: &[u8], blob_length: usize) -> Option<Vec<u32>> {
+    let blob_length = u32::try_from(blob_length).ok()?;
+    let offsets: Vec<u32> = u32_values(bytes).collect();
     let valid = offsets.first() == Some(&0)
         && offsets.last() == Some(&blob_length)
         && offsets.windows(2).all(|pair| pair[0] <= pair[1]);
@@ -64,6 +65,19 @@ fn read_range(source: &Source, section: usize, range: &Range<usize>) -> Result<V
     let mut bytes = vec![0; range.len()];
     source.read(section, range.start, &mut bytes)?;
     Ok(bytes)
+}
+
+struct ShapeTable {
+    bytes: Vec<u8>,
+    offsets: Vec<u32>,
+}
+
+impl ShapeTable {
+    fn get(&self, shape: usize) -> Option<&[u8]> {
+        let start = *self.offsets.get(shape)? as usize;
+        let end = *self.offsets.get(shape + 1)? as usize;
+        self.bytes.get(start..end)
+    }
 }
 
 struct Tables<'a> {
@@ -79,7 +93,7 @@ struct Tables<'a> {
     ref_bits: u32,
     template_bits: u32,
     shape_bits: u32,
-    shape_ops: Vec<Vec<u8>>,
+    shape_ops: ShapeTable,
 }
 
 pub(in crate::packed) fn check(source: &Source, section: usize) -> Result<Checked, Error> {
@@ -221,16 +235,15 @@ fn check_shapes(
     section: usize,
     layout: &Layout,
     specs: &[NumSpec],
-) -> Result<Vec<Vec<u8>>, Error> {
+) -> Result<ShapeTable, Error> {
     let shape_bytes = read_range(source, section, &layout.shapes)?;
     let shape_offsets = offsets_of(
         &read_range(source, section, &layout.shape_offsets)?,
         shape_bytes.len(),
     )
     .ok_or_else(|| source.broken("the feature shapes are not delimited correctly"))?;
-    let mut shape_ops = Vec::with_capacity(shape_offsets.len());
     for pair in shape_offsets.windows(2) {
-        let ops = &shape_bytes[pair[0]..pair[1]];
+        let ops = &shape_bytes[pair[0] as usize..pair[1] as usize];
         let mut scan = ShapeScan::new();
         if !ops
             .iter()
@@ -238,9 +251,11 @@ fn check_shapes(
         {
             return Err(source.broken("a feature shape has an operation that is not valid"));
         }
-        shape_ops.push(ops.to_vec());
     }
-    Ok(shape_ops)
+    Ok(ShapeTable {
+        bytes: shape_bytes,
+        offsets: shape_offsets,
+    })
 }
 
 fn words_of<const WIDTH: usize>(bytes: &[u8], read: fn([u8; WIDTH]) -> u32) -> Vec<u32> {
@@ -353,7 +368,7 @@ fn check_pieces(source: &Source, section: usize, layout: &Layout) -> Result<(), 
     )
     .ok_or_else(|| invalid("the feature pieces are not delimited correctly"))?;
     for pair in offsets.windows(2) {
-        if str::from_utf8(&pool[pair[0]..pair[1]]).is_err() {
+        if str::from_utf8(&pool[pair[0] as usize..pair[1] as usize]).is_err() {
             return Err(invalid("a feature piece is not valid UTF-8"));
         }
     }

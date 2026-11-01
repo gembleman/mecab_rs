@@ -76,6 +76,7 @@ pub fn quantize(
         templates.right_size(),
         parts,
         Vec::new(),
+        Vec::new(),
     )
 }
 
@@ -83,7 +84,7 @@ pub fn find_exceptions(
     exact: &ConnectionTemplates,
     candidate: &IntTemplates,
     threads: usize,
-) -> Result<Vec<(u32, i16)>, Error> {
+) -> Result<(Vec<u32>, Vec<i16>), Error> {
     let (left_size, right_size) = (exact.left_size(), exact.right_size());
     if u32::try_from(left_size * right_size).is_err()
         || candidate.left_size() != left_size
@@ -127,7 +128,7 @@ pub fn find_exceptions(
     });
     let mut found = found.into_inner().unwrap_or_else(PoisonError::into_inner);
     found.sort_unstable_by_key(|&(cell, _)| cell);
-    Ok(found)
+    Ok(found.into_iter().unzip())
 }
 
 pub fn exact_int_templates(
@@ -137,8 +138,8 @@ pub fn exact_int_templates(
     path: &Path,
 ) -> Result<IntTemplates, Error> {
     let plain = quantize(templates, shift, path)?;
-    let exceptions = find_exceptions(templates, &plain, threads)?;
-    plain.with_exceptions(exceptions)
+    let (cells, values) = find_exceptions(templates, &plain, threads)?;
+    plain.with_exceptions(cells, values)
 }
 
 pub fn write_int_files(

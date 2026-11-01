@@ -57,8 +57,31 @@ pub(crate) fn runtime_form_from(
     write_runtime(inputs, shape, MIN_SPARSE_GAIN)
 }
 
+const SECTION_ALIGNMENT: usize = 8;
+
+struct BorrowedBytes<'a>(&'a [u8]);
+
+impl SectionSource for BorrowedBytes<'_> {
+    #[inline]
+    fn bytes(&self, start: usize, end: usize) -> &[u8] {
+        &self.0[start..end]
+    }
+
+    #[inline]
+    fn all_bytes(&self) -> &[u8] {
+        self.0
+    }
+}
+
+fn is_section_aligned(bytes: &[u8]) -> bool {
+    bytes.as_ptr().addr().is_multiple_of(SECTION_ALIGNMENT)
+}
+
 pub fn runtime_form_of(bytes: &[u8], shape: &HotShape) -> Result<Vec<u8>, Error> {
     let path = Path::new(MATRIX_ITP_FILE);
+    if is_section_aligned(bytes) {
+        return MappedIntTemplates::from_source(BorrowedBytes(bytes), path)?.runtime_form(shape);
+    }
     let mut map = MmapOptions::new()
         .len(bytes.len().max(1))
         .map_anon()
@@ -205,8 +228,7 @@ fn renumber_clusters(
         }
         let table = &inputs.tables[original_start..];
         let cells = reordered_cells(table, shape, &left, &right);
-        let encoded = encode_table(&cells, min_sparse_gain);
-        result.tables.extend_from_slice(&encoded.bytes);
+        let encoded = encode_table(&cells, min_sparse_gain, &mut result.tables);
         result.shapes.push([
             shape.left_keys as u32,
             shape.right_keys as u32,
@@ -245,13 +267,28 @@ fn write_runtime(
     assemble_runtime(inputs, hot, &exceptions, &clusters)
 }
 
+fn runtime_capacity(exceptions: &ExceptionColumns, clusters: &RenumberedClusters) -> usize {
+    const WORD_BYTES: usize = 4;
+    const HEADER_WORDS: usize = 9;
+    const ALIGNMENT_SLACK: usize = 16;
+    MAGIC.len()
+        + HEADER_WORDS * WORD_BYTES
+        + clusters.shapes.len() * SHAPE_WORDS * WORD_BYTES
+        + exceptions.row_starts.len() * WORD_BYTES
+        + exceptions.columns.len() * size_of::<u16>()
+        + (clusters.left_keys.len() + clusters.right_keys.len()) * size_of::<u16>()
+        + clusters.tables.len()
+        + TABLE_SLACK
+        + ALIGNMENT_SLACK
+}
+
 fn assemble_runtime(
     inputs: &RuntimeInputs,
     (hot_left, hot_right): (usize, usize),
     exceptions: &ExceptionColumns,
     clusters: &RenumberedClusters,
 ) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(runtime_capacity(exceptions, clusters));
     out.extend_from_slice(MAGIC);
     for word in [
         RUNTIME_VERSION,
@@ -286,7 +323,6 @@ struct EncodedTable {
     width: usize,
     base: i32,
     nonzero: usize,
-    bytes: Vec<u8>,
 }
 
 fn spread_of(values: impl Iterator<Item = i32> + Clone) -> (i32, usize) {
@@ -306,12 +342,11 @@ fn push_cell(bytes: &mut Vec<u8>, value: i32, base: i32, width: usize) {
     bytes.extend_from_slice(&stored.to_le_bytes()[..width]);
 }
 
-fn encode_table(cells: &[i32], min_sparse_gain: usize) -> EncodedTable {
+fn encode_table(cells: &[i32], min_sparse_gain: usize, bytes: &mut Vec<u8>) -> EncodedTable {
     let (dense_base, dense_width) = spread_of(cells.iter().copied());
     let nonzero: Vec<i32> = cells.iter().copied().filter(|&cell| cell != 0).collect();
     let (base, width) = spread_of(nonzero.iter().copied());
     let sparse_bytes = cells.len().div_ceil(BLOCK_CELLS) * BLOCK_BYTES + nonzero.len() * width;
-    let mut bytes = Vec::new();
     if sparse_bytes + min_sparse_gain <= cells.len() * dense_width {
         let mut before = 0u32;
         for block in cells.chunks(BLOCK_CELLS) {
@@ -324,25 +359,23 @@ fn encode_table(cells: &[i32], min_sparse_gain: usize) -> EncodedTable {
             before += bits.count_ones();
         }
         for &value in &nonzero {
-            push_cell(&mut bytes, value, base, width);
+            push_cell(bytes, value, base, width);
         }
         return EncodedTable {
             sparse: true,
             width,
             base,
             nonzero: nonzero.len(),
-            bytes,
         };
     }
     for &cell in cells {
-        push_cell(&mut bytes, cell, dense_base, dense_width);
+        push_cell(bytes, cell, dense_base, dense_width);
     }
     EncodedTable {
         sparse: false,
         width: dense_width,
         base: dense_base,
         nonzero: 0,
-        bytes,
     }
 }
 

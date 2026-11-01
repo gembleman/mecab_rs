@@ -131,14 +131,15 @@ pub(crate) fn plan_projection_clusters(
     plans
 }
 
-pub(crate) fn fill_cells<T: Copy + Default + Send>(
+pub(crate) fn fill_cells<T: Copy + Send>(
     plan: &ClusterPlan,
     threads: usize,
+    table: &mut [T],
     cell_of: impl Fn(u16, u16) -> T + Sync,
-) -> Vec<T> {
+) {
+    debug_assert_eq!(table.len(), plan.cells());
     let lefts = representatives(&plan.left_ids, plan.left_keys);
     let rights = representatives(&plan.right_ids, plan.right_keys);
-    let mut table = vec![T::default(); plan.cells()];
     let chunks = Mutex::new(
         table
             .chunks_mut(ROWS_PER_CHUNK * plan.left_keys)
@@ -160,7 +161,6 @@ pub(crate) fn fill_cells<T: Copy + Default + Send>(
             });
         }
     });
-    table
 }
 
 pub(crate) fn interleaved_ids(

@@ -83,6 +83,15 @@ impl HotShape {
         Self { lengths }
     }
 
+    pub(crate) fn rows_bytes(&self, rows: Range<usize>) -> usize {
+        let end = rows.end.min(self.rows());
+        let start = rows.start.min(end);
+        self.lengths[start..end]
+            .iter()
+            .map(|&length| length as usize * COST_BYTES)
+            .sum()
+    }
+
     pub fn rows(&self) -> usize {
         self.lengths.len()
     }

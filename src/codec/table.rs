@@ -76,6 +76,11 @@ impl std::fmt::Debug for Lexicon {
     }
 }
 
+enum LineRef {
+    Row(usize),
+    Irregular(usize),
+}
+
 #[derive(Default)]
 pub struct Lexicon {
     pub n_cols: usize,
@@ -155,38 +160,72 @@ impl Lexicon {
         }
     }
 
-    pub fn write_text<F: FnMut(&[u8])>(&self, order: Option<&[u32]>, mut sink: F) {
+    fn walk_lines<E>(
+        &self,
+        order: Option<&[u32]>,
+        mut visit: impl FnMut(LineRef, bool) -> Result<(), E>,
+    ) -> Result<(), E> {
         debug_assert_eq!(self.irregular.len(), self.irregular_at.len());
         let rows = self.rows();
         let total = rows + self.irregular.len();
         let mut emitted = 0usize;
-        let mut end_line = |sink: &mut F| {
+        let mut is_terminated = || {
             emitted += 1;
-            if emitted < total || !self.no_final_newline {
-                sink(b"\n");
-            }
+            emitted < total || !self.no_final_newline
         };
         let mut next_irregular = 0usize;
         for slot in 0..=rows {
             while next_irregular < self.irregular.len()
                 && (slot == rows || self.irregular_at[next_irregular] as usize <= slot)
             {
-                sink(&self.irregular[next_irregular]);
-                end_line(&mut sink);
+                visit(LineRef::Irregular(next_irregular), is_terminated())?;
                 next_irregular += 1;
             }
             if slot < rows {
                 let r = order.map_or(slot, |o| o[slot] as usize);
-                self.write_row(r, &mut sink);
-                end_line(&mut sink);
+                visit(LineRef::Row(r), is_terminated())?;
             }
         }
+        Ok(())
     }
 
-    pub fn to_text(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.data.len() + self.data.len() / 4 + 64);
-        self.write_text(None, |p| out.extend_from_slice(p));
-        out
+    pub fn write_text<F: FnMut(&[u8])>(&self, order: Option<&[u32]>, mut sink: F) {
+        let walked = self.walk_lines::<std::convert::Infallible>(order, |line, terminated| {
+            match line {
+                LineRef::Irregular(i) => sink(&self.irregular[i]),
+                LineRef::Row(r) => self.write_row(r, &mut sink),
+            }
+            if terminated {
+                sink(b"\n");
+            }
+            Ok(())
+        });
+        debug_assert!(walked.is_ok());
+    }
+
+    pub fn for_each_line<E>(
+        &self,
+        mut visit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(u64, u64), E> {
+        let mut scratch = Vec::new();
+        let mut digest = FNV_OFFSET;
+        let mut text_len = 0u64;
+        self.walk_lines(None, |line, terminated| {
+            scratch.clear();
+            match line {
+                LineRef::Irregular(i) => scratch.extend_from_slice(&self.irregular[i]),
+                LineRef::Row(r) => self.write_row(r, &mut |p| scratch.extend_from_slice(p)),
+            }
+            visit(&scratch)?;
+            digest = fnv1a(digest, &scratch);
+            text_len += scratch.len() as u64;
+            if terminated {
+                digest = fnv1a(digest, b"\n");
+                text_len += 1;
+            }
+            Ok(())
+        })?;
+        Ok((digest, text_len))
     }
 
     pub fn reserve(&mut self, rows: usize, bytes: usize) -> bool {

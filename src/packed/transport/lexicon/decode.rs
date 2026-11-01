@@ -1,8 +1,9 @@
 use super::{
-    COMMA, HashMap, LINE_END, Model, NUL, NUMBER_FIELDS, Param, QUOTE, UNKNOWN_PARAM_BYTES,
-    Undecodable, decode_lexicon, get_varint,
+    COMMA, HashMap, Model, NUL, NUMBER_FIELDS, Param, QUOTE, UNKNOWN_PARAM_BYTES, Undecodable,
+    get_varint, visit_lexicon_lines,
 };
-use crate::wire::{i16_at, u16_at};
+use crate::wire::{FNV_OFFSET, fnv1a, i16_at, u16_at};
+use std::borrow::Cow;
 
 pub(super) struct Reader<'a> {
     pub(super) bytes: &'a [u8],
@@ -36,29 +37,74 @@ impl<'a> Reader<'a> {
     }
 }
 
-pub(super) struct Interner<'a> {
-    pub(super) params: HashMap<Param, u32>,
-    pub(super) features: HashMap<&'a str, u32>,
+const EMPTY_SLOT: u32 = 0;
+const FIRST_SLOT_COUNT: usize = 1 << 4;
+
+#[derive(Default)]
+pub(super) struct FeatureTable {
+    slots: Vec<u32>,
+    starts: Vec<usize>,
 }
 
-impl<'a> Interner<'a> {
-    pub(super) fn intern(
-        &mut self,
-        model: &mut Model,
-        param: Param,
-        feature: &'a str,
-    ) -> (u32, u32) {
+impl FeatureTable {
+    fn bytes_of<'b>(&self, stored: &'b [u8], number: usize) -> &'b [u8] {
+        let end = self.starts.get(number + 1).copied().unwrap_or(stored.len());
+        &stored[self.starts[number]..end - 1]
+    }
+
+    fn slot_start(&self, feature: &[u8]) -> usize {
+        fnv1a(FNV_OFFSET, feature) as usize & (self.slots.len() - 1)
+    }
+
+    fn grow_if_full(&mut self, stored: &[u8]) {
+        if (self.starts.len() + 1) * 2 <= self.slots.len() {
+            return;
+        }
+        let slot_count = (self.slots.len() * 2).max(FIRST_SLOT_COUNT);
+        self.slots = vec![EMPTY_SLOT; slot_count];
+        for number in 0..self.starts.len() {
+            let mut at = self.slot_start(self.bytes_of(stored, number));
+            while self.slots[at] != EMPTY_SLOT {
+                at = (at + 1) & (slot_count - 1);
+            }
+            self.slots[at] = number as u32 + 1;
+        }
+    }
+
+    fn intern(&mut self, stored: &mut Vec<u8>, feature: &str) -> u32 {
+        self.grow_if_full(stored);
+        let feature = feature.as_bytes();
+        let mut at = self.slot_start(feature);
+        while self.slots[at] != EMPTY_SLOT {
+            let number = self.slots[at] - 1;
+            if self.bytes_of(stored, number as usize) == feature {
+                return number;
+            }
+            at = (at + 1) & (self.slots.len() - 1);
+        }
+        let number = self.starts.len() as u32;
+        self.starts.push(stored.len());
+        stored.extend_from_slice(feature);
+        stored.push(NUL);
+        self.slots[at] = number + 1;
+        number
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Interner {
+    pub(super) params: HashMap<Param, u32>,
+    pub(super) features: FeatureTable,
+}
+
+impl Interner {
+    pub(super) fn intern(&mut self, model: &mut Model, param: Param, feature: &str) -> (u32, u32) {
         let next = self.params.len() as u32;
         let param_number = *self.params.entry(param).or_insert_with(|| {
             model.params.push(param);
             next
         });
-        let next = self.features.len() as u32;
-        let feature_number = *self.features.entry(feature).or_insert_with(|| {
-            model.features.extend_from_slice(feature.as_bytes());
-            model.features.push(NUL);
-            next
-        });
+        let feature_number = self.features.intern(&mut model.features, feature);
         (param_number, feature_number)
     }
 }
@@ -97,18 +143,26 @@ impl<'a> PosIds<'a> {
 }
 
 pub(super) struct CsvLine<'a> {
-    pub(super) key: String,
+    pub(super) key: Cow<'a, str>,
     pub(super) param: Param,
     pub(super) feature: &'a str,
 }
 
-pub(super) fn split_key(line: &str) -> Option<(String, &str)> {
+pub(super) fn split_key(line: &str) -> Option<(Cow<'_, str>, &str)> {
     let Some(quoted) = line.strip_prefix(QUOTE as char) else {
         let (key, rest) = line.split_once(COMMA as char)?;
-        return Some((key.to_string(), rest));
+        return Some((Cow::Borrowed(key), rest));
     };
-    let mut key = String::new();
-    let mut rest = quoted;
+    let (first, after_first) = quoted.split_once(QUOTE as char)?;
+    let Some(escaped) = after_first.strip_prefix(QUOTE as char) else {
+        return Some((
+            Cow::Borrowed(first),
+            after_first.strip_prefix(COMMA as char)?,
+        ));
+    };
+    let mut key = String::from(first);
+    key.push(QUOTE as char);
+    let mut rest = escaped;
     loop {
         let (before, after) = rest.split_once(QUOTE as char)?;
         key.push_str(before);
@@ -117,7 +171,7 @@ pub(super) fn split_key(line: &str) -> Option<(String, &str)> {
                 key.push(QUOTE as char);
                 rest = escaped;
             }
-            None => return Some((key, after.strip_prefix(COMMA as char)?)),
+            None => return Some((Cow::Owned(key), after.strip_prefix(COMMA as char)?)),
         }
     }
 }
@@ -141,11 +195,11 @@ pub(super) fn parse_line(line: &str) -> Option<CsvLine<'_>> {
     })
 }
 
-pub(super) fn decode_unknown<'a>(
-    mut reader: Reader<'a>,
+pub(super) fn decode_unknown(
+    mut reader: Reader<'_>,
     pos_ids: &mut PosIds,
     model: &mut Model,
-    interner: &mut Interner<'a>,
+    interner: &mut Interner,
 ) -> Result<(), Undecodable> {
     let categories = reader.count()?;
     let mut counts = Vec::with_capacity(categories.min(reader.bytes.len()));
@@ -179,11 +233,11 @@ pub(super) fn decode_unknown<'a>(
     Ok(())
 }
 
-fn append_token_line<'a>(
-    line: &'a str,
+fn append_token_line(
+    line: &str,
     pos_ids: &mut PosIds,
     model: &mut Model,
-    interner: &mut Interner<'a>,
+    interner: &mut Interner,
 ) -> Result<(), Undecodable> {
     let CsvLine {
         key,
@@ -195,41 +249,43 @@ fn append_token_line<'a>(
     model.token_params.push(param);
     model.token_features.push(feature);
     match (model.keys.last(), model.counts.last_mut()) {
-        (Some(last), Some(count)) if *last == key => {
+        (Some(last), Some(count)) if last.as_str() == key => {
             *count = count
                 .checked_add(1)
                 .ok_or(Undecodable("a key has more than 255 tokens"))?;
         }
         _ => {
-            model.keys.push(key);
+            model.keys.push(key.into_owned());
             model.counts.push(1);
         }
     }
     Ok(())
 }
 
-pub(super) fn model_from_csv(csv: &[u8], unknown: &[u8], pos: &[u8]) -> Result<Model, Undecodable> {
-    let text = str::from_utf8(csv).map_err(|_| Undecodable("the lexicon is not UTF-8"))?;
+fn append_token_bytes(
+    bytes: &[u8],
+    pos_ids: &mut PosIds,
+    model: &mut Model,
+    interner: &mut Interner,
+) -> Result<(), Undecodable> {
+    let line = str::from_utf8(bytes).map_err(|_| Undecodable("the lexicon is not UTF-8"))?;
+    append_token_line(line, pos_ids, model, interner)
+}
+
+pub(super) fn restore(lexicon: &[u8], unknown: &[u8], pos: &[u8]) -> Result<Model, Undecodable> {
     let unknown = Reader {
         bytes: unknown,
         at: 0,
     };
     let mut pos_ids = PosIds::new(pos);
     let mut model = Model::default();
-    let mut interner = Interner {
-        params: HashMap::new(),
-        features: HashMap::new(),
-    };
-    for line in text.split_terminator(LINE_END as char) {
-        append_token_line(line, &mut pos_ids, &mut model, &mut interner)?;
-    }
+    let mut interner = Interner::default();
+    visit_lexicon_lines(lexicon, |line| {
+        append_token_bytes(line, &mut pos_ids, &mut model, &mut interner)
+    })?;
     decode_unknown(unknown, &mut pos_ids, &mut model, &mut interner)?;
     if !pos_ids.at_end() {
         return Err(Undecodable("the part-of-speech ids have trailing bytes"));
     }
     Ok(model)
-}
-
-pub(super) fn restore(lexicon: &[u8], unknown: &[u8], pos: &[u8]) -> Result<Model, Undecodable> {
-    model_from_csv(&decode_lexicon(lexicon)?, unknown, pos)
 }
