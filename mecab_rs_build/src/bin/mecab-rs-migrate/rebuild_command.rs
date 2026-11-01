@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::path::Path;
 use std::time::Instant;
 
 use mecab_rs_build::rebuild;
@@ -33,17 +34,25 @@ pub fn rebuild_command(args: &[OsString]) -> Result<(), String> {
         previous = Instant::now();
     })
     .map_err(shown)?;
-    println!(
+    println!("{}", built_message(&report, out));
+    if let Some(slim) = report.slim {
+        println!("{}", slim_message(&slim));
+    }
+    Ok(())
+}
+
+fn built_message(report: &rebuild::RuntimeReport, out: &Path) -> String {
+    format!(
         "built {} x {} ids into {}",
         report.left_size,
         report.right_size,
         out.display()
-    );
-    if let Some(slim) = report.slim {
-        println!(
-            "sys.dic features {} -> {} bytes, file {} -> {}",
-            slim.old_feature_size, slim.new_feature_size, slim.old_file_size, slim.new_file_size
-        );
-    }
-    Ok(())
+    )
+}
+
+fn slim_message(slim: &rebuild::SlimReport) -> String {
+    format!(
+        "sys.dic features {} -> {} bytes, file {} -> {}",
+        slim.old_feature_size, slim.new_feature_size, slim.old_file_size, slim.new_file_size
+    )
 }

@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use mecab_rs_build::cli_options::{OptionSpec, Options};
+use mecab_rs_build::cli_options::{OptionSpec, Options, lossy_arguments};
 use mecab_rs_build::learn::evaluate;
 
 const USAGE: &str = "usage: mecab-rs-system-eval [options] output answer
@@ -39,36 +39,45 @@ const SPECS: [OptionSpec; 4] = [
     },
 ];
 
-fn run() -> Result<ExitCode, String> {
-    let options = Options::from_env(&SPECS)?;
+fn emit(stdout: &mut dyn Write, text: &str) -> Result<(), String> {
+    writeln!(stdout, "{text}").map_err(|error| error.to_string())
+}
+
+fn run_with(arguments: &[String], stdout: &mut dyn Write) -> Result<ExitCode, String> {
+    let options = Options::parse(arguments, &SPECS)?;
     if options.flag("help") {
-        println!("{USAGE}");
+        emit(stdout, USAGE)?;
         return Ok(ExitCode::SUCCESS);
     }
     if options.flag("version") {
-        println!("mecab-rs-system-eval of {}", env!("CARGO_PKG_VERSION"));
+        emit(
+            stdout,
+            &format!("mecab-rs-system-eval of {}", env!("CARGO_PKG_VERSION")),
+        )?;
         return Ok(ExitCode::SUCCESS);
     }
     let [system, answer, ..] = options.rest.as_slice() else {
-        println!("Usage: mecab-rs-system-eval output answer");
+        emit(stdout, "Usage: mecab-rs-system-eval output answer")?;
         return Ok(ExitCode::FAILURE);
     };
     let level = options.get("level").unwrap_or("0 -1");
-    let mut out: Box<dyn Write> = match options.get("output") {
-        None | Some("-") => Box::new(std::io::stdout().lock()),
+    let mut file;
+    let out: &mut dyn Write = match options.get("output") {
+        None | Some("-") => stdout,
         Some(path) => {
-            Box::new(std::fs::File::create(path).map_err(|error| format!("{path}: {error}"))?)
+            file = std::fs::File::create(path).map_err(|error| format!("{path}: {error}"))?;
+            &mut file
         }
     };
-    evaluate(
-        &PathBuf::from(system),
-        &PathBuf::from(answer),
-        level,
-        &mut out,
-    )
-    .map_err(|error| error.report())?;
+    evaluate(&PathBuf::from(system), &PathBuf::from(answer), level, out)
+        .map_err(|error| error.report())?;
     out.flush().map_err(|error| error.to_string())?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn run() -> Result<ExitCode, String> {
+    let arguments = lossy_arguments(&std::env::args_os().skip(1).collect::<Vec<_>>());
+    run_with(&arguments, &mut std::io::stdout().lock())
 }
 
 fn main() -> ExitCode {

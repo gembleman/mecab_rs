@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use mecab_rs_build::cli_options::{OptionSpec, Options};
+use mecab_rs_build::cli_options::{OptionSpec, Options, lossy_arguments};
 use mecab_rs_build::learn::{TrainOptions, train};
 
 const USAGE: &str = "usage: mecab-rs-cost-train [options] corpus model
@@ -77,18 +77,25 @@ const SPECS: [OptionSpec; 9] = [
     },
 ];
 
-fn run() -> Result<ExitCode, String> {
-    let options = Options::from_env(&SPECS)?;
+fn emit(stdout: &mut dyn Write, text: &str) -> Result<(), String> {
+    writeln!(stdout, "{text}").map_err(|error| error.to_string())
+}
+
+fn run_with(arguments: &[String], stdout: &mut dyn Write) -> Result<ExitCode, String> {
+    let options = Options::parse(arguments, &SPECS)?;
     if options.flag("help") {
-        println!("{USAGE}");
+        emit(stdout, USAGE)?;
         return Ok(ExitCode::SUCCESS);
     }
     if options.flag("version") {
-        println!("mecab-rs-cost-train of {}", env!("CARGO_PKG_VERSION"));
+        emit(
+            stdout,
+            &format!("mecab-rs-cost-train of {}", env!("CARGO_PKG_VERSION")),
+        )?;
         return Ok(ExitCode::SUCCESS);
     }
     let [corpus, model] = options.rest.as_slice() else {
-        println!("Usage: mecab-rs-cost-train corpus model");
+        emit(stdout, "Usage: mecab-rs-cost-train corpus model")?;
         return Ok(ExitCode::FAILURE);
     };
     let train_options = TrainOptions {
@@ -100,17 +107,20 @@ fn run() -> Result<ExitCode, String> {
         threads: options.number("thread"),
         crlf: options.flag("crlf"),
     };
-    let stdout = std::io::stdout();
-    let mut log = stdout.lock();
     let result = train(
         &train_options,
         &PathBuf::from(corpus),
         &PathBuf::from(model),
-        &mut log,
+        stdout,
     );
-    let _ = log.flush();
+    let _ = stdout.flush();
     result.map_err(|error| error.report())?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn run() -> Result<ExitCode, String> {
+    let arguments = lossy_arguments(&std::env::args_os().skip(1).collect::<Vec<_>>());
+    run_with(&arguments, &mut std::io::stdout().lock())
 }
 
 fn main() -> ExitCode {

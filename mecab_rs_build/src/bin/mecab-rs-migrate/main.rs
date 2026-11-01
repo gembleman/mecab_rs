@@ -21,7 +21,10 @@ fn shown(error: mecab_rs::Error) -> String {
 }
 
 fn run() -> Result<(), String> {
-    let all: Vec<OsString> = std::env::args_os().skip(1).collect();
+    run_with(std::env::args_os().skip(1).collect())
+}
+
+fn run_with(all: Vec<OsString>) -> Result<(), String> {
     if let Some(command) = all.first().and_then(|first| first.to_str()) {
         let start = Instant::now();
         let args = &all[1..];

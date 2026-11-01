@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use mecab_rs_build::cli_options::{OptionSpec, Options};
+use mecab_rs_build::cli_options::{OptionSpec, Options, lossy_arguments};
 use mecab_rs_build::learn::{GenerateOptions, generate};
 
 const USAGE: &str = "usage: mecab-rs-dict-gen [options]
@@ -64,15 +64,20 @@ const SPECS: [OptionSpec; 7] = [
     },
 ];
 
-fn run() -> Result<(), String> {
-    let options = Options::from_env(&SPECS)?;
+fn emit(stdout: &mut dyn Write, text: &str) -> Result<(), String> {
+    writeln!(stdout, "{text}").map_err(|error| error.to_string())
+}
+
+fn run_with(arguments: &[String], stdout: &mut dyn Write) -> Result<(), String> {
+    let options = Options::parse(arguments, &SPECS)?;
     if options.flag("help") {
-        println!("{USAGE}");
-        return Ok(());
+        return emit(stdout, USAGE);
     }
     if options.flag("version") {
-        println!("mecab-rs-dict-gen of {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+        return emit(
+            stdout,
+            &format!("mecab-rs-dict-gen of {}", env!("CARGO_PKG_VERSION")),
+        );
     }
     let generate_options = GenerateOptions {
         dic_dir: PathBuf::from(options.get("dicdir").unwrap_or(".")),
@@ -81,11 +86,14 @@ fn run() -> Result<(), String> {
         crlf: options.flag("crlf"),
         build: options.flag("build"),
     };
-    let stdout = std::io::stdout();
-    let mut log = stdout.lock();
-    let result = generate(&generate_options, &mut log);
-    let _ = log.flush();
+    let result = generate(&generate_options, stdout);
+    let _ = stdout.flush();
     result.map_err(|error| error.report())
+}
+
+fn run() -> Result<(), String> {
+    let arguments = lossy_arguments(&std::env::args_os().skip(1).collect::<Vec<_>>());
+    run_with(&arguments, &mut std::io::stdout().lock())
 }
 
 fn main() -> ExitCode {

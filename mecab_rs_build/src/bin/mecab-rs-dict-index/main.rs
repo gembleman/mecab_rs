@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -32,6 +33,7 @@ Only UTF-8 is supported for -c, -t and -f. Without -u the system dictionary is b
 (when model.def exists). With -u the CSV files given as arguments are compiled into the user
 dictionary FILE.";
 
+#[derive(Debug)]
 struct Arguments {
     dic_dir: PathBuf,
     out_dir: PathBuf,
@@ -41,9 +43,11 @@ struct Arguments {
     options: BuildOptions,
 }
 
+#[derive(Debug)]
 enum Parsed {
     Run(Box<Arguments>),
-    Exit,
+    Version,
+    Help,
 }
 
 const fn flag(name: &'static str, short: Option<char>) -> OptionSpec {
@@ -103,14 +107,8 @@ fn apply(parsed: &mut Arguments, name: &str, text: &str) -> Result<Option<Parsed
         "wakati" => parsed.options.wakati = true,
         "posid" => {}
         "node-format" => return Err("-F (node-format) is not supported".to_owned()),
-        "version" => {
-            println!("mecab-rs-dict-index of {}", env!("CARGO_PKG_VERSION"));
-            return Ok(Some(Parsed::Exit));
-        }
-        _ => {
-            println!("{USAGE}");
-            return Ok(Some(Parsed::Exit));
-        }
+        "version" => return Ok(Some(Parsed::Version)),
+        _ => return Ok(Some(Parsed::Help)),
     }
     Ok(None)
 }
@@ -133,42 +131,60 @@ fn parse(arguments: &[OsString]) -> Result<Parsed, String> {
     Ok(Parsed::Run(Box::new(parsed)))
 }
 
-fn print_report(report: &BuildReport) {
-    for (path, count) in &report.read {
-        println!("reading {} ... {count}", path.display());
-    }
-    for path in &report.written {
-        println!("wrote {}", path.display());
-    }
+fn emit(stdout: &mut dyn Write, text: &str) -> Result<(), String> {
+    writeln!(stdout, "{text}").map_err(|error| error.to_string())
 }
 
-fn run() -> Result<(), String> {
-    let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let Parsed::Run(arguments) = parse(&arguments)? else {
-        return Ok(());
-    };
+fn print_report(report: &BuildReport, stdout: &mut dyn Write) -> Result<(), String> {
+    for (path, count) in &report.read {
+        emit(stdout, &format!("reading {} ... {count}", path.display()))?;
+    }
+    for path in &report.written {
+        emit(stdout, &format!("wrote {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn build_report(arguments: &Arguments) -> Result<BuildReport, String> {
     let shown = |error: mecab_rs::Error| error.report();
-    let report = match &arguments.user {
+    match &arguments.user {
         Some(output) if arguments.assign => build::assign_user_costs(
             &arguments.dic_dir,
             &arguments.rest,
             output,
             &arguments.options,
         )
-        .map_err(shown)?,
+        .map_err(shown),
         Some(output) => build::compile_user(
             &arguments.dic_dir,
             &arguments.rest,
             output,
             &arguments.options,
         )
-        .map_err(shown)?,
+        .map_err(shown),
         None => build::compile_system(&arguments.dic_dir, &arguments.out_dir, &arguments.options)
-            .map_err(shown)?,
-    };
-    print_report(&report);
-    println!("\ndone!");
-    Ok(())
+            .map_err(shown),
+    }
+}
+
+fn run_with(arguments: &[OsString], stdout: &mut dyn Write) -> Result<(), String> {
+    match parse(arguments)? {
+        Parsed::Version => emit(
+            stdout,
+            &format!("mecab-rs-dict-index of {}", env!("CARGO_PKG_VERSION")),
+        ),
+        Parsed::Help => emit(stdout, USAGE),
+        Parsed::Run(arguments) => {
+            let report = build_report(&arguments)?;
+            print_report(&report, stdout)?;
+            emit(stdout, "\ndone!")
+        }
+    }
+}
+
+fn run() -> Result<(), String> {
+    let arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+    run_with(&arguments, &mut std::io::stdout().lock())
 }
 
 fn main() -> ExitCode {
