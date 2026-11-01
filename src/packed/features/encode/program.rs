@@ -1,7 +1,7 @@
 use super::{
     Class, Error, Numbers, OP_BLOB, OP_BLOB_NEXT, OP_COPY, OP_DERIVE, OP_EMPTY, OP_HIGH, OP_INLINE,
-    OP_KEY, OP_NUM, OP_NUMB, OP_REF, OP_STAR, Planner, SmallKeyMap, TextOp, blob_slot, plan_op,
-    push_piece, split_fields,
+    OP_KEY, OP_NUM, OP_NUMB, OP_REF, OP_STAR, Planner, SmallKeyMap, Spans, TextOp, blob_slot,
+    plan_op, push_piece,
 };
 
 pub(super) fn intern_bytes(map: &mut SmallKeyMap<Vec<u8>, u32>, bytes: &[u8]) -> u32 {
@@ -38,6 +38,7 @@ pub(super) struct ProgramSet<'a> {
 pub(super) struct ProgramBuilder<'c, 'a> {
     pub(super) planner: &'c Planner<'c, 'a>,
     pub(super) entries: &'c [&'a [u8]],
+    pub(super) spans: &'c Spans,
     pub(super) numbers: &'c Numbers,
     pub(super) string_uses: &'c SmallKeyMap<&'a [u8], u32>,
     pub(super) set: ProgramSet<'a>,
@@ -57,6 +58,7 @@ impl<'c, 'a> ProgramBuilder<'c, 'a> {
     pub(super) fn new(
         planner: &'c Planner<'c, 'a>,
         entries: &'c [&'a [u8]],
+        spans: &'c Spans,
         numbers: &'c Numbers,
         string_uses: &'c SmallKeyMap<&'a [u8], u32>,
         plan_codes: Vec<u8>,
@@ -64,6 +66,7 @@ impl<'c, 'a> ProgramBuilder<'c, 'a> {
         Self {
             planner,
             entries,
+            spans,
             numbers,
             string_uses,
             set: ProgramSet::default(),
@@ -100,7 +103,7 @@ impl<'c, 'a> ProgramBuilder<'c, 'a> {
 
     pub(super) fn add_variant(&mut self, entry: usize) -> Result<(), Error> {
         let text = self.entries[entry];
-        split_fields(text, &mut self.fields);
+        self.spans.fill(entry, &mut self.fields);
         self.program.clear();
         self.piece.clear();
         self.ops.clear();

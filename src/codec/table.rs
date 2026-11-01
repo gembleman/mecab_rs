@@ -65,6 +65,24 @@ pub(crate) fn parse_line(line: &str, buf: &mut Vec<u8>, ends: &mut Vec<u32>) -> 
     }
 }
 
+fn write_field<F: FnMut(&[u8])>(field: &[u8], sink: &mut F) {
+    if field.iter().any(|&x| x == b',' || x == b'"') {
+        sink(b"\"");
+        let mut start = 0;
+        for (i, &x) in field.iter().enumerate() {
+            if x == b'"' {
+                sink(&field[start..=i]);
+                sink(b"\"");
+                start = i + 1;
+            }
+        }
+        sink(&field[start..]);
+        sink(b"\"");
+    } else {
+        sink(field);
+    }
+}
+
 impl std::fmt::Debug for Lexicon {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -73,6 +91,36 @@ impl std::fmt::Debug for Lexicon {
             .field("rows", &self.ends.len())
             .field("bytes", &self.data.len())
             .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Record<'a> {
+    Row(Row<'a>),
+    Irregular(&'a [u8]),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Row<'a> {
+    lex: &'a Lexicon,
+    row: usize,
+}
+
+impl<'a> Row<'a> {
+    pub fn n_cols(&self) -> usize {
+        self.lex.n_cols
+    }
+
+    pub fn field(&self, col: usize) -> &'a [u8] {
+        self.lex.field_bytes(self.row, col)
+    }
+
+    pub fn write_csv<F: FnMut(&[u8])>(&self, sink: &mut F) {
+        self.lex.write_row(self.row, sink);
+    }
+
+    pub fn write_field_csv<F: FnMut(&[u8])>(&self, col: usize, sink: &mut F) {
+        write_field(self.field(col), sink);
     }
 }
 
@@ -141,22 +189,7 @@ impl Lexicon {
             if col > 0 {
                 sink(b",");
             }
-            let field = self.field_bytes(row, col);
-            if field.iter().any(|&x| x == b',' || x == b'"') {
-                sink(b"\"");
-                let mut start = 0;
-                for (i, &x) in field.iter().enumerate() {
-                    if x == b'"' {
-                        sink(&field[start..=i]);
-                        sink(b"\"");
-                        start = i + 1;
-                    }
-                }
-                sink(&field[start..]);
-                sink(b"\"");
-            } else {
-                sink(field);
-            }
+            write_field(self.field_bytes(row, col), sink);
         }
     }
 
@@ -203,29 +236,29 @@ impl Lexicon {
         debug_assert!(walked.is_ok());
     }
 
-    pub fn for_each_line<E>(
+    pub fn for_each_record<E>(
         &self,
-        mut visit: impl FnMut(&[u8]) -> Result<(), E>,
-    ) -> Result<(u64, u64), E> {
-        let mut scratch = Vec::new();
-        let mut digest = FNV_OFFSET;
-        let mut text_len = 0u64;
-        self.walk_lines(None, |line, terminated| {
-            scratch.clear();
-            match line {
-                LineRef::Irregular(i) => scratch.extend_from_slice(&self.irregular[i]),
-                LineRef::Row(r) => self.write_row(r, &mut |p| scratch.extend_from_slice(p)),
-            }
-            visit(&scratch)?;
-            digest = fnv1a(digest, &scratch);
-            text_len += scratch.len() as u64;
-            if terminated {
-                digest = fnv1a(digest, b"\n");
-                text_len += 1;
-            }
-            Ok(())
-        })?;
-        Ok((digest, text_len))
+        mut visit: impl FnMut(Record<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.walk_lines(None, |line, _| match line {
+            LineRef::Irregular(i) => visit(Record::Irregular(&self.irregular[i])),
+            LineRef::Row(r) => visit(Record::Row(Row { lex: self, row: r })),
+        })
+    }
+
+    pub fn row_iter(&self) -> impl Iterator<Item = Row<'_>> {
+        (0..self.rows()).map(|row| Row { lex: self, row })
+    }
+
+    pub fn fields_are_utf8(&self) -> bool {
+        const CONTINUATION_MASK: u8 = 0xC0;
+        const CONTINUATION: u8 = 0x80;
+        std::str::from_utf8(&self.data).is_ok()
+            && self.ends.iter().all(|&end| {
+                self.data
+                    .get(end as usize)
+                    .is_none_or(|&byte| byte & CONTINUATION_MASK != CONTINUATION)
+            })
     }
 
     pub fn reserve(&mut self, rows: usize, bytes: usize) -> bool {

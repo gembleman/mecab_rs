@@ -1,9 +1,58 @@
 use super::{
     COMMA, HashMap, Model, NUL, NUMBER_FIELDS, Param, QUOTE, UNKNOWN_PARAM_BYTES, Undecodable,
-    get_varint, visit_lexicon_lines,
+    get_varint, visit_lexicon_records,
 };
-use crate::wire::{FNV_OFFSET, fnv1a, i16_at, u16_at};
+use crate::codec::{Record, Row};
+use crate::wire::{i16_at, u16_at};
 use std::borrow::Cow;
+use std::hash::{BuildHasherDefault, Hasher};
+
+const PARAM_SEED: u64 = 0x517c_c1b7_2722_0a95;
+const PARAM_FOLD: u32 = 32;
+const DIRECT_COLS: usize = 5;
+const KEY_COL: usize = 0;
+const LEFT_COL: usize = 1;
+const RIGHT_COL: usize = 2;
+const COST_COL: usize = 3;
+const FEATURE_COL: usize = 4;
+
+#[derive(Default)]
+pub(super) struct ParamHasher {
+    hash: u64,
+}
+
+impl Hasher for ParamHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        let mixed = (self.hash ^ value).wrapping_mul(PARAM_SEED);
+        self.hash = mixed ^ (mixed >> PARAM_FOLD);
+    }
+
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+pub(super) struct ParamKey(u64);
+
+impl ParamKey {
+    fn of(param: Param) -> Self {
+        Self(
+            u64::from(param.left_id)
+                | (u64::from(param.right_id) << 16)
+                | (u64::from(param.pos_id) << 32)
+                | (u64::from(param.word_cost as u16) << 48),
+        )
+    }
+}
+
+type ParamMap = HashMap<ParamKey, u32, BuildHasherDefault<ParamHasher>>;
 
 pub(super) struct Reader<'a> {
     pub(super) bytes: &'a [u8],
@@ -37,13 +86,43 @@ impl<'a> Reader<'a> {
     }
 }
 
-const EMPTY_SLOT: u32 = 0;
-const FIRST_SLOT_COUNT: usize = 1 << 4;
+const FIRST_SLOT_COUNT: usize = 1 << 16;
+const WORD_BYTES: usize = 8;
+const HASH_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+const HASH_ROTATE: u32 = 23;
+const HASH_SHIFT: u32 = 32;
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    number_plus_one: u32,
+    hash: u32,
+}
+
+fn hash_feature(feature: &[u8]) -> u32 {
+    let mut state = (feature.len() as u64).wrapping_mul(HASH_SEED);
+    let (words, tail) = feature.as_chunks::<WORD_BYTES>();
+    for word in words {
+        let value = u64::from_le_bytes(*word);
+        state = (state.rotate_left(HASH_ROTATE) ^ value).wrapping_mul(HASH_SEED);
+    }
+    let mut last = [0u8; WORD_BYTES];
+    last[..tail.len()].copy_from_slice(tail);
+    state = (state.rotate_left(HASH_ROTATE) ^ u64::from_le_bytes(last)).wrapping_mul(HASH_SEED);
+    (state >> HASH_SHIFT) as u32
+}
+
 pub(super) struct FeatureTable {
-    slots: Vec<u32>,
+    slots: Vec<Slot>,
     starts: Vec<usize>,
+}
+
+impl Default for FeatureTable {
+    fn default() -> Self {
+        Self {
+            slots: vec![Slot::default(); FIRST_SLOT_COUNT],
+            starts: Vec::new(),
+        }
+    }
 }
 
 impl FeatureTable {
@@ -52,55 +131,60 @@ impl FeatureTable {
         &stored[self.starts[number]..end - 1]
     }
 
-    fn slot_start(&self, feature: &[u8]) -> usize {
-        fnv1a(FNV_OFFSET, feature) as usize & (self.slots.len() - 1)
-    }
-
-    fn grow_if_full(&mut self, stored: &[u8]) {
+    fn grow_if_full(&mut self) {
         if (self.starts.len() + 1) * 2 <= self.slots.len() {
             return;
         }
-        let slot_count = (self.slots.len() * 2).max(FIRST_SLOT_COUNT);
-        self.slots = vec![EMPTY_SLOT; slot_count];
-        for number in 0..self.starts.len() {
-            let mut at = self.slot_start(self.bytes_of(stored, number));
-            while self.slots[at] != EMPTY_SLOT {
-                at = (at + 1) & (slot_count - 1);
+        let slot_count = self.slots.len() * 2;
+        let old = std::mem::replace(&mut self.slots, vec![Slot::default(); slot_count]);
+        let mask = slot_count - 1;
+        for slot in old.into_iter().filter(|slot| slot.number_plus_one != 0) {
+            let mut at = slot.hash as usize & mask;
+            while self.slots[at].number_plus_one != 0 {
+                at = (at + 1) & mask;
             }
-            self.slots[at] = number as u32 + 1;
+            self.slots[at] = slot;
         }
     }
 
-    fn intern(&mut self, stored: &mut Vec<u8>, feature: &str) -> u32 {
-        self.grow_if_full(stored);
-        let feature = feature.as_bytes();
-        let mut at = self.slot_start(feature);
-        while self.slots[at] != EMPTY_SLOT {
-            let number = self.slots[at] - 1;
-            if self.bytes_of(stored, number as usize) == feature {
+    fn intern(&mut self, stored: &mut Vec<u8>, feature: &[u8]) -> u32 {
+        self.grow_if_full();
+        let hash = hash_feature(feature);
+        let mask = self.slots.len() - 1;
+        let mut at = hash as usize & mask;
+        loop {
+            let slot = self.slots[at];
+            if slot.number_plus_one == 0 {
+                break;
+            }
+            let number = slot.number_plus_one - 1;
+            if slot.hash == hash && self.bytes_of(stored, number as usize) == feature {
                 return number;
             }
-            at = (at + 1) & (self.slots.len() - 1);
+            at = (at + 1) & mask;
         }
         let number = self.starts.len() as u32;
         self.starts.push(stored.len());
         stored.extend_from_slice(feature);
         stored.push(NUL);
-        self.slots[at] = number + 1;
+        self.slots[at] = Slot {
+            number_plus_one: number + 1,
+            hash,
+        };
         number
     }
 }
 
 #[derive(Default)]
 pub(super) struct Interner {
-    pub(super) params: HashMap<Param, u32>,
+    pub(super) params: ParamMap,
     pub(super) features: FeatureTable,
 }
 
 impl Interner {
-    pub(super) fn intern(&mut self, model: &mut Model, param: Param, feature: &str) -> (u32, u32) {
+    pub(super) fn intern(&mut self, model: &mut Model, param: Param, feature: &[u8]) -> (u32, u32) {
         let next = self.params.len() as u32;
-        let param_number = *self.params.entry(param).or_insert_with(|| {
+        let param_number = *self.params.entry(ParamKey::of(param)).or_insert_with(|| {
             model.params.push(param);
             next
         });
@@ -219,7 +303,7 @@ pub(super) fn decode_unknown(
             let length = reader.count()?;
             let feature = str::from_utf8(reader.take(length)?)
                 .map_err(|_| Undecodable("an unknown feature is not valid UTF-8"))?;
-            let (param, feature) = interner.intern(model, param, feature);
+            let (param, feature) = interner.intern(model, param, feature.as_bytes());
             model.unknown_params.push(param);
             model.unknown_features.push(feature);
         }
@@ -229,6 +313,22 @@ pub(super) fn decode_unknown(
     }
     if !reader.at_end() {
         return Err(Undecodable("the unknown tokens have trailing bytes"));
+    }
+    Ok(())
+}
+
+fn append_key(model: &mut Model, key: &[u8]) -> Result<(), Undecodable> {
+    match (model.keys.last(), model.counts.last_mut()) {
+        (Some(last), Some(count)) if last.as_bytes() == key => {
+            *count = count
+                .checked_add(1)
+                .ok_or(Undecodable("a key has more than 255 tokens"))?;
+        }
+        _ => {
+            let key = str::from_utf8(key).map_err(|_| Undecodable("the lexicon is not UTF-8"))?;
+            model.keys.push(key.to_owned());
+            model.counts.push(1);
+        }
     }
     Ok(())
 }
@@ -245,21 +345,10 @@ fn append_token_line(
         feature,
     } = parse_line(line).ok_or(Undecodable("the lexicon text is not valid"))?;
     param.pos_id = pos_ids.next()?;
-    let (param, feature) = interner.intern(model, param, feature);
+    let (param, feature) = interner.intern(model, param, feature.as_bytes());
     model.token_params.push(param);
     model.token_features.push(feature);
-    match (model.keys.last(), model.counts.last_mut()) {
-        (Some(last), Some(count)) if last.as_str() == key => {
-            *count = count
-                .checked_add(1)
-                .ok_or(Undecodable("a key has more than 255 tokens"))?;
-        }
-        _ => {
-            model.keys.push(key.into_owned());
-            model.counts.push(1);
-        }
-    }
-    Ok(())
+    append_key(model, key.as_bytes())
 }
 
 fn append_token_bytes(
@@ -272,16 +361,126 @@ fn append_token_bytes(
     append_token_line(line, pos_ids, model, interner)
 }
 
+#[derive(Clone, Copy)]
+struct DirectFields<'a> {
+    key: &'a [u8],
+    param: Param,
+    feature: &'a [u8],
+}
+
+fn parse_number<T: TryFrom<i64>>(field: &[u8], signed: bool) -> Option<T> {
+    let (negative, digits) = match field.split_first()? {
+        (&b'-', rest) if signed => (true, rest),
+        (&b'+', rest) => (false, rest),
+        _ => (false, field),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value = 0i64;
+    for &byte in digits {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value * 10 + i64::from(byte - b'0');
+        if value > i64::from(u32::MAX) {
+            return None;
+        }
+    }
+    T::try_from(if negative { -value } else { value }).ok()
+}
+
+fn direct_fields<'a>(row: &Row<'a>, scratch: &'a mut Vec<u8>) -> Option<DirectFields<'a>> {
+    let cols = row.n_cols();
+    if cols <= FEATURE_COL {
+        return None;
+    }
+    let param = Param {
+        left_id: parse_number(row.field(LEFT_COL), false)?,
+        right_id: parse_number(row.field(RIGHT_COL), false)?,
+        pos_id: 0,
+        word_cost: parse_number(row.field(COST_COL), true)?,
+    };
+    let first = row.field(FEATURE_COL);
+    let feature: &'a [u8] = if cols == DIRECT_COLS && is_plain(first) {
+        first
+    } else {
+        scratch.clear();
+        for col in FEATURE_COL..cols {
+            if col > FEATURE_COL {
+                scratch.push(COMMA);
+            }
+            row.write_field_csv(col, &mut |piece| scratch.extend_from_slice(piece));
+        }
+        scratch
+    };
+    Some(DirectFields {
+        key: row.field(KEY_COL),
+        param,
+        feature,
+    })
+}
+
+fn is_plain(field: &[u8]) -> bool {
+    !field.iter().any(|&byte| byte == COMMA || byte == QUOTE)
+}
+
+fn append_direct(
+    fields: DirectFields<'_>,
+    pos_ids: &mut PosIds,
+    model: &mut Model,
+    interner: &mut Interner,
+) -> Result<(), Undecodable> {
+    let DirectFields {
+        key,
+        mut param,
+        feature,
+    } = fields;
+    param.pos_id = pos_ids.next()?;
+    let (param, feature) = interner.intern(model, param, feature);
+    model.token_params.push(param);
+    model.token_features.push(feature);
+    append_key(model, key)
+}
+
+fn append_record(
+    record: Record<'_>,
+    scratch: &mut Vec<u8>,
+    pos_ids: &mut PosIds,
+    model: &mut Model,
+    interner: &mut Interner,
+) -> Result<(), Undecodable> {
+    match record {
+        Record::Irregular(bytes) => append_token_bytes(bytes, pos_ids, model, interner),
+        Record::Row(row) => {
+            if let Some(fields) = direct_fields(&row, scratch) {
+                append_direct(fields, pos_ids, model, interner)
+            } else {
+                let mut line = Vec::new();
+                row.write_csv(&mut |piece| line.extend_from_slice(piece));
+                append_token_bytes(&line, pos_ids, model, interner)
+            }
+        }
+    }
+}
+
 pub(super) fn restore(lexicon: &[u8], unknown: &[u8], pos: &[u8]) -> Result<Model, Undecodable> {
     let unknown = Reader {
         bytes: unknown,
         at: 0,
     };
     let mut pos_ids = PosIds::new(pos);
+    let mut scratch = Vec::new();
     let mut model = Model::default();
     let mut interner = Interner::default();
-    visit_lexicon_lines(lexicon, |line| {
-        append_token_bytes(line, &mut pos_ids, &mut model, &mut interner)
+    visit_lexicon_records(lexicon, |record| {
+        append_record(
+            record,
+            &mut scratch,
+            &mut pos_ids,
+            &mut model,
+            &mut interner,
+        )
     })?;
     decode_unknown(unknown, &mut pos_ids, &mut model, &mut interner)?;
     if !pos_ids.at_end() {

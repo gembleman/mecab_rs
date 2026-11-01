@@ -54,7 +54,7 @@ pub(super) type SmallKeyMap<K, V> = HashMap<K, V, BuildHasherDefault<SmallKeyHas
 
 pub(super) type SmallKeySet<K> = HashSet<K, BuildHasherDefault<SmallKeyHasher>>;
 
-pub(in crate::packed) fn split_fields(text: &[u8], fields: &mut Vec<(usize, usize)>) {
+pub(super) fn split_fields(text: &[u8], fields: &mut Vec<(usize, usize)>) {
     fields.clear();
     let length = text.len();
     let mut start = 0;

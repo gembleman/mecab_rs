@@ -1,7 +1,7 @@
 use super::{
     Blob, Class, DERIVE_CONTEXT, DERIVE_TARGET, MAX_REMOVED_CHARS, MAX_RULE_SUFFIX, MAX_RULES,
-    MAX_SLOTS, MIN_RULE_USES, RULE_BYTES, RULE_CHAR_BITS, RULE_HEADER_BYTES, SmallKeyMap,
-    blob_slot, split_fields,
+    MAX_SLOTS, MIN_RULE_USES, RULE_BYTES, RULE_CHAR_BITS, RULE_HEADER_BYTES, SmallKeyMap, Spans,
+    blob_slot,
 };
 use crate::Error;
 
@@ -100,6 +100,7 @@ pub(super) struct Derive<'a> {
 impl<'a> Derive<'a> {
     pub(super) fn learn(
         entries: &[&'a [u8]],
+        spans: &Spans,
         tokens: &[(u32, &str)],
         classes: &[Class],
         blob: Option<&Blob>,
@@ -113,7 +114,7 @@ impl<'a> Derive<'a> {
         if !enabled {
             return Ok(derive);
         }
-        let counts = derive.count_derivations(entries, tokens, blob);
+        let counts = derive.count_derivations(entries, spans, tokens, blob);
         derive.register_rules(choose_splits(counts))?;
         Ok(derive)
     }
@@ -121,6 +122,7 @@ impl<'a> Derive<'a> {
     fn count_derivations(
         &mut self,
         entries: &[&'a [u8]],
+        spans: &Spans,
         tokens: &[(u32, &str)],
         blob: Option<&Blob>,
     ) -> SmallKeyMap<RuleSite, SmallKeyMap<Split<'a>, u32>> {
@@ -134,7 +136,7 @@ impl<'a> Derive<'a> {
             let Some(last) = key.chars().next_back() else {
                 continue;
             };
-            split_fields(text, &mut fields);
+            spans.fill(entry, &mut fields);
             let Some(context) = context_of(text, &fields) else {
                 continue;
             };

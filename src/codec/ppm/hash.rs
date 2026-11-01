@@ -21,6 +21,9 @@ impl Hasher for IdHasher {
             self.0 = (self.0 ^ u64::from(b)).wrapping_mul(FNV_PRIME);
         }
     }
+    fn write_u32(&mut self, x: u32) {
+        self.0 = u64::from(x).wrapping_mul(MIX_INCREMENT);
+    }
     fn write_u64(&mut self, x: u64) {
         self.0 = x;
     }

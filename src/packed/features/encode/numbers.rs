@@ -1,5 +1,5 @@
 use super::{
-    Class, MAX_NUMERIC, NumSpec, Stat, bits_for, choose_split, parse_number, split_fields,
+    Class, MAX_NUMERIC, NumSpec, Spans, Stat, bits_for, choose_split, for_each_lane, parse_number,
 };
 
 pub(super) fn shifted_copy(
@@ -43,17 +43,22 @@ impl Numbers {
     }
 }
 
-pub(super) fn parse_candidate_values(entries: &[&[u8]], candidates: &[usize]) -> Vec<Vec<u64>> {
+pub(super) fn parse_candidate_values(
+    entries: &[&[u8]],
+    spans: &Spans,
+    field_counts: &[u16],
+    candidates: &[usize],
+) -> Vec<Vec<u64>> {
     let mut values: Vec<Vec<u64>> = vec![vec![0; entries.len()]; candidates.len()];
-    let mut fields = Vec::new();
-    for (entry, text) in entries.iter().enumerate() {
-        split_fields(text, &mut fields);
-        for (slot, &field) in candidates.iter().enumerate() {
-            if let Some(&(begin, end)) = fields.get(field) {
-                values[slot][entry] = parse_number(&text[begin..end]).unwrap_or(0);
+    for_each_lane(&mut values, entries.len(), |slot, column| {
+        let field = candidates[slot];
+        for (entry, text) in entries.iter().enumerate() {
+            if usize::from(field_counts[entry]) > field {
+                let (begin, end) = spans.span(entry, field);
+                column[entry] = parse_number(&text[begin..end]).unwrap_or(0);
             }
         }
-    }
+    });
     values
 }
 
@@ -117,6 +122,7 @@ pub(super) fn split_number(
 
 pub(super) fn plan_numbers(
     entries: &[&[u8]],
+    spans: &Spans,
     field_counts: &[u16],
     stats: &[Stat],
     classes: &mut [Class],
@@ -125,7 +131,7 @@ pub(super) fn plan_numbers(
         .filter(|&f| classes[f] == Class::Text && stats[f].numeric && stats[f].present > 0)
         .collect();
     let mut numbers = Numbers {
-        values: parse_candidate_values(entries, &candidates),
+        values: parse_candidate_values(entries, spans, field_counts, &candidates),
         ..Numbers::default()
     };
     let mut low_total = 0usize;

@@ -1,5 +1,5 @@
 use super::{
-    Class, Error, HashMap, MAX_BLOB_FIELDS, MAX_ID_BYTES, SmallKeyMap, Stored, chars, split_fields,
+    Class, Error, MAX_BLOB_FIELDS, MAX_ID_BYTES, SmallKeyMap, Spans, Stored, chars, for_each_lane,
 };
 
 pub(super) struct Blob<'a> {
@@ -26,39 +26,48 @@ impl Blob<'_> {
     }
 }
 
+fn field_follows_ids(
+    entries: &[&[u8]],
+    spans: &Spans,
+    field_counts: &[u16],
+    ids: &[u64],
+    number_field: usize,
+    field: usize,
+) -> bool {
+    let mut map: SmallKeyMap<u64, &[u8]> = SmallKeyMap::default();
+    for (entry, text) in entries.iter().enumerate() {
+        let count = usize::from(field_counts[entry]);
+        if count <= number_field || count <= field {
+            continue;
+        }
+        let (begin, end) = spans.span(entry, field);
+        let value = &text[begin..end];
+        if *map.entry(ids[entry]).or_insert(value) != value {
+            return false;
+        }
+    }
+    !map.is_empty()
+}
+
 fn shared_text_fields(
     entries: &[&[u8]],
+    spans: &Spans,
     field_counts: &[u16],
     classes: &[Class],
     ids: &[u64],
     number_field: usize,
 ) -> Vec<usize> {
-    let texts: Vec<usize> = (0..classes.len())
+    let mut verdicts: Vec<(usize, bool)> = (0..classes.len())
         .filter(|&field| classes[field] == Class::Text && field != number_field)
+        .map(|field| (field, false))
         .collect();
-    let mut maps: Vec<Option<SmallKeyMap<u64, &[u8]>>> =
-        texts.iter().map(|_| Some(SmallKeyMap::default())).collect();
-    let mut fields = Vec::new();
-    for (entry, text) in entries.iter().enumerate() {
-        if usize::from(field_counts[entry]) <= number_field {
-            continue;
-        }
-        split_fields(text, &mut fields);
-        for (slot, &field) in texts.iter().enumerate() {
-            let (Some(map), Some(&(begin, end))) = (maps[slot].as_mut(), fields.get(field)) else {
-                continue;
-            };
-            let value = &text[begin..end];
-            if *map.entry(ids[entry]).or_insert(value) != value {
-                maps[slot] = None;
-            }
-        }
-    }
-    texts
-        .iter()
-        .zip(&maps)
-        .filter(|(_, map)| map.as_ref().is_some_and(|map| !map.is_empty()))
-        .map(|(&field, _)| field)
+    for_each_lane(&mut verdicts, entries.len(), |_, verdict| {
+        verdict.1 = field_follows_ids(entries, spans, field_counts, ids, number_field, verdict.0);
+    });
+    verdicts
+        .into_iter()
+        .filter(|&(_, follows)| follows)
+        .map(|(field, _)| field)
         .take(MAX_BLOB_FIELDS)
         .collect()
 }
@@ -67,6 +76,7 @@ type KnownTexts<'a> = SmallKeyMap<u64, Vec<&'a [u8]>>;
 
 fn known_texts<'a>(
     entries: &[&'a [u8]],
+    spans: &Spans,
     eligible: &[bool],
     ids: &[u64],
     chosen: &[usize],
@@ -83,7 +93,7 @@ fn known_texts<'a>(
         if known.contains_key(&id) {
             continue;
         }
-        split_fields(text, &mut fields);
+        spans.fill(entry, &mut fields);
         known.insert(
             id,
             chosen
@@ -97,6 +107,7 @@ fn known_texts<'a>(
 
 pub(super) fn blob_for_number<'a>(
     entries: &[&'a [u8]],
+    spans: &Spans,
     field_counts: &[u16],
     classes: &[Class],
     stored: &[Stored],
@@ -109,7 +120,7 @@ pub(super) fn blob_for_number<'a>(
     if !shift_ok {
         return None;
     }
-    let chosen = shared_text_fields(entries, field_counts, classes, ids, number_field);
+    let chosen = shared_text_fields(entries, spans, field_counts, classes, ids, number_field);
     let first = *chosen.first()?;
     if first >= number_field {
         return None;
@@ -119,7 +130,7 @@ pub(super) fn blob_for_number<'a>(
         .iter()
         .map(|&count| usize::from(count) > last)
         .collect();
-    let (known, eligible_count) = known_texts(entries, &eligible, ids, &chosen);
+    let (known, eligible_count) = known_texts(entries, spans, &eligible, ids, &chosen);
     if known.len() * 2 > eligible_count {
         return None;
     }
@@ -136,6 +147,7 @@ pub(super) fn blob_for_number<'a>(
 
 pub(super) fn plan_blob<'a>(
     entries: &[&'a [u8]],
+    spans: &Spans,
     field_counts: &[u16],
     classes: &[Class],
     stored: &[Stored],
@@ -149,7 +161,7 @@ pub(super) fn plan_blob<'a>(
             .iter()
             .map(|&value| value >> shift)
             .collect();
-        let found = blob_for_number(entries, field_counts, classes, stored, &ids, number);
+        let found = blob_for_number(entries, spans, field_counts, classes, stored, &ids, number);
         if let Some(found) = found
             && best
                 .as_ref()
@@ -179,7 +191,7 @@ pub(super) fn char_ranks(
     inline: &[&[u8]],
     blob: Option<&Blob>,
 ) -> Result<Vec<char>, Error> {
-    let mut counts: HashMap<char, u64> = HashMap::new();
+    let mut counts: SmallKeyMap<char, u64> = SmallKeyMap::default();
     let blob_texts = blob.into_iter().flat_map(|blob| {
         blob.entries
             .iter()
@@ -206,7 +218,7 @@ pub(super) fn char_ranks(
 
 pub(super) fn code_text(
     text: &[u8],
-    rank_of: &HashMap<char, usize>,
+    rank_of: &SmallKeyMap<char, usize>,
     out: &mut Vec<u8>,
 ) -> Result<(), Error> {
     for ch in text_of(text)?.chars() {
@@ -221,7 +233,7 @@ struct CodedArea {
     new_starts: Vec<u32>,
 }
 
-fn code_area(area: &[u8], rank_of: &HashMap<char, usize>) -> Result<CodedArea, Error> {
+fn code_area(area: &[u8], rank_of: &SmallKeyMap<char, usize>) -> Result<CodedArea, Error> {
     let mut coded = CodedArea {
         bytes: Vec::new(),
         old_starts: Vec::new(),
@@ -244,7 +256,7 @@ fn code_area(area: &[u8], rank_of: &HashMap<char, usize>) -> Result<CodedArea, E
 
 fn code_blob(
     blob: Option<&Blob>,
-    rank_of: &HashMap<char, usize>,
+    rank_of: &SmallKeyMap<char, usize>,
 ) -> Result<(Vec<u8>, Vec<u32>), Error> {
     let too_large = || Error::Unsupported("feature strings of more than 4 GiB");
     let mut coded_blob: Vec<u8> = Vec::new();
@@ -272,7 +284,7 @@ pub(super) fn recode(
     blob: Option<&Blob>,
 ) -> Result<Recoded, Error> {
     let ranked = char_ranks(area, inline, blob)?;
-    let rank_of: HashMap<char, usize> = ranked
+    let rank_of: SmallKeyMap<char, usize> = ranked
         .iter()
         .enumerate()
         .map(|(rank, &ch)| (ch, rank))

@@ -80,26 +80,33 @@ impl Runtime<'_> {
     }
 }
 
+const CHAR_SPACE: usize = 0x11_0000;
+
 fn le_bytes<T: Copy, const N: usize>(values: &[T], bytes: fn(T) -> [u8; N]) -> Vec<u8> {
     values.iter().flat_map(|&value| bytes(value)).collect()
 }
 
 impl Model {
     fn code_table(&self) -> Result<Vec<u16>, Error> {
-        let mut frequency: HashMap<char, u32> = HashMap::new();
+        let mut frequency = vec![0u32; CHAR_SPACE];
         for key in &self.keys {
             for char in key.chars() {
-                *frequency.entry(char).or_insert(0) += 1;
+                frequency[char as usize] += 1;
             }
         }
-        let mut chars: Vec<(char, u32)> = frequency.into_iter().collect();
+        let mut chars: Vec<(char, u32)> = frequency
+            .iter()
+            .enumerate()
+            .filter(|&(_, &count)| count != 0)
+            .filter_map(|(code, &count)| char::from_u32(code as u32).map(|char| (char, count)))
+            .collect();
         chars.sort_unstable_by_key(|&(char, count)| (std::cmp::Reverse(count), char));
         if chars.len() >= MAX_CODE_COUNT {
             return Err(Error::Unsupported(
                 "more than 65534 different key characters",
             ));
         }
-        let mut table = vec![0u16; 0x11_0000];
+        let mut table = vec![0u16; CHAR_SPACE];
         for (number, &(char, _)) in chars.iter().enumerate() {
             table[char as usize] = number as u16 + 1;
         }
@@ -176,16 +183,25 @@ impl Model {
     }
 
     pub(super) fn encode_lexicon_sections(&self) -> Result<LexiconSections, Error> {
-        let table = self.code_table()?;
-        let code_count = table.iter().max().map_or(1, |&max| u32::from(max) + 1);
-        self.check_token_counts()?;
+        let counted = self.check_token_counts();
+        if counted.is_err() {
+            self.code_table()?;
+            return counted.map(|()| unreachable!());
+        }
         let layout = order::by_word_cost(self);
-        let (cells, encoded) = std::thread::scope(|scope| {
+        let (tabled, encoded) = std::thread::scope(|scope| {
             let encoded = scope.spawn(|| self.encode_features(&layout));
-            let cells = self.trie_cells(&table, &layout);
-            (cells, encoded.join().expect("the feature encoder panicked"))
+            let tabled = self
+                .code_table()
+                .and_then(|table| Ok((self.trie_cells(&table, &layout)?, table)));
+            (
+                tabled,
+                encoded.join().expect("the feature encoder panicked"),
+            )
         });
-        let (cells, encoded) = (cells?, encoded?);
+        let (cells, table) = tabled?;
+        let encoded = encoded?;
+        let code_count = table.iter().max().map_or(1, |&max| u32::from(max) + 1);
         let (system_starts, unknown_starts) = encoded.starts.split_at(self.token_features.len());
         let mut sections: [Cow<'static, [u8]>; SECTIONS] = Default::default();
         let (index, blocks) = char_map(&table);

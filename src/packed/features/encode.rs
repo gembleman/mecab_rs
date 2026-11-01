@@ -12,21 +12,24 @@ use crate::Error;
 
 mod blob;
 mod derive;
+mod lanes;
 mod numbers;
 mod plans;
 mod program;
 mod records;
 mod scan;
+mod spans;
 mod stats;
 
 use blob::{Blob, Recoded, plan_blob, recode};
 use derive::{Derive, Planner, TextOp};
+use lanes::for_each_lane;
 use numbers::{Numbers, Stored, plan_numbers};
 use plans::{plan_code, plan_op};
 use program::{ProgramBuilder, ProgramSet};
 use records::{Assembly, write_records};
-pub(in crate::packed) use scan::split_fields;
 use scan::{SmallKeyMap, SmallKeySet, parse_number};
+use spans::Spans;
 use stats::{Class, Stat, choose_split};
 
 const MAX_FIELDS: usize = 256;
@@ -34,6 +37,7 @@ const FOLD_MAX_VALUES: usize = 256;
 const MAX_TEMPLATES: usize = 1 << 16;
 const MAX_LOW_PARTS: usize = 1 << 16;
 const ABSENT: u16 = u16::MAX;
+const NO_VARIANT: u32 = u32::MAX;
 const DERIVE_TARGET: usize = 10;
 const DERIVE_CONTEXT: [usize; 2] = [4, 5];
 const MIN_RULE_USES: u32 = 2;
@@ -51,63 +55,117 @@ fn blob_slot(blob: Option<&Blob>, entry: usize, field: usize) -> Option<usize> {
 }
 
 fn split_entries(features: &[u8]) -> Result<Vec<&[u8]>, Error> {
-    let mut entries: Vec<&[u8]> = features.split(|&byte| byte == 0).collect();
-    entries.pop();
+    if u32::try_from(features.len()).is_err() {
+        return Err(Error::Unsupported("feature strings of more than 4 GiB"));
+    }
+    let terminators: usize = features.iter().map(|&byte| usize::from(byte == 0)).sum();
+    let mut entries: Vec<&[u8]> = Vec::with_capacity(terminators);
+    let mut rest = features;
+    while let Some(at) = rest.iter().position(|&byte| byte == 0) {
+        entries.push(&rest[..at]);
+        rest = &rest[at + 1..];
+    }
     if u32::try_from(entries.len()).is_err() {
         return Err(Error::Unsupported("more than 2^32 feature strings"));
     }
     Ok(entries)
 }
 
-fn observe_fields<'a>(entries: &[&'a [u8]]) -> (Vec<u16>, Vec<Stat<'a>>) {
+fn observe_fields<'a>(entries: &[&'a [u8]], spans: &Spans, field_counts: &[u16]) -> Vec<Stat<'a>> {
     let count = entries.len();
-    let mut stats: Vec<Stat> = Vec::new();
-    let mut field_counts: Vec<u16> = Vec::with_capacity(count);
-    let mut fields = Vec::new();
-    for (entry, text) in entries.iter().enumerate() {
-        split_fields(text, &mut fields);
-        field_counts.push(fields.len() as u16);
-        while stats.len() < fields.len() {
-            stats.push(Stat::new(count));
+    let width = field_counts.iter().copied().max().map_or(0, usize::from);
+    let mut stats: Vec<Stat> = (0..width).map(|_| Stat::new(count)).collect();
+    for_each_lane(&mut stats, count, |field, stat| {
+        for (entry, &text) in entries.iter().enumerate() {
+            if usize::from(field_counts[entry]) > field {
+                let (begin, end) = spans.span(entry, field);
+                stat.observe(entry, &text[begin..end]);
+            }
         }
-        for (field, &(begin, end)) in fields.iter().enumerate() {
-            stats[field].observe(entry, &text[begin..end]);
+    });
+    stats
+}
+
+const FLAT_JOINT_MAX: usize = 1 << 22;
+
+struct JointIndex {
+    flat: Vec<u32>,
+    width: usize,
+    map: SmallKeyMap<(u32, u16), u32>,
+    len: u32,
+}
+
+impl JointIndex {
+    fn new(joints: u32, values: usize) -> Self {
+        let width = values + 1;
+        let cells = (joints as usize).saturating_mul(width);
+        let flat = if cells <= FLAT_JOINT_MAX {
+            vec![u32::MAX; cells]
+        } else {
+            Vec::new()
+        };
+        Self {
+            flat,
+            width,
+            map: SmallKeyMap::default(),
+            len: 0,
         }
     }
-    (field_counts, stats)
+
+    fn id(&mut self, previous: u32, value: u16) -> u32 {
+        if self.flat.is_empty() {
+            let next = self.len;
+            let id = *self.map.entry((previous, value)).or_insert(next);
+            self.len += u32::from(id == next);
+            return id;
+        }
+        let column = if value == ABSENT {
+            self.width - 1
+        } else {
+            usize::from(value)
+        };
+        let cell = &mut self.flat[previous as usize * self.width + column];
+        if *cell == u32::MAX {
+            *cell = self.len;
+            self.len += 1;
+        }
+        *cell
+    }
 }
 
 fn classify_folds(stats: &mut [Stat], field_counts: &[u16]) -> Vec<Class> {
     let count = field_counts.len();
-    let mut joint: Vec<u32> = {
-        let mut known: SmallKeyMap<u16, u32> = SmallKeyMap::default();
-        field_counts
+    let (mut joint, mut joints): (Vec<u32>, u32) = {
+        let mut known = vec![u32::MAX; MAX_FIELDS + 1];
+        let mut total = 0u32;
+        let joint = field_counts
             .iter()
             .map(|&number| {
-                let next = known.len() as u32;
-                *known.entry(number).or_insert(next)
+                let slot = &mut known[usize::from(number)];
+                if *slot == u32::MAX {
+                    *slot = total;
+                    total += 1;
+                }
+                *slot
             })
-            .collect()
+            .collect();
+        (joint, total)
     };
     let mut order: Vec<usize> = (0..stats.len()).filter(|&f| stats[f].folds()).collect();
     order.sort_by_key(|&field| (stats[field].values.len(), field));
     let mut classes = vec![Class::Text; stats.len()];
     for field in order {
-        let mut known: SmallKeyMap<(u32, u16), u32> = SmallKeyMap::default();
+        let mut known = JointIndex::new(joints, stats[field].values.len());
         let mut next = Vec::with_capacity(count);
         for (entry, &previous) in joint.iter().enumerate() {
-            let length = known.len() as u32;
-            next.push(
-                *known
-                    .entry((previous, stats[field].value_ids[entry]))
-                    .or_insert(length),
-            );
-            if known.len() > MAX_TEMPLATES {
+            next.push(known.id(previous, stats[field].value_ids[entry]));
+            if known.len as usize > MAX_TEMPLATES {
                 break;
             }
         }
-        if known.len() <= MAX_TEMPLATES {
+        if known.len as usize <= MAX_TEMPLATES {
             joint = next;
+            joints = known.len;
             classes[field] = Class::Folded;
         }
     }
@@ -126,12 +184,15 @@ struct Variants<'k, 'a> {
 
 fn collect_variants<'k, 'a>(
     entries: &[&'a [u8]],
+    spans: &Spans,
     tokens: &'k [(u32, &'k str)],
     planner: &Planner<'_, 'a>,
 ) -> Result<Variants<'k, 'a>, Error> {
     let mut planned: Vec<Option<TextOp>> = Vec::new();
     let mut variants: Vec<(usize, &[u8])> = Vec::new();
     let mut variant_of: SmallKeyMap<(u32, &[u8]), u32> = SmallKeyMap::default();
+    let mut plain_variant: Vec<u32> = vec![NO_VARIANT; entries.len()];
+    let mut filled_entry = usize::MAX;
     let mut starts_of: Vec<u32> = Vec::with_capacity(tokens.len());
     let mut string_uses: SmallKeyMap<&[u8], u32> = SmallKeyMap::default();
     let mut plan_codes: Vec<u8> = Vec::new();
@@ -143,12 +204,23 @@ fn collect_variants<'k, 'a>(
             "a token with a feature that is not there",
         ))?;
         let key = key.as_bytes();
-        split_fields(text, &mut fields);
+        if filled_entry != entry {
+            spans.fill(entry, &mut fields);
+            filled_entry = entry;
+        }
         planner.plan(entry, text, &fields, key, &mut slots, &mut planned);
         let keyed = planner.uses_key(&planned);
         let key: &[u8] = if keyed { key } else { b"" };
         let next = variants.len() as u32;
-        let number = *variant_of.entry((feature, key)).or_insert(next);
+        let number = if key.is_empty() {
+            let slot = &mut plain_variant[entry];
+            if *slot == NO_VARIANT {
+                *slot = next;
+            }
+            *slot
+        } else {
+            *variant_of.entry((feature, key)).or_insert(next)
+        };
         if number == next {
             variants.push((entry, key));
             record_plan(text, &fields, &planned, &mut string_uses, &mut plan_codes);
@@ -180,31 +252,40 @@ fn record_plan<'a>(
 
 pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Result<Encoded, Error> {
     let entries = split_entries(features)?;
-    let (field_counts, mut stats) = observe_fields(&entries);
+    let (spans, field_counts) = Spans::build(&entries);
+    let mut stats = observe_fields(&entries, &spans, &field_counts);
     let mut classes = classify_folds(&mut stats, &field_counts);
-    let numbers = plan_numbers(&entries, &field_counts, &stats, &mut classes);
+    let numbers = plan_numbers(&entries, &spans, &field_counts, &stats, &mut classes);
     let blob = plan_blob(
         &entries,
+        &spans,
         &field_counts,
         &classes,
         &numbers.stored,
         &numbers.stored_values,
         &numbers.values,
     );
-    let derive = Derive::learn(&entries, tokens, &classes, blob.as_ref())?;
+    let derive = Derive::learn(&entries, &spans, tokens, &classes, blob.as_ref())?;
     let planner = Planner {
         classes: &classes,
         derive: &derive,
         blob: blob.as_ref(),
     };
-    let variants = collect_variants(&entries, tokens, &planner)?;
+    let variants = collect_variants(&entries, &spans, tokens, &planner)?;
     let Variants {
         list,
         starts_of,
         string_uses,
         plan_codes,
     } = variants;
-    let mut builder = ProgramBuilder::new(&planner, &entries, &numbers, &string_uses, plan_codes);
+    let mut builder = ProgramBuilder::new(
+        &planner,
+        &entries,
+        &spans,
+        &numbers,
+        &string_uses,
+        plan_codes,
+    );
     for &(entry, _) in &list {
         builder.add_variant(entry)?;
     }

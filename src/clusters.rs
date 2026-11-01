@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Mutex;
 use std::thread;
@@ -12,7 +11,6 @@ const ROWS_PER_CHUNK: usize = 16;
 const MAX_SHAPES: usize = 256;
 
 pub(crate) struct ClusterPlan {
-    id: usize,
     pub(crate) parts: Vec<usize>,
     pub(crate) left_ids: Vec<u16>,
     pub(crate) right_ids: Vec<u16>,
@@ -20,24 +18,90 @@ pub(crate) struct ClusterPlan {
     pub(crate) right_keys: usize,
 }
 
-fn dense_ids(keys: impl Iterator<Item = u32>) -> (Vec<u16>, usize) {
-    let mut seen: HashMap<u32, u16> = HashMap::new();
-    let ids = keys
-        .map(|key| {
-            let next = seen.len() as u16;
-            *seen.entry(key).or_insert(next)
-        })
-        .collect();
-    (ids, seen.len())
+const PROJECTION_KEYS: usize = 1 << u16::BITS;
+const UNKNOWN_GROWTH: i64 = i64::MIN;
+
+struct DenseScratch {
+    stamps: Vec<u32>,
+    values: Vec<u16>,
+    generation: u32,
 }
 
-fn joined_ids(first: &[u16], second: &[u16]) -> (Vec<u16>, usize) {
-    dense_ids(
-        first
+impl DenseScratch {
+    fn new() -> Self {
+        Self {
+            stamps: Vec::new(),
+            values: Vec::new(),
+            generation: 0,
+        }
+    }
+
+    fn begin(&mut self, slots: usize) {
+        if self.stamps.len() < slots {
+            self.stamps.resize(slots, 0);
+            self.values.resize(slots, 0);
+        }
+        self.generation = self.generation.checked_add(1).unwrap_or_else(|| {
+            self.stamps.fill(0);
+            1
+        });
+    }
+
+    #[inline]
+    fn number(&mut self, slot: usize, distinct: &mut usize) -> u16 {
+        if self.stamps[slot] == self.generation {
+            return self.values[slot];
+        }
+        self.stamps[slot] = self.generation;
+        let number = *distinct as u16;
+        self.values[slot] = number;
+        *distinct += 1;
+        number
+    }
+
+    fn projection_ids(&mut self, projection: &[u16]) -> (Vec<u16>, usize) {
+        self.begin(PROJECTION_KEYS);
+        let mut distinct = 0;
+        let ids = projection
+            .iter()
+            .map(|&key| self.number(usize::from(key), &mut distinct))
+            .collect();
+        (ids, distinct)
+    }
+
+    fn joined_ids(
+        &mut self,
+        first: &[u16],
+        second: &[u16],
+        first_keys: usize,
+        second_keys: usize,
+    ) -> (Vec<u16>, usize) {
+        self.begin(first_keys * second_keys);
+        let mut distinct = 0;
+        let ids = first
             .iter()
             .zip(second)
-            .map(|(&a, &b)| u32::from(a) << u16::BITS | u32::from(b)),
-    )
+            .map(|(&a, &b)| {
+                self.number(usize::from(a) * second_keys + usize::from(b), &mut distinct)
+            })
+            .collect();
+        (ids, distinct)
+    }
+
+    fn joined_count(
+        &mut self,
+        first: &[u16],
+        second: &[u16],
+        first_keys: usize,
+        second_keys: usize,
+    ) -> usize {
+        self.begin(first_keys * second_keys);
+        let mut distinct = 0;
+        for (&a, &b) in first.iter().zip(second) {
+            self.number(usize::from(a) * second_keys + usize::from(b), &mut distinct);
+        }
+        distinct
+    }
 }
 
 pub(crate) fn representatives(ids: &[u16], keys: usize) -> Vec<u16> {
@@ -49,12 +113,16 @@ pub(crate) fn representatives(ids: &[u16], keys: usize) -> Vec<u16> {
 }
 
 impl ClusterPlan {
-    fn of_projections(id: usize, left_projection: &[u16], right_projection: &[u16]) -> Self {
-        let (left_ids, left_keys) = dense_ids(left_projection.iter().map(|&key| u32::from(key)));
-        let (right_ids, right_keys) = dense_ids(right_projection.iter().map(|&key| u32::from(key)));
+    fn of_projections(
+        scratch: &mut DenseScratch,
+        part: usize,
+        left_projection: &[u16],
+        right_projection: &[u16],
+    ) -> Self {
+        let (left_ids, left_keys) = scratch.projection_ids(left_projection);
+        let (right_ids, right_keys) = scratch.projection_ids(right_projection);
         Self {
-            id,
-            parts: vec![id],
+            parts: vec![part],
             left_ids,
             right_ids,
             left_keys,
@@ -66,18 +134,36 @@ impl ClusterPlan {
         self.left_keys * self.right_keys
     }
 
-    fn merged_cells(&self, other: &Self) -> usize {
-        joined_ids(&self.left_ids, &other.left_ids).1
-            * joined_ids(&self.right_ids, &other.right_ids).1
+    fn merged_cells(&self, scratch: &mut DenseScratch, other: &Self) -> usize {
+        scratch.joined_count(
+            &self.left_ids,
+            &other.left_ids,
+            self.left_keys,
+            other.left_keys,
+        ) * scratch.joined_count(
+            &self.right_ids,
+            &other.right_ids,
+            self.right_keys,
+            other.right_keys,
+        )
     }
 
-    fn merged(&self, id: usize, other: &Self) -> Self {
-        let (left_ids, left_keys) = joined_ids(&self.left_ids, &other.left_ids);
-        let (right_ids, right_keys) = joined_ids(&self.right_ids, &other.right_ids);
+    fn merged(&self, scratch: &mut DenseScratch, other: &Self) -> Self {
+        let (left_ids, left_keys) = scratch.joined_ids(
+            &self.left_ids,
+            &other.left_ids,
+            self.left_keys,
+            other.left_keys,
+        );
+        let (right_ids, right_keys) = scratch.joined_ids(
+            &self.right_ids,
+            &other.right_ids,
+            self.right_keys,
+            other.right_keys,
+        );
         let mut parts = [self.parts.as_slice(), other.parts.as_slice()].concat();
         parts.sort_unstable();
         Self {
-            id,
             parts,
             left_ids,
             right_ids,
@@ -87,8 +173,13 @@ impl ClusterPlan {
     }
 }
 
-fn growth_of_merge(plans: &[ClusterPlan], first: usize, second: usize) -> i64 {
-    let merged = plans[first].merged_cells(&plans[second]) as i64;
+fn growth_of_merge(
+    scratch: &mut DenseScratch,
+    plans: &[ClusterPlan],
+    first: usize,
+    second: usize,
+) -> i64 {
+    let merged = plans[first].merged_cells(scratch, &plans[second]) as i64;
     merged - plans[first].cells() as i64 - plans[second].cells() as i64
 }
 
@@ -104,31 +195,52 @@ pub(crate) fn plan_projection_clusters(
     projections: &[(&[u16], &[u16])],
     target: usize,
 ) -> Vec<ClusterPlan> {
+    let mut scratch = DenseScratch::new();
     let mut plans: Vec<ClusterPlan> = projections
         .iter()
         .enumerate()
-        .map(|(index, &(left, right))| ClusterPlan::of_projections(index, left, right))
+        .map(|(index, &(left, right))| {
+            ClusterPlan::of_projections(&mut scratch, index, left, right)
+        })
         .collect();
-    let mut next_id = plans.len();
-    let mut growth: HashMap<(usize, usize), i64> = HashMap::new();
-    while plans.len() > target.max(1) {
+    let count = plans.len();
+    let mut alive: Vec<usize> = (0..count).collect();
+    let mut growth: Vec<Vec<i64>> = (0..count)
+        .map(|first| vec![UNKNOWN_GROWTH; count - first - 1])
+        .collect();
+    while alive.len() > target.max(1) {
         let mut cheapest = (i64::MAX, 0, 1);
-        for first in 0..plans.len() {
-            for second in first + 1..plans.len() {
-                let key = (plans[first].id, plans[second].id);
-                let cells = *growth
-                    .entry(key)
-                    .or_insert_with(|| growth_of_merge(&plans, first, second));
-                cheapest = cheapest.min((cells, first, second));
+        for (first_position, &first) in alive.iter().enumerate() {
+            for (offset, &second) in alive[first_position + 1..].iter().enumerate() {
+                let cached = &mut growth[first][second - first - 1];
+                if *cached == UNKNOWN_GROWTH {
+                    *cached = growth_of_merge(&mut scratch, &plans, first, second);
+                }
+                cheapest = cheapest.min((*cached, first_position, first_position + 1 + offset));
             }
         }
-        let (_, first, second) = cheapest;
-        let merged = plans[first].merged(next_id, &plans[second]);
-        next_id += 1;
-        plans.remove(second);
+        let (_, first_position, second_position) = cheapest;
+        let first = alive[first_position];
+        let second = alive[second_position];
+        let merged = plans[first].merged(&mut scratch, &plans[second]);
         plans[first] = merged;
+        alive.remove(second_position);
+        forget_growth_of(&mut growth, first);
     }
+    let mut survivors = alive.into_iter().peekable();
     plans
+        .into_iter()
+        .enumerate()
+        .filter(|(slot, _)| survivors.next_if_eq(slot).is_some())
+        .map(|(_, plan)| plan)
+        .collect()
+}
+
+fn forget_growth_of(growth: &mut [Vec<i64>], slot: usize) {
+    growth[slot].fill(UNKNOWN_GROWTH);
+    for (earlier, row) in growth[..slot].iter_mut().enumerate() {
+        row[slot - earlier - 1] = UNKNOWN_GROWTH;
+    }
 }
 
 pub(crate) fn fill_cells<T: Copy + Send>(
