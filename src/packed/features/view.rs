@@ -1,15 +1,15 @@
 use std::fmt;
+use std::mem::MaybeUninit;
 use std::ops::Range;
 
-use super::number::put_number;
 use super::sink::{Cursor, Sink};
 use super::{
     MAX_NUMERIC, MAX_SLOTS, NO_RULE, NumSpec, OP_BLOB, OP_BLOB_NEXT, OP_COPY, OP_COPY_MAX,
     OP_DERIVE, OP_EMPTY, OP_HIGH, OP_HIGH_MAX, OP_INLINE, OP_KEY, OP_NUM, OP_NUM_MAX, OP_NUMB,
     OP_NUMB_MAX, OP_REF, OP_STAR, RULE_BYTES, RULE_CHAR_BITS, RULE_CHAR_MASK, RULE_HEADER_BYTES,
-    access, check, pieces, read_bits, read_small,
+    access, check, pieces, read_bits, read_masked, read_small,
 };
-use crate::packed::bits::{extract, narrow_mask};
+use crate::packed::bits::mask_of;
 
 pub(in crate::packed) fn push_piece(program: &mut Vec<u8>, piece: &[u8]) {
     if piece.len() < 255 {
@@ -45,6 +45,11 @@ pub(crate) struct FeatureView<'a> {
     pub(in crate::packed) ref_bits: u32,
     pub(in crate::packed) blob_bits: u32,
     pub(in crate::packed) id_bytes: usize,
+    template_mask: u64,
+    shape_mask: u64,
+    ref_mask: u64,
+    blob_mask: u64,
+    id_mask: u64,
 }
 
 impl<'a> FeatureView<'a> {
@@ -82,6 +87,11 @@ impl<'a> FeatureView<'a> {
             ref_bits: layout.ref_bits,
             blob_bits: layout.blob_bits,
             id_bytes: layout.counts.id_bytes as usize,
+            template_mask: mask_of(layout.template_bits),
+            shape_mask: mask_of(layout.shape_bits),
+            ref_mask: mask_of(layout.ref_bits),
+            blob_mask: mask_of(layout.blob_bits),
+            id_mask: mask_of(8 * layout.counts.id_bytes),
         }
     }
 
@@ -146,8 +156,8 @@ impl FeatureView<'_> {
         let record = access::from::<TRUSTED>(self.records, offset as usize);
         let mut walk = Walk::new(record, key);
         let header = access::word::<TRUSTED>(record, 0);
-        walk.template = extract(header, 0, self.template_bits) as usize;
-        let shape = extract(header >> self.template_bits, 0, self.shape_bits) as usize;
+        walk.template = (header & self.template_mask) as usize;
+        let shape = ((header >> self.template_bits) & self.shape_mask) as usize;
         walk.bit = (self.template_bits + self.shape_bits) as usize;
         let entry_bit = walk.template * self.entry_bits as usize;
         let (ops_start, ops_end) = access::u32_pair_at::<TRUSTED>(self.shape_offsets, 4 * shape);
@@ -178,14 +188,20 @@ impl FeatureView<'_> {
             OP_COPY..=OP_COPY_MAX => unsafe { self.emit_copy::<TRUSTED, S>(op, walk, sink) },
             OP_NUM..=OP_NUM_MAX => self.emit_num::<TRUSTED, S>(op, walk, sink),
             OP_NUMB..=OP_NUMB_MAX => self.emit_numb::<TRUSTED, S>(op, walk, sink),
-            OP_HIGH..=OP_HIGH_MAX => put_number(sink, walk.highs[usize::from(op - OP_HIGH)]),
+            OP_HIGH..=OP_HIGH_MAX => sink.put_number(walk.highs[usize::from(op - OP_HIGH)]),
             _ => Ok(()),
         }
     }
 
     #[inline(always)]
-    unsafe fn put_codes<S: Sink + ?Sized>(&self, sink: &mut S, codes: &[u8]) -> fmt::Result {
-        unsafe { sink.put_coded(self.chars, codes) }
+    unsafe fn put_codes<S: Sink + ?Sized>(
+        &self,
+        sink: &mut S,
+        region: &[u8],
+        start: usize,
+        length: usize,
+    ) -> fmt::Result {
+        unsafe { sink.put_coded(self.chars, region, start, length) }
     }
 
     #[inline(always)]
@@ -194,12 +210,11 @@ impl FeatureView<'_> {
         walk: &mut Walk,
         sink: &mut S,
     ) -> fmt::Result {
-        let target = read_small::<TRUSTED>(walk.record, walk.bit, self.ref_bits) as usize;
+        let target = read_masked::<TRUSTED>(walk.record, walk.bit, self.ref_mask) as usize;
         walk.bit += self.ref_bits as usize;
         let (start, length) = self.string::<TRUSTED>(target);
         let begin = sink.mark();
-        let codes = access::range::<TRUSTED>(self.strings, start..start + length);
-        unsafe { self.put_codes(sink, codes)? };
+        unsafe { self.put_codes(sink, self.strings, start, length)? };
         walk.slots.push((start, length), (begin, sink.mark()));
         Ok(())
     }
@@ -214,8 +229,7 @@ impl FeatureView<'_> {
         let length = find_byte(access::from::<TRUSTED>(walk.record, start), 0);
         walk.bit = (start + length + 1) * 8;
         let begin = sink.mark();
-        let codes = access::range::<TRUSTED>(walk.record, start..start + length);
-        unsafe { self.put_codes(sink, codes)? };
+        unsafe { self.put_codes(sink, walk.record, start, length)? };
         walk.slots
             .push((start | IN_RECORD, length), (begin, sink.mark()));
         Ok(())
@@ -229,7 +243,7 @@ impl FeatureView<'_> {
         sink: &mut S,
     ) -> fmt::Result {
         if op == OP_BLOB {
-            walk.blob_at = read_small::<TRUSTED>(walk.record, walk.bit, self.blob_bits) as usize;
+            walk.blob_at = read_masked::<TRUSTED>(walk.record, walk.bit, self.blob_mask) as usize;
             walk.bit += self.blob_bits as usize;
             walk.blob_next = walk.blob_at + self.id_bytes;
         }
@@ -237,8 +251,7 @@ impl FeatureView<'_> {
         let length = find_byte(access::from::<TRUSTED>(self.blob, start), 0);
         walk.blob_next = start + length + 1;
         let begin = sink.mark();
-        let codes = access::range::<TRUSTED>(self.blob, start..start + length);
-        unsafe { self.put_codes(sink, codes)? };
+        unsafe { self.put_codes(sink, self.blob, start, length)? };
         walk.slots
             .push((start | IN_BLOB, length), (begin, sink.mark()));
         Ok(())
@@ -280,8 +293,7 @@ impl FeatureView<'_> {
             }
         };
         let start = offset_of(start);
-        let codes = access::range::<TRUSTED>(region, start..start + length);
-        unsafe { self.put_codes(sink, codes) }
+        unsafe { self.put_codes(sink, region, start, length) }
     }
 
     #[inline(always)]
@@ -307,8 +319,7 @@ impl FeatureView<'_> {
     ) -> fmt::Result {
         let number = usize::from(op - OP_NUMB);
         let spec = &self.specs[number];
-        let id_mask = narrow_mask(8 * self.id_bytes as u32);
-        let high = access::word::<TRUSTED>(self.blob, walk.blob_at) & id_mask;
+        let high = access::word::<TRUSTED>(self.blob, walk.blob_at) & self.id_mask;
         self.put_split_number::<TRUSTED, S>(spec, number, high, walk, sink)
     }
 
@@ -326,7 +337,7 @@ impl FeatureView<'_> {
         let low_at = 8 * (spec.lo_start as usize + index);
         let low = access::word::<TRUSTED>(self.lo, low_at);
         walk.highs[number] = high;
-        put_number(sink, high << spec.shift | low)
+        sink.put_number(high << spec.shift | low)
     }
 
     #[inline(always)]
@@ -422,24 +433,45 @@ fn kept_length(key: &str, removed: usize) -> usize {
     keep
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub(in crate::packed) fn find_byte(bytes: &[u8], needle: u8) -> usize {
-    const ONES: u64 = 0x0101_0101_0101_0101;
-    let pattern = ONES * u64::from(needle);
-    let (chunks, rest) = bytes.as_chunks::<8>();
+    use std::arch::x86_64::{
+        __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
+    };
+    const LANES: usize = 16;
+    let (chunks, rest) = bytes.as_chunks::<LANES>();
+    let pattern = unsafe { _mm_set1_epi8(needle as i8) };
     let mut at = 0;
-    for &chunk in chunks {
-        let word = u64::from_le_bytes(chunk) ^ pattern;
-        let zeros = word.wrapping_sub(ONES) & !word & (ONES << 7);
-        if zeros != 0 {
-            return at + (zeros.trailing_zeros() / 8) as usize;
+    for chunk in chunks {
+        let found = unsafe {
+            #[allow(
+                clippy::cast_ptr_alignment,
+                reason = "_mm_loadu_si128 performs an unaligned load"
+            )]
+            let lanes = _mm_loadu_si128(chunk.as_ptr().cast::<__m128i>());
+            _mm_movemask_epi8(_mm_cmpeq_epi8(lanes, pattern)) as u32
+        };
+        if found != 0 {
+            return at + found.trailing_zeros() as usize;
         }
-        at += 8;
+        at += LANES;
     }
-    at + rest
+    at + position_of(rest, needle)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+pub(in crate::packed) fn find_byte(bytes: &[u8], needle: u8) -> usize {
+    position_of(bytes, needle)
+}
+
+#[inline(always)]
+fn position_of(bytes: &[u8], needle: u8) -> usize {
+    bytes
         .iter()
         .position(|&byte| byte == needle)
-        .unwrap_or(rest.len())
+        .unwrap_or(bytes.len())
 }
 
 #[derive(Clone, Copy)]
@@ -448,8 +480,13 @@ struct Slot {
     output: (usize, usize),
 }
 
+const NO_SLOT: Slot = Slot {
+    source: (0, 0),
+    output: (0, 0),
+};
+
 struct Slots {
-    items: [Slot; MAX_SLOTS],
+    items: [MaybeUninit<Slot>; MAX_SLOTS],
     count: usize,
 }
 
@@ -457,10 +494,7 @@ impl Slots {
     #[inline(always)]
     fn new() -> Self {
         Self {
-            items: [Slot {
-                source: (0, 0),
-                output: (0, 0),
-            }; MAX_SLOTS],
+            items: [MaybeUninit::uninit(); MAX_SLOTS],
             count: 0,
         }
     }
@@ -468,14 +502,19 @@ impl Slots {
     #[inline(always)]
     fn push(&mut self, source: (usize, usize), output: (usize, usize)) {
         if self.count < MAX_SLOTS {
-            self.items[self.count] = Slot { source, output };
+            self.items[self.count] = MaybeUninit::new(Slot { source, output });
             self.count += 1;
         }
     }
 
     #[inline(always)]
     fn get(&self, index: usize) -> Slot {
-        self.items[index]
+        debug_assert!(self.count <= MAX_SLOTS);
+        if index < self.count {
+            unsafe { self.items.get_unchecked(index).assume_init() }
+        } else {
+            NO_SLOT
+        }
     }
 }
 

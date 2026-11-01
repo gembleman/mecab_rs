@@ -97,21 +97,29 @@ pub(super) fn for_each_char(
 }
 
 #[inline(always)]
-pub(super) unsafe fn decode_unchecked(table: &[u8], codes: &[u8], target: *mut u8) -> usize {
+pub(super) unsafe fn decode_unchecked(
+    table: &[u8],
+    region: &[u8],
+    start: usize,
+    length: usize,
+    target: *mut u8,
+) -> usize {
+    debug_assert!(start + length < region.len());
+    let codes = unsafe { region.as_ptr().add(start) };
     let mut at = 0;
     let mut written = 0;
-    while at < codes.len() {
-        let first = unsafe { *codes.get_unchecked(at) };
-        debug_assert!(first != 0);
-        let rank = if first < FIRST_LEAD {
-            at += 1;
-            usize::from(first) - 1
-        } else {
-            let second = unsafe { *codes.get_unchecked(at + 1) };
-            debug_assert!(second != 0);
-            at += 2;
-            rank_of(first, second)
-        };
+    while at < length {
+        let first = unsafe { *codes.add(at) };
+        let second = unsafe { *codes.add(at + 1) };
+        let is_lead = usize::from(first >= FIRST_LEAD);
+        let lead_mask = is_lead.wrapping_neg();
+        let single = usize::from(first).wrapping_sub(1);
+        let double = SINGLE_CODES - 1
+            + usize::from(first.wrapping_sub(FIRST_LEAD)) * SECOND_CODES
+            + usize::from(second);
+        let rank = (double & lead_mask) | (single & !lead_mask);
+        at += 1 + is_lead;
+        debug_assert!(first != 0 && (is_lead == 0 || second != 0));
         debug_assert!((rank + 1) * ENTRY_BYTES <= table.len());
         let entry = u64::from_le(unsafe {
             table

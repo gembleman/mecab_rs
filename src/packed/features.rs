@@ -10,7 +10,7 @@ mod sink;
 mod view;
 
 pub(super) use super::bits::BitWriter;
-pub(super) use bitio::{read_bits, read_small};
+pub(super) use bitio::{read_bits, read_masked, read_small};
 pub(super) use layout::{Counts, Layout, NumSpec, bits_for};
 pub(crate) use view::FeatureView;
 pub(super) use view::{find_byte, push_piece};

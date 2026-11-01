@@ -26,6 +26,7 @@ const BLOCK_BYTES: usize = 12;
 const MIN_SPARSE_GAIN: usize = 1 << 18;
 const ABOVE: u16 = 1 << 15;
 const SHAPE_WORDS: usize = 8;
+const LINEAR_SEARCH_MAX: usize = 8;
 
 struct Layout {
     cluster: usize,
@@ -192,7 +193,7 @@ impl<S: SectionSource> RuntimeIntTemplates<S> {
 
     pub(crate) fn cost(&self, left_node_rc: u16, right_node_lc: u16) -> i16 {
         let (column, row) = (usize::from(left_node_rc), usize::from(right_node_lc));
-        assert!(
+        debug_assert!(
             column >= self.hot_left || row >= self.hot_right,
             "the cell lies inside of the hot block"
         );
@@ -201,24 +202,20 @@ impl<S: SectionSource> RuntimeIntTemplates<S> {
             "the cell lies outside of the matrix"
         );
         let file = self.map.all_bytes();
+        let starts = unsafe { self.row_starts.view_in(file) };
+        debug_assert!(row + 1 < starts.len());
+        let span =
+            unsafe { *starts.get_unchecked(row) as usize..*starts.get_unchecked(row + 1) as usize };
         let computed = int_cost(
             self.total(file, left_node_rc, right_node_lc),
             self.cost_factor,
             self.shift,
         );
-        let starts = unsafe { self.row_starts.view_in(file) };
-        debug_assert!(row + 1 < starts.len());
-        let span =
-            unsafe { *starts.get_unchecked(row) as usize..*starts.get_unchecked(row + 1) as usize };
         if span.is_empty() {
             return computed;
         }
         let listed = unsafe { self.columns.view_in(file).get_unchecked(span) };
-        match listed.binary_search_by(|exception| (exception & !ABOVE).cmp(&left_node_rc)) {
-            Ok(at) if listed[at] & ABOVE != 0 => computed.saturating_add(1),
-            Ok(_) => computed.saturating_sub(1),
-            Err(_) => computed,
-        }
+        computed.saturating_add(exception_step(listed, left_node_rc))
     }
 
     #[inline]
@@ -247,13 +244,35 @@ impl<S: SectionSource> RuntimeIntTemplates<S> {
             let block_at = layout.table_start + index / BLOCK_CELLS * BLOCK_BYTES;
             let (before, bits) = unsafe { read_block(tables, block_at) };
             let bit = index % BLOCK_CELLS;
-            if bits >> bit & 1 != 0 {
-                let rank = before as usize + (bits & ((1 << bit) - 1)).count_ones() as usize;
+            let upto = bits << (BLOCK_CELLS - 1 - bit);
+            if upto >> (BLOCK_CELLS - 1) != 0 {
+                let rank = before as usize + upto.count_ones() as usize - 1;
                 let value = unsafe { read_word(tables, layout.word_at(shape.values_start, rank)) };
                 total += shape.base + i64::from(value & layout.mask);
             }
         }
         total
+    }
+}
+
+#[inline]
+fn exception_step(listed: &[u16], column: u16) -> i16 {
+    let found = if listed.len() <= LINEAR_SEARCH_MAX {
+        listed
+            .iter()
+            .copied()
+            .find(|exception| exception & !ABOVE >= column)
+            .filter(|exception| exception & !ABOVE == column)
+    } else {
+        listed
+            .binary_search_by(|exception| (exception & !ABOVE).cmp(&column))
+            .ok()
+            .map(|at| listed[at])
+    };
+    match found {
+        Some(exception) if exception & ABOVE != 0 => 1,
+        Some(_) => -1,
+        None => 0,
     }
 }
 

@@ -138,16 +138,16 @@ impl Lattice {
         let eos = NodeId::from_index(self.best_nodes.len() - 1);
         self.path_cost = i64::from(self.best_nodes[eos].cost);
         self.collect_best_ids(eos);
-        let path_len = self.path.len();
-        self.nodes.reserve(path_len);
+        let best_nodes = &self.best_nodes;
         let mut left_end = 0;
-        for slot in 0..path_len {
-            let best = self.best_nodes[self.path[slot]];
-            let node = Self::materialize_node(best, left_end, slot);
-            left_end = best.candidate.end;
-            self.nodes.push(node);
-            self.path[slot] = NodeId::from_index(slot);
-        }
+        self.nodes
+            .extend(self.path.iter_mut().enumerate().map(|(slot, id)| {
+                let best = best_nodes[*id];
+                *id = NodeId::from_index(slot);
+                let node = Self::materialize_node(best, left_end, slot);
+                left_end = best.candidate.end;
+                node
+            }));
     }
 
     #[inline(always)]

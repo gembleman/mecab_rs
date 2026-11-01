@@ -184,7 +184,6 @@ impl Span {
 
 struct BestSite<'a> {
     lefts: &'a [LeftCandidate],
-    widest: u16,
     position: usize,
     first: usize,
 }

@@ -59,7 +59,7 @@ impl<S: SectionSource> DenseMatrix<S> {
     #[inline]
     pub(crate) fn columns(&self) -> DenseColumns<'_> {
         DenseColumns {
-            cells: self.costs.view_source(&self.map),
+            cells: unsafe { self.costs.view_in(self.map.all_bytes()) },
             left_size: self.left_size,
         }
     }

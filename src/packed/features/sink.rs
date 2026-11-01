@@ -1,5 +1,6 @@
 use std::fmt;
 
+use super::number::{digit_count, digits_of, write_digits};
 use super::{SLACK, chars};
 
 const COPY_BLOCK: usize = 16;
@@ -43,7 +44,15 @@ pub(crate) trait Sink {
 
     unsafe fn put_region(&mut self, region: &[u8], start: usize, length: usize) -> fmt::Result;
 
-    unsafe fn put_coded(&mut self, table: &[u8], codes: &[u8]) -> fmt::Result;
+    unsafe fn put_coded(
+        &mut self,
+        table: &[u8],
+        region: &[u8],
+        start: usize,
+        length: usize,
+    ) -> fmt::Result;
+
+    fn put_number(&mut self, value: u64) -> fmt::Result;
 }
 
 impl Sink for String {
@@ -61,7 +70,14 @@ impl Sink for String {
     }
 
     #[inline(always)]
-    unsafe fn put_coded(&mut self, table: &[u8], codes: &[u8]) -> fmt::Result {
+    unsafe fn put_coded(
+        &mut self,
+        table: &[u8],
+        region: &[u8],
+        start: usize,
+        length: usize,
+    ) -> fmt::Result {
+        let codes = &region[start..start + length];
         chars::for_each_char(table, codes, |text| self.put(text))
     }
 
@@ -81,6 +97,19 @@ impl Sink for String {
             let target = vector.as_mut_ptr().add(end);
             copy_blocks(window.as_ptr(), target, length);
             vector.set_len(end + length);
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn put_number(&mut self, value: u64) -> fmt::Result {
+        let count = digit_count(value);
+        unsafe {
+            let vector = self.as_mut_vec();
+            vector.reserve(count);
+            let end = vector.len();
+            write_digits(value, count, vector.as_mut_ptr().add(end));
+            vector.set_len(end + count);
         }
         Ok(())
     }
@@ -147,9 +176,16 @@ impl Sink for Cursor<'_> {
     }
 
     #[inline(always)]
-    unsafe fn put_coded(&mut self, table: &[u8], codes: &[u8]) -> fmt::Result {
-        self.reserve(codes.len() * chars::MAX_EXPANSION + chars::ENTRY_BYTES);
-        self.len += unsafe { chars::decode_unchecked(table, codes, self.ptr.add(self.len)) };
+    unsafe fn put_coded(
+        &mut self,
+        table: &[u8],
+        region: &[u8],
+        start: usize,
+        length: usize,
+    ) -> fmt::Result {
+        self.reserve(length * chars::MAX_EXPANSION + chars::ENTRY_BYTES);
+        let target = unsafe { self.ptr.add(self.len) };
+        self.len += unsafe { chars::decode_unchecked(table, region, start, length, target) };
         Ok(())
     }
 
@@ -166,18 +202,21 @@ impl Sink for Cursor<'_> {
     #[inline(always)]
     unsafe fn put_region(&mut self, region: &[u8], start: usize, length: usize) -> fmt::Result {
         debug_assert!(start + length + SLACK <= region.len());
-        if length == 1 {
-            self.reserve(1);
-            unsafe { *self.ptr.add(self.len) = *region.get_unchecked(start) };
-            self.len += 1;
-            return Ok(());
-        }
         let window = unsafe { region.get_unchecked(start..start + length + SLACK) };
         self.reserve(length + SLACK);
         unsafe {
             copy_blocks(window.as_ptr(), self.ptr.add(self.len), length);
         }
         self.len += length;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn put_number(&mut self, value: u64) -> fmt::Result {
+        let count = digit_count(value);
+        self.reserve(count);
+        unsafe { write_digits(value, count, self.ptr.add(self.len)) };
+        self.len += count;
         Ok(())
     }
 }
@@ -193,8 +232,16 @@ impl Sink for fmt::Formatter<'_> {
         unreachable!("a formatter does not record its output")
     }
 
-    unsafe fn put_coded(&mut self, table: &[u8], codes: &[u8]) -> fmt::Result {
-        chars::for_each_char(table, codes, |text| self.write_str(text))
+    unsafe fn put_coded(
+        &mut self,
+        table: &[u8],
+        region: &[u8],
+        start: usize,
+        length: usize,
+    ) -> fmt::Result {
+        chars::for_each_char(table, &region[start..start + length], |text| {
+            self.write_str(text)
+        })
     }
 
     fn put(&mut self, text: &str) -> fmt::Result {
@@ -203,6 +250,11 @@ impl Sink for fmt::Formatter<'_> {
 
     unsafe fn put_region(&mut self, region: &[u8], start: usize, length: usize) -> fmt::Result {
         self.write_str(unsafe { text_of(&region[start..start + length]) })
+    }
+
+    fn put_number(&mut self, value: u64) -> fmt::Result {
+        let (digits, count) = digits_of(value);
+        self.write_str(unsafe { text_of(&digits[..count]) })
     }
 }
 

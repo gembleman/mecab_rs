@@ -35,6 +35,13 @@ pub(super) fn best_left<const SELECT: bool>(
     (best_cost, best)
 }
 
+#[inline(always)]
+pub(super) fn widest_right_id(lefts: &[LeftCandidate]) -> u16 {
+    lefts
+        .iter()
+        .fold(0, |widest, left| widest.max(left.right_id))
+}
+
 #[cold]
 pub(super) fn overflow_result(overflow: bool) -> Result<(), Error> {
     if overflow {
@@ -56,7 +63,7 @@ pub(super) fn links_fit(existing: usize, added: usize) -> bool {
 }
 
 #[inline(always)]
-pub(super) fn store_best<const TRACK_WIDEST: bool>(
+pub(super) fn store_best(
     best_nodes: &mut [BestNode],
     ends: &mut [EndSlot],
     position: usize,
@@ -76,9 +83,5 @@ pub(super) fn store_best<const TRACK_WIDEST: bool>(
         id: NodeId::from_index(index),
     };
     let slot = &mut ends[node.candidate.end as usize - position - 1];
-    if TRACK_WIDEST {
-        slot.push(left);
-    } else {
-        slot.push_untracked(left);
-    }
+    slot.push_untracked(left);
 }

@@ -449,13 +449,31 @@ impl CharProperty {
     }
 }
 
+const LEAD_WINDOW_BYTES: usize = 4;
+
+#[inline(always)]
+fn lead_window(rest: &[u8]) -> [u8; LEAD_WINDOW_BYTES] {
+    if let Some(window) = rest.first_chunk::<LEAD_WINDOW_BYTES>() {
+        *window
+    } else {
+        let mut window = [0; LEAD_WINDOW_BYTES];
+        window[..rest.len()].copy_from_slice(rest);
+        window
+    }
+}
+
 #[inline]
 fn decode_utf8(text: &[u8], begin: usize, available: usize) -> (u32, usize) {
-    let byte = |offset: usize| text.get(begin + offset).copied().unwrap_or(0);
-    let first = byte(0);
+    let rest = text.get(begin..).unwrap_or_default();
+    let Some(&first) = rest.first() else {
+        return (0, 1);
+    };
     if first < 0x80 {
-        (u32::from(first), 1)
-    } else if available >= 2 && is_two_byte_lead(first) {
+        return (u32::from(first), 1);
+    }
+    let window = lead_window(rest);
+    let byte = |offset: usize| window[offset];
+    if available >= 2 && is_two_byte_lead(first) {
         (
             u32::from(first & TWO_BYTE_PAYLOAD) << 6 | u32::from(byte(1) & CONTINUATION_PAYLOAD),
             2,

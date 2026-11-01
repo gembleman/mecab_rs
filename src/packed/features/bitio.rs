@@ -20,6 +20,15 @@ pub(in crate::packed) fn read_small<const TRUSTED: bool>(
 }
 
 #[inline(always)]
+pub(in crate::packed) fn read_masked<const TRUSTED: bool>(
+    bytes: &[u8],
+    bit: usize,
+    mask: u64,
+) -> u64 {
+    (access::word::<TRUSTED>(bytes, bit >> 3) >> (bit & 7)) & mask
+}
+
+#[inline(always)]
 fn read_narrow(bytes: &[u8], bit: usize, width: u32) -> u64 {
     extract(access::word::<false>(bytes, bit >> 3), bit, width)
 }

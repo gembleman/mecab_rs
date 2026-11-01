@@ -42,16 +42,18 @@ fn pick_where_set(
 const PAIR_SHIFT: u32 = 16;
 
 #[cfg(target_arch = "x86_64")]
+const HALF_SHIFT: u32 = 32;
+
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn pack_pair(first: &[i16], second: &[i16], right_id: usize) -> i32 {
+unsafe fn pack_pair(first: &[i16], second: &[i16], right_id: usize) -> u64 {
     let (first, second) = unsafe {
         (
             *first.get_unchecked(right_id),
             *second.get_unchecked(right_id),
         )
     };
-    let packed = u32::from(first as u16) | (u32::from(second as u16) << PAIR_SHIFT);
-    packed as i32
+    u64::from(first as u16) | (u64::from(second as u16) << PAIR_SHIFT)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -66,10 +68,7 @@ unsafe fn gather_cells(
     unsafe {
         let low = pack_pair(columns[0], columns[1], right_id);
         let high = pack_pair(columns[2], columns[3], right_id);
-        std::arch::x86_64::_mm_unpacklo_epi32(
-            std::arch::x86_64::_mm_cvtsi32_si128(low),
-            std::arch::x86_64::_mm_cvtsi32_si128(high),
-        )
+        std::arch::x86_64::_mm_cvtsi64_si128((low | (high << HALF_SHIFT)) as i64)
     }
 }
 
@@ -80,30 +79,32 @@ pub(super) fn best_lefts(
     columns: [&[i16]; CONNECT_GROUP_SIZE],
 ) -> [(i32, NodeId); CONNECT_GROUP_SIZE] {
     use std::arch::x86_64::{
-        _mm_add_epi32, _mm_cmpgt_epi32, _mm_set1_epi32, _mm_setzero_si128, _mm_srai_epi32,
-        _mm_storeu_si128, _mm_unpacklo_epi16,
+        _mm_add_epi32, _mm_and_si128, _mm_cmpgt_epi32, _mm_set1_epi32, _mm_setzero_si128,
+        _mm_srai_epi32, _mm_storeu_si128, _mm_sub_epi32, _mm_unpacklo_epi16,
     };
 
     debug_assert!(!lefts.is_empty());
     debug_assert!(i32::try_from(lefts.len()).is_ok());
     let mut costs = [0i32; CONNECT_GROUP_SIZE];
-    let mut positions = [0i32; CONNECT_GROUP_SIZE];
+    let mut behind = [0i32; CONNECT_GROUP_SIZE];
     unsafe {
         let mut best_cost = _mm_set1_epi32(i32::MAX);
-        let mut best_position = _mm_setzero_si128();
-        let mut position = _mm_setzero_si128();
-        let one = _mm_set1_epi32(1);
+        let mut lefts_since_best = _mm_setzero_si128();
         for left in lefts {
             let cells = gather_cells(&columns, usize::from(left.right_id));
             let widened = _mm_srai_epi32::<SIGN_EXTEND_SHIFT>(_mm_unpacklo_epi16(cells, cells));
             let cost = _mm_add_epi32(_mm_set1_epi32(left.cost), widened);
             let worse = _mm_cmpgt_epi32(cost, best_cost);
             best_cost = pick_where_set(worse, best_cost, cost);
-            best_position = pick_where_set(worse, best_position, position);
-            position = _mm_add_epi32(position, one);
+            lefts_since_best = _mm_and_si128(_mm_sub_epi32(lefts_since_best, worse), worse);
         }
         _mm_storeu_si128(costs.as_mut_ptr().cast(), best_cost);
-        _mm_storeu_si128(positions.as_mut_ptr().cast(), best_position);
+        _mm_storeu_si128(behind.as_mut_ptr().cast(), lefts_since_best);
     }
-    std::array::from_fn(|lane| (costs[lane], lefts[positions[lane] as usize].id))
+    let last = lefts.len() - 1;
+    std::array::from_fn(|lane| {
+        let position = last - behind[lane] as usize;
+        debug_assert!(position < lefts.len());
+        (costs[lane], unsafe { lefts.get_unchecked(position) }.id)
+    })
 }
