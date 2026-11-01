@@ -7,6 +7,9 @@ use super::{Hit, PARAM_BYTES, PackedDictionary, TokenRecord};
 use crate::char_property::SentenceChars;
 use crate::packed::{BLOCK_CODES, PARAMS, TOKENS};
 
+const PARAM_FIELD_BITS: u32 = u16::BITS;
+const _: () = assert!(PARAM_BYTES == 4 * size_of::<u16>() && PARAM_BYTES == size_of::<u64>());
+
 impl std::fmt::Debug for PackedView<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -70,14 +73,13 @@ impl PackedView<'_> {
         }
     }
 
-    #[inline]
-    pub(crate) fn common_prefix_search_sentence(
+    #[inline(always)]
+    pub(crate) fn walk_sentence(
         &self,
         chars: &SentenceChars,
         start: usize,
-        hits: &mut Vec<Hit>,
+        mut found: impl FnMut(Hit),
     ) {
-        hits.clear();
         let mut cursor = Cursor::new(self.cells);
         let length = chars.len();
         let mut position = start;
@@ -87,7 +89,7 @@ impl PackedView<'_> {
             match cursor.step(code) {
                 Step::Stop => return,
                 Step::Inner => {}
-                Step::Key(first_token, token_count) => hits.push(Hit {
+                Step::Key(first_token, token_count) => found(Hit {
                     length: position - start,
                     first_token: first_token as usize,
                     token_count: token_count as usize,
@@ -153,12 +155,13 @@ impl PackedView<'_> {
             let (param, feature) = format.split(word);
             let (param, feature) = (param as usize, feature as u32);
             let record = self.params.as_ptr().add(param * PARAM_BYTES);
-            let word = |at: usize| u16::from_le(record.add(at).cast::<u16>().read_unaligned());
+            let fields = u64::from_le(record.cast::<u64>().read_unaligned());
+            let field = |nth: u32| (fields >> (nth * PARAM_FIELD_BITS)) as u16;
             TokenRecord {
-                left_id: word(0),
-                right_id: word(2),
-                pos_id: word(4),
-                word_cost: word(6).cast_signed(),
+                left_id: field(0),
+                right_id: field(1),
+                pos_id: field(2),
+                word_cost: field(3).cast_signed(),
                 feature,
             }
         }

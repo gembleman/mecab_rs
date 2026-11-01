@@ -3,7 +3,7 @@ use super::cost::{best_left, overflow_result, prefetch, store_best};
 use super::{BestNode, BestSite, CONNECT_GROUP_SIZE, EndSlot, Lattice, LeftCandidate};
 use crate::dictionary::Dictionary;
 use crate::error::Error;
-use crate::matrix::{DenseMatrix, HotView, Matrix};
+use crate::matrix::{DenseColumns, DenseMatrix, HotView, Matrix};
 
 #[cfg(feature = "pair-stats")]
 fn record_pairs(nodes: &[BestNode], lefts: &[LeftCandidate]) {
@@ -30,6 +30,8 @@ fn prefetch_columns(
         }
     }
 }
+const DENSE_GROUPED: bool = true;
+
 impl Lattice {
     pub(super) fn connect_best(
         &mut self,
@@ -69,22 +71,44 @@ impl Lattice {
         dense: &DenseMatrix,
         overflow: &mut bool,
     ) {
-        for index in (site.first..best_nodes.len()).rev() {
-            let column = dense.right_column(best_nodes[index].candidate.left_id);
+        let columns = dense.columns();
+        let mut next = best_nodes.len();
+        while next > site.first {
+            if DENSE_GROUPED && next - site.first >= CONNECT_GROUP_SIZE {
+                let group = Self::dense_group_columns(best_nodes, &columns, next);
+                Self::connect_group_with::<false>(
+                    best_nodes, later_ends, site, next, group, overflow,
+                );
+                next -= CONNECT_GROUP_SIZE;
+                continue;
+            }
+            next -= 1;
+            let column = columns.right_column(best_nodes[next].candidate.left_id);
             let (cost, best) = best_left::<false>(site.lefts, |id| {
                 debug_assert!(usize::from(id) < column.len());
                 unsafe { *column.get_unchecked(usize::from(id)) }
             });
-            store_best(
+            store_best::<false>(
                 best_nodes,
                 later_ends,
                 site.position,
-                index,
+                next,
                 cost,
                 best,
                 overflow,
             );
         }
+    }
+
+    #[inline(always)]
+    fn dense_group_columns<'m>(
+        best_nodes: &[BestNode],
+        columns: &DenseColumns<'m>,
+        next: usize,
+    ) -> [&'m [i16]; CONNECT_GROUP_SIZE] {
+        std::array::from_fn(|lane| {
+            columns.right_column(best_nodes[next - 1 - lane].candidate.left_id)
+        })
     }
 
     #[inline(always)]
@@ -122,7 +146,7 @@ impl Lattice {
             } else {
                 best_left::<true>(lefts, column.into_cost_fn())
             };
-            store_best(best_nodes, later_ends, position, next, cost, best, overflow);
+            store_best::<true>(best_nodes, later_ends, position, next, cost, best, overflow);
         }
     }
 
@@ -136,26 +160,37 @@ impl Lattice {
         reaches: impl Fn(&[i16]) -> bool,
         overflow: &mut bool,
     ) -> bool {
-        let indices: [usize; CONNECT_GROUP_SIZE] = std::array::from_fn(|lane| next - 1 - lane);
-        let columns = indices.map(|index| {
-            hot.right_column(best_nodes[index].candidate.left_id)
+        let columns: [&[i16]; CONNECT_GROUP_SIZE] = std::array::from_fn(|lane| {
+            hot.right_column(best_nodes[next - 1 - lane].candidate.left_id)
                 .cells()
         });
         if !columns.iter().all(|cells| reaches(cells)) {
             return false;
         }
+        Self::connect_group_with::<true>(best_nodes, later_ends, site, next, columns, overflow);
+        true
+    }
+
+    #[inline(always)]
+    fn connect_group_with<const TRACK_WIDEST: bool>(
+        best_nodes: &mut [BestNode],
+        later_ends: &mut [EndSlot],
+        site: &BestSite<'_>,
+        next: usize,
+        columns: [&[i16]; CONNECT_GROUP_SIZE],
+        overflow: &mut bool,
+    ) {
         let found = best_lefts(site.lefts, columns);
-        for (index, (cost, best)) in indices.into_iter().zip(found) {
-            store_best(
+        for (lane, (cost, best)) in found.into_iter().enumerate() {
+            store_best::<TRACK_WIDEST>(
                 best_nodes,
                 later_ends,
                 site.position,
-                index,
+                next - 1 - lane,
                 cost,
                 best,
                 overflow,
             );
         }
-        true
     }
 }

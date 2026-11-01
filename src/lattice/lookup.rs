@@ -113,11 +113,11 @@ impl Lattice {
     ) {
         let key = &sentence[found.surface..found.key_end];
         if found.whole {
-            view.common_prefix_search_sentence(&self.sentence_chars, found.surface, &mut self.hits);
+            self.push_sentence_hits::<BEST>(dictionary, system, view, sentence, found);
         } else {
             view.common_prefix_search(key, &mut self.hits);
+            self.push_packed_hits::<BEST>(dictionary, system, view, sentence, found);
         }
-        self.push_packed_hits::<BEST>(dictionary, system, view, sentence, found);
         for (index, user) in dictionary.users.iter().enumerate() {
             user.common_prefix_search(key, &mut self.hits);
             let source = NodeSource::User(UserIndex::from_position(index));
@@ -226,26 +226,55 @@ impl Lattice {
     ) {
         for hit_index in 0..self.hits.len() {
             let hit = self.hits[hit_index];
-            let (hit_end, end) = hit_ends(dictionary, sentence, found, hit);
-            let source = if end == hit_end {
-                NodeSource::System
-            } else {
-                NodeSource::SystemExtended
-            };
-            for token in view.tokens(hit.tokens()) {
-                if !BEST
-                    && found.partial
-                    && !self.constraints.admits(found.begin, end, |out| {
-                        let key = &sentence[found.surface..hit_end];
-                        words.write_feature(token.feature, str::from_utf8(key).unwrap_or(""), out);
-                    })
-                {
-                    continue;
-                }
-                let candidate =
-                    Candidate::from_token(&token, found.surface, end, source, found.char_type);
-                self.push_candidate::<BEST>(found.begin, candidate);
+            self.push_packed_hit::<BEST>(dictionary, words, view, sentence, found, hit);
+        }
+    }
+
+    #[inline(always)]
+    fn push_sentence_hits<const BEST: bool>(
+        &mut self,
+        dictionary: &Dictionary,
+        words: &PackedDictionary,
+        view: &PackedView<'_>,
+        sentence: &[u8],
+        found: &HitSite,
+    ) {
+        let chars = std::mem::take(&mut self.sentence_chars);
+        view.walk_sentence(&chars, found.surface, |hit| {
+            self.push_packed_hit::<BEST>(dictionary, words, view, sentence, found, hit);
+        });
+        self.sentence_chars = chars;
+    }
+
+    #[inline(always)]
+    fn push_packed_hit<const BEST: bool>(
+        &mut self,
+        dictionary: &Dictionary,
+        words: &PackedDictionary,
+        view: &PackedView<'_>,
+        sentence: &[u8],
+        found: &HitSite,
+        hit: PrefixHit,
+    ) {
+        let (hit_end, end) = hit_ends(dictionary, sentence, found, hit);
+        let source = if end == hit_end {
+            NodeSource::System
+        } else {
+            NodeSource::SystemExtended
+        };
+        for token in view.tokens(hit.tokens()) {
+            if !BEST
+                && found.partial
+                && !self.constraints.admits(found.begin, end, |out| {
+                    let key = &sentence[found.surface..hit_end];
+                    words.write_feature(token.feature, str::from_utf8(key).unwrap_or(""), out);
+                })
+            {
+                continue;
             }
+            let candidate =
+                Candidate::from_token(&token, found.surface, end, source, found.char_type);
+            self.push_candidate::<BEST>(found.begin, candidate);
         }
     }
 

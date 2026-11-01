@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use self::source::read_at;
 use self::token_format::TokenFormat;
-use super::features::check::MappedLayout;
 use super::features::{FeatureView, NumSpec};
 use super::{
     BLOCK_CODES, CELLS, CHAR_BLOCKS, CHAR_INDEX, CHAR_TABLE, DICRC, FEATURES, HEADER_BYTES, MATRIX,
@@ -63,8 +62,8 @@ pub struct PackedDictionary {
     ascii: [u16; 128],
     bos_feature: Range<usize>,
     unknown_feature: Option<Range<usize>>,
-    features: MappedLayout,
-    numbers: Box<[NumSpec]>,
+    _specs: Arc<[NumSpec]>,
+    view: FeatureView<'static>,
 }
 
 impl PackedDictionary {
@@ -118,6 +117,8 @@ impl PackedDictionary {
         let cells = Section::new(&map, sections[CELLS].clone()).ok_or_else(view_error)?;
         let dicrc_start = sections[DICRC].start + validate::DICRC_HEADER_BYTES;
         let (bos_length, unknown_length) = (dicrc.bos_length, dicrc.unknown_length);
+        let numbers: Arc<[NumSpec]> = numbers.into();
+        let view = unsafe { FeatureView::new(&map[..], &features, &numbers).detached() };
         let mut dictionary = Self {
             map,
             char_index,
@@ -134,8 +135,8 @@ impl PackedDictionary {
             unknown_feature: (unknown_length > 0)
                 .then(|| dicrc_start + bos_length..dicrc_start + bos_length + unknown_length),
             ascii: [0; 128],
-            features,
-            numbers: numbers.into(),
+            _specs: numbers,
+            view,
             sections,
         };
         dictionary.ascii = std::array::from_fn(|byte| dictionary.code_of(char::from(byte as u8)));
@@ -181,8 +182,8 @@ impl PackedDictionary {
     }
 
     #[inline]
-    pub(crate) fn feature_view(&self) -> FeatureView<'_> {
-        FeatureView::new(&self.map[..], &self.features, &self.numbers)
+    pub(crate) fn feature_view(&self) -> &FeatureView<'_> {
+        &self.view
     }
 
     #[inline]

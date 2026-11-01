@@ -55,6 +55,28 @@ impl<S: SectionSource> DenseMatrix<S> {
         let start = self.left_size * usize::from(right_left_id);
         &self.costs.view_source(&self.map)[start..start + self.left_size]
     }
+
+    #[inline]
+    pub(crate) fn columns(&self) -> DenseColumns<'_> {
+        DenseColumns {
+            cells: self.costs.view_source(&self.map),
+            left_size: self.left_size,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DenseColumns<'m> {
+    cells: &'m [i16],
+    left_size: usize,
+}
+
+impl<'m> DenseColumns<'m> {
+    #[inline(always)]
+    pub(crate) fn right_column(&self, right_left_id: u16) -> &'m [i16] {
+        let start = self.left_size * usize::from(right_left_id);
+        &self.cells[start..start + self.left_size]
+    }
 }
 
 pub(crate) type ColdPath<S = MappedBytes> = Box<RuntimeIntTemplates<S>>;

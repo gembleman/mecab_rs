@@ -39,6 +39,22 @@ fn pick_where_set(
 }
 
 #[cfg(target_arch = "x86_64")]
+const PAIR_SHIFT: u32 = 16;
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn pack_pair(first: &[i16], second: &[i16], right_id: usize) -> i32 {
+    let (first, second) = unsafe {
+        (
+            *first.get_unchecked(right_id),
+            *second.get_unchecked(right_id),
+        )
+    };
+    let packed = u32::from(first as u16) | (u32::from(second as u16) << PAIR_SHIFT);
+    packed as i32
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn gather_cells(
     columns: &[&[i16]; CONNECT_GROUP_SIZE],
@@ -48,15 +64,11 @@ unsafe fn gather_cells(
         debug_assert!(right_id < cells.len());
     }
     unsafe {
-        std::arch::x86_64::_mm_setr_epi16(
-            *columns[0].get_unchecked(right_id),
-            *columns[1].get_unchecked(right_id),
-            *columns[2].get_unchecked(right_id),
-            *columns[3].get_unchecked(right_id),
-            0,
-            0,
-            0,
-            0,
+        let low = pack_pair(columns[0], columns[1], right_id);
+        let high = pack_pair(columns[2], columns[3], right_id);
+        std::arch::x86_64::_mm_unpacklo_epi32(
+            std::arch::x86_64::_mm_cvtsi32_si128(low),
+            std::arch::x86_64::_mm_cvtsi32_si128(high),
         )
     }
 }

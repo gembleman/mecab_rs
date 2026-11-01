@@ -18,7 +18,27 @@ unsafe fn copy_blocks(source: *const u8, target: *mut u8, length: usize) {
     }
 }
 
+#[inline(always)]
+unsafe fn move_blocks(source: *const u8, target: *mut u8, length: usize) {
+    let mut done = 0;
+    loop {
+        unsafe {
+            std::ptr::copy(source.add(done), target.add(done), COPY_BLOCK);
+        }
+        done += COPY_BLOCK;
+        if done >= length {
+            break;
+        }
+    }
+}
+
 pub(crate) trait Sink {
+    const RECORDS_OUTPUT: bool;
+
+    fn mark(&self) -> usize;
+
+    fn put_marked(&mut self, start: usize, end: usize) -> fmt::Result;
+
     fn put(&mut self, text: &str) -> fmt::Result;
 
     unsafe fn put_region(&mut self, region: &[u8], start: usize, length: usize) -> fmt::Result;
@@ -27,6 +47,19 @@ pub(crate) trait Sink {
 }
 
 impl Sink for String {
+    const RECORDS_OUTPUT: bool = true;
+
+    #[inline(always)]
+    fn mark(&self) -> usize {
+        self.len()
+    }
+
+    #[inline(always)]
+    fn put_marked(&mut self, start: usize, end: usize) -> fmt::Result {
+        self.extend_from_within(start..end);
+        Ok(())
+    }
+
     #[inline(always)]
     unsafe fn put_coded(&mut self, table: &[u8], codes: &[u8]) -> fmt::Result {
         chars::for_each_char(table, codes, |text| self.put(text))
@@ -94,6 +127,25 @@ impl<'a> Cursor<'a> {
 }
 
 impl Sink for Cursor<'_> {
+    const RECORDS_OUTPUT: bool = true;
+
+    #[inline(always)]
+    fn mark(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    fn put_marked(&mut self, start: usize, end: usize) -> fmt::Result {
+        debug_assert!(start <= end && end <= self.len);
+        let length = end - start;
+        self.reserve(length + SLACK);
+        unsafe {
+            move_blocks(self.ptr.add(start), self.ptr.add(self.len), length);
+        }
+        self.len += length;
+        Ok(())
+    }
+
     #[inline(always)]
     unsafe fn put_coded(&mut self, table: &[u8], codes: &[u8]) -> fmt::Result {
         self.reserve(codes.len() * chars::MAX_EXPANSION + chars::ENTRY_BYTES);
@@ -131,6 +183,16 @@ impl Sink for Cursor<'_> {
 }
 
 impl Sink for fmt::Formatter<'_> {
+    const RECORDS_OUTPUT: bool = false;
+
+    fn mark(&self) -> usize {
+        0
+    }
+
+    fn put_marked(&mut self, _start: usize, _end: usize) -> fmt::Result {
+        unreachable!("a formatter does not record its output")
+    }
+
     unsafe fn put_coded(&mut self, table: &[u8], codes: &[u8]) -> fmt::Result {
         chars::for_each_char(table, codes, |text| self.write_str(text))
     }

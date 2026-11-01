@@ -19,6 +19,16 @@ use crate::utf8::{
 use crate::wire::u32_at;
 
 const SPACE_CODE: u32 = 0x20;
+const PALETTE_SLOTS: usize = u8::MAX as usize + 1;
+const _: () = assert!(MAX_PALETTE <= PALETTE_SLOTS);
+
+fn padded_palette(mut palette: Vec<Class>) -> Box<[Class; PALETTE_SLOTS]> {
+    palette.resize(PALETTE_SLOTS, Class::default());
+    palette
+        .into_boxed_slice()
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("the palette was padded to its slot count"))
+}
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct CharInfo(u32);
@@ -243,7 +253,7 @@ impl std::fmt::Debug for CharProperty {
         formatter
             .debug_struct("CharProperty")
             .field("category_count", &self.category_count)
-            .field("palette_entries", &self.palette.len())
+            .field("palette_entries", &self.palette_entries)
             .finish_non_exhaustive()
     }
 }
@@ -251,7 +261,8 @@ impl std::fmt::Debug for CharProperty {
 pub struct CharProperty {
     map: MappedBytes,
     category_count: usize,
-    palette: Vec<Class>,
+    palette: Box<[Class; PALETTE_SLOTS]>,
+    palette_entries: usize,
     table_start: usize,
     space: CharInfo,
 }
@@ -315,7 +326,8 @@ impl CharProperty {
         Ok(Self {
             map,
             category_count,
-            palette,
+            palette: padded_palette(palette),
+            palette_entries: palette_len,
             table_start,
             space,
         })

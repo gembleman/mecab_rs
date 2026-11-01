@@ -219,6 +219,11 @@ impl EndSlot {
         self.lefts.push(left);
     }
 
+    #[inline(always)]
+    fn push_untracked(&mut self, left: LeftCandidate) {
+        self.lefts.push(left);
+    }
+
     fn clear(&mut self) {
         self.lefts.clear();
         self.widest = 0;

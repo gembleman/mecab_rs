@@ -44,3 +44,9 @@ pub(super) fn u32_at<const TRUSTED: bool>(bytes: &[u8], at: usize) -> usize {
         u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes")) as usize
     }
 }
+
+#[inline(always)]
+pub(super) fn u32_pair_at<const TRUSTED: bool>(bytes: &[u8], at: usize) -> (usize, usize) {
+    let pair = word::<TRUSTED>(bytes, at);
+    (pair as u32 as usize, (pair >> 32) as usize)
+}

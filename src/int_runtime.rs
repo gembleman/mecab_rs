@@ -50,6 +50,39 @@ impl Layout {
     }
 }
 
+struct DensePlan {
+    cluster: usize,
+    table_start: usize,
+    row_bytes: usize,
+    gap_bytes: usize,
+    right_mixed: usize,
+    stride: usize,
+    mask: u32,
+}
+
+impl DensePlan {
+    fn from_layout(layout: &Layout) -> Self {
+        Self {
+            cluster: layout.cluster,
+            table_start: layout.table_start,
+            row_bytes: layout.left_mixed * layout.stride,
+            gap_bytes: layout.left_gap * layout.stride,
+            right_mixed: layout.right_mixed,
+            stride: layout.stride,
+            mask: layout.mask,
+        }
+    }
+
+    #[inline]
+    fn byte_at(&self, left: u16, right: u16) -> usize {
+        let (left, right) = (usize::from(left), usize::from(right));
+        self.table_start
+            + right * self.row_bytes
+            + left * self.stride
+            + right.min(self.right_mixed) * self.gap_bytes
+    }
+}
+
 struct SparseShape {
     layout: Layout,
     values_start: usize,
@@ -78,7 +111,7 @@ pub struct RuntimeIntTemplates<S = MappedFile> {
     hot_left: usize,
     hot_right: usize,
     cluster_count: usize,
-    dense: Vec<Layout>,
+    dense: Vec<DensePlan>,
     sparse: Vec<SparseShape>,
     base: i64,
     row_starts: Section<u32>,
@@ -123,7 +156,7 @@ impl<S: SectionSource> RuntimeIntTemplates<S> {
             hot_left: header.hot_left,
             hot_right: header.hot_right,
             cluster_count: header.cluster_count,
-            dense: layouts.dense,
+            dense: layouts.dense.iter().map(DensePlan::from_layout).collect(),
             sparse: layouts.sparse,
             base: layouts.base,
             row_starts: arrays.row_starts,
@@ -203,16 +236,14 @@ impl<S: SectionSource> RuntimeIntTemplates<S> {
         let lefts = unsafe { lefts.as_ptr().add(column * count) };
         let rights = unsafe { rights.as_ptr().add(row * count) };
         let mut total = self.base;
-        let index_of = |layout: &Layout| unsafe {
-            layout.index(*lefts.add(layout.cluster), *rights.add(layout.cluster))
-        };
-        for layout in &self.dense {
-            let at = layout.word_at(layout.table_start, index_of(layout));
-            total += i64::from(unsafe { read_word(tables, at) } & layout.mask);
+        for plan in &self.dense {
+            let at = unsafe { plan.byte_at(*lefts.add(plan.cluster), *rights.add(plan.cluster)) };
+            total += i64::from(unsafe { read_word(tables, at) } & plan.mask);
         }
         for shape in &self.sparse {
             let layout = &shape.layout;
-            let index = index_of(layout);
+            let index =
+                unsafe { layout.index(*lefts.add(layout.cluster), *rights.add(layout.cluster)) };
             let block_at = layout.table_start + index / BLOCK_CELLS * BLOCK_BYTES;
             let (before, bits) = unsafe { read_block(tables, block_at) };
             let bit = index % BLOCK_CELLS;

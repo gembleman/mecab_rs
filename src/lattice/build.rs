@@ -91,7 +91,7 @@ impl Lattice {
     }
 
     #[inline(always)]
-    fn push_bos<const BEST: bool>(&mut self) {
+    pub(super) fn push_bos<const BEST: bool>(&mut self) {
         let bos = if BEST {
             self.best_nodes.push(BestNode {
                 candidate: Candidate::bos(),
@@ -110,7 +110,11 @@ impl Lattice {
     }
 
     #[inline(always)]
-    fn push_eos<const BEST: bool>(&mut self, sentence_len: usize, last_filled_end: usize) -> usize {
+    pub(super) fn push_eos<const BEST: bool>(
+        &mut self,
+        sentence_len: usize,
+        last_filled_end: usize,
+    ) -> usize {
         debug_assert!(last_filled_end <= sentence_len && sentence_len <= MAX_TEXT_LEN);
         if BEST {
             self.best_nodes.push(BestNode {
@@ -130,47 +134,40 @@ impl Lattice {
         }
     }
 
-    fn collect_best_nodes(&mut self) {
+    pub(super) fn collect_best_nodes(&mut self) {
         let eos = NodeId::from_index(self.best_nodes.len() - 1);
         self.path_cost = i64::from(self.best_nodes[eos].cost);
-        let path_len = self.path_len(eos);
-        self.nodes
-            .resize(path_len, RawNode::boundary(NodeSource::Bos, 0));
-        self.path.extend((0..path_len).map(NodeId::from_index));
-        let mut slot = path_len;
-        let mut cursor = Some(eos);
-        while let Some(id) = cursor {
-            slot -= 1;
-            let best = self.best_nodes[id];
-            self.nodes[slot] = self.materialize_node(best, slot);
-            cursor = best.prev;
+        self.collect_best_ids(eos);
+        let path_len = self.path.len();
+        self.nodes.reserve(path_len);
+        let mut left_end = 0;
+        for slot in 0..path_len {
+            let best = self.best_nodes[self.path[slot]];
+            let node = Self::materialize_node(best, left_end, slot);
+            left_end = best.candidate.end;
+            self.nodes.push(node);
+            self.path[slot] = NodeId::from_index(slot);
         }
     }
 
     #[inline(always)]
-    fn path_len(&self, eos: NodeId) -> usize {
-        let mut len = 0;
+    fn collect_best_ids(&mut self, eos: NodeId) {
         let mut cursor = Some(eos);
         while let Some(id) = cursor {
-            len += 1;
+            self.path.push(id);
             cursor = self.best_nodes[id].prev;
         }
-        len
+        self.path.reverse();
     }
 
     #[inline(always)]
-    fn materialize_node(&self, best: BestNode, slot: usize) -> RawNode {
+    fn materialize_node(best: BestNode, left_end: u32, slot: usize) -> RawNode {
         let candidate = best.candidate;
         let mut node = match candidate.source {
             NodeSource::Bos | NodeSource::Eos => {
                 RawNode::boundary(candidate.source, candidate.surface as usize)
             }
-            _ => {
-                let begin = self.best_nodes[best.prev.expect("a word has a left node")]
-                    .candidate
-                    .end;
-                candidate.raw(begin as usize)
-            }
+            _ => candidate.raw(left_end as usize),
         };
         node.cost = best.cost;
         node.prev = slot.checked_sub(1).map(NodeId::from_index);

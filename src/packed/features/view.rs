@@ -9,7 +9,7 @@ use super::{
     OP_NUMB_MAX, OP_REF, OP_STAR, RULE_BYTES, RULE_CHAR_BITS, RULE_CHAR_MASK, RULE_HEADER_BYTES,
     access, check, pieces, read_bits, read_small,
 };
-use crate::packed::bits::narrow_mask;
+use crate::packed::bits::{extract, narrow_mask};
 
 pub(in crate::packed) fn push_piece(program: &mut Vec<u8>, piece: &[u8]) {
     if piece.len() < 255 {
@@ -84,6 +84,11 @@ impl<'a> FeatureView<'a> {
             id_bytes: layout.counts.id_bytes as usize,
         }
     }
+
+    #[inline]
+    pub(in crate::packed) unsafe fn detached(self) -> FeatureView<'static> {
+        unsafe { std::mem::transmute::<FeatureView<'a>, FeatureView<'static>>(self) }
+    }
 }
 
 const RECORD_REGION_BIT: u32 = 62;
@@ -140,16 +145,13 @@ impl FeatureView<'_> {
     ) -> fmt::Result {
         let record = access::from::<TRUSTED>(self.records, offset as usize);
         let mut walk = Walk::new(record, key);
-        walk.template = read_small::<TRUSTED>(record, walk.bit, self.template_bits) as usize;
-        walk.bit += self.template_bits as usize;
-        let shape = read_small::<TRUSTED>(record, walk.bit, self.shape_bits) as usize;
-        walk.bit += self.shape_bits as usize;
+        let header = access::word::<TRUSTED>(record, 0);
+        walk.template = extract(header, 0, self.template_bits) as usize;
+        let shape = extract(header >> self.template_bits, 0, self.shape_bits) as usize;
+        walk.bit = (self.template_bits + self.shape_bits) as usize;
         let entry_bit = walk.template * self.entry_bits as usize;
-        let ops = access::range::<TRUSTED>(
-            self.shapes,
-            access::u32_at::<TRUSTED>(self.shape_offsets, 4 * shape)
-                ..access::u32_at::<TRUSTED>(self.shape_offsets, 4 * shape + 4),
-        );
+        let (ops_start, ops_end) = access::u32_pair_at::<TRUSTED>(self.shape_offsets, 4 * shape);
+        let ops = access::range::<TRUSTED>(self.shapes, ops_start..ops_end);
         for (position, &op) in ops.iter().enumerate() {
             unsafe { self.put_piece::<TRUSTED, S>(sink, entry_bit, position)? };
             unsafe { self.emit_op::<TRUSTED, S>(op, &mut walk, sink)? };
@@ -195,9 +197,11 @@ impl FeatureView<'_> {
         let target = read_small::<TRUSTED>(walk.record, walk.bit, self.ref_bits) as usize;
         walk.bit += self.ref_bits as usize;
         let (start, length) = self.string::<TRUSTED>(target);
-        walk.slots.push((start, length));
+        let begin = sink.mark();
         let codes = access::range::<TRUSTED>(self.strings, start..start + length);
-        unsafe { self.put_codes(sink, codes) }
+        unsafe { self.put_codes(sink, codes)? };
+        walk.slots.push((start, length), (begin, sink.mark()));
+        Ok(())
     }
 
     #[inline(always)]
@@ -209,9 +213,12 @@ impl FeatureView<'_> {
         let start = walk.bit.div_ceil(8);
         let length = find_byte(access::from::<TRUSTED>(walk.record, start), 0);
         walk.bit = (start + length + 1) * 8;
-        walk.slots.push((start | IN_RECORD, length));
+        let begin = sink.mark();
         let codes = access::range::<TRUSTED>(walk.record, start..start + length);
-        unsafe { self.put_codes(sink, codes) }
+        unsafe { self.put_codes(sink, codes)? };
+        walk.slots
+            .push((start | IN_RECORD, length), (begin, sink.mark()));
+        Ok(())
     }
 
     #[inline(always)]
@@ -229,9 +236,12 @@ impl FeatureView<'_> {
         let start = walk.blob_next;
         let length = find_byte(access::from::<TRUSTED>(self.blob, start), 0);
         walk.blob_next = start + length + 1;
-        walk.slots.push((start | IN_BLOB, length));
+        let begin = sink.mark();
         let codes = access::range::<TRUSTED>(self.blob, start..start + length);
-        unsafe { self.put_codes(sink, codes) }
+        unsafe { self.put_codes(sink, codes)? };
+        walk.slots
+            .push((start | IN_BLOB, length), (begin, sink.mark()));
+        Ok(())
     }
 
     #[inline(always)]
@@ -241,8 +251,11 @@ impl FeatureView<'_> {
         sink: &mut S,
     ) -> fmt::Result {
         let (rule, keep) = self.derive::<TRUSTED>(walk.template, walk.key);
-        walk.slots.push((rule | IN_DERIVED, keep));
-        unsafe { self.put_derived::<TRUSTED, S>(sink, walk.key, rule, keep) }
+        let begin = sink.mark();
+        unsafe { self.put_derived::<TRUSTED, S>(sink, walk.key, rule, keep)? };
+        walk.slots
+            .push((rule | IN_DERIVED, keep), (begin, sink.mark()));
+        Ok(())
     }
 
     #[inline(always)]
@@ -252,7 +265,11 @@ impl FeatureView<'_> {
         walk: &Walk,
         sink: &mut S,
     ) -> fmt::Result {
-        let (start, length) = walk.slots.get(usize::from(op - OP_COPY));
+        let slot = walk.slots.get(usize::from(op - OP_COPY));
+        if S::RECORDS_OUTPUT {
+            return sink.put_marked(slot.output.0, slot.output.1);
+        }
+        let (start, length) = slot.source;
         let region = match region_of(start) {
             0 => self.strings,
             IN_RECORD => walk.record,
@@ -278,7 +295,7 @@ impl FeatureView<'_> {
         let spec = &self.specs[number];
         let high = read_bits(walk.record, walk.bit, spec.hi_bits);
         walk.bit += spec.hi_bits as usize;
-        self.put_split_number::<TRUSTED, S>(number, high, walk, sink)
+        self.put_split_number::<TRUSTED, S>(spec, number, high, walk, sink)
     }
 
     #[inline(always)]
@@ -289,20 +306,21 @@ impl FeatureView<'_> {
         sink: &mut S,
     ) -> fmt::Result {
         let number = usize::from(op - OP_NUMB);
+        let spec = &self.specs[number];
         let id_mask = narrow_mask(8 * self.id_bytes as u32);
         let high = access::word::<TRUSTED>(self.blob, walk.blob_at) & id_mask;
-        self.put_split_number::<TRUSTED, S>(number, high, walk, sink)
+        self.put_split_number::<TRUSTED, S>(spec, number, high, walk, sink)
     }
 
     #[inline(always)]
     fn put_split_number<const TRUSTED: bool, S: Sink + ?Sized>(
         &self,
+        spec: &NumSpec,
         number: usize,
         high: u64,
         walk: &mut Walk,
         sink: &mut S,
     ) -> fmt::Result {
-        let spec = &self.specs[number];
         let index = read_small::<TRUSTED>(walk.record, walk.bit, spec.lo_bits) as usize;
         walk.bit += spec.lo_bits as usize;
         let low_at = 8 * (spec.lo_start as usize + index);
@@ -336,14 +354,7 @@ impl FeatureView<'_> {
                 let removed =
                     access::range::<TRUSTED>(self.rules, rule * RULE_BYTES..rule * RULE_BYTES + 1)
                         [0];
-                let mut keep = key.len();
-                for _ in 0..removed {
-                    match key[..keep].chars().next_back() {
-                        Some(ch) => keep -= ch.len_utf8(),
-                        None => break,
-                    }
-                }
-                return (rule, keep);
+                return (rule, kept_length(key, usize::from(removed)));
             }
             if found < wanted {
                 low = middle + 1;
@@ -385,10 +396,30 @@ impl FeatureView<'_> {
         }
         let local = read_small::<TRUSTED>(self.entries, entry_bit + shift, bits) as usize;
         let number = base + local;
-        let start = access::u32_at::<TRUSTED>(self.piece_offsets, 4 * number);
-        let end = access::u32_at::<TRUSTED>(self.piece_offsets, 4 * number + 4);
+        let (start, end) = access::u32_pair_at::<TRUSTED>(self.piece_offsets, 4 * number);
         unsafe { sink.put_region(self.pool, start, end - start) }
     }
+}
+
+#[inline(always)]
+const fn is_continuation(byte: u8) -> bool {
+    byte & 0xC0 == 0x80
+}
+
+#[inline(always)]
+fn kept_length(key: &str, removed: usize) -> usize {
+    let bytes = key.as_bytes();
+    let mut keep = bytes.len();
+    for _ in 0..removed {
+        if keep == 0 {
+            break;
+        }
+        keep -= 1;
+        while keep > 0 && is_continuation(bytes[keep]) {
+            keep -= 1;
+        }
+    }
+    keep
 }
 
 #[inline(always)]
@@ -411,8 +442,14 @@ pub(in crate::packed) fn find_byte(bytes: &[u8], needle: u8) -> usize {
         .unwrap_or(rest.len())
 }
 
+#[derive(Clone, Copy)]
+struct Slot {
+    source: (usize, usize),
+    output: (usize, usize),
+}
+
 struct Slots {
-    items: [(usize, usize); MAX_SLOTS],
+    items: [Slot; MAX_SLOTS],
     count: usize,
 }
 
@@ -420,21 +457,24 @@ impl Slots {
     #[inline(always)]
     fn new() -> Self {
         Self {
-            items: [(0, 0); MAX_SLOTS],
+            items: [Slot {
+                source: (0, 0),
+                output: (0, 0),
+            }; MAX_SLOTS],
             count: 0,
         }
     }
 
     #[inline(always)]
-    fn push(&mut self, slot: (usize, usize)) {
+    fn push(&mut self, source: (usize, usize), output: (usize, usize)) {
         if self.count < MAX_SLOTS {
-            self.items[self.count] = slot;
+            self.items[self.count] = Slot { source, output };
             self.count += 1;
         }
     }
 
     #[inline(always)]
-    fn get(&self, index: usize) -> (usize, usize) {
+    fn get(&self, index: usize) -> Slot {
         self.items[index]
     }
 }

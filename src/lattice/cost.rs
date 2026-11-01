@@ -56,7 +56,7 @@ pub(super) fn links_fit(existing: usize, added: usize) -> bool {
 }
 
 #[inline(always)]
-pub(super) fn store_best(
+pub(super) fn store_best<const TRACK_WIDEST: bool>(
     best_nodes: &mut [BestNode],
     ends: &mut [EndSlot],
     position: usize,
@@ -70,9 +70,15 @@ pub(super) fn store_best(
     *overflow |= !cost_in_range(cost);
     node.prev = Some(best);
     node.cost = cost;
-    ends[node.candidate.end as usize - position - 1].push(LeftCandidate {
+    let left = LeftCandidate {
         right_id: node.candidate.right_id,
         cost,
         id: NodeId::from_index(index),
-    });
+    };
+    let slot = &mut ends[node.candidate.end as usize - position - 1];
+    if TRACK_WIDEST {
+        slot.push(left);
+    } else {
+        slot.push_untracked(left);
+    }
 }
