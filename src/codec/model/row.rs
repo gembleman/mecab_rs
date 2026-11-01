@@ -1,6 +1,7 @@
 use super::align::{Run, Span};
 use crate::codec::coder::Coder;
-use crate::codec::ppm::NOVEL;
+use crate::codec::hints::HintReader;
+use crate::codec::ppm::{NOVEL, PpmHint};
 use crate::codec::text::CharModel;
 use crate::wire::{get_varint, put_varint};
 
@@ -36,13 +37,18 @@ pub(super) struct RowState {
 }
 
 impl RowState {
-    pub(super) fn new(n_cols: usize) -> RowState {
+    pub(super) fn hints(&self, out: &mut Vec<PpmHint>) {
+        self.raw_chars.hints(out);
+        self.cat_chars.hints(out);
+    }
+
+    pub(super) fn new(n_cols: usize, hints: &mut HintReader) -> RowState {
         RowState {
             fields: vec![String::new(); n_cols],
             coded_text: String::new(),
             key_buf: Vec::new(),
-            raw_chars: CharModel::new(RAW_CHAR_ORDER),
-            cat_chars: CharModel::new(CAT_CHAR_ORDER),
+            raw_chars: CharModel::new(RAW_CHAR_ORDER, hints),
+            cat_chars: CharModel::new(CAT_CHAR_ORDER, hints),
             pos_hash: 0,
             pos_first_hash: 0,
             pos_first_two_hash: 0,

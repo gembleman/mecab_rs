@@ -4,7 +4,8 @@ use super::state::StepState;
 use super::strings::{GroupPlan, StrState};
 use super::strings_plan::plan_str;
 use crate::codec::coder::Coder;
-use crate::codec::ppm::{Interner, NOVEL, Ppm, mix};
+use crate::codec::hints::HintReader;
+use crate::codec::ppm::{Interner, NOVEL, Ppm, PpmHint, mix};
 
 const EX_KEY_BYTES: usize = 2;
 
@@ -24,9 +25,13 @@ fn ex_at(key: &[u8], k: usize) -> u32 {
 }
 
 impl StrGroup {
-    pub(super) fn new(plan_steps: &[Step]) -> StrGroup {
+    pub(super) fn hints(&self, out: &mut Vec<PpmHint>) {
+        out.push(self.ppm.hint());
+    }
+
+    pub(super) fn new(plan_steps: &[Step], hints: &mut HintReader) -> StrGroup {
         StrGroup {
-            ppm: Ppm::default(),
+            ppm: hints.ppm(),
             vecs: Interner::default(),
             steps: plan_steps
                 .iter()

@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use std::thread;
 
 use crate::error::Error;
+use crate::hash::FastMap;
 use crate::part::{PartSlices, Weight};
 use crate::section::{Section, SectionSource};
 use crate::templates::{TemplateReader, write_array};
@@ -25,7 +26,11 @@ struct DenseScratch {
     stamps: Vec<u32>,
     values: Vec<u16>,
     generation: u32,
+    pair_bits: Vec<u64>,
+    touched_words: Vec<u32>,
 }
+
+const WORD_BITS: usize = u64::BITS as usize;
 
 impl DenseScratch {
     fn new() -> Self {
@@ -33,6 +38,8 @@ impl DenseScratch {
             stamps: Vec::new(),
             values: Vec::new(),
             generation: 0,
+            pair_bits: Vec::new(),
+            touched_words: Vec::new(),
         }
     }
 
@@ -69,23 +76,28 @@ impl DenseScratch {
         (ids, distinct)
     }
 
-    fn joined_ids(
-        &mut self,
-        first: &[u16],
-        second: &[u16],
-        first_keys: usize,
-        second_keys: usize,
-    ) -> (Vec<u16>, usize) {
-        self.begin(first_keys * second_keys);
-        let mut distinct = 0;
+    fn joined_ids(first: &[u16], second: &[u16]) -> (Vec<u16>, usize) {
+        let mut seen: FastMap<u32, u16> = FastMap::default();
+        seen.reserve(first.len());
         let ids = first
             .iter()
             .zip(second)
             .map(|(&a, &b)| {
-                self.number(usize::from(a) * second_keys + usize::from(b), &mut distinct)
+                let next = seen.len() as u16;
+                *seen
+                    .entry(u32::from(a) << u16::BITS | u32::from(b))
+                    .or_insert(next)
             })
             .collect();
-        (ids, distinct)
+        (ids, seen.len())
+    }
+
+    fn reserve_pair_bits(&mut self, cells: usize) {
+        let words = cells.div_ceil(WORD_BITS);
+        if self.pair_bits.len() < words {
+            self.pair_bits.reserve_exact(words - self.pair_bits.len());
+            self.pair_bits.resize(words, 0);
+        }
     }
 
     fn joined_count(
@@ -95,11 +107,26 @@ impl DenseScratch {
         first_keys: usize,
         second_keys: usize,
     ) -> usize {
-        self.begin(first_keys * second_keys);
+        self.reserve_pair_bits(first_keys * second_keys);
+        debug_assert_eq!(self.touched_words, [] as [u32; 0]);
         let mut distinct = 0;
         for (&a, &b) in first.iter().zip(second) {
-            self.number(usize::from(a) * second_keys + usize::from(b), &mut distinct);
+            let cell = usize::from(a) * second_keys + usize::from(b);
+            let word = cell / WORD_BITS;
+            let bit = 1u64 << (cell % WORD_BITS);
+            let bits = self.pair_bits[word];
+            if bits & bit == 0 {
+                if bits == 0 {
+                    self.touched_words.push(word as u32);
+                }
+                self.pair_bits[word] = bits | bit;
+                distinct += 1;
+            }
         }
+        for &word in &self.touched_words {
+            self.pair_bits[word as usize] = 0;
+        }
+        self.touched_words.clear();
         distinct
     }
 }
@@ -148,19 +175,9 @@ impl ClusterPlan {
         )
     }
 
-    fn merged(&self, scratch: &mut DenseScratch, other: &Self) -> Self {
-        let (left_ids, left_keys) = scratch.joined_ids(
-            &self.left_ids,
-            &other.left_ids,
-            self.left_keys,
-            other.left_keys,
-        );
-        let (right_ids, right_keys) = scratch.joined_ids(
-            &self.right_ids,
-            &other.right_ids,
-            self.right_keys,
-            other.right_keys,
-        );
+    fn merged(&self, other: &Self) -> Self {
+        let (left_ids, left_keys) = DenseScratch::joined_ids(&self.left_ids, &other.left_ids);
+        let (right_ids, right_keys) = DenseScratch::joined_ids(&self.right_ids, &other.right_ids);
         let mut parts = [self.parts.as_slice(), other.parts.as_slice()].concat();
         parts.sort_unstable();
         Self {
@@ -222,7 +239,7 @@ pub(crate) fn plan_projection_clusters(
         let (_, first_position, second_position) = cheapest;
         let first = alive[first_position];
         let second = alive[second_position];
-        let merged = plans[first].merged(&mut scratch, &plans[second]);
+        let merged = plans[first].merged(&plans[second]);
         plans[first] = merged;
         alive.remove(second_position);
         forget_growth_of(&mut growth, first);

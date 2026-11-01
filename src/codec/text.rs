@@ -1,5 +1,6 @@
 use super::coder::Coder;
-use super::ppm::{NOVEL, Ppm, mix};
+use super::hints::HintReader;
+use super::ppm::{NOVEL, Ppm, PpmHint, mix};
 
 const CHAR_CODE_LIMIT: u32 = 0x11_0000;
 const END: u32 = CHAR_CODE_LIMIT;
@@ -13,12 +14,19 @@ const KANA_LAST: char = '\u{30FF}';
 const CONTEXT_SEED: u64 = 0x5151;
 const MAX_CONTEXT_LEVELS: usize = 8;
 
-#[derive(Default)]
+pub(crate) const CHAR_MODEL_PPMS: usize = 2;
+
 pub(crate) struct NovelChar {
     blocks: Ppm,
 }
 
 impl NovelChar {
+    fn new(hints: &mut HintReader) -> Self {
+        NovelChar {
+            blocks: hints.ppm(),
+        }
+    }
+
     fn code(&mut self, coder: &mut Coder, ch: u32) -> u32 {
         let block = ch >> BLOCK_SHIFT;
         let coded_block = match self.blocks.code(coder, &[1], block) {
@@ -38,12 +46,17 @@ pub(crate) struct CharModel {
 }
 
 impl CharModel {
-    pub(crate) fn new(order: usize) -> Self {
+    pub(crate) fn new(order: usize, hints: &mut HintReader) -> Self {
         CharModel {
             order,
-            ppm: Ppm::default(),
-            novel: NovelChar::default(),
+            ppm: hints.ppm(),
+            novel: NovelChar::new(hints),
         }
+    }
+
+    pub(crate) fn hints(&self, out: &mut Vec<PpmHint>) {
+        out.push(self.ppm.hint());
+        out.push(self.novel.blocks.hint());
     }
 
     fn code_sym(&mut self, coder: &mut Coder, tail: &[u32], sym: u32) -> u32 {

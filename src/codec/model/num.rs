@@ -2,7 +2,8 @@ use super::digits::{canonical_i64, set_i64};
 use super::row::RowState;
 use super::spec::NumMode;
 use crate::codec::coder::{Coder, Flag, UintModel};
-use crate::codec::ppm::{Interner, NOVEL, Ppm, mix};
+use crate::codec::hints::HintReader;
+use crate::codec::ppm::{Interner, NOVEL, Ppm, PpmHint, mix};
 use crate::hash::IdMap;
 use crate::wire::{unzigzag, zigzag};
 
@@ -22,17 +23,22 @@ pub(super) struct NumState {
 }
 
 impl NumState {
-    pub(super) fn new() -> NumState {
+    pub(super) fn new(hints: &mut HintReader) -> NumState {
         NumState {
-            ppm: Ppm::default(),
+            ppm: hints.ppm(),
             intern: Interner::default(),
             uint: UintModel::default(),
             irregular: Flag::default(),
-            d_ppm: Ppm::default(),
+            d_ppm: hints.ppm(),
             d_intern: Interner::default(),
             d_uint: UintModel::default(),
             refs: IdMap::default(),
         }
+    }
+
+    pub(super) fn hints(&self, out: &mut Vec<PpmHint>) {
+        out.push(self.ppm.hint());
+        out.push(self.d_ppm.hint());
     }
 }
 

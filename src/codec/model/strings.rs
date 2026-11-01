@@ -3,7 +3,8 @@ use super::row::RowState;
 use super::spec::MAX_RECENT;
 use super::strings_plan::plan_str;
 use crate::codec::coder::{Coder, UintModel};
-use crate::codec::ppm::{Interner, NOVEL, Ppm, mix};
+use crate::codec::hints::HintReader;
+use crate::codec::ppm::{Interner, NOVEL, Ppm, PpmHint, mix};
 use crate::codec::text::{CharModel, kata};
 use crate::hash::IdSet;
 use crate::wire::{get_varint, put_varint};
@@ -76,26 +77,36 @@ pub(super) struct StrState {
 }
 
 impl StrState {
-    pub(super) fn new(recent_limit: u8, srcs: Vec<usize>) -> StrState {
+    pub(super) fn new(recent_limit: u8, srcs: Vec<usize>, hints: &mut HintReader) -> StrState {
         StrState {
             limit: recent_limit as usize,
             srcs,
-            tuple_ppm: Ppm::default(),
+            tuple_ppm: hints.ppm(),
             tuples: Interner::default(),
-            ref_ppm: Ppm::default(),
+            ref_ppm: hints.ppm(),
             trim: UintModel::default(),
-            chars: CharModel::new(STR_CHAR_ORDER),
-            ex_ppm: Ppm::default(),
-            run_ppm: Ppm::default(),
+            chars: CharModel::new(STR_CHAR_ORDER, hints),
+            ex_ppm: hints.ppm(),
+            run_ppm: hints.ppm(),
             run_readings: Interner::default(),
-            read_chars: CharModel::new(STR_CHAR_ORDER),
+            read_chars: CharModel::new(STR_CHAR_ORDER, hints),
             recent: Vec::new(),
             group_plan: None,
             group_exact: 0,
-            seg_ppm: Ppm::default(),
+            seg_ppm: hints.ppm(),
             segs: Interner::default(),
             known: IdSet::default(),
         }
+    }
+
+    pub(super) fn hints(&self, out: &mut Vec<PpmHint>) {
+        out.push(self.tuple_ppm.hint());
+        out.push(self.ref_ppm.hint());
+        self.chars.hints(out);
+        out.push(self.ex_ppm.hint());
+        out.push(self.run_ppm.hint());
+        self.read_chars.hints(out);
+        out.push(self.seg_ppm.hint());
     }
 
     pub(super) fn code_ex(&mut self, row: &RowState, coder: &mut Coder, want: u32) -> u32 {

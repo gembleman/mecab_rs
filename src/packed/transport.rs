@@ -18,7 +18,7 @@ use crate::file_write::write_file;
 use crate::wire::{fnv1a64, u32_at, u64_at};
 
 const MAGIC: &[u8; 4] = b"MRDT";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 const MAX_PAYLOAD: u64 = 256 << 20;
 const MAX_PARTS: usize = 64;
 const DIGEST_BYTES: usize = 8;

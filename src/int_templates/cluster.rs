@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -100,7 +101,7 @@ pub(crate) struct RuntimeInputs<'a> {
     pub(crate) shapes: &'a [ClusterShape],
     pub(crate) left_keys: &'a [u16],
     pub(crate) right_keys: &'a [u16],
-    pub(crate) tables: &'a [i32],
+    pub(crate) tables: Cow<'a, [i32]>,
     pub(crate) exception_cells: &'a [u32],
     pub(crate) exception_values: &'a [i16],
 }

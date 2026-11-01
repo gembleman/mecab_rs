@@ -16,14 +16,17 @@ pub(crate) use intern::Interner;
 const TOTAL_LIMIT: u32 = 60000;
 const MAX_SYMBOLS: u32 = 24000;
 pub(crate) const NOVEL: u32 = u32::MAX;
-const MAX_LEVELS: usize = 8;
+pub(crate) const MAX_LEVELS: usize = 8;
 
 const BIG_AT: u32 = 24;
-const BIG: u32 = u32::MAX;
 const HIT_INC: u32 = 2;
 const EXCLUSION_CAP: usize = 48;
 const EXCLUSION_SCAN_MAX: usize = 24;
 const INITIAL_SLOTS: usize = 32;
+const LOAD_NUM: usize = 3;
+const LOAD_DEN: usize = 4;
+const MAX_HINT_CONTEXTS: u32 = 1 << 26;
+const MAX_HINT_ARENA: u32 = 1 << 27;
 
 #[derive(Clone, Copy, Default)]
 struct Slot {
@@ -31,9 +34,16 @@ struct Slot {
     t: Table,
 }
 
+const _: () = assert!(size_of::<Slot>() == 32);
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct PpmHint {
+    pub(crate) contexts: u32,
+    pub(crate) arena: u32,
+}
+
 pub(crate) struct Ppm {
     slots: Vec<Slot>,
-    mask: usize,
     used: usize,
     arena: Vec<(u32, u32)>,
     bigs: Vec<Big>,
@@ -45,11 +55,31 @@ pub(crate) struct Ppm {
 
 impl Default for Ppm {
     fn default() -> Self {
+        Ppm::with_hint(PpmHint::default())
+    }
+}
+
+#[inline]
+fn home(key: u64, slot_count: usize) -> usize {
+    ((u128::from(key) * slot_count as u128) >> u64::BITS) as usize
+}
+
+#[inline]
+fn next_probe(i: usize, slot_count: usize) -> usize {
+    let next = i + 1;
+    if next == slot_count { 0 } else { next }
+}
+
+impl Ppm {
+    pub(crate) fn with_hint(hint: PpmHint) -> Ppm {
+        let contexts = hint.contexts.min(MAX_HINT_CONTEXTS) as usize;
+        let arena = hint.arena.min(MAX_HINT_ARENA) as usize;
+        let needed = (contexts + MAX_LEVELS) * LOAD_DEN;
+        let slot_count = needed.div_ceil(LOAD_NUM).max(INITIAL_SLOTS);
         Ppm {
-            slots: vec![Slot::default(); INITIAL_SLOTS],
-            mask: INITIAL_SLOTS - 1,
+            slots: vec![Slot::default(); slot_count],
             used: 0,
-            arena: Vec::new(),
+            arena: Vec::with_capacity(arena),
             bigs: Vec::new(),
             visited: [0; MAX_LEVELS],
             nvisited: 0,
@@ -57,18 +87,19 @@ impl Default for Ppm {
             hit: false,
         }
     }
-}
 
-#[inline]
-fn home(key: u64, mask: usize) -> usize {
-    (key >> 1) as usize & mask
-}
+    pub(crate) fn hint(&self) -> PpmHint {
+        PpmHint {
+            contexts: u32::try_from(self.used).unwrap_or(u32::MAX),
+            arena: u32::try_from(self.arena.len()).unwrap_or(u32::MAX),
+        }
+    }
 
-impl Ppm {
     #[inline]
     fn slot_for(&mut self, h: u64) -> u32 {
         let h = h | 1;
-        let mut i = home(h, self.mask);
+        let n = self.slots.len();
+        let mut i = home(h, n);
         loop {
             let k = self.slots[i].key;
             if k == h {
@@ -79,22 +110,23 @@ impl Ppm {
                 self.used += 1;
                 return i as u32;
             }
-            i = (i + 1) & self.mask;
+            i = next_probe(i, n);
         }
     }
 
     pub(crate) fn distinct(&self, h: u64) -> u32 {
         let h = h | 1;
-        let mut i = home(h, self.mask);
+        let n = self.slots.len();
+        let mut i = home(h, n);
         loop {
             let k = self.slots[i].key;
             if k == h {
-                return self.slots[i].t.len;
+                return self.slots[i].t.len();
             }
             if k == 0 {
                 return 0;
             }
-            i = (i + 1) & self.mask;
+            i = next_probe(i, n);
         }
     }
 
@@ -103,7 +135,7 @@ impl Ppm {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-            let i = home(h | 1, self.mask);
+            let i = home(h | 1, self.slots.len());
             _mm_prefetch(self.slots.as_ptr().add(i).cast::<i8>(), _MM_HINT_T0);
         }
         #[cfg(not(target_arch = "x86_64"))]
@@ -114,12 +146,11 @@ impl Ppm {
     fn grow(&mut self) {
         let n = self.slots.len() * 2;
         let old = std::mem::replace(&mut self.slots, vec![Slot::default(); n]);
-        self.mask = n - 1;
         for s in old {
             if s.key != 0 {
-                let mut i = home(s.key, self.mask);
+                let mut i = home(s.key, n);
                 while self.slots[i].key != 0 {
-                    i = (i + 1) & self.mask;
+                    i = next_probe(i, n);
                 }
                 self.slots[i] = s;
             }
@@ -128,7 +159,7 @@ impl Ppm {
 
     #[inline]
     fn ensure_room(&mut self) {
-        if (self.used + MAX_LEVELS) * 2 > self.slots.len() {
+        if (self.used + MAX_LEVELS) * LOAD_DEN > self.slots.len() * LOAD_NUM {
             self.grow();
         }
     }
@@ -150,15 +181,15 @@ impl Ppm {
         excluded: &mut Exclusions,
     ) -> Option<(usize, u32)> {
         let t = &self.slots[slot].t;
-        if t.total == 0 {
+        if t.total() == 0 {
             return None;
         }
         let mass = Mass {
-            total: t.total,
-            distinct: t.len,
+            total: t.total(),
+            distinct: t.len(),
         };
-        if t.cap == BIG {
-            return code_big(&mut self.bigs[t.start as usize], mass, coder, sym);
+        if t.is_big() {
+            return code_big(&mut self.bigs[t.big_index()], mass, coder, sym);
         }
         let entries = t.entries(&self.arena);
         let found = code_small(mass, entries, coder, sym, excluded);
@@ -193,13 +224,13 @@ impl Ppm {
             learn::reinforce(t, &mut self.arena, &mut self.bigs, pos, HIT_INC);
             HIT_INC
         } else {
-            if t.len >= MAX_SYMBOLS {
+            if t.len() >= MAX_SYMBOLS {
                 return;
             }
             learn::learn_symbol(t, &mut self.arena, &mut self.bigs, sym);
             1
         };
-        t.total += inc;
+        t.add_total(inc);
         learn::halve_over_limit(t, &mut self.arena, &mut self.bigs);
     }
 

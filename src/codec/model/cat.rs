@@ -2,7 +2,8 @@ use super::row::{RowState, put_str, read_str};
 use super::spec::{Kind, Step};
 use super::state::StepState;
 use crate::codec::coder::Coder;
-use crate::codec::ppm::{Interner, NOVEL, Ppm, hash_bytes, mix};
+use crate::codec::hints::HintReader;
+use crate::codec::ppm::{Interner, NOVEL, Ppm, PpmHint, hash_bytes, mix};
 
 pub(super) const NO_PREVIOUS: u64 = 0;
 const MAX_CAT_CONTEXTS: usize = 4;
@@ -14,11 +15,15 @@ pub(super) struct CatState {
 }
 
 impl CatState {
-    pub(super) fn new() -> CatState {
+    pub(super) fn new(hints: &mut HintReader) -> CatState {
         CatState {
-            ppm: Ppm::default(),
+            ppm: hints.ppm(),
             intern: Interner::default(),
         }
+    }
+
+    pub(super) fn hints(&self, out: &mut Vec<PpmHint>) {
+        out.push(self.ppm.hint());
     }
 }
 
@@ -30,9 +35,17 @@ pub(super) struct CatGroup {
 }
 
 impl CatGroup {
-    pub(super) fn new(plan_steps: &[Step], ctx_col: Option<usize>) -> CatGroup {
+    pub(super) fn hints(&self, out: &mut Vec<PpmHint>) {
+        out.push(self.ppm.hint());
+    }
+
+    pub(super) fn new(
+        plan_steps: &[Step],
+        ctx_col: Option<usize>,
+        hints: &mut HintReader,
+    ) -> CatGroup {
         CatGroup {
-            ppm: Ppm::default(),
+            ppm: hints.ppm(),
             tuples: Interner::default(),
             ctx_col,
             steps: plan_steps

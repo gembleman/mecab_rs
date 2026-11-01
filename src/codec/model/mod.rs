@@ -12,6 +12,8 @@ mod strings_group;
 mod strings_plan;
 
 use super::coder::Coder;
+use super::hints::HintReader;
+use super::ppm::PpmHint;
 use state::ModelState;
 
 pub(super) use digits::{canonical_i64, canonical_u64};
@@ -24,10 +26,18 @@ pub(crate) struct Model {
 
 impl Model {
     pub(crate) fn new(plan: Plan) -> Model {
+        Model::with_hints(plan, &mut HintReader::untrained())
+    }
+
+    pub(crate) fn with_hints(plan: Plan, hints: &mut HintReader) -> Model {
         Model {
-            state: ModelState::new(&plan),
+            state: ModelState::new(&plan, hints),
             plan,
         }
+    }
+
+    pub(crate) fn hints(&self, out: &mut Vec<PpmHint>) {
+        self.state.hints(out);
     }
 
     pub(crate) fn set_active(&mut self, mask: Option<Vec<bool>>, bundle_cats: bool) {

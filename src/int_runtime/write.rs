@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::Path;
 
 use memmap2::MmapOptions;
@@ -46,14 +47,11 @@ impl<S: SectionSource> MappedIntTemplates<S> {
         let inputs = self.runtime_inputs().ok_or(Error::Unsupported(
             "integer templates without clusters have no runtime form",
         ))?;
-        runtime_form_from(&inputs, shape)
+        runtime_form_from(inputs, shape)
     }
 }
 
-pub(crate) fn runtime_form_from(
-    inputs: &RuntimeInputs,
-    shape: &HotShape,
-) -> Result<Vec<u8>, Error> {
+pub(crate) fn runtime_form_from(inputs: RuntimeInputs, shape: &HotShape) -> Result<Vec<u8>, Error> {
     write_runtime(inputs, shape, MIN_SPARSE_GAIN)
 }
 
@@ -163,7 +161,7 @@ fn exceptions_outside_hot(
 struct RenumberedClusters {
     left_keys: Vec<u16>,
     right_keys: Vec<u16>,
-    tables: Vec<u8>,
+    tables: Vec<Vec<u8>>,
     shapes: Vec<[u32; SHAPE_WORDS]>,
 }
 
@@ -173,7 +171,8 @@ fn reordered_cells(
     left: &Renumbered,
     right: &Renumbered,
 ) -> Vec<i32> {
-    let mut cells = Vec::new();
+    let capacity = right.mixed * shape.left_keys + (shape.right_keys - right.mixed) * left.mixed;
+    let mut cells = Vec::with_capacity(capacity);
     for (new_right, &old_right) in right.old_of_new.iter().enumerate() {
         let row = &table[usize::from(old_right) * shape.left_keys..][..shape.left_keys];
         let wanted = if new_right < right.mixed {
@@ -187,6 +186,7 @@ fn reordered_cells(
                 .map(|&old| row[usize::from(old)]),
         );
     }
+    debug_assert_eq!(cells.len(), capacity);
     cells
 }
 
@@ -200,8 +200,8 @@ fn renumber_clusters(
     let mut result = RenumberedClusters {
         left_keys: vec![0u16; inputs.left_size * count],
         right_keys: vec![0u16; inputs.right_size * count],
-        tables: Vec::new(),
-        shapes: Vec::new(),
+        tables: Vec::with_capacity(count),
+        shapes: Vec::with_capacity(count),
     };
     for (cluster, (shape, &original_start)) in inputs.shapes.iter().zip(starts).enumerate() {
         let side = |keys: &[u16], key_count, hot| {
@@ -228,7 +228,9 @@ fn renumber_clusters(
         }
         let table = &inputs.tables[original_start..];
         let cells = reordered_cells(table, shape, &left, &right);
-        let encoded = encode_table(&cells, min_sparse_gain, &mut result.tables);
+        let encoded = encode_table(&cells, min_sparse_gain);
+        drop(cells);
+        result.tables.push(encoded.bytes);
         result.shapes.push([
             shape.left_keys as u32,
             shape.right_keys as u32,
@@ -244,7 +246,7 @@ fn renumber_clusters(
 }
 
 fn write_runtime(
-    inputs: &RuntimeInputs,
+    mut inputs: RuntimeInputs,
     shape: &HotShape,
     min_sparse_gain: usize,
 ) -> Result<Vec<u8>, Error> {
@@ -261,23 +263,25 @@ fn write_runtime(
             "too many left ids for the exceptions of a runtime form",
         ));
     }
-    let starts = cluster_starts(inputs);
-    let exceptions = exceptions_outside_hot(inputs, shape, &starts)?;
-    let clusters = renumber_clusters(inputs, &starts, hot, min_sparse_gain);
-    assemble_runtime(inputs, hot, &exceptions, &clusters)
+    let starts = cluster_starts(&inputs);
+    let exceptions = exceptions_outside_hot(&inputs, shape, &starts)?;
+    let clusters = renumber_clusters(&inputs, &starts, hot, min_sparse_gain);
+    inputs.tables = Cow::Borrowed(&[]);
+    assemble_runtime(&inputs, hot, &exceptions, clusters)
 }
 
 fn runtime_capacity(exceptions: &ExceptionColumns, clusters: &RenumberedClusters) -> usize {
     const WORD_BYTES: usize = 4;
     const HEADER_WORDS: usize = 9;
     const ALIGNMENT_SLACK: usize = 16;
+    let table_bytes: usize = clusters.tables.iter().map(Vec::len).sum();
     MAGIC.len()
         + HEADER_WORDS * WORD_BYTES
         + clusters.shapes.len() * SHAPE_WORDS * WORD_BYTES
         + exceptions.row_starts.len() * WORD_BYTES
         + exceptions.columns.len() * size_of::<u16>()
         + (clusters.left_keys.len() + clusters.right_keys.len()) * size_of::<u16>()
-        + clusters.tables.len()
+        + table_bytes
         + TABLE_SLACK
         + ALIGNMENT_SLACK
 }
@@ -286,9 +290,9 @@ fn assemble_runtime(
     inputs: &RuntimeInputs,
     (hot_left, hot_right): (usize, usize),
     exceptions: &ExceptionColumns,
-    clusters: &RenumberedClusters,
+    mut clusters: RenumberedClusters,
 ) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::with_capacity(runtime_capacity(exceptions, clusters));
+    let mut out = Vec::with_capacity(runtime_capacity(exceptions, &clusters));
     out.extend_from_slice(MAGIC);
     for word in [
         RUNTIME_VERSION,
@@ -311,8 +315,12 @@ fn assemble_runtime(
     write_array(&mut out, &exceptions.row_starts, u32::to_le_bytes).map_err(&io_error)?;
     write_array(&mut out, &exceptions.columns, u16::to_le_bytes).map_err(&io_error)?;
     write_array(&mut out, &clusters.left_keys, u16::to_le_bytes).map_err(&io_error)?;
+    drop(std::mem::take(&mut clusters.left_keys));
     write_array(&mut out, &clusters.right_keys, u16::to_le_bytes).map_err(io_error)?;
-    out.extend_from_slice(&clusters.tables);
+    drop(std::mem::take(&mut clusters.right_keys));
+    for table in std::mem::take(&mut clusters.tables) {
+        out.extend_from_slice(&table);
+    }
     out.extend_from_slice(&[0; TABLE_SLACK]);
     pad(&mut out);
     Ok(out)
@@ -323,6 +331,7 @@ struct EncodedTable {
     width: usize,
     base: i32,
     nonzero: usize,
+    bytes: Vec<u8>,
 }
 
 fn spread_of(values: impl Iterator<Item = i32> + Clone) -> (i32, usize) {
@@ -342,12 +351,15 @@ fn push_cell(bytes: &mut Vec<u8>, value: i32, base: i32, width: usize) {
     bytes.extend_from_slice(&stored.to_le_bytes()[..width]);
 }
 
-fn encode_table(cells: &[i32], min_sparse_gain: usize, bytes: &mut Vec<u8>) -> EncodedTable {
+fn encode_table(cells: &[i32], min_sparse_gain: usize) -> EncodedTable {
     let (dense_base, dense_width) = spread_of(cells.iter().copied());
-    let nonzero: Vec<i32> = cells.iter().copied().filter(|&cell| cell != 0).collect();
-    let (base, width) = spread_of(nonzero.iter().copied());
-    let sparse_bytes = cells.len().div_ceil(BLOCK_CELLS) * BLOCK_BYTES + nonzero.len() * width;
-    if sparse_bytes + min_sparse_gain <= cells.len() * dense_width {
+    let nonzero_cells = || cells.iter().copied().filter(|&cell| cell != 0);
+    let (base, width) = spread_of(nonzero_cells());
+    let nonzero = nonzero_cells().count();
+    let sparse_bytes = cells.len().div_ceil(BLOCK_CELLS) * BLOCK_BYTES + nonzero * width;
+    let dense_bytes = cells.len() * dense_width;
+    if sparse_bytes + min_sparse_gain <= dense_bytes {
+        let mut bytes = Vec::with_capacity(sparse_bytes);
         let mut before = 0u32;
         for block in cells.chunks(BLOCK_CELLS) {
             let bits = block
@@ -358,24 +370,28 @@ fn encode_table(cells: &[i32], min_sparse_gain: usize, bytes: &mut Vec<u8>) -> E
             bytes.extend_from_slice(&bits.to_le_bytes());
             before += bits.count_ones();
         }
-        for &value in &nonzero {
-            push_cell(bytes, value, base, width);
+        for value in nonzero_cells() {
+            push_cell(&mut bytes, value, base, width);
         }
+        debug_assert_eq!(bytes.len(), sparse_bytes);
         return EncodedTable {
             sparse: true,
             width,
             base,
-            nonzero: nonzero.len(),
+            nonzero,
+            bytes,
         };
     }
+    let mut bytes = Vec::with_capacity(dense_bytes);
     for &cell in cells {
-        push_cell(bytes, cell, dense_base, dense_width);
+        push_cell(&mut bytes, cell, dense_base, dense_width);
     }
     EncodedTable {
         sparse: false,
         width: dense_width,
         base: dense_base,
         nonzero: 0,
+        bytes,
     }
 }
 

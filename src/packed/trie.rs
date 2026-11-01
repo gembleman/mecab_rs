@@ -184,11 +184,28 @@ fn place_children(
     }
 }
 
+fn node_count<'a>(entries: impl Iterator<Item = Entry<'a>>) -> usize {
+    let mut previous: &[u16] = &[];
+    let mut count = 1;
+    for entry in entries {
+        let shared = entry
+            .codes
+            .iter()
+            .zip(previous)
+            .take_while(|(a, b)| a == b)
+            .count();
+        count += entry.codes.len().saturating_sub(shared);
+        previous = entry.codes;
+    }
+    count
+}
+
 pub(super) fn place<'a>(
-    entries: impl ExactSizeIterator<Item = Entry<'a>>,
+    entries: impl ExactSizeIterator<Item = Entry<'a>> + Clone,
 ) -> Result<Placed, Error> {
     let entry_count = entries.len();
-    let mut nodes = vec![Node::new(0)];
+    let mut nodes = Vec::with_capacity(node_count(entries.clone()));
+    nodes.push(Node::new(0));
     link_trie(entries, &mut nodes)?;
     let expected_units = nodes.len() + nodes.len() / UNIT_SLACK_DIVISOR;
     let mut units = Units {

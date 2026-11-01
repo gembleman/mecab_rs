@@ -1,7 +1,8 @@
 use super::row::{RowState, put_str, read_str};
 use super::spec::FIXED_COLS;
 use crate::codec::coder::Coder;
-use crate::codec::ppm::{Interner, NOVEL, Ppm, hash_bytes, mix};
+use crate::codec::hints::HintReader;
+use crate::codec::ppm::{Interner, NOVEL, Ppm, PpmHint, hash_bytes, mix};
 use crate::codec::text::CharModel;
 
 const COMP_CHAR_ORDER: usize = 1;
@@ -29,16 +30,22 @@ pub(super) struct PosModel {
 }
 
 impl PosModel {
-    pub(super) fn new(cols: usize) -> PosModel {
+    pub(super) fn new(cols: usize, hints: &mut HintReader) -> PosModel {
         PosModel {
-            ppm: Ppm::default(),
+            ppm: hints.ppm(),
             intern: Interner::default(),
-            comp_ppm: (0..cols).map(|_| Ppm::default()).collect(),
+            comp_ppm: (0..cols).map(|_| hints.ppm()).collect(),
             comp_intern: (0..cols).map(|_| Interner::default()).collect(),
-            comp_chars: CharModel::new(COMP_CHAR_ORDER),
+            comp_chars: CharModel::new(COMP_CHAR_ORDER, hints),
             hashes: Vec::new(),
             cols,
         }
+    }
+
+    pub(super) fn hints(&self, out: &mut Vec<PpmHint>) {
+        out.push(self.ppm.hint());
+        out.extend(self.comp_ppm.iter().map(Ppm::hint));
+        self.comp_chars.hints(out);
     }
 
     #[inline]

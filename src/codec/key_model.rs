@@ -1,5 +1,6 @@
 use super::coder::{Coder, UintModel};
-use super::ppm::{NOVEL, Ppm, mix};
+use super::hints::HintReader;
+use super::ppm::{NOVEL, Ppm, PpmHint, mix};
 use super::text::CharModel;
 
 const KEY_CHAR_ORDER: usize = 2;
@@ -23,19 +24,26 @@ fn saturate_u32(v: u64) -> u32 {
 }
 
 impl KeyModel {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(hints: &mut HintReader) -> Self {
         KeyModel {
-            prefix_len: Ppm::default(),
+            prefix_len: hints.ppm(),
             prefix_len_escape: UintModel::default(),
-            first_char_delta: Ppm::default(),
+            first_char_delta: hints.ppm(),
             first_char_delta_escape: UintModel::default(),
-            chars: CharModel::new(KEY_CHAR_ORDER),
-            group_size: Ppm::default(),
+            chars: CharModel::new(KEY_CHAR_ORDER, hints),
+            group_size: hints.ppm(),
             group_size_escape: UintModel::default(),
             prev: Vec::new(),
             cur: Vec::new(),
             last_prefix_len: 0,
         }
+    }
+
+    pub(super) fn hints(&self, out: &mut Vec<PpmHint>) {
+        out.push(self.prefix_len.hint());
+        out.push(self.first_char_delta.hint());
+        self.chars.hints(out);
+        out.push(self.group_size.hint());
     }
 
     fn encoder_shared_len(&self) -> usize {

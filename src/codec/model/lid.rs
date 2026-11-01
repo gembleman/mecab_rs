@@ -3,7 +3,8 @@ use super::num::IRREGULAR_FLAG_LIMIT;
 use super::row::RowState;
 use super::spec::LidSpec;
 use crate::codec::coder::{Coder, Flag, UintModel};
-use crate::codec::ppm::{Ppm, hash_bytes, mix};
+use crate::codec::hints::HintReader;
+use crate::codec::ppm::{Ppm, PpmHint, hash_bytes, mix};
 use crate::hash::IdMap;
 use crate::wire::{unzigzag, zigzag};
 use std::collections::BTreeMap;
@@ -61,20 +62,26 @@ pub(super) struct LidState {
 }
 
 impl LidState {
-    pub(super) fn new() -> LidState {
+    pub(super) fn new(hints: &mut HintReader) -> LidState {
         LidState {
             seen: IdMap::default(),
             order: BTreeMap::new(),
-            mode_ppm: Ppm::default(),
+            mode_ppm: hints.ppm(),
             delta: UintModel::default(),
             direct: UintModel::default(),
             from_last: UintModel::default(),
-            lo_ppm: Ppm::default(),
-            hi_ppm: Ppm::default(),
+            lo_ppm: hints.ppm(),
+            hi_ppm: hints.ppm(),
             irregular: Flag::default(),
             partner_bad: Flag::default(),
             last_new: 0,
         }
+    }
+
+    pub(super) fn hints(&self, out: &mut Vec<PpmHint>) {
+        out.push(self.mode_ppm.hint());
+        out.push(self.lo_ppm.hint());
+        out.push(self.hi_ppm.hint());
     }
 
     fn choose_mode(&self, near: Neighbours, id: u64, seen: Option<u64>) -> LidMode {

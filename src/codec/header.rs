@@ -1,9 +1,11 @@
 use super::coder::Coder;
+use super::hints::{read_hints, write_hints};
 use super::model::Plan;
+use super::ppm::PpmHint;
 use crate::error::Undecodable;
 use crate::wire::{FNV_OFFSET, fnv1a, get_varint, put_varint};
 
-pub(super) const MAGIC: &[u8; 4] = b"MLX1";
+pub(super) const MAGIC: &[u8; 4] = b"MLX2";
 const FLAG_NO_FINAL_NEWLINE: u8 = 1;
 const FLAG_GROUPED: u8 = 2;
 const FLAG_STORED: u8 = 4;
@@ -21,7 +23,17 @@ pub(super) enum Body {
         n_keys: usize,
         n_irregular: usize,
         plan: Plan,
+        hints: Vec<PpmHint>,
     },
+}
+
+impl Body {
+    pub(super) fn hints(&self) -> &[PpmHint] {
+        match self {
+            Body::Stored => &[],
+            Body::Coded { hints, .. } => hints,
+        }
+    }
 }
 
 pub(super) struct Header {
@@ -81,6 +93,7 @@ pub(super) struct CodedHeader<'a> {
     pub n_keys: usize,
     pub n_irregular: usize,
     pub plan: &'a Plan,
+    pub hints: &'a [PpmHint],
 }
 
 pub(super) fn write_coded_header(out: &mut Vec<u8>, header: &CodedHeader) {
@@ -91,6 +104,7 @@ pub(super) fn write_coded_header(out: &mut Vec<u8>, header: &CodedHeader) {
     put_varint(out, header.n_keys as u64);
     put_varint(out, header.n_irregular as u64);
     header.plan.write(out);
+    write_hints(out, header.hints);
 }
 
 struct Prefix {
@@ -146,10 +160,14 @@ fn read_coded_body(data: &[u8], prefix: &mut Prefix) -> Result<Body, Undecodable
     if !lines_fit_text(prefix.text_len, plan.n_cols as u64, n_keys, n_irregular) {
         return corrupt("bad line count");
     }
+    let Some(hints) = read_hints(data, pos) else {
+        return corrupt("bad size hints");
+    };
     Ok(Body::Coded {
         n_keys: n_keys as usize,
         n_irregular: n_irregular as usize,
         plan,
+        hints,
     })
 }
 

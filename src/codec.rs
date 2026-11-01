@@ -1,5 +1,6 @@
 mod coder;
 mod header;
+mod hints;
 mod key_model;
 mod model;
 mod plan_choice;
@@ -14,13 +15,15 @@ use header::{
     Body, CodedHeader, Header, OVERRUN_MESSAGE, charge_symbol, corrupt, ensure_not_overrun,
     header_flags, lines_fit_text, read_header, stored, write_coded_header,
 };
+use hints::HintReader;
 use key_model::KeyModel;
 use model::{Model, Plan};
+use ppm::PpmHint;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use table::{Parsed, parse_text};
-use text::CharModel;
+use text::{CHAR_MODEL_PPMS, CharModel};
 
 pub(crate) use header::MAX_LEXICON_TEXT_LEN;
 pub(crate) use table::{Lexicon, Record, Row};
@@ -30,6 +33,7 @@ const RESERVE_BYTES_PER_INPUT_BYTE: u64 = 1 << 10;
 const IRREGULAR_CHAR_ORDER: usize = 2;
 const SYMBOLS_PER_TEXT_BYTE: u64 = 3;
 const SYMBOL_SLACK: u64 = 1 << 16;
+const HEADER_SLACK: usize = 1 << 10;
 const ROWS_PER_CHUNK: usize = 4096;
 const CHUNK_DATA_HINT: usize = 1 << 18;
 const CHUNKS_IN_FLIGHT: usize = 8;
@@ -76,12 +80,12 @@ fn encode_counts(input: &EncodeInput, key_model: &mut KeyModel, coder: &mut Code
     }
 }
 
-fn encode_rows(input: &EncodeInput, plan: Plan, coder: &mut Coder) {
+fn encode_rows(input: &EncodeInput, plan: &Plan, coder: &mut Coder, hints: &mut Vec<PpmHint>) {
     let lex = &input.parsed.lex;
     if lex.n_cols == 0 {
         return;
     }
-    let mut model = Model::new(plan);
+    let mut model = Model::new(plan.clone());
     let mut fields: Vec<&str> = Vec::with_capacity(lex.n_cols);
     for group in input.groups {
         model.start_group();
@@ -93,10 +97,11 @@ fn encode_rows(input: &EncodeInput, plan: Plan, coder: &mut Coder) {
             model.code_row(coder, &fields, "");
         }
     }
+    model.hints(hints);
 }
 
-fn encode_irregular(lex: &Lexicon, coder: &mut Coder) {
-    let mut irregular_model = CharModel::new(IRREGULAR_CHAR_ORDER);
+fn encode_irregular(lex: &Lexicon, coder: &mut Coder, hints: &mut Vec<PpmHint>) {
+    let mut irregular_model = CharModel::new(IRREGULAR_CHAR_ORDER, &mut HintReader::untrained());
     let mut gaps = UintModel::default();
     let mut line_buf = Vec::new();
     let mut previous_at = 0;
@@ -105,6 +110,7 @@ fn encode_irregular(lex: &Lexicon, coder: &mut Coder) {
         previous_at = at;
         irregular_model.code_bytes(coder, line, &mut line_buf);
     }
+    irregular_model.hints(hints);
 }
 
 fn verified_or_stored(out: Vec<u8>, parsed: &Parsed, text_len: u64) -> Vec<u8> {
@@ -129,7 +135,18 @@ pub fn encode_lexicon(csv: &[u8]) -> Vec<u8> {
     let plan = plan_choice::choose_plan(&parsed, &groups);
     let (digest, text_len) = lex.digest(Some(&parsed.order));
 
-    let mut out = Vec::new();
+    let mut coder = Coder::encoder();
+    let mut hints = Vec::new();
+    let mut key_model = KeyModel::new(&mut HintReader::untrained());
+    encode_keys(&input, &mut key_model, &mut coder);
+    encode_counts(&input, &mut key_model, &mut coder);
+    key_model.hints(&mut hints);
+    drop(key_model);
+    encode_rows(&input, &plan, &mut coder, &mut hints);
+    encode_irregular(lex, &mut coder, &mut hints);
+    let payload = coder.finish();
+
+    let mut out = Vec::with_capacity(payload.len() + HEADER_SLACK);
     write_coded_header(
         &mut out,
         &CodedHeader {
@@ -139,16 +156,10 @@ pub fn encode_lexicon(csv: &[u8]) -> Vec<u8> {
             n_keys: groups.len(),
             n_irregular: lex.irregular.len(),
             plan: &plan,
+            hints: &hints,
         },
     );
-
-    let mut coder = Coder::encoder();
-    let mut key_model = KeyModel::new();
-    encode_keys(&input, &mut key_model, &mut coder);
-    encode_counts(&input, &mut key_model, &mut coder);
-    encode_rows(&input, plan, &mut coder);
-    encode_irregular(lex, &mut coder);
-    out.extend_from_slice(&coder.finish());
+    out.extend_from_slice(&payload);
     verified_or_stored(out, &parsed, text_len)
 }
 
@@ -208,12 +219,19 @@ struct DecodeRows<'a, C> {
     text_len: u64,
 }
 
+fn symbol_budget(text_len: u64) -> u64 {
+    text_len
+        .saturating_mul(SYMBOLS_PER_TEXT_BYTE)
+        .saturating_add(SYMBOL_SLACK)
+}
+
 fn decode_rows_with<C: Copy + Into<usize>>(
     coder: &mut Coder,
     rows: &DecodeRows<'_, C>,
+    hints: &mut HintReader,
     mut push: impl FnMut(&[String]) -> u64,
 ) -> Result<(), Undecodable> {
-    let mut model = Model::new(rows.plan.clone());
+    let mut model = Model::with_hints(rows.plan.clone(), hints);
     for (key, &group_len) in rows.keys.iter().zip(rows.counts) {
         model.start_group();
         for _ in 0..group_len.into() {
@@ -232,8 +250,9 @@ fn decode_irregular(
     coder: &mut Coder,
     lex: &mut Lexicon,
     n_irregular: usize,
+    hints: &mut HintReader,
 ) -> Result<(), Undecodable> {
-    let mut irregular_model = CharModel::new(IRREGULAR_CHAR_ORDER);
+    let mut irregular_model = CharModel::new(IRREGULAR_CHAR_ORDER, hints);
     let mut gaps = UintModel::default();
     let rows = lex.rows() as u64;
     let mut at = 0u64;
@@ -269,6 +288,7 @@ fn reserve_lexicon(lex: &mut Lexicon, total_rows: u64, hint_bytes: u64) -> Resul
 
 struct CodedStart<'a> {
     coder: Coder<'a>,
+    hints: HintReader<'a>,
     keys: Vec<String>,
     counts: Vec<usize>,
     total_rows: u64,
@@ -276,24 +296,22 @@ struct CodedStart<'a> {
 
 fn start_coded<'a>(
     data: &'a [u8],
-    h: &Header,
+    h: &'a Header,
     n_keys: usize,
     n_irregular: usize,
     plan: &Plan,
 ) -> Result<CodedStart<'a>, Undecodable> {
     let mut coder = Coder::decoder(&data[h.payload..]);
-    coder.limit_symbols(
-        h.text_len
-            .saturating_mul(SYMBOLS_PER_TEXT_BYTE)
-            .saturating_add(SYMBOL_SLACK),
-    );
+    coder.limit_symbols(symbol_budget(h.text_len));
+    let mut hints = HintReader::new(h.body.hints(), symbol_budget(h.text_len));
     let n_cols = plan.n_cols;
     if n_cols == 0 && n_keys > 0 {
         return corrupt("bad key count");
     }
-    let mut key_model = KeyModel::new();
+    let mut key_model = KeyModel::new(&mut hints);
     let keys = decode_keys(&mut coder, &mut key_model, n_keys)?;
     let counts = decode_counts(&mut coder, &mut key_model, &keys)?;
+    drop(key_model);
     let total_rows: u64 = counts.iter().map(|&group_len| group_len as u64).sum();
     if total_rows < n_keys as u64
         || !lines_fit_text(h.text_len, n_cols as u64, total_rows, n_irregular as u64)
@@ -302,6 +320,7 @@ fn start_coded<'a>(
     }
     Ok(CodedStart {
         coder,
+        hints,
         keys,
         counts,
         total_rows,
@@ -317,6 +336,7 @@ fn decode_coded(
 ) -> Result<Lexicon, Undecodable> {
     let CodedStart {
         mut coder,
+        mut hints,
         keys,
         counts,
         total_rows,
@@ -333,12 +353,13 @@ fn decode_coded(
             counts: &counts,
             text_len: h.text_len,
         };
-        decode_rows_with(&mut coder, &rows, |fields| {
+        decode_rows_with(&mut coder, &rows, &mut hints, |fields| {
             lex.push_row(fields);
             lex.data_len() as u64
         })?;
     }
-    decode_irregular(&mut coder, &mut lex, n_irregular)?;
+    decode_irregular(&mut coder, &mut lex, n_irregular, &mut hints)?;
+    hints.finish()?;
     Ok(lex)
 }
 
@@ -349,6 +370,7 @@ fn decode_body(data: &[u8], h: &Header) -> Result<Lexicon, Undecodable> {
             n_keys,
             n_irregular,
             plan,
+            ..
         } => decode_coded(data, h, *n_keys, *n_irregular, plan),
     }
 }
@@ -372,6 +394,7 @@ pub(crate) fn visit_lexicon_records(
             n_keys,
             n_irregular: 0,
             plan,
+            ..
         } if plan.n_cols > 0 => visit_pipelined(data, &h, (*n_keys, plan), on_keys, visit),
         _ => visit_decoded(&decode_body(data, &h)?, &h, visit),
     }
@@ -444,6 +467,7 @@ fn decode_chunks(
     let (n_keys, plan) = start;
     let CodedStart {
         mut coder,
+        mut hints,
         keys,
         counts,
         ..
@@ -462,7 +486,7 @@ fn decode_chunks(
     };
     let mut chunk = new_chunk(n_cols);
     let mut total_bytes = 0u64;
-    decode_rows_with(&mut coder, &rows, |fields| {
+    decode_rows_with(&mut coder, &rows, &mut hints, |fields| {
         let before = chunk.data_len();
         chunk.push_row(fields);
         total_bytes += (chunk.data_len() - before) as u64;
@@ -475,6 +499,8 @@ fn decode_chunks(
     if chunk.rows() > 0 {
         publish_chunk(&records, &checks, chunk);
     }
+    hints.skip(CHAR_MODEL_PPMS);
+    hints.finish()?;
     drop(records);
     drop(checks);
     Ok(())

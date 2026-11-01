@@ -1,6 +1,6 @@
 use super::big::Big;
 use super::table::Table;
-use super::{BIG, BIG_AT, TOTAL_LIMIT};
+use super::{BIG_AT, TOTAL_LIMIT};
 
 #[inline]
 pub(super) fn reinforce(
@@ -10,8 +10,8 @@ pub(super) fn reinforce(
     pos: usize,
     inc: u32,
 ) {
-    if t.cap == BIG {
-        bigs[t.start as usize].add(pos, inc);
+    if t.is_big() {
+        bigs[t.big_index()].add(pos, inc);
     } else {
         move_up(t.entries_mut(arena), pos, inc);
     }
@@ -32,12 +32,12 @@ pub(super) fn learn_symbol(
     bigs: &mut Vec<Big>,
     sym: u32,
 ) {
-    if t.cap == BIG {
-        bigs[t.start as usize].push(sym, 1);
-        t.len += 1;
-    } else if t.len >= BIG_AT {
+    if t.is_big() {
+        bigs[t.big_index()].push(sym, 1);
+        t.count_one_more();
+    } else if t.len() >= BIG_AT {
         promote(t, arena, bigs, sym);
-        t.len += 1;
+        t.count_one_more();
     } else {
         t.push(arena, (sym, 1));
     }
@@ -46,22 +46,21 @@ pub(super) fn learn_symbol(
 fn promote(t: &mut Table, arena: &[(u32, u32)], bigs: &mut Vec<Big>, sym: u32) {
     let mut big = Big::from_sorted(t.entries(arena));
     big.push(sym, 1);
-    t.start = bigs.len() as u32;
-    t.cap = BIG;
+    t.set_big_index(bigs.len());
     bigs.push(big);
 }
 
 #[inline]
 pub(super) fn halve_over_limit(t: &mut Table, arena: &mut [(u32, u32)], bigs: &mut [Big]) {
-    if t.total + t.len <= TOTAL_LIMIT {
+    if t.total() + t.len() <= TOTAL_LIMIT {
         return;
     }
-    let total = if t.cap == BIG {
-        bigs[t.start as usize].halve()
+    let total = if t.is_big() {
+        bigs[t.big_index()].halve()
     } else {
         halve_counts(t.entries_mut(arena))
     };
-    t.total = total;
+    t.set_total(total);
 }
 
 fn halve_counts(e: &mut [(u32, u32)]) -> u32 {

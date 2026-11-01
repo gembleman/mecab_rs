@@ -8,7 +8,8 @@ use super::spec::{Kind, Plan, Step};
 use super::strings::{StrState, code_str};
 use super::strings_group::{StrGroup, code_str_group};
 use crate::codec::coder::{Coder, Flag};
-use crate::codec::ppm::hash_bytes;
+use crate::codec::hints::HintReader;
+use crate::codec::ppm::{PpmHint, hash_bytes};
 
 pub(super) enum StepState {
     Cat(Box<CatState>),
@@ -36,19 +37,19 @@ pub(super) struct ModelState {
     pub step_bits: Vec<f64>,
 }
 
-fn build_steps(plan: &Plan) -> Vec<StepState> {
+fn build_steps(plan: &Plan, hints: &mut HintReader) -> Vec<StepState> {
     let mut steps = Vec::new();
     let mut srcs = vec![0usize];
     for s in &plan.steps {
         steps.push(match &s.kind {
-            Kind::Cat => StepState::Cat(Box::new(CatState::new())),
+            Kind::Cat => StepState::Cat(Box::new(CatState::new(hints))),
             Kind::Str { recent, .. } => {
-                let st = StrState::new(*recent, srcs.clone());
+                let st = StrState::new(*recent, srcs.clone(), hints);
                 srcs.push(s.col);
                 StepState::Str(Box::new(st))
             }
-            Kind::Lid { .. } => StepState::Lid(Box::new(LidState::new())),
-            Kind::Num { .. } => StepState::Num(Box::new(NumState::new())),
+            Kind::Lid { .. } => StepState::Lid(Box::new(LidState::new(hints))),
+            Kind::Num { .. } => StepState::Num(Box::new(NumState::new(hints))),
         });
     }
     steps
@@ -68,13 +69,28 @@ fn step_is_irregular(step: &Step, row: &RowState) -> bool {
 }
 
 impl ModelState {
-    pub(super) fn new(plan: &Plan) -> ModelState {
+    pub(super) fn hints(&self, out: &mut Vec<PpmHint>) {
+        for step in &self.steps {
+            match step {
+                StepState::Cat(st) => st.hints(out),
+                StepState::Str(st) => st.hints(out),
+                StepState::Lid(st) => st.hints(out),
+                StepState::Num(st) => st.hints(out),
+            }
+        }
+        self.row_state.hints(out);
+        self.pos.hints(out);
+        self.cat_group.hints(out);
+        self.str_group.hints(out);
+    }
+
+    pub(super) fn new(plan: &Plan, hints: &mut HintReader) -> ModelState {
         ModelState {
-            steps: build_steps(plan),
-            row_state: RowState::new(plan.n_cols),
-            pos: PosModel::new(plan.pos_cols),
-            cat_group: CatGroup::new(&plan.steps, plan.cat_ctx),
-            str_group: StrGroup::new(&plan.steps),
+            steps: build_steps(plan, hints),
+            row_state: RowState::new(plan.n_cols, hints),
+            pos: PosModel::new(plan.pos_cols, hints),
+            cat_group: CatGroup::new(&plan.steps, plan.cat_ctx, hints),
+            str_group: StrGroup::new(&plan.steps, hints),
             row_flag: Flag::default(),
             bundle_cats: true,
             active: None,
