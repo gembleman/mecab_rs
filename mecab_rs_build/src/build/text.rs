@@ -113,48 +113,80 @@ fn find(buffer: &[u8], from: usize, to: usize, byte: u8) -> usize {
         .map_or(to, |offset| from + offset)
 }
 
+struct CsvField {
+    start: usize,
+    end: usize,
+    next: usize,
+}
+
+fn skip_blanks(buffer: &[u8], mut offset: usize) -> usize {
+    while buffer[offset] == b' ' || buffer[offset] == b'\t' {
+        offset += 1;
+    }
+    offset
+}
+
+fn unquote_in_place(buffer: &mut [u8], mut offset: usize, end_of_string: usize) -> (usize, usize) {
+    let mut written = offset;
+    while offset < end_of_string {
+        if buffer[offset] == b'"' {
+            offset += 1;
+            if buffer[offset] != b'"' {
+                break;
+            }
+        }
+        buffer[written] = buffer[offset];
+        written += 1;
+        offset += 1;
+    }
+    (offset, written)
+}
+
+fn read_quoted_field(buffer: &mut [u8], opening_quote: usize, end_of_string: usize) -> CsvField {
+    let start = opening_quote + 1;
+    let (scan, written) = unquote_in_place(buffer, start, end_of_string);
+    let next = find(buffer, scan, end_of_string, b',');
+    CsvField {
+        start,
+        end: written,
+        next,
+    }
+}
+
+fn read_plain_field(buffer: &[u8], start: usize, end_of_string: usize) -> CsvField {
+    let end = find(buffer, start, end_of_string, b',');
+    CsvField {
+        start,
+        end,
+        next: end,
+    }
+}
+
+fn read_field(buffer: &mut [u8], offset: usize, end_of_string: usize) -> CsvField {
+    if buffer[offset] == b'"' {
+        read_quoted_field(buffer, offset, end_of_string)
+    } else {
+        read_plain_field(buffer, offset, end_of_string)
+    }
+}
+
 pub(crate) fn tokenize_csv(buffer: &mut [u8], max_columns: usize) -> Vec<usize> {
     let end_of_string = strlen(buffer);
     let mut columns_left = max_columns;
     let mut columns = Vec::new();
     let mut offset = 0;
     while offset < end_of_string {
-        while buffer[offset] == b' ' || buffer[offset] == b'\t' {
-            offset += 1;
-        }
-        let start;
-        let end;
-        if buffer[offset] == b'"' {
-            offset += 1;
-            start = offset;
-            let mut written = start;
-            while offset < end_of_string {
-                if buffer[offset] == b'"' {
-                    offset += 1;
-                    if buffer[offset] != b'"' {
-                        break;
-                    }
-                }
-                buffer[written] = buffer[offset];
-                written += 1;
-                offset += 1;
-            }
-            offset = find(buffer, offset, end_of_string, b',');
-            end = written;
-        } else {
-            start = offset;
-            offset = find(buffer, offset, end_of_string, b',');
-            end = offset;
-        }
+        offset = skip_blanks(buffer, offset);
+        let field = read_field(buffer, offset, end_of_string);
         if columns_left > 1 {
-            buffer[end] = 0;
+            buffer[field.end] = 0;
         }
         columns_left -= 1;
-        columns.push(start);
+        columns.push(field.start);
         if columns_left == 0 {
             break;
         }
-        offset += 1;
+        offset = field.next + 1;
     }
     columns
 }

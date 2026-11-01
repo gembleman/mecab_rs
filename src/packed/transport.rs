@@ -19,6 +19,7 @@ const MAGIC: &[u8; 4] = b"MRDT";
 const VERSION: u32 = 3;
 const MAX_PAYLOAD: u64 = 256 << 20;
 const MAX_PARTS: usize = 64;
+const DIGEST_BYTES: usize = 8;
 
 pub use matrix::encode as matrix_part;
 
@@ -111,56 +112,102 @@ pub fn container(parts: &[Part]) -> Vec<u8> {
     out
 }
 
-pub(super) fn parse_container<'a>(payload: &'a [u8], path: &'a Path) -> Result<Parts<'a>, Error> {
+type PartSlice<'a> = (&'a str, u32, &'a [u8]);
+
+struct ContainerCursor<'a> {
+    path: &'a Path,
+    body: &'a [u8],
+    at: usize,
+}
+
+impl<'a> ContainerCursor<'a> {
+    fn take(&mut self, length: usize) -> Result<&'a [u8], Error> {
+        let end = self
+            .at
+            .checked_add(length)
+            .filter(|&end| end <= self.body.len())
+            .ok_or_else(|| Error::format(self.path, "the data ends early"))?;
+        let slice = &self.body[self.at..end];
+        self.at = end;
+        Ok(slice)
+    }
+
+    fn word(&mut self) -> Result<u32, Error> {
+        Ok(u32_at(self.take(4)?, 0))
+    }
+
+    fn length(&mut self) -> Result<usize, Error> {
+        let length = u64_at(self.take(8)?, 0);
+        usize::try_from(length).map_err(|_| Error::format(self.path, "a part is too long"))
+    }
+
+    fn name(&mut self) -> Result<&'a str, Error> {
+        let name_length = usize::from(self.take(1)?[0]);
+        str::from_utf8(self.take(name_length)?)
+            .map_err(|_| Error::format(self.path, "a part name is not valid UTF-8"))
+    }
+
+    fn expect_end(&self) -> Result<(), Error> {
+        if self.at == self.body.len() {
+            Ok(())
+        } else {
+            Err(Error::format(self.path, "the data has trailing bytes"))
+        }
+    }
+}
+
+fn split_digest<'a>(payload: &'a [u8], path: &Path) -> Result<&'a [u8], Error> {
     let body_length = payload
         .len()
-        .checked_sub(8)
+        .checked_sub(DIGEST_BYTES)
         .ok_or_else(|| Error::format(path, "the data is too short"))?;
     let (body, digest) = payload.split_at(body_length);
     if fnv1a64(body) != u64_at(digest, 0) {
         return Err(Error::format(path, "the FNV digest does not match"));
     }
-    let mut at = 0usize;
-    let mut take = |length: usize| -> Result<&'a [u8], Error> {
-        let end = at
-            .checked_add(length)
-            .filter(|&end| end <= body.len())
-            .ok_or_else(|| Error::format(path, "the data ends early"))?;
-        let slice = &body[at..end];
-        at = end;
-        Ok(slice)
-    };
-    let word = |bytes: &[u8]| u32_at(bytes, 0);
-    if take(4)? != MAGIC {
-        return Err(Error::format(path, "the magic is not valid"));
+    Ok(body)
+}
+
+fn read_part_count(cursor: &mut ContainerCursor) -> Result<usize, Error> {
+    if cursor.take(MAGIC.len())? != MAGIC {
+        return Err(Error::format(cursor.path, "the magic is not valid"));
     }
-    if word(take(4)?) != VERSION {
+    if cursor.word()? != VERSION {
         return Err(Error::format(
-            path,
+            cursor.path,
             "the transport format version is not supported; pack the dictionary again",
         ));
     }
-    let count = word(take(4)?) as usize;
+    let count = cursor.word()? as usize;
     if count > MAX_PARTS {
-        return Err(Error::format(path, "the part count is too large"));
+        return Err(Error::format(cursor.path, "the part count is too large"));
     }
-    let mut parts: Vec<(&str, u32, &[u8])> = Vec::new();
+    Ok(count)
+}
+
+fn read_part<'a>(
+    cursor: &mut ContainerCursor<'a>,
+    read: &[PartSlice<'a>],
+) -> Result<PartSlice<'a>, Error> {
+    let name = cursor.name()?;
+    let encoding = cursor.word()?;
+    let length = cursor.length()?;
+    if read.iter().any(|part| part.0 == name) {
+        return Err(Error::format(cursor.path, "a part is repeated"));
+    }
+    Ok((name, encoding, cursor.take(length)?))
+}
+
+pub(super) fn parse_container<'a>(payload: &'a [u8], path: &'a Path) -> Result<Parts<'a>, Error> {
+    let body = split_digest(payload, path)?;
+    let mut cursor = ContainerCursor { path, body, at: 0 };
+    let count = read_part_count(&mut cursor)?;
+    let mut parts: Vec<PartSlice<'a>> = Vec::new();
     for _ in 0..count {
-        let name_length = usize::from(take(1)?[0]);
-        let name = str::from_utf8(take(name_length)?)
-            .map_err(|_| Error::format(path, "a part name is not valid UTF-8"))?;
-        let encoding = word(take(4)?);
-        let length = u64_at(take(8)?, 0);
-        let length =
-            usize::try_from(length).map_err(|_| Error::format(path, "a part is too long"))?;
-        if parts.iter().any(|part| part.0 == name) {
-            return Err(Error::format(path, "a part is repeated"));
-        }
-        parts.push((name, encoding, take(length)?));
+        let part = read_part(&mut cursor, &parts)?;
+        parts.push(part);
     }
-    if at != body.len() {
-        return Err(Error::format(path, "the data has trailing bytes"));
-    }
+    cursor.expect_end()?;
     Ok(Parts { path, parts })
 }
 

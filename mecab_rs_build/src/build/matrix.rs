@@ -76,63 +76,76 @@ fn next_field<'a>(line: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
     (*cursor > start).then(|| &line[start..*cursor])
 }
 
+fn open_matrix_def(matrix_def: &Path) -> Result<Lines, Error> {
+    if matrix_def.is_file() {
+        return Lines::open(matrix_def, Some(LINE_BUFFER_BYTES));
+    }
+    eprintln!(
+        "{} is not found. minimum setting is used.",
+        matrix_def.display()
+    );
+    Ok(Lines::builtin(
+        MATRIX_DEF_DEFAULT,
+        matrix_def,
+        Some(LINE_BUFFER_BYTES),
+    ))
+}
+
+fn read_triple(line: &[u8]) -> Option<[i32; FIELDS_PER_LINE]> {
+    let mut cursor = 0;
+    let mut numbers = [0i32; FIELDS_PER_LINE];
+    for number in &mut numbers {
+        *number = atoi(next_field(line, &mut cursor)?);
+    }
+    Some(numbers)
+}
+
+fn cell_index(left: i32, right: i32, size: MatrixSize) -> Option<usize> {
+    let within = |value: i32, bound: usize| value >= 0 && (value as usize) < bound;
+    (within(left, size.left) && within(right, size.right))
+        .then(|| left as usize + size.left * right as usize)
+}
+
+fn parse_entry(line: &[u8], at: Position, size: MatrixSize) -> Result<(usize, i16), Error> {
+    let Some([left, right, cost]) = read_triple(line) else {
+        let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
+        return Err(at.build(format!("format error: {shown}")));
+    };
+    let index =
+        cell_index(left, right, size).ok_or_else(|| at.build("index values are out of range"))?;
+    let cost = i16::try_from(cost)
+        .map_err(|_| at.build(format!("cost out of the 16-bit range: {cost}")))?;
+    Ok((index, cost))
+}
+
+fn write_matrix(output: &mut dyn Write, size: MatrixSize, matrix: &[i16]) -> io::Result<()> {
+    output.write_all(&(size.left as u16).to_le_bytes())?;
+    output.write_all(&(size.right as u16).to_le_bytes())?;
+    let mut bytes = Vec::with_capacity(WRITE_CHUNK_CELLS * MATRIX_COST_BYTES);
+    for chunk in matrix.chunks(WRITE_CHUNK_CELLS) {
+        bytes.clear();
+        for cell in chunk {
+            bytes.extend_from_slice(&cell.to_le_bytes());
+        }
+        output.write_all(&bytes)?;
+    }
+    Ok(())
+}
+
 pub(super) fn compile(
     matrix_def: &Path,
     output_path: &Path,
     output: &mut impl Write,
 ) -> Result<(), Error> {
-    let mut lines = if matrix_def.is_file() {
-        Lines::open(matrix_def, Some(LINE_BUFFER_BYTES))?
-    } else {
-        eprintln!(
-            "{} is not found. minimum setting is used.",
-            matrix_def.display()
-        );
-        Lines::builtin(MATRIX_DEF_DEFAULT, matrix_def, Some(LINE_BUFFER_BYTES))
-    };
+    let mut lines = open_matrix_def(matrix_def)?;
     let declared = size_of_first_line(&mut lines, matrix_def)?
         .ok_or_else(|| build_error(matrix_def, "format error: "))?;
-    let left_size = declared.left;
-    let right_size = declared.right;
-    let mut matrix = vec![0i16; left_size * right_size];
+    let mut matrix = vec![0i16; declared.left * declared.right];
 
     while let Some((number, line)) = lines.next_line()? {
-        let at = Position::new(matrix_def, number);
-        let mut cursor = 0;
-        let mut numbers = [0i32; FIELDS_PER_LINE];
-        let mut count = 0;
-        while count < FIELDS_PER_LINE {
-            let Some(found) = next_field(line, &mut cursor) else {
-                break;
-            };
-            numbers[count] = atoi(found);
-            count += 1;
-        }
-        if count != FIELDS_PER_LINE {
-            let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();
-            return Err(at.build(format!("format error: {shown}")));
-        }
-        let [left, right, cost] = numbers;
-        if left < 0 || right < 0 || left as usize >= left_size || right as usize >= right_size {
-            return Err(at.build("index values are out of range"));
-        }
-        let cost = i16::try_from(cost)
-            .map_err(|_| at.build(format!("cost out of the 16-bit range: {cost}")))?;
-        matrix[left as usize + left_size * right as usize] = cost;
+        let (index, cost) = parse_entry(line, Position::new(matrix_def, number), declared)?;
+        matrix[index] = cost;
     }
 
-    let write = |output: &mut dyn Write| -> io::Result<()> {
-        output.write_all(&(left_size as u16).to_le_bytes())?;
-        output.write_all(&(right_size as u16).to_le_bytes())?;
-        let mut bytes = Vec::with_capacity(WRITE_CHUNK_CELLS * MATRIX_COST_BYTES);
-        for chunk in matrix.chunks(WRITE_CHUNK_CELLS) {
-            bytes.clear();
-            for cell in chunk {
-                bytes.extend_from_slice(&cell.to_le_bytes());
-            }
-            output.write_all(&bytes)?;
-        }
-        Ok(())
-    };
-    write(output).map_err(io_error(IoAction::Write, output_path))
+    write_matrix(output, declared, &matrix).map_err(io_error(IoAction::Write, output_path))
 }

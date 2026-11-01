@@ -1,23 +1,24 @@
-use std::fmt;
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::clusters::{
-    ClusterPlan, ClusterShape, fill_cells, interleaved_ids, left_ids, plan_clusters, right_ids,
-    write_cluster_layout,
-};
 use crate::dict_files::MATRIX_ITP_FILE;
-use crate::error::{Error, Undecodable};
-use crate::hot_shape::{CELL_SUM_BOUND, HotShape, MAX_KEYS};
-#[cfg(feature = "xz")]
-use crate::int_runtime::runtime_form_from;
-use crate::part::{IntPart, PartSlices, RowScratch, total_of};
+use crate::error::Error;
+use crate::hot_shape::{HotShape, MAX_KEYS};
+use crate::part::{IntPart, PartSlices, total_of};
 use crate::templates::{TemplateReader, write_array};
 
+mod cluster;
 mod mapped;
+#[cfg(feature = "xz")]
+mod runtime;
+mod validation;
+mod view;
 
+pub(crate) use cluster::RuntimeInputs;
 pub use mapped::MappedIntTemplates;
+
+use cluster::{cluster_data, cluster_plans, write_clusters};
+use validation::{validate, validate_exception_cells, validate_exception_lengths};
 
 pub(crate) const MAGIC: &[u8; 4] = b"MXIT";
 const VERSION: u32 = 1;
@@ -139,173 +140,10 @@ impl TemplateHeader {
     }
 }
 
-fn max_weight(part: &PartSlices<i32>) -> u64 {
-    part.weight
-        .iter()
-        .map(|weight| u64::from(weight.unsigned_abs()))
-        .max()
-        .unwrap_or(0)
-}
-
-fn is_valid_part(part: &PartSlices<i32>, left_size: usize, right_size: usize) -> bool {
-    part.has_sizes(left_size, right_size) && part.is_consistent() && part.has_sorted_spans()
-}
-
 fn exception_of(cells: &[u32], values: &[i16], cell: usize) -> Option<i16> {
     let found = cells.binary_search(&u32::try_from(cell).ok()?).ok()?;
     Some(values[found])
 }
-
-fn validate<'a>(
-    parts: impl Iterator<Item = PartSlices<'a, i32>>,
-    cost_factor: u32,
-    shift: u32,
-    left_size: usize,
-    right_size: usize,
-    exception_cells: &[u32],
-) -> Result<(), Undecodable> {
-    let corrupt = Undecodable("the integer templates are inconsistent");
-    if left_size == 0 || right_size == 0 || left_size > MAX_KEYS || right_size > MAX_KEYS {
-        return Err(Undecodable("the template matrix size is out of range"));
-    }
-    if shift > MAX_SHIFT || cost_factor > MAX_COST_FACTOR {
-        return Err(corrupt);
-    }
-    let mut magnitude = 0u64;
-    for part in parts {
-        if !is_valid_part(&part, left_size, right_size) {
-            return Err(corrupt);
-        }
-        magnitude += max_weight(&part);
-    }
-    if u128::from(magnitude) * u128::from(cost_factor) >= CELL_SUM_BOUND {
-        return Err(corrupt);
-    }
-    validate_exception_cells(exception_cells, left_size, right_size)
-}
-
-fn validate_exception_cells(
-    exception_cells: &[u32],
-    left_size: usize,
-    right_size: usize,
-) -> Result<(), Undecodable> {
-    let cells = left_size * right_size;
-    let sorted = exception_cells.windows(2).all(|pair| pair[0] < pair[1]);
-    let inside = exception_cells
-        .last()
-        .is_none_or(|&last| (last as usize) < cells);
-    if sorted && inside {
-        Ok(())
-    } else {
-        Err(Undecodable("the integer templates are inconsistent"))
-    }
-}
-
-fn validate_exception_lengths(cells: &[u32], values: &[i16]) -> Result<(), Undecodable> {
-    if cells.len() == values.len() {
-        Ok(())
-    } else {
-        Err(Undecodable("the integer templates are inconsistent"))
-    }
-}
-
-impl fmt::Debug for IntView<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("IntView")
-            .field("cost_factor", &self.cost_factor)
-            .field("shift", &self.shift)
-            .field("left_size", &self.left_size)
-            .field("right_size", &self.right_size)
-            .field("parts", &self.parts.len())
-            .finish_non_exhaustive()
-    }
-}
-
-pub struct IntView<'a> {
-    pub(crate) cost_factor: u32,
-    pub(crate) shift: u32,
-    pub(crate) left_size: usize,
-    pub(crate) right_size: usize,
-    parts: Vec<PartSlices<'a, i32>>,
-    exception_cells: &'a [u32],
-    exception_values: &'a [i16],
-}
-
-impl IntView<'_> {
-    pub fn render_computed_row(&self, row: usize, scratch: &mut IntRowScratch, out: &mut [i16]) {
-        scratch
-            .0
-            .fill_row_sums(self.parts.iter().copied(), row, self.left_size);
-        for (cost, &sum) in out.iter_mut().zip(&scratch.0.sums) {
-            *cost = int_cost(sum, self.cost_factor, self.shift);
-        }
-    }
-
-    pub(crate) fn render_row(&self, row: usize, scratch: &mut IntRowScratch, out: &mut [i16]) {
-        self.render_computed_row(row, scratch, out);
-        let first = row * self.left_size;
-        let begin = self
-            .exception_cells
-            .partition_point(|&cell| (cell as usize) < first);
-        let end = self
-            .exception_cells
-            .partition_point(|&cell| (cell as usize) < first + self.left_size);
-        for (&cell, &value) in self.exception_cells[begin..end]
-            .iter()
-            .zip(&self.exception_values[begin..end])
-        {
-            out[cell as usize - first] = value;
-        }
-    }
-
-    pub fn scratch(&self) -> IntRowScratch {
-        IntRowScratch(RowScratch::new(self.parts.iter().copied(), self.left_size))
-    }
-
-    pub(crate) fn write_hot_matrix(
-        &self,
-        shape: &HotShape,
-        threads: usize,
-        output: &mut impl Write,
-    ) -> io::Result<()> {
-        shape.write_matrix_in_order(
-            self.left_size,
-            self.right_size,
-            threads,
-            output,
-            || (self.scratch(), vec![0i16; self.left_size]),
-            |(scratch, row_costs), rows| {
-                let mut bytes = vec![0u8; shape.rows_bytes(rows.clone())];
-                let mut unwritten = bytes.as_mut_slice();
-                for row in rows {
-                    let length = shape.row_length(row);
-                    if length == 0 {
-                        continue;
-                    }
-                    self.render_row(row, scratch, row_costs);
-                    let (written, rest) = unwritten.split_at_mut(length * size_of::<i16>());
-                    unwritten = rest;
-                    let cells = written.as_chunks_mut::<2>().0.iter_mut();
-                    for (cell, cost) in cells.zip(&row_costs[..length]) {
-                        *cell = cost.to_le_bytes();
-                    }
-                }
-                bytes
-            },
-        )
-    }
-}
-
-impl fmt::Debug for IntRowScratch {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("IntRowScratch")
-            .finish_non_exhaustive()
-    }
-}
-
-pub struct IntRowScratch(RowScratch<i32>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntTemplates {
@@ -459,18 +297,6 @@ impl IntTemplates {
             .unwrap_or_else(|| self.computed_cost(left_node_rc, right_node_lc))
     }
 
-    pub fn view(&self) -> IntView<'_> {
-        IntView {
-            cost_factor: self.cost_factor,
-            shift: self.shift,
-            left_size: self.left_size,
-            right_size: self.right_size,
-            parts: self.parts.iter().map(IntPart::slices).collect(),
-            exception_cells: &self.exception_cells,
-            exception_values: &self.exception_values,
-        }
-    }
-
     pub fn write_hot_matrix(
         &self,
         shape: &HotShape,
@@ -516,127 +342,4 @@ impl IntTemplates {
         let data = cluster_data(&slices, &plans, self.left_size, self.right_size, threads)?;
         write_clusters(&data, output)
     }
-
-    #[cfg(feature = "xz")]
-    pub(crate) fn runtime_form(
-        &self,
-        shape: &HotShape,
-        cluster_count: usize,
-        threads: usize,
-    ) -> Result<Vec<u8>, Error> {
-        let slices: Vec<PartSlices<i32>> = self.parts.iter().map(IntPart::slices).collect();
-        let plans = cluster_plans(&slices, cluster_count);
-        let data = cluster_data(&slices, &plans, self.left_size, self.right_size, threads)
-            .map_err(|_| Error::Unsupported("a cluster sum that does not fit an i32"))?;
-        let inputs = RuntimeInputs {
-            cost_factor: self.cost_factor,
-            shift: self.shift,
-            left_size: self.left_size,
-            right_size: self.right_size,
-            shapes: &data.shapes,
-            left_keys: &data.left_keys,
-            right_keys: &data.right_keys,
-            tables: &data.tables,
-            exception_cells: &self.exception_cells,
-            exception_values: &self.exception_values,
-        };
-        runtime_form_from(&inputs, shape)
-    }
-}
-
-fn cluster_plans(slices: &[PartSlices<i32>], cluster_count: usize) -> Vec<ClusterPlan> {
-    if cluster_count == 0 {
-        return Vec::new();
-    }
-    plan_clusters(slices, cluster_count)
-}
-
-fn fill_int_table(
-    plan: &ClusterPlan,
-    parts: &[PartSlices<i32>],
-    threads: usize,
-    table: &mut [i32],
-) -> io::Result<()> {
-    let overflow = AtomicBool::new(false);
-    fill_cells(plan, threads, table, |left, right| {
-        let total = total_of(plan.parts.iter().map(|&p| parts[p]), left, right);
-        i32::try_from(total).unwrap_or_else(|_| {
-            overflow.store(true, Ordering::Relaxed);
-            0
-        })
-    });
-    if overflow.into_inner() {
-        return Err(io::Error::other(
-            "a cluster sum does not fit an i32; use a coarser grid or more clusters",
-        ));
-    }
-    Ok(())
-}
-
-struct ClusterData {
-    shapes: Vec<ClusterShape>,
-    left_keys: Vec<u16>,
-    right_keys: Vec<u16>,
-    tables: Vec<i32>,
-}
-
-fn cluster_data(
-    parts: &[PartSlices<i32>],
-    plans: &[ClusterPlan],
-    left_size: usize,
-    right_size: usize,
-    threads: usize,
-) -> io::Result<ClusterData> {
-    let mut table_start = 0;
-    let shapes = plans
-        .iter()
-        .map(|plan| {
-            let shape = ClusterShape {
-                table_start,
-                left_keys: plan.left_keys,
-                right_keys: plan.right_keys,
-            };
-            table_start += plan.cells();
-            shape
-        })
-        .collect();
-    let mut tables = vec![0i32; table_start];
-    let mut unfilled = tables.as_mut_slice();
-    for plan in plans {
-        let (table, rest) = unfilled.split_at_mut(plan.cells());
-        fill_int_table(plan, parts, threads, table)?;
-        unfilled = rest;
-    }
-    Ok(ClusterData {
-        shapes,
-        left_keys: interleaved_ids(plans, left_size, left_ids),
-        right_keys: interleaved_ids(plans, right_size, right_ids),
-        tables,
-    })
-}
-
-fn write_clusters(data: &ClusterData, output: &mut impl Write) -> io::Result<()> {
-    write_cluster_layout(
-        output,
-        data.shapes
-            .iter()
-            .map(|shape| (shape.left_keys, shape.right_keys)),
-        &data.left_keys,
-        &data.right_keys,
-        data.tables.len(),
-    )?;
-    write_array(output, &data.tables, i32::to_le_bytes)
-}
-
-pub(crate) struct RuntimeInputs<'a> {
-    pub(crate) cost_factor: u32,
-    pub(crate) shift: u32,
-    pub(crate) left_size: usize,
-    pub(crate) right_size: usize,
-    pub(crate) shapes: &'a [ClusterShape],
-    pub(crate) left_keys: &'a [u16],
-    pub(crate) right_keys: &'a [u16],
-    pub(crate) tables: &'a [i32],
-    pub(crate) exception_cells: &'a [u32],
-    pub(crate) exception_values: &'a [i16],
 }

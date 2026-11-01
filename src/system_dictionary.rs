@@ -3,13 +3,17 @@ use std::fs::File;
 use std::io;
 use std::ops::Range;
 use std::path::Path;
-use std::thread;
 
 use crate::error::{Error, IoAction, io_error};
 use crate::mapped_file::MappedFile;
 use crate::section::{Plain, Section};
 use crate::utf8::is_continuation;
-use crate::wire::u32_at;
+
+mod check;
+mod header;
+
+use check::{Checked, check_last_feature_byte};
+use header::Header;
 
 pub const MAGIC_ID: u32 = 0xEF71_8F77;
 pub const DIC_VERSION: u32 = 102;
@@ -109,60 +113,6 @@ const _: () = assert!(size_of::<RawToken>() == TOKEN_SIZE);
 
 unsafe impl Plain for RawToken {}
 
-struct Header {
-    left_size: usize,
-    right_size: usize,
-    array_end: usize,
-    tokens_end: usize,
-    features_end: usize,
-}
-
-impl Header {
-    fn parse(bytes: &[u8], kind: DictionaryKind, path: &Path) -> Result<Self, Error> {
-        let broken = |reason| Error::format(path, reason);
-        if bytes.len() < HEADER_SIZE
-            || (u32_at(bytes, 0) ^ MAGIC_ID) as usize != bytes.len()
-            || u32_at(bytes, VERSION_AT) != DIC_VERSION
-        {
-            return Err(broken("the header, magic number or version is not valid"));
-        }
-        if u32_at(bytes, KIND_AT) != kind as u32 {
-            return Err(broken("the dictionary type is not the expected one"));
-        }
-        if !is_utf8_charset(charset_name(bytes)) {
-            return Err(Error::Unsupported("a dictionary charset other than UTF-8"));
-        }
-        let ends = section_ends(bytes);
-        let Some((array_end, tokens_end, features_end)) = ends.filter(|ends| ends.2 == bytes.len())
-        else {
-            return Err(broken("the section sizes do not add up to the file size"));
-        };
-        Ok(Self {
-            left_size: u32_at(bytes, LEFT_SIZE_AT) as usize,
-            right_size: u32_at(bytes, RIGHT_SIZE_AT) as usize,
-            array_end,
-            tokens_end,
-            features_end,
-        })
-    }
-}
-
-fn check_last_feature_byte(file: &File, header: &Header, path: &Path) -> Result<(), Error> {
-    if header.features_end <= header.tokens_end {
-        return Ok(());
-    }
-    let mut last_feature_byte = [0];
-    read_exact_at(file, &mut last_feature_byte, header.features_end as u64 - 1)
-        .map_err(io_error(IoAction::Read, path))?;
-    if last_feature_byte[0] != 0 {
-        return Err(Error::format(
-            path,
-            "the features do not end with a NUL byte",
-        ));
-    }
-    Ok(())
-}
-
 impl fmt::Debug for SystemDictionary {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -198,28 +148,22 @@ impl SystemDictionary {
         let broken = |reason| Error::format(path, reason);
         let bytes = &map[..];
         let header = Header::parse(bytes, kind, path)?;
-        let cells = Section::new(bytes, HEADER_SIZE..header.array_end)
+        let cells = Section::new(bytes, header.cells())
             .ok_or_else(|| broken("the double array is misaligned"))?;
-        let tokens = Section::new(bytes, header.array_end..header.tokens_end)
+        let tokens = Section::new(bytes, header.tokens())
             .ok_or_else(|| broken("the token table is misaligned"))?;
         check_last_feature_byte(map.file(), &header, path)?;
-        let checked = Checked {
-            file: map.file(),
-            cells: HEADER_SIZE..header.array_end,
-            tokens: header.array_end..header.tokens_end,
-            features: header.tokens_end..header.features_end,
-            left_size: header.left_size,
-            right_size: header.right_size,
-            read_block_bytes: read_block_bytes.max(1),
-        };
-        checked.run().map_err(&io_error)?.map_err(broken)?;
+        Checked::new(map.file(), &header, read_block_bytes)
+            .run()
+            .map_err(&io_error)?
+            .map_err(broken)?;
         Ok(Self {
             map,
             left_size: header.left_size,
             right_size: header.right_size,
             cells,
             tokens,
-            features: header.tokens_end..header.features_end,
+            features: header.features(),
         })
     }
 
@@ -287,19 +231,8 @@ impl SystemDictionary {
     }
 }
 
-const PARALLEL_MIN_BYTES: usize = 1 << 22;
-const MAX_CHECK_THREADS: usize = 8;
 pub(crate) const CHECK_BLOCK_BYTES: usize = 1 << 18;
 pub(crate) const CELL_SIZE: usize = 8;
-
-fn section_ends(bytes: &[u8]) -> Option<(usize, usize, usize)> {
-    let end_after =
-        |start: usize, size_at: usize| start.checked_add(u32_at(bytes, size_at) as usize);
-    let array_end = end_after(HEADER_SIZE, ARRAY_BYTES_AT)?;
-    let tokens_end = end_after(array_end, TOKEN_BYTES_AT)?;
-    let features_end = end_after(tokens_end, FEATURE_BYTES_AT)?;
-    Some((array_end, tokens_end, features_end))
-}
 
 fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
     while !buf.is_empty() {
@@ -314,233 +247,6 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result
         offset += count as u64;
     }
     Ok(())
-}
-
-struct Checked<'a> {
-    file: &'a File,
-    cells: Range<usize>,
-    tokens: Range<usize>,
-    features: Range<usize>,
-    left_size: usize,
-    right_size: usize,
-    read_block_bytes: usize,
-}
-
-impl Checked<'_> {
-    fn run(&self) -> io::Result<Result<(), &'static str>> {
-        let threads = if self.features.len() < PARALLEL_MIN_BYTES {
-            1
-        } else {
-            thread::available_parallelism().map_or(1, |count| count.get().min(MAX_CHECK_THREADS))
-        };
-        let (tokens, cells) = in_parallel(
-            threads,
-            |part| self.tokens_part(part, threads),
-            |part| self.terminals_part(part, threads),
-        );
-        let mut offsets = Vec::new();
-        let mut contexts_in_range = true;
-        for result in tokens {
-            let (valid, part) = result?;
-            contexts_in_range &= valid;
-            offsets.extend(part);
-        }
-        let mut terminals_in_token_table = true;
-        for result in cells {
-            terminals_in_token_table &= result?;
-        }
-        offsets.sort_unstable();
-        offsets.dedup();
-        contexts_in_range &= offsets
-            .last()
-            .is_none_or(|&last| (last as usize) < self.features.len());
-        let (features, _) = in_parallel(
-            threads,
-            |part| self.features_part(part, threads, &offsets),
-            |_| (),
-        );
-        let mut features_are_utf8 = true;
-        for result in features {
-            let (valid, boundaries) = result?;
-            features_are_utf8 &= valid;
-            contexts_in_range &= boundaries;
-        }
-        if !features_are_utf8 {
-            return Ok(Err("the features are not valid UTF-8"));
-        }
-        if !contexts_in_range {
-            return Ok(Err(
-                "a token context id is out of range or a feature offset is not at a character boundary",
-            ));
-        }
-        if !terminals_in_token_table {
-            return Ok(Err(OUTSIDE_TOKEN_TABLE));
-        }
-        Ok(Ok(()))
-    }
-
-    fn each_block(
-        &self,
-        section: usize,
-        size: usize,
-        range: Range<usize>,
-        mut check: impl FnMut(usize, &[u8]) -> bool,
-    ) -> io::Result<bool> {
-        let file = self.file;
-        let per_block = (self.read_block_bytes / size).max(1);
-        let mut buf = vec![0; per_block.min(range.len()) * size];
-        let mut index = range.start;
-        while index < range.end {
-            let count = per_block.min(range.end - index);
-            let bytes = &mut buf[..count * size];
-            read_exact_at(file, bytes, (section + index * size) as u64)?;
-            if !check(index, bytes) {
-                return Ok(false);
-            }
-            index += count;
-        }
-        Ok(true)
-    }
-
-    fn tokens_part(&self, part: usize, parts: usize) -> io::Result<(bool, Vec<u32>)> {
-        let range = part_of(self.tokens.len() / TOKEN_SIZE, part, parts);
-        let mut offsets = Vec::with_capacity(range.len());
-        let valid = self.each_block(self.tokens.start, TOKEN_SIZE, range, |_, bytes| {
-            bytes.as_chunks::<TOKEN_SIZE>().0.iter().all(|raw| {
-                let token = RawToken {
-                    word: u32_at(raw, 0),
-                    costs: u32_at(raw, 4),
-                    feature: u32_at(raw, 8),
-                    reserved: 0,
-                }
-                .record();
-                offsets.push(token.feature);
-                usize::from(token.left_id) < self.right_size
-                    && usize::from(token.right_id) < self.left_size
-            })
-        })?;
-        Ok((valid, offsets))
-    }
-
-    fn terminals_part(&self, part: usize, parts: usize) -> io::Result<bool> {
-        let token_count = self.tokens.len() / TOKEN_SIZE;
-        let range = part_of(self.cells.len() / CELL_SIZE, part, parts);
-        self.each_block(self.cells.start, CELL_SIZE, range, |first, bytes| {
-            bytes
-                .as_chunks::<CELL_SIZE>()
-                .0
-                .iter()
-                .enumerate()
-                .all(|(offset, cell)| {
-                    let value = u32_at(cell, 0).cast_signed();
-                    let check = u32_at(cell, 4) as usize;
-                    let is_terminal = value < 0 && check == first + offset;
-                    let hit_value = !value;
-                    !is_terminal || PrefixHit::new(hit_value, 0).tokens().end <= token_count
-                })
-        })
-    }
-
-    fn after_nul(&self, file: &File, from: usize) -> io::Result<usize> {
-        let length = self.features.len();
-        let mut buf = vec![0; self.read_block_bytes.min(length - from)];
-        let mut at = from;
-        while at < length {
-            let count = buf.len().min(length - at);
-            read_exact_at(file, &mut buf[..count], (self.features.start + at) as u64)?;
-            if let Some(nul) = buf[..count].iter().position(|&byte| byte == 0) {
-                return Ok(at + nul + 1);
-            }
-            at += count;
-        }
-        Ok(length)
-    }
-
-    fn features_part(
-        &self,
-        part: usize,
-        parts: usize,
-        offsets: &[u32],
-    ) -> io::Result<(bool, bool)> {
-        let file = self.file;
-        let length = self.features.len();
-        let start = match part {
-            0 => 0,
-            _ => self.after_nul(file, length / parts * part)?,
-        };
-        let end = if part + 1 == parts {
-            length
-        } else {
-            self.after_nul(file, length / parts * (part + 1))?
-        };
-        let offsets = &offsets[offsets.partition_point(|&offset| (offset as usize) < start)..];
-        let offsets = &offsets[..offsets.partition_point(|&offset| (offset as usize) < end)];
-        let mut next = offsets.iter().peekable();
-        let (mut features_are_utf8, mut boundaries) = (true, true);
-        let mut buf = Vec::new();
-        let mut position = start;
-        while position < end {
-            let count = self.read_block_bytes.min(end - position);
-            let buf_start = position - buf.len();
-            let old = buf.len();
-            buf.resize(old + count, 0);
-            read_exact_at(
-                file,
-                &mut buf[old..],
-                (self.features.start + position) as u64,
-            )?;
-            position += count;
-            while let Some(&&offset) = next.peek()
-                && (offset as usize) < position
-            {
-                boundaries &= !is_continuation(buf[offset as usize - buf_start]);
-                next.next();
-            }
-            let complete = buf
-                .iter()
-                .rposition(|&byte| byte == 0)
-                .map_or(0, |at| at + 1);
-            features_are_utf8 &= str::from_utf8(&buf[..complete]).is_ok();
-            buf.drain(..complete);
-            if !features_are_utf8 || !boundaries {
-                return Ok((features_are_utf8, boundaries));
-            }
-        }
-        features_are_utf8 &= str::from_utf8(&buf).is_ok();
-        Ok((features_are_utf8, boundaries))
-    }
-}
-
-fn part_of(count: usize, part: usize, parts: usize) -> Range<usize> {
-    let chunk = count.div_ceil(parts).max(1);
-    (part * chunk).min(count)..((part + 1) * chunk).min(count)
-}
-
-fn join<T>(handle: thread::ScopedJoinHandle<T>) -> T {
-    handle.join().expect("a check thread panicked")
-}
-
-fn in_parallel<A: Send, B: Send>(
-    threads: usize,
-    first: impl Fn(usize) -> A + Sync,
-    second: impl Fn(usize) -> B + Sync,
-) -> (Vec<A>, Vec<B>) {
-    if threads == 1 {
-        return (vec![first(0)], vec![second(0)]);
-    }
-    thread::scope(|scope| {
-        let (first, second) = (&first, &second);
-        let firsts: Vec<_> = (0..threads)
-            .map(|part| scope.spawn(move || first(part)))
-            .collect();
-        let seconds: Vec<_> = (0..threads)
-            .map(|part| scope.spawn(move || second(part)))
-            .collect();
-        (
-            firsts.into_iter().map(join).collect(),
-            seconds.into_iter().map(join).collect(),
-        )
-    })
 }
 
 fn cell(cells: &[[u32; 2]], index: i64) -> Option<(i32, u32)> {

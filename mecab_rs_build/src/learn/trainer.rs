@@ -1,18 +1,19 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use self::optimizer::Optimizer;
 use super::features::{FeatureIndex, Features, remap_weights};
-use super::lattice::{EvalSizes, Reader, Sentence, Tally};
-use super::lbfgs::Lbfgs;
+use super::lattice::{EvalSizes, Reader, Sentence};
 use super::tokenizer::Tokenizer;
 use super::{Config, Existing, LineEnding, format_g, open_lines};
 use crate::tool_error::learn_error;
 use mecab_rs::__private::files::DICRC_FILE;
 use mecab_rs::Error;
 
+mod optimizer;
+
 const MAX_THREADS: usize = 512;
 const PROGRESS_INTERVAL: usize = 100;
-const CONVERGED_ITERATIONS: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct TrainOptions {
@@ -44,30 +45,209 @@ pub struct TrainReport {
     pub sentences: usize,
 }
 
-#[derive(Default)]
-struct Partial {
-    expected: Vec<f64>,
-    objective: f64,
-    errors: usize,
-    tally: Tally,
+struct TrainSettings {
+    cost: f64,
+    eta: f64,
+    eval_size: usize,
+    unk_eval_size: usize,
+    threads: usize,
+    freq: usize,
 }
 
-struct Shared<'a> {
-    pool: &'a [i32],
-    alpha: &'a [f64],
-    features: &'a Features,
-    sizes: EvalSizes,
-}
-
-fn run_group(group: &mut [Sentence], shared: &Shared, partial: &mut Partial) {
-    partial.tally = Tally::default();
-    partial.errors = 0;
-    partial.objective = 0.0;
-    partial.expected.fill(0.0);
-    for sentence in group {
-        partial.objective += sentence.gradient(shared.pool, shared.alpha, &mut partial.expected);
-        partial.errors += sentence.eval(shared.features, shared.sizes, &mut partial.tally);
+impl TrainSettings {
+    fn read(config: &Config) -> Self {
+        Self {
+            cost: config.number("cost"),
+            eta: config.number("eta"),
+            eval_size: config.number("eval-size"),
+            unk_eval_size: config.number("unk-eval-size"),
+            threads: config.number("thread"),
+            freq: config.number("freq"),
+        }
     }
+
+    fn sizes(&self) -> EvalSizes {
+        EvalSizes {
+            eval_size: self.eval_size,
+            unk_eval_size: self.unk_eval_size,
+        }
+    }
+
+    fn validate(&self, dic_dir: &Path) -> Result<(), Error> {
+        self.check_cost(dic_dir)?;
+        self.check_eta(dic_dir)?;
+        self.check_counts(dic_dir)?;
+        self.check_threads(dic_dir)
+    }
+
+    fn check_cost(&self, dic_dir: &Path) -> Result<(), Error> {
+        if self.cost.is_nan() || self.cost <= 0.0 {
+            return Err(learn_error(
+                dic_dir,
+                format!("cost parameter is out of range: {}", format_g(self.cost)),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_eta(&self, dic_dir: &Path) -> Result<(), Error> {
+        if self.eta.is_nan() || self.eta <= 0.0 {
+            return Err(learn_error(
+                dic_dir,
+                format!("eta is out of range: {}", format_g(self.eta)),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_counts(&self, dic_dir: &Path) -> Result<(), Error> {
+        if self.eval_size == 0 {
+            return Err(learn_error(dic_dir, "eval-size is out of range: 0"));
+        }
+        if self.unk_eval_size == 0 {
+            return Err(learn_error(dic_dir, "unk-eval-size is out of range: 0"));
+        }
+        if self.freq == 0 {
+            return Err(learn_error(
+                dic_dir,
+                format!("freq is out of range: {}", self.freq),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_threads(&self, dic_dir: &Path) -> Result<(), Error> {
+        if self.threads == 0 || self.threads > MAX_THREADS {
+            return Err(learn_error(
+                dic_dir,
+                format!("# thread is invalid: {}", self.threads),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn load_config(options: &TrainOptions) -> Result<Config, Error> {
+    let mut config = Config::default();
+    config.set("cost", &options.cost.to_string(), Existing::Replace);
+    config.set("eta", &options.eta.to_string(), Existing::Replace);
+    config.set("freq", &options.freq.to_string(), Existing::Replace);
+    config.set("thread", &options.threads.to_string(), Existing::Replace);
+    config.load(&options.dic_dir.join(DICRC_FILE))?;
+    Ok(config)
+}
+
+fn load_previous_model(
+    options: &TrainOptions,
+    index: &mut FeatureIndex,
+    charset: &str,
+    config: &mut Config,
+    log: &mut dyn Write,
+) -> Result<Vec<f64>, Error> {
+    let Some(old_model) = &options.old_model else {
+        return Ok(Vec::new());
+    };
+    let _ = writeln!(log, "Using previous model: {}", old_model.display());
+    let _ = writeln!(log, "--cost --freq and --eta options are overwritten.");
+    let (alpha, settings) = index.reopen(old_model, charset)?;
+    for (key, value) in settings {
+        config.set(&key, &value, Existing::Replace);
+    }
+    Ok(alpha)
+}
+
+fn log_virtual_feature(log: &mut dyn Write, feature: &[u8]) {
+    let _ = writeln!(
+        log,
+        "adding virtual node: {}",
+        String::from_utf8_lossy(feature)
+    );
+}
+
+fn log_sentence_progress(log: &mut dyn Write, count: usize) {
+    if count.is_multiple_of(PROGRESS_INTERVAL) {
+        let _ = write!(log, "{count}... ");
+    }
+}
+
+fn read_corpus(
+    corpus: &Path,
+    log: &mut dyn Write,
+    tokenizer: &mut Tokenizer,
+    features: &mut Features,
+    index: &mut FeatureIndex,
+    sizes: EvalSizes,
+) -> Result<(Vec<Sentence>, Vec<f64>), Error> {
+    let _ = write!(log, "reading corpus ...");
+    let mut lines = open_lines(corpus)?;
+    let mut observed = Vec::new();
+    let mut sentences = Vec::new();
+    let mut reader = Reader {
+        tokenizer,
+        features,
+        index,
+        eval_size: sizes.eval_size,
+        unk_eval_size: sizes.unk_eval_size,
+        found: Vec::new(),
+    };
+    loop {
+        let read = Sentence::read(&mut reader, &mut lines, &mut observed)?;
+        let done = read.is_none();
+        if let Some(read) = read {
+            for feature in &read.virtual_features {
+                log_virtual_feature(log, feature);
+            }
+            sentences.push(read.sentence);
+        }
+        log_sentence_progress(log, sentences.len());
+        if done {
+            break;
+        }
+    }
+    Ok((sentences, observed))
+}
+
+fn log_header(
+    log: &mut dyn Write,
+    settings: &TrainSettings,
+    sentence_count: usize,
+    size: usize,
+    charset: &str,
+) {
+    let TrainSettings {
+        cost,
+        eta,
+        eval_size,
+        unk_eval_size,
+        threads,
+        freq,
+    } = *settings;
+    let _ = writeln!(log);
+    let _ = writeln!(log, "Number of sentences: {sentence_count}");
+    let _ = writeln!(log, "Number of features:  {size}");
+    let _ = writeln!(log, "eta:                 {eta:.5}");
+    let _ = writeln!(log, "freq:                {freq}");
+    let _ = writeln!(log, "eval-size:           {eval_size}");
+    let _ = writeln!(log, "unk-eval-size:       {unk_eval_size}");
+    let _ = writeln!(log, "threads:             {threads}");
+    let _ = writeln!(log, "charset:             {charset}");
+    let _ = writeln!(log, "C(sigma^2):          {cost:.5}\n");
+}
+
+fn model_header(settings: &TrainSettings, charset: &str) -> String {
+    let TrainSettings {
+        cost,
+        eta,
+        eval_size,
+        unk_eval_size,
+        freq,
+        ..
+    } = *settings;
+    format!(
+        "eta: {}\nfreq: {freq}\nC: {}\neval-size: {eval_size}\nunk-eval-size: {unk_eval_size}\ncharset: {charset}\n",
+        format_g(eta),
+        format_g(cost),
+    )
 }
 
 pub fn train(
@@ -77,244 +257,48 @@ pub fn train(
     log: &mut dyn Write,
 ) -> Result<TrainReport, Error> {
     let dic_dir = options.dic_dir.as_path();
-    let mut config = Config::default();
-    config.set("cost", &options.cost.to_string(), Existing::Replace);
-    config.set("eta", &options.eta.to_string(), Existing::Replace);
-    config.set("freq", &options.freq.to_string(), Existing::Replace);
-    config.set("thread", &options.threads.to_string(), Existing::Replace);
-    config.load(&dic_dir.join(DICRC_FILE))?;
-
+    let mut config = load_config(options)?;
     let mut tokenizer = Tokenizer::open(dic_dir, &config)?;
     let mut features = Features::open(dic_dir)?;
     let mut index = FeatureIndex::open(dic_dir)?;
+    let old_alpha = load_previous_model(options, &mut index, &tokenizer.charset, &mut config, log)?;
 
-    let mut old_alpha = Vec::new();
-    if let Some(old_model) = &options.old_model {
-        let _ = writeln!(log, "Using previous model: {}", old_model.display());
-        let _ = writeln!(log, "--cost --freq and --eta options are overwritten.");
-        let (alpha, settings) = index.reopen(old_model, &tokenizer.charset)?;
-        old_alpha = alpha;
-        for (key, value) in settings {
-            config.set(&key, &value, Existing::Replace);
-        }
-    }
+    let settings = TrainSettings::read(&config);
+    settings.validate(dic_dir)?;
 
-    let cost: f64 = config.number("cost");
-    let eta: f64 = config.number("eta");
-    let eval_size: usize = config.number("eval-size");
-    let unk_eval_size: usize = config.number("unk-eval-size");
-    let threads: usize = config.number("thread");
-    let freq: usize = config.number("freq");
-
-    if cost.is_nan() || cost <= 0.0 {
-        return Err(learn_error(
-            dic_dir,
-            format!("cost parameter is out of range: {}", format_g(cost)),
-        ));
-    }
-    if eta.is_nan() || eta <= 0.0 {
-        return Err(learn_error(
-            dic_dir,
-            format!("eta is out of range: {}", format_g(eta)),
-        ));
-    }
-    if eval_size == 0 {
-        return Err(learn_error(dic_dir, "eval-size is out of range: 0"));
-    }
-    if unk_eval_size == 0 {
-        return Err(learn_error(dic_dir, "unk-eval-size is out of range: 0"));
-    }
-    if freq == 0 {
-        return Err(learn_error(
-            dic_dir,
-            format!("freq is out of range: {freq}"),
-        ));
-    }
-    if threads == 0 || threads > MAX_THREADS {
-        return Err(learn_error(
-            dic_dir,
-            format!("# thread is invalid: {threads}"),
-        ));
-    }
-
-    let _ = write!(log, "reading corpus ...");
-    let mut lines = open_lines(corpus)?;
-    let mut observed: Vec<f64> = Vec::new();
-    let mut sentences: Vec<Sentence> = Vec::new();
-    {
-        let mut reader = Reader {
-            tokenizer: &mut tokenizer,
-            features: &mut features,
-            index: &mut index,
-            eval_size,
-            unk_eval_size,
-            found: Vec::new(),
-        };
-        loop {
-            let read = Sentence::read(&mut reader, &mut lines, &mut observed)?;
-            let done = read.is_none();
-            if let Some(read) = read {
-                for feature in &read.virtual_features {
-                    let _ = writeln!(
-                        log,
-                        "adding virtual node: {}",
-                        String::from_utf8_lossy(feature)
-                    );
-                }
-                sentences.push(read.sentence);
-            }
-            if sentences.len().is_multiple_of(PROGRESS_INTERVAL) {
-                let _ = write!(log, "{}... ", sentences.len());
-            }
-            if done {
-                break;
-            }
-        }
-    }
-
+    let (sentences, mut observed) = read_corpus(
+        corpus,
+        log,
+        &mut tokenizer,
+        &mut features,
+        &mut index,
+        settings.sizes(),
+    )?;
     if sentences.is_empty() {
         return Err(learn_error(corpus, "the corpus has no sentences"));
     }
 
-    let renumbered = index.shrink(freq, &mut observed);
+    let renumbered = index.shrink(settings.freq, &mut observed);
     index.clear_cache();
     features.clear_rewrites();
 
     let size = index.size();
     observed.resize(size, 0.0);
-    let mut expected = vec![0.0; size];
     let old_alpha = remap_weights(&old_alpha, &renumbered, size);
-    let mut alpha = old_alpha.clone();
+    log_header(log, &settings, sentences.len(), size, &tokenizer.charset);
 
-    let _ = writeln!(log);
-    let _ = writeln!(log, "Number of sentences: {}", sentences.len());
-    let _ = writeln!(log, "Number of features:  {size}");
-    let _ = writeln!(log, "eta:                 {eta:.5}");
-    let _ = writeln!(log, "freq:                {freq}");
-    let _ = writeln!(log, "eval-size:           {eval_size}");
-    let _ = writeln!(log, "unk-eval-size:       {unk_eval_size}");
-    let _ = writeln!(log, "threads:             {threads}");
-    let _ = writeln!(log, "charset:             {}", tokenizer.charset);
-    let _ = writeln!(log, "C(sigma^2):          {cost:.5}\n");
-
-    let sentence_count = sentences.len();
-    let mut groups: Vec<Vec<Sentence>> = (0..threads).map(|_| Vec::new()).collect();
-    for (at, sentence) in sentences.into_iter().enumerate() {
-        groups[at % threads].push(sentence);
-    }
-    let mut partials: Vec<Partial> = (0..threads)
-        .map(|_| Partial {
-            expected: vec![0.0; size],
-            ..Partial::default()
-        })
-        .collect();
-
-    let mut stable_iterations = 0;
-    let mut previous = 0.0;
-    let mut lbfgs = Lbfgs::default();
-
-    for iteration in 0.. {
-        let mut objective = 0.0;
-        let mut errors = 0;
-        let mut micro_p = 0usize;
-        let mut micro_r = 0usize;
-        let mut micro_c = 0usize;
-
-        let shared = Shared {
-            pool: index.pool(),
-            alpha: &alpha,
-            features: &features,
-            sizes: EvalSizes {
-                eval_size,
-                unk_eval_size,
-            },
-        };
-        if threads > 1 {
-            std::thread::scope(|scope| {
-                for (group, partial) in groups.iter_mut().zip(partials.iter_mut()) {
-                    let shared = &shared;
-                    scope.spawn(move || run_group(group, shared, partial));
-                }
-            });
-            expected.fill(0.0);
-            for partial in &partials {
-                objective += partial.objective;
-                errors += partial.errors;
-                micro_r += partial.tally.recall;
-                micro_p += partial.tally.precision;
-                micro_c += partial.tally.correct;
-                for (total, value) in expected.iter_mut().zip(&partial.expected) {
-                    *total += value;
-                }
-            }
-        } else {
-            let partial = &mut partials[0];
-            run_group(&mut groups[0], &shared, partial);
-            expected.copy_from_slice(&partial.expected);
-            objective = partial.objective;
-            errors = partial.errors;
-            micro_r = partial.tally.recall;
-            micro_p = partial.tally.precision;
-            micro_c = partial.tally.correct;
-        }
-
-        let precision = 1.0 * micro_c as f64 / micro_p as f64;
-        let recall = 1.0 * micro_c as f64 / micro_r as f64;
-        let micro_f = 2.0 * precision * recall / (precision + recall);
-
-        for i in 0..size {
-            let penalty = alpha[i] - old_alpha[i];
-            objective += penalty * penalty / (2.0 * cost);
-            expected[i] = expected[i] - observed[i] + penalty / cost;
-        }
-
-        if !objective.is_finite() {
-            return Err(learn_error(
-                dic_dir,
-                format!("the objective became non-finite at iteration {iteration}"),
-            ));
-        }
-
-        let diff = if iteration == 0 {
-            1.0
-        } else {
-            (1.0 * (previous - objective)).abs() / previous
-        };
-        let _ = writeln!(
-            log,
-            "iter={iteration} err={:.5} F={micro_f:.5} target={objective:.5} diff={diff:.5}",
-            1.0 * errors as f64 / sentence_count as f64
-        );
-        previous = objective;
-
-        if diff < eta {
-            stable_iterations += 1;
-        } else {
-            stable_iterations = 0;
-        }
-        if stable_iterations == CONVERGED_ITERATIONS {
-            break;
-        }
-
-        let status = lbfgs.optimize(size, &mut alpha, objective, &expected);
-        if status < 0 {
-            return Err(learn_error(dic_dir, "unexpected error in LBFGS routine"));
-        }
-        if status == 0 {
-            break;
-        }
-    }
+    let mut optimizer = Optimizer::new(&settings, sentences, size, observed, old_alpha);
+    optimizer.run(dic_dir, index.pool(), &features, log)?;
 
     let _ = writeln!(log, "\nDone! writing model file ... ");
-    let header = format!(
-        "eta: {}\nfreq: {freq}\nC: {}\neval-size: {eval_size}\nunk-eval-size: {unk_eval_size}\ncharset: {}\n",
-        format_g(eta),
-        format_g(cost),
-        tokenizer.charset
-    );
-    index.save(model, &header, &alpha, LineEnding::from(options.crlf))?;
+    index.save(
+        model,
+        &model_header(&settings, &tokenizer.charset),
+        &optimizer.alpha,
+        LineEnding::from(options.crlf),
+    )?;
 
     Ok(TrainReport {
-        sentences: sentence_count,
+        sentences: optimizer.sentence_count,
     })
 }

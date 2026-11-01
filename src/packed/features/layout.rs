@@ -49,6 +49,53 @@ fn align8(value: u64) -> Option<u64> {
     value.checked_add(7).map(|sum| sum & !7)
 }
 
+fn place(start: u64, length: u64) -> Option<(Range<usize>, u64)> {
+    let end = start.checked_add(length)?;
+    let range = usize::try_from(start).ok()?..usize::try_from(end).ok()?;
+    Some((range, align8(end)?))
+}
+
+struct Sections {
+    next: Option<u64>,
+}
+
+impl Sections {
+    fn starting_after_header() -> Self {
+        Self {
+            next: Some(HEADER_BYTES as u64),
+        }
+    }
+
+    fn take(&mut self, length: Option<u64>) -> Range<usize> {
+        let placed = self
+            .next
+            .zip(length)
+            .and_then(|(start, length)| place(start, length));
+        self.next = placed.as_ref().map(|(_, next)| *next);
+        placed.map_or(0..0, |(range, _)| range)
+    }
+
+    fn is_intact(&self) -> bool {
+        self.next.is_some()
+    }
+}
+
+fn template_group_bytes(counts: &Counts) -> u64 {
+    if counts.rule_groups == 0 {
+        0
+    } else {
+        2 * u64::from(counts.templates)
+    }
+}
+
+fn group_start_bytes(counts: &Counts) -> u64 {
+    if counts.rule_groups == 0 {
+        0
+    } else {
+        4 * (u64::from(counts.rule_groups) + 1)
+    }
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub(in crate::packed) struct Counts {
     pub(in crate::packed) templates: u32,
@@ -133,13 +180,7 @@ pub(in crate::packed) struct Layout {
 
 impl Layout {
     pub(in crate::packed) fn new(counts: Counts) -> Option<Self> {
-        let mut at = HEADER_BYTES as u64;
-        let mut take = |length: u64| -> Option<Range<usize>> {
-            let start = at;
-            let end = start.checked_add(length)?;
-            at = align8(end)?;
-            Some(usize::try_from(start).ok()?..usize::try_from(end).ok()?)
-        };
+        let mut sections = Sections::starting_after_header();
         let sync_count = (counts.record_count as usize).div_ceil(SYNC_EVERY) as u64;
         let blob_sync_count = (counts.blob_entries as usize).div_ceil(BLOB_SYNC_EVERY) as u64;
         let layout = Self {
@@ -148,38 +189,34 @@ impl Layout {
             shape_bits: bits_for(u64::from(counts.shapes)),
             ref_bits: bits_for(counts.strings),
             blob_bits: bits_for(counts.blob_bytes),
-            positions: take(pieces::POSITION_BYTES as u64 * u64::from(counts.positions))?,
-            piece_offsets: take(4 * (u64::from(counts.pieces) + 1))?,
-            pool: take(counts.pool_bytes.checked_add(SLACK as u64)?)?,
-            entries: take(
+            positions: sections.take(Some(
+                pieces::POSITION_BYTES as u64 * u64::from(counts.positions),
+            )),
+            piece_offsets: sections.take(Some(4 * (u64::from(counts.pieces) + 1))),
+            pool: sections.take(counts.pool_bytes.checked_add(SLACK as u64)),
+            entries: sections.take(
                 (u64::from(counts.templates) * u64::from(counts.entry_bits))
                     .div_ceil(8)
-                    .checked_add(SLACK as u64)?,
-            )?,
-            shape_offsets: take(4 * (u64::from(counts.shapes) + 1))?,
-            shapes: take(counts.shape_bytes)?,
-            specs: take(SPEC_BYTES as u64 * u64::from(counts.numerics))?,
-            lo: take(8 * u64::from(counts.lo_total))?,
-            chars: take(chars::ENTRY_BYTES as u64 * u64::from(counts.chars))?,
-            sync: take(4 * sync_count)?,
-            strings: take(counts.strings.checked_add(SLACK as u64)?)?,
-            blob_sync: take(4 * blob_sync_count)?,
-            blob: take(counts.blob_bytes.checked_add(SLACK as u64)?)?,
-            template_groups: take(if counts.rule_groups == 0 {
-                0
-            } else {
-                2 * u64::from(counts.templates)
-            })?,
-            group_starts: take(if counts.rule_groups == 0 {
-                0
-            } else {
-                4 * (u64::from(counts.rule_groups) + 1)
-            })?,
-            rule_entries: take(4 * u64::from(counts.rule_entries))?,
-            rules: take(RULE_BYTES as u64 * u64::from(counts.rule_count) + SLACK as u64)?,
-            records: take(counts.records.checked_add(RECORD_PADDING as u64)?)?,
+                    .checked_add(SLACK as u64),
+            ),
+            shape_offsets: sections.take(Some(4 * (u64::from(counts.shapes) + 1))),
+            shapes: sections.take(Some(counts.shape_bytes)),
+            specs: sections.take(Some(SPEC_BYTES as u64 * u64::from(counts.numerics))),
+            lo: sections.take(Some(8 * u64::from(counts.lo_total))),
+            chars: sections.take(Some(chars::ENTRY_BYTES as u64 * u64::from(counts.chars))),
+            sync: sections.take(Some(4 * sync_count)),
+            strings: sections.take(counts.strings.checked_add(SLACK as u64)),
+            blob_sync: sections.take(Some(4 * blob_sync_count)),
+            blob: sections.take(counts.blob_bytes.checked_add(SLACK as u64)),
+            template_groups: sections.take(Some(template_group_bytes(&counts))),
+            group_starts: sections.take(Some(group_start_bytes(&counts))),
+            rule_entries: sections.take(Some(4 * u64::from(counts.rule_entries))),
+            rules: sections.take(Some(
+                RULE_BYTES as u64 * u64::from(counts.rule_count) + SLACK as u64,
+            )),
+            records: sections.take(counts.records.checked_add(RECORD_PADDING as u64)),
         };
-        Some(layout)
+        sections.is_intact().then_some(layout)
     }
 
     pub(in crate::packed) fn length(&self) -> usize {

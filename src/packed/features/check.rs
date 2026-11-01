@@ -1,20 +1,21 @@
 mod parallel;
+mod piece_checks;
 mod records;
 mod strings;
 
 use std::ops::Range;
 
 use super::chars::{self, ENTRY_BYTES};
-use super::pieces::{POSITION_BYTES, Position};
 use super::{
     Counts, HEADER_BYTES, Layout, MAX_NUMERIC, MAX_RULE_SUFFIX, MAX_SLOTS, NumSpec, OP_BLOB,
     OP_BLOB_NEXT, OP_COPY, OP_COPY_MAX, OP_DERIVE, OP_EMPTY, OP_HIGH, OP_HIGH_MAX, OP_INLINE,
     OP_KEY, OP_NUM, OP_NUM_MAX, OP_NUMB, OP_NUMB_MAX, OP_REF, OP_STAR, RULE_BYTES, RULE_CHAR_BITS,
-    RULE_CHAR_MASK, RULE_HEADER_BYTES, SPEC_BYTES, read_bits,
+    RULE_CHAR_MASK, RULE_HEADER_BYTES, SPEC_BYTES,
 };
 use crate::Error;
 use crate::packed::reader::Source;
 use crate::wire::u32_values;
+use piece_checks::check_pieces;
 
 pub(in crate::packed) struct Checked {
     pub(in crate::packed) layout: Layout,
@@ -201,32 +202,62 @@ impl ShapeScan {
 
     fn accepts(&mut self, op: u8, counts: &Counts, spec_count: usize) -> bool {
         match op {
-            OP_REF | OP_INLINE => self.add_slot(),
-            OP_BLOB if self.blob_seen == 0 && counts.blob_fields > 0 => {
-                self.blob_seen = 1;
-                self.add_slot();
-            }
-            OP_BLOB_NEXT if self.blob_seen > 0 && self.blob_seen < counts.blob_fields => {
-                self.blob_seen += 1;
-                self.add_slot();
-            }
-            OP_NUMB..=OP_NUMB_MAX
-                if self.blob_seen > 0 && u32::from(op - OP_NUMB) == counts.blob_number =>
-            {
-                self.numbers |= 1 << (op - OP_NUMB);
-            }
-            OP_DERIVE if counts.rule_groups > 0 => self.add_slot(),
-            OP_EMPTY | OP_STAR | OP_KEY => {}
-            OP_COPY..=OP_COPY_MAX if usize::from(op - OP_COPY) < self.slots => {}
-            OP_NUM..=OP_NUM_MAX if usize::from(op - OP_NUM) < spec_count => {
-                self.numbers |= 1 << (op - OP_NUM);
-            }
-            OP_HIGH..=OP_HIGH_MAX
-                if usize::from(op - OP_HIGH) < MAX_NUMERIC
-                    && self.numbers >> (op - OP_HIGH) & 1 != 0 => {}
-            _ => return false,
+            OP_REF | OP_INLINE => self.accept_slot(),
+            OP_BLOB => self.accept_blob_start(counts),
+            OP_BLOB_NEXT => self.accept_blob_next(counts),
+            OP_NUMB..=OP_NUMB_MAX => self.accept_blob_number(op, counts),
+            OP_DERIVE => self.accept_derive(counts),
+            OP_EMPTY | OP_STAR | OP_KEY => true,
+            OP_COPY..=OP_COPY_MAX => usize::from(op - OP_COPY) < self.slots,
+            OP_NUM..=OP_NUM_MAX => self.accept_number(op, spec_count),
+            OP_HIGH..=OP_HIGH_MAX => self.accept_high(op),
+            _ => false,
         }
+    }
+
+    fn accept_slot(&mut self) -> bool {
+        self.add_slot();
         true
+    }
+
+    fn accept_blob_start(&mut self, counts: &Counts) -> bool {
+        if self.blob_seen != 0 || counts.blob_fields == 0 {
+            return false;
+        }
+        self.blob_seen = 1;
+        self.accept_slot()
+    }
+
+    fn accept_blob_next(&mut self, counts: &Counts) -> bool {
+        if self.blob_seen == 0 || self.blob_seen >= counts.blob_fields {
+            return false;
+        }
+        self.blob_seen += 1;
+        self.accept_slot()
+    }
+
+    fn accept_blob_number(&mut self, op: u8, counts: &Counts) -> bool {
+        let names_blob_number = self.blob_seen > 0 && u32::from(op - OP_NUMB) == counts.blob_number;
+        if names_blob_number {
+            self.numbers |= 1 << (op - OP_NUMB);
+        }
+        names_blob_number
+    }
+
+    fn accept_derive(&mut self, counts: &Counts) -> bool {
+        counts.rule_groups > 0 && self.accept_slot()
+    }
+
+    fn accept_number(&mut self, op: u8, spec_count: usize) -> bool {
+        let names_spec = usize::from(op - OP_NUM) < spec_count;
+        if names_spec {
+            self.numbers |= 1 << (op - OP_NUM);
+        }
+        names_spec
+    }
+
+    fn accept_high(&self, op: u8) -> bool {
+        usize::from(op - OP_HIGH) < MAX_NUMERIC && self.numbers >> (op - OP_HIGH) & 1 != 0
     }
 }
 
@@ -341,60 +372,4 @@ fn check_rules(source: &Source, section: usize, layout: &Layout) -> Result<(), E
     }
     check_rule_groups(source, section, layout)?;
     check_rule_texts(source, section, layout)
-}
-
-fn check_pieces(source: &Source, section: usize, layout: &Layout) -> Result<(), Error> {
-    let counts = layout.counts;
-    let invalid = |reason: &'static str| source.broken(reason);
-    let position_bytes = read_range(source, section, &layout.positions)?;
-    let entry_bits = counts.entry_bits as usize;
-    let positions: Vec<Position> = position_bytes
-        .as_chunks::<POSITION_BYTES>()
-        .0
-        .iter()
-        .map(Position::parse)
-        .collect::<Option<_>>()
-        .ok_or_else(|| invalid("a piece position of the features is not valid"))?;
-    if positions.iter().any(|position| {
-        !position.constant && position.shift as usize + position.bits as usize > entry_bits
-    }) {
-        return Err(invalid("a piece position of the features leaves its entry"));
-    }
-    let mut pool = read_range(source, section, &layout.pool)?;
-    pool.truncate(counts.pool_bytes as usize);
-    let offsets = offsets_of(
-        &read_range(source, section, &layout.piece_offsets)?,
-        pool.len(),
-    )
-    .ok_or_else(|| invalid("the feature pieces are not delimited correctly"))?;
-    for pair in offsets.windows(2) {
-        if str::from_utf8(&pool[pair[0] as usize..pair[1] as usize]).is_err() {
-            return Err(invalid("a feature piece is not valid UTF-8"));
-        }
-    }
-    for position in positions.iter().filter(|position| position.constant) {
-        let start = position.base as usize;
-        let piece = pool.get(start..start + position.shift as usize);
-        if piece.is_none_or(|piece| str::from_utf8(piece).is_err()) {
-            return Err(invalid("a constant feature piece is not valid"));
-        }
-    }
-    drop(pool);
-    let entries = read_range(source, section, &layout.entries)?;
-    let pieces = u64::from(counts.pieces);
-    for template in 0..counts.templates as usize {
-        for position in positions.iter().filter(|position| !position.constant) {
-            let local = read_bits(
-                &entries,
-                template * entry_bits + position.shift as usize,
-                position.bits,
-            );
-            if u64::from(position.base) + local >= pieces {
-                return Err(invalid(
-                    "a feature template names a piece that does not exist",
-                ));
-            }
-        }
-    }
-    Ok(())
 }

@@ -1,21 +1,34 @@
-use super::{
+use std::ops::Range;
+use std::path::Path;
+
+use super::token_format::TokenFormat;
+use super::{CHUNK, PARAM_BYTES, Source};
+use crate::char_table::{CHAR_TABLE_HEADER_BYTES, MAGIC as CHAR_TABLE_MAGIC};
+use crate::error::Error;
+use crate::hot_shape::HotShape;
+use crate::int_runtime::is_runtime_form;
+use crate::matrix::MATRIX_HEADER_BYTES;
+use crate::packed::bits::{MAX_RECORD_BITS, section_bytes};
+use crate::packed::features::check as feature_check;
+use crate::packed::{
     BLOCK_CODES, BLOCK_COUNT, CATEGORY_COUNT_AT, CELLS, CELLS_PADDING, CHAR_BLOCKS, CHAR_INDEX,
-    CHAR_TABLE, CHAR_TABLE_HEADER_BYTES, CHAR_TABLE_MAGIC, CODE_COUNT_AT, DICRC, Error,
-    FEATURE_BITS_AT, FEATURES, FLAG_HOT_MATRIX, FLAG_INT_TEMPLATES, FLAGS_AT, HEADER_BYTES,
-    HOT_ROWS_BYTES, HotShape, MAGIC, MAGIC_BYTES, MATRIX, MATRIX_HEADER_BYTES, MAX_CODE_COUNT,
-    MAX_RECORD_BITS, MAX_UNITS, PARAM_BITS_AT, PARAM_BYTES, PARAM_COUNT_AT, PARAMS, Path,
-    ROW_START_BYTES, Range, SECTION_ALIGNMENT, SECTION_ENTRY_BYTES, SECTION_LENGTH_IN_ENTRY,
-    SECTION_OFFSET_IN_ENTRY, SECTION_TABLE_AT, SECTIONS, Source, TEMPLATE_HEADER_PEEK_BYTES,
-    TEMPLATES, TOKEN_COUNT_AT, TOKENS, TokenFormat, UNIT_BYTES, UNKNOWN_STARTS, UNKNOWN_TOKENS,
-    VERSION, VERSION_AT, check_cells, check_tokens, feature_check, header_sizes, is_runtime_form,
-    section_bytes, u16_at, u16_values, u32_at, u32_values, u64_at,
+    CHAR_TABLE, CODE_COUNT_AT, DATA_LABEL, DICRC, FEATURE_BITS_AT, FEATURES, FLAG_HOT_MATRIX,
+    FLAG_INT_TEMPLATES, FLAGS_AT, HEADER_BYTES, MAGIC, MAGIC_BYTES, MATRIX, MAX_CODE_COUNT,
+    MAX_UNITS, PARAM_BITS_AT, PARAM_COUNT_AT, PARAMS, SECTION_ALIGNMENT, SECTION_ENTRY_BYTES,
+    SECTION_LENGTH_IN_ENTRY, SECTION_OFFSET_IN_ENTRY, SECTION_TABLE_AT, SECTIONS, TEMPLATES,
+    TERMINAL_FLAG, TOKEN_COUNT_AT, TOKENS, UNIT_BYTES, UNKNOWN_STARTS, UNKNOWN_TOKENS,
+    UNUSED_LABEL, Unit, VERSION, VERSION_AT,
 };
+use crate::templates::{TEMPLATE_HEADER_PEEK_BYTES, header_sizes};
+use crate::wire::{u16_at, u16_values, u32_at, u32_values, u64_at};
 
 const KNOWN_FLAGS: u32 = FLAG_HOT_MATRIX | FLAG_INT_TEMPLATES;
 const MAX_FORMAT_BITS: u32 = 32;
 pub(super) const DICRC_HEADER_BYTES: usize = 8;
 const UNKNOWN_START_BYTES: usize = 4;
 const BLOCK_ENTRY_BYTES: usize = 2;
+const HOT_ROWS_BYTES: usize = 4;
+const ROW_START_BYTES: usize = 4;
 
 const CHAR_TABLE_CATEGORIES_AT: usize = 8;
 
@@ -264,6 +277,40 @@ fn check_unknown_starts(source: &Source, header: &Header) -> Result<usize, Error
     Ok(unknown_count)
 }
 
+fn check_tokens(
+    source: &Source,
+    section: usize,
+    count: usize,
+    format: TokenFormat,
+    valid: impl Fn(u64, u64) -> bool,
+    reason: &'static str,
+) -> Result<(), Error> {
+    let bits = format.bits;
+    let step = ((CHUNK * 8 / bits) & !7).max(8);
+    let mut buffer = vec![0u8; (step * bits).div_ceil(8) + 8];
+    let mut done = 0;
+    while done < count {
+        let tokens = step.min(count - done);
+        let bytes = (tokens * bits).div_ceil(8);
+        source.read(section, done * bits / 8, &mut buffer[..bytes])?;
+        buffer[bytes..].fill(0);
+        for token in 0..tokens {
+            let at = token * bits;
+            let word = buffer
+                .get(at >> 3..)
+                .and_then(|rest| rest.first_chunk())
+                .map_or(0, |&word| u64::from_le_bytes(word))
+                >> (at & 7);
+            let (param, feature) = format.split(word);
+            if !valid(param, feature) {
+                return Err(source.broken(reason));
+            }
+        }
+        done += tokens;
+    }
+    Ok(())
+}
+
 fn check_token_sections(
     source: &Source,
     header: &Header,
@@ -280,6 +327,40 @@ fn check_token_sections(
         (UNKNOWN_TOKENS, unknown_count),
     ] {
         check_tokens(source, section, count, header.format, valid_token, reason)?;
+    }
+    Ok(())
+}
+
+fn check_cells(source: &Source, bytes: &[u8], token_count: usize) -> Result<(), Error> {
+    let units = bytes.as_chunks::<UNIT_BYTES>().0;
+    let reason = "a double array unit is not valid";
+    let valid_range = |first: u32, count: usize| count > 0 && first as usize + count <= token_count;
+    let decode = |chunk: &[u8; UNIT_BYTES]| {
+        let [a, b, c, d, e, f] = *chunk;
+        Unit::from_bits(u64::from_le_bytes([a, b, c, d, e, f, 0, 0]))
+    };
+    for chunk in units {
+        let unit = decode(chunk);
+        let label = unit.label();
+        let value = unit.value();
+        let flags = unit.flags();
+        let valid = if label == UNUSED_LABEL {
+            true
+        } else if label == DATA_LABEL {
+            valid_range(value, usize::from(flags))
+        } else if !unit.is_terminal() {
+            flags == 0
+        } else if unit.is_inline() {
+            !unit.has_unused_flag_bits() && valid_range(value, usize::from(unit.inline_count()))
+        } else {
+            flags == TERMINAL_FLAG
+                && units
+                    .get(value as usize)
+                    .is_some_and(|data| decode(data).label() == DATA_LABEL)
+        };
+        if !valid {
+            return Err(source.broken(reason));
+        }
     }
     Ok(())
 }
