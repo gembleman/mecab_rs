@@ -1,5 +1,5 @@
+use crate::hash::FastMap;
 use crate::wire::{FNV_OFFSET, fnv1a};
-use std::collections::HashMap;
 
 fn read_quoted_field(bytes: &[u8], mut i: usize, buf: &mut Vec<u8>) -> Option<usize> {
     let start = buf.len();
@@ -299,7 +299,7 @@ fn dominant_col_count<'a>(
     buf: &mut Vec<u8>,
     ends: &mut Vec<u32>,
 ) -> usize {
-    let mut lines_by_col_count: HashMap<usize, usize> = HashMap::new();
+    let mut lines_by_col_count: FastMap<usize, usize> = FastMap::default();
     for line in lines {
         if parse_utf8_line(line, buf, ends) {
             *lines_by_col_count.entry(ends.len()).or_insert(0) += 1;

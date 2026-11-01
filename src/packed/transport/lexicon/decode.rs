@@ -1,42 +1,18 @@
 use super::{
-    COMMA, HashMap, Model, NUL, NUMBER_FIELDS, Param, QUOTE, UNKNOWN_PARAM_BYTES, Undecodable,
-    get_varint, visit_lexicon_records,
+    COMMA, Model, NUL, NUMBER_FIELDS, Param, QUOTE, UNKNOWN_PARAM_BYTES, Undecodable, get_varint,
+    visit_lexicon_records,
 };
 use crate::codec::{Record, Row};
+use crate::hash::FastMap;
 use crate::wire::{i16_at, u16_at};
 use std::borrow::Cow;
-use std::hash::{BuildHasherDefault, Hasher};
 
-const PARAM_SEED: u64 = 0x517c_c1b7_2722_0a95;
-const PARAM_FOLD: u32 = 32;
 const DIRECT_COLS: usize = 5;
 const KEY_COL: usize = 0;
 const LEFT_COL: usize = 1;
 const RIGHT_COL: usize = 2;
 const COST_COL: usize = 3;
 const FEATURE_COL: usize = 4;
-
-#[derive(Default)]
-pub(super) struct ParamHasher {
-    hash: u64,
-}
-
-impl Hasher for ParamHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.write_u64(u64::from(byte));
-        }
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        let mixed = (self.hash ^ value).wrapping_mul(PARAM_SEED);
-        self.hash = mixed ^ (mixed >> PARAM_FOLD);
-    }
-
-    fn finish(&self) -> u64 {
-        self.hash
-    }
-}
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 pub(super) struct ParamKey(u64);
@@ -51,8 +27,6 @@ impl ParamKey {
         )
     }
 }
-
-type ParamMap = HashMap<ParamKey, u32, BuildHasherDefault<ParamHasher>>;
 
 pub(super) struct Reader<'a> {
     pub(super) bytes: &'a [u8],
@@ -177,7 +151,7 @@ impl FeatureTable {
 
 #[derive(Default)]
 pub(super) struct Interner {
-    pub(super) params: ParamMap,
+    pub(super) params: FastMap<ParamKey, u32>,
     pub(super) features: FeatureTable,
 }
 
@@ -341,14 +315,15 @@ fn append_token_line(
 ) -> Result<(), Undecodable> {
     let CsvLine {
         key,
-        mut param,
+        param,
         feature,
     } = parse_line(line).ok_or(Undecodable("the lexicon text is not valid"))?;
-    param.pos_id = pos_ids.next()?;
-    let (param, feature) = interner.intern(model, param, feature.as_bytes());
-    model.token_params.push(param);
-    model.token_features.push(feature);
-    append_key(model, key.as_bytes())
+    let fields = DirectFields {
+        key: key.as_bytes(),
+        param,
+        feature: feature.as_bytes(),
+    };
+    append_direct(fields, pos_ids, model, interner)
 }
 
 fn append_token_bytes(

@@ -1,9 +1,9 @@
-use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
 
 use crate::build::text::{LINE_BUFFER_BYTES, Lines, key_value};
 use crate::tool_error::{caused_by, learn_error};
+use mecab_rs::__private::hash::FastMap;
 use mecab_rs::Error;
 
 mod dict_gen;
@@ -25,7 +25,7 @@ pub(crate) enum Existing {
 }
 
 #[derive(Default)]
-pub(crate) struct Config(HashMap<String, String>);
+pub(crate) struct Config(FastMap<String, String>);
 
 impl Config {
     pub(crate) fn set(&mut self, key: &str, value: &str, existing: Existing) {

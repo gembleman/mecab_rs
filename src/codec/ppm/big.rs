@@ -1,4 +1,4 @@
-use super::hash::FastMap;
+use crate::hash::FastMap;
 
 const BIG_INITIAL_CAP: usize = 64;
 

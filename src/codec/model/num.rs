@@ -2,7 +2,8 @@ use super::digits::{canonical_i64, set_i64};
 use super::row::RowState;
 use super::spec::NumMode;
 use crate::codec::coder::{Coder, Flag, UintModel};
-use crate::codec::ppm::{FastMap, Interner, NOVEL, Ppm, mix};
+use crate::codec::ppm::{Interner, NOVEL, Ppm, mix};
+use crate::hash::IdMap;
 use crate::wire::{unzigzag, zigzag};
 
 pub(super) const IRREGULAR_FLAG_LIMIT: u32 = 30000;
@@ -17,7 +18,7 @@ pub(super) struct NumState {
     d_ppm: Ppm,
     d_intern: Interner,
     d_uint: UintModel,
-    refs: FastMap<u64, (i64, i64)>,
+    refs: IdMap<u64, (i64, i64)>,
 }
 
 impl NumState {
@@ -30,7 +31,7 @@ impl NumState {
             d_ppm: Ppm::default(),
             d_intern: Interner::default(),
             d_uint: UintModel::default(),
-            refs: FastMap::default(),
+            refs: IdMap::default(),
         }
     }
 }

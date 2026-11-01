@@ -1,10 +1,9 @@
-use super::{
-    ABSENT, FOLD_MAX_VALUES, MAX_LOW_PARTS, SmallKeyMap, SmallKeySet, bits_for, parse_number,
-};
+use super::{ABSENT, FOLD_MAX_VALUES, FastMap, MAX_LOW_PARTS, bits_for, parse_number};
+use crate::hash::FastSet;
 
 pub(super) struct Stat<'a> {
     pub(super) present: usize,
-    pub(super) values: SmallKeyMap<&'a [u8], u16>,
+    pub(super) values: FastMap<&'a [u8], u16>,
     pub(super) value_ids: Vec<u16>,
     pub(super) overflow: bool,
     pub(super) numeric: bool,
@@ -15,7 +14,7 @@ impl<'a> Stat<'a> {
     pub(super) fn new(entries: usize) -> Self {
         Self {
             present: 0,
-            values: SmallKeyMap::default(),
+            values: FastMap::default(),
             value_ids: vec![ABSENT; entries],
             overflow: false,
             numeric: true,
@@ -42,7 +41,7 @@ impl<'a> Stat<'a> {
             self.last = Some((value, id));
         } else if self.values.len() >= FOLD_MAX_VALUES {
             self.overflow = true;
-            self.values = SmallKeyMap::default();
+            self.values = FastMap::default();
             self.value_ids = Vec::new();
             self.last = None;
         } else {
@@ -92,7 +91,7 @@ fn count_lows(values: &[u64], shift: u32) -> usize {
         }
         return count;
     }
-    let mut lows: SmallKeySet<u64> = SmallKeySet::default();
+    let mut lows: FastSet<u64> = FastSet::default();
     for &value in values {
         lows.insert(value & mask);
         if lows.len() > MAX_LOW_PARTS {
@@ -120,7 +119,7 @@ fn collect_lows(values: &[u64], shift: u32) -> Vec<u64> {
         }
         return table;
     }
-    let mut set: SmallKeySet<u64> = SmallKeySet::default();
+    let mut set: FastSet<u64> = FastSet::default();
     set.extend(values.iter().map(|&value| value & mask));
     let mut table: Vec<u64> = set.into_iter().collect();
     table.sort_unstable();

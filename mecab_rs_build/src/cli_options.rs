@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use mecab_rs::__private::hash::FastMap;
 
 const LONG_PREFIX: &str = "--";
 const END_OF_OPTIONS: &str = "--";
@@ -35,7 +35,7 @@ pub struct Occurrence<'a> {
 
 #[derive(Debug, Default)]
 pub struct Options {
-    values: HashMap<String, Vec<String>>,
+    values: FastMap<String, Vec<String>>,
     occurrences: Vec<(&'static str, String)>,
     pub rest: Vec<String>,
 }

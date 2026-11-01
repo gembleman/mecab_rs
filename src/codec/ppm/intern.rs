@@ -1,8 +1,9 @@
-use super::hash::{FastMap, hash_bytes};
+use super::hash::hash_bytes;
+use crate::hash::IdMap;
 
 #[derive(Default)]
 pub(crate) struct Interner {
-    map: FastMap<u64, u32>,
+    map: IdMap<u64, u32>,
     buf: Vec<u8>,
     ends: Vec<usize>,
 }

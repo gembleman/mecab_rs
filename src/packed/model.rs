@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -17,6 +16,7 @@ use super::{
 };
 use crate::Error;
 use crate::dict_files::MATRIX_HOT_FILE;
+use crate::hash::FastMap;
 use crate::hot_shape::HotShape;
 use crate::int_runtime::{is_runtime_form, runtime_form_of};
 
@@ -347,7 +347,7 @@ fn encode_tokens(params: &[u32], starts: &[u32], param_bits: u32, feature_bits: 
 fn char_map(table: &[u16]) -> (Vec<u16>, Vec<u16>) {
     let mut blocks: Vec<u16> = vec![0; BLOCK_CODES];
     let zero = [0u16; BLOCK_CODES];
-    let mut known: HashMap<&[u16], u16> = HashMap::new();
+    let mut known: FastMap<&[u16], u16> = FastMap::default();
     known.insert(&zero, 0);
     let mut index = Vec::with_capacity(BLOCK_COUNT);
     for block in table.chunks(BLOCK_CODES) {

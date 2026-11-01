@@ -1,6 +1,6 @@
 use super::{
-    Blob, Class, DERIVE_CONTEXT, DERIVE_TARGET, MAX_REMOVED_CHARS, MAX_RULE_SUFFIX, MAX_RULES,
-    MAX_SLOTS, MIN_RULE_USES, RULE_BYTES, RULE_CHAR_BITS, RULE_HEADER_BYTES, SmallKeyMap, Spans,
+    Blob, Class, DERIVE_CONTEXT, DERIVE_TARGET, FastMap, MAX_REMOVED_CHARS, MAX_RULE_SUFFIX,
+    MAX_RULES, MAX_SLOTS, MIN_RULE_USES, RULE_BYTES, RULE_CHAR_BITS, RULE_HEADER_BYTES, Spans,
     blob_slot,
 };
 use crate::Error;
@@ -89,9 +89,9 @@ pub(super) fn kept_bytes(key: &str, removed: u8) -> Option<usize> {
 
 #[derive(Default)]
 pub(super) struct Derive<'a> {
-    pub(super) contexts: SmallKeyMap<Context<'a>, u32>,
+    pub(super) contexts: FastMap<Context<'a>, u32>,
     pub(super) table_of_context: Vec<u16>,
-    pub(super) rules: SmallKeyMap<(u16, char), u16>,
+    pub(super) rules: FastMap<(u16, char), u16>,
     pub(super) rule_list: Vec<(u8, Vec<u8>)>,
     pub(super) entries: Vec<u32>,
     pub(super) group_starts: Vec<u32>,
@@ -125,8 +125,8 @@ impl<'a> Derive<'a> {
         spans: &Spans,
         tokens: &[(u32, &str)],
         blob: Option<&Blob>,
-    ) -> SmallKeyMap<RuleSite, SmallKeyMap<Split<'a>, u32>> {
-        let mut counts: SmallKeyMap<RuleSite, SmallKeyMap<Split<'a>, u32>> = SmallKeyMap::default();
+    ) -> FastMap<RuleSite, FastMap<Split<'a>, u32>> {
+        let mut counts: FastMap<RuleSite, FastMap<Split<'a>, u32>> = FastMap::default();
         let mut fields = Vec::new();
         for &(feature, key) in tokens {
             let entry = feature as usize;
@@ -164,7 +164,7 @@ impl<'a> Derive<'a> {
 
     fn register_rules(&mut self, chosen: Vec<(RuleSite, Split<'a>)>) -> Result<(), Error> {
         self.table_of_context = vec![0; self.contexts.len()];
-        let mut rule_index: SmallKeyMap<(u8, &[u8]), u16> = SmallKeyMap::default();
+        let mut rule_index: FastMap<(u8, &[u8]), u16> = FastMap::default();
         let mut table = 0u16;
         let mut current: Option<u32> = None;
         for ((id, last), split) in chosen {
@@ -286,9 +286,7 @@ impl<'a> Planner<'_, 'a> {
     }
 }
 
-fn choose_splits(
-    counts: SmallKeyMap<RuleSite, SmallKeyMap<Split<'_>, u32>>,
-) -> Vec<(RuleSite, Split<'_>)> {
+fn choose_splits(counts: FastMap<RuleSite, FastMap<Split<'_>, u32>>) -> Vec<(RuleSite, Split<'_>)> {
     let mut chosen: Vec<(RuleSite, Split)> = counts
         .into_iter()
         .filter_map(|(at, uses)| {

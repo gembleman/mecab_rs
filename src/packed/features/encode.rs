@@ -1,6 +1,3 @@
-use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasherDefault, Hasher};
-
 use super::{
     BLOB_SYNC_EVERY, BitWriter, Counts, Layout, MAX_BLOB_FIELDS, MAX_ID_BYTES, MAX_NUMERIC,
     MAX_RULE_SUFFIX, MAX_RULES, MAX_SLOTS, NumSpec, OP_BLOB, OP_BLOB_NEXT, OP_COPY, OP_DERIVE,
@@ -21,6 +18,7 @@ mod scan;
 mod spans;
 mod stats;
 
+use crate::hash::FastMap;
 use blob::{Blob, Recoded, plan_blob, recode};
 use derive::{Derive, Planner, TextOp};
 use lanes::for_each_lane;
@@ -28,7 +26,7 @@ use numbers::{Numbers, Stored, plan_numbers};
 use plans::{plan_code, plan_op};
 use program::{ProgramBuilder, ProgramSet};
 use records::{Assembly, write_records};
-use scan::{SmallKeyMap, SmallKeySet, parse_number};
+use scan::parse_number;
 use spans::Spans;
 use stats::{Class, Stat, choose_split};
 
@@ -38,12 +36,11 @@ const MAX_TEMPLATES: usize = 1 << 16;
 const MAX_LOW_PARTS: usize = 1 << 16;
 const ABSENT: u16 = u16::MAX;
 const NO_VARIANT: u32 = u32::MAX;
+const NO_STRING: u32 = u32::MAX;
 const DERIVE_TARGET: usize = 10;
 const DERIVE_CONTEXT: [usize; 2] = [4, 5];
 const MIN_RULE_USES: u32 = 2;
 const MAX_REMOVED_CHARS: usize = 15;
-const HASH_MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
-const FINAL_MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
 
 pub(in crate::packed) struct Encoded {
     pub(in crate::packed) bytes: Vec<u8>,
@@ -86,50 +83,34 @@ fn observe_fields<'a>(entries: &[&'a [u8]], spans: &Spans, field_counts: &[u16])
     stats
 }
 
-const FLAT_JOINT_MAX: usize = 1 << 22;
-
 struct JointIndex {
-    flat: Vec<u32>,
+    id_plus_one: Vec<u32>,
     width: usize,
-    map: SmallKeyMap<(u32, u16), u32>,
     len: u32,
 }
 
 impl JointIndex {
     fn new(joints: u32, values: usize) -> Self {
         let width = values + 1;
-        let cells = (joints as usize).saturating_mul(width);
-        let flat = if cells <= FLAT_JOINT_MAX {
-            vec![u32::MAX; cells]
-        } else {
-            Vec::new()
-        };
         Self {
-            flat,
+            id_plus_one: vec![0u32; joints as usize * width],
             width,
-            map: SmallKeyMap::default(),
             len: 0,
         }
     }
 
     fn id(&mut self, previous: u32, value: u16) -> u32 {
-        if self.flat.is_empty() {
-            let next = self.len;
-            let id = *self.map.entry((previous, value)).or_insert(next);
-            self.len += u32::from(id == next);
-            return id;
-        }
         let column = if value == ABSENT {
             self.width - 1
         } else {
             usize::from(value)
         };
-        let cell = &mut self.flat[previous as usize * self.width + column];
-        if *cell == u32::MAX {
-            *cell = self.len;
+        let cell = &mut self.id_plus_one[previous as usize * self.width + column];
+        if *cell == 0 {
             self.len += 1;
+            *cell = self.len;
         }
-        *cell
+        *cell - 1
     }
 }
 
@@ -175,11 +156,30 @@ fn classify_folds(stats: &mut [Stat], field_counts: &[u16]) -> Vec<Class> {
     classes
 }
 
-struct Variants<'k, 'a> {
+struct Variants<'k> {
     list: Vec<(usize, &'k [u8])>,
     starts_of: Vec<u32>,
-    string_uses: SmallKeyMap<&'a [u8], u32>,
+    uses_of_id: Vec<u32>,
+    string_ids: Vec<u32>,
     plan_codes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct StringIds<'a> {
+    id_of: FastMap<&'a [u8], u32>,
+    uses_of_id: Vec<u32>,
+}
+
+impl<'a> StringIds<'a> {
+    fn count(&mut self, text: &'a [u8]) -> u32 {
+        let next = self.uses_of_id.len() as u32;
+        let id = *self.id_of.entry(text).or_insert(next);
+        if id == next {
+            self.uses_of_id.push(0);
+        }
+        self.uses_of_id[id as usize] += 1;
+        id
+    }
 }
 
 fn collect_variants<'k, 'a>(
@@ -187,14 +187,15 @@ fn collect_variants<'k, 'a>(
     spans: &Spans,
     tokens: &'k [(u32, &'k str)],
     planner: &Planner<'_, 'a>,
-) -> Result<Variants<'k, 'a>, Error> {
+) -> Result<Variants<'k>, Error> {
     let mut planned: Vec<Option<TextOp>> = Vec::new();
     let mut variants: Vec<(usize, &[u8])> = Vec::new();
-    let mut variant_of: SmallKeyMap<(u32, &[u8]), u32> = SmallKeyMap::default();
+    let mut variant_of: FastMap<(u32, &[u8]), u32> = FastMap::default();
     let mut plain_variant: Vec<u32> = vec![NO_VARIANT; entries.len()];
     let mut filled_entry = usize::MAX;
     let mut starts_of: Vec<u32> = Vec::with_capacity(tokens.len());
-    let mut string_uses: SmallKeyMap<&[u8], u32> = SmallKeyMap::default();
+    let mut string_table = StringIds::default();
+    let mut string_ids: Vec<u32> = Vec::new();
     let mut plan_codes: Vec<u8> = Vec::new();
     let mut slots: Vec<&[u8]> = Vec::new();
     let mut fields = Vec::new();
@@ -223,14 +224,22 @@ fn collect_variants<'k, 'a>(
         };
         if number == next {
             variants.push((entry, key));
-            record_plan(text, &fields, &planned, &mut string_uses, &mut plan_codes);
+            record_plan(
+                text,
+                &fields,
+                &planned,
+                &mut string_table,
+                &mut string_ids,
+                &mut plan_codes,
+            );
         }
         starts_of.push(number);
     }
     Ok(Variants {
         list: variants,
         starts_of,
-        string_uses,
+        uses_of_id: string_table.uses_of_id,
+        string_ids,
         plan_codes,
     })
 }
@@ -239,13 +248,17 @@ fn record_plan<'a>(
     text: &'a [u8],
     fields: &[(usize, usize)],
     planned: &[Option<TextOp>],
-    string_uses: &mut SmallKeyMap<&'a [u8], u32>,
+    string_table: &mut StringIds<'a>,
+    string_ids: &mut Vec<u32>,
     plan_codes: &mut Vec<u8>,
 ) {
     for (&(begin, end), &op) in fields.iter().zip(planned) {
-        if let Some(TextOp::New) = op {
-            *string_uses.entry(&text[begin..end]).or_insert(0) += 1;
-        }
+        let id = if let Some(TextOp::New) = op {
+            string_table.count(&text[begin..end])
+        } else {
+            NO_STRING
+        };
+        string_ids.push(id);
         plan_codes.push(plan_code(op));
     }
 }
@@ -275,7 +288,8 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
     let Variants {
         list,
         starts_of,
-        string_uses,
+        uses_of_id,
+        string_ids,
         plan_codes,
     } = variants;
     let mut builder = ProgramBuilder::new(
@@ -283,7 +297,8 @@ pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Resu
         &entries,
         &spans,
         &numbers,
-        &string_uses,
+        &uses_of_id,
+        string_ids,
         plan_codes,
     );
     for &(entry, _) in &list {

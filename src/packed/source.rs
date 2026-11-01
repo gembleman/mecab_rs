@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use crate::hash::FastMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -37,7 +37,7 @@ fn key_value(line: &[u8]) -> Option<(&[u8], &[u8])> {
 
 fn dicrc_features(path: &Path) -> Result<(String, Option<String>), Error> {
     let bytes = fs::read(path).map_err(io_error(IoAction::Read, path))?;
-    let mut values: HashMap<&[u8], &[u8]> = HashMap::new();
+    let mut values: Vec<(&[u8], &[u8])> = Vec::new();
     for line in bytes.split(|&byte| byte == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() || line[0] == b';' || line[0] == b'#' {
@@ -46,19 +46,23 @@ fn dicrc_features(path: &Path) -> Result<(String, Option<String>), Error> {
         let Some((key, value)) = key_value(line) else {
             return Err(Error::format(path, "a line has no '='"));
         };
-        values.entry(key).or_insert(value);
+        values.push((key, value));
     }
+    let find = |wanted: &[u8]| {
+        values
+            .iter()
+            .find(|(key, _)| *key == wanted)
+            .map(|&(_, value)| value)
+    };
     let text = |value: &[u8]| {
         String::from_utf8(value.to_vec())
             .map_err(|_| Error::format(path, "bos-feature or unk-feature is not valid UTF-8"))
     };
-    let unknown = values
-        .get(b"unk-feature".as_slice())
+    let unknown = find(b"unk-feature")
         .filter(|value| !value.is_empty())
-        .map(|value| text(value))
+        .map(text)
         .transpose()?;
-    let bos = values
-        .get(b"bos-feature".as_slice())
+    let bos = find(b"bos-feature")
         .filter(|value| !value.is_empty())
         .ok_or_else(|| Error::format(path, "bos-feature is missing"))?;
     Ok((text(bos)?, unknown))
@@ -425,8 +429,8 @@ pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
         ..Model::default()
     };
     let mut interner = Interner {
-        params: HashMap::new(),
-        features: HashMap::new(),
+        params: FastMap::default(),
+        features: FastMap::default(),
     };
     check_key_order(&system_keys, &system_path)?;
     intern_system_tokens(&mut model, &mut interner, &system, system_keys.keys);
@@ -435,8 +439,8 @@ pub fn read_dictionary(directory: &Path) -> Result<Model, Error> {
 }
 
 struct Interner<'a> {
-    params: HashMap<Param, u32>,
-    features: HashMap<&'a str, u32>,
+    params: FastMap<Param, u32>,
+    features: FastMap<&'a str, u32>,
 }
 
 impl<'a> Interner<'a> {

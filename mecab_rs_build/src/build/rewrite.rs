@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::text::{
@@ -7,6 +6,7 @@ use super::text::{
 };
 use crate::tool_error::{Position, build_error};
 use mecab_rs::__private::files::POS_ID_DEF_FILE;
+use mecab_rs::__private::hash::FastMap;
 use mecab_rs::Error;
 
 struct RewritePattern {
@@ -158,7 +158,7 @@ pub(crate) struct Rewriter {
     unigram: RewriteRules,
     left: RewriteRules,
     right: RewriteRules,
-    cache: HashMap<Vec<u8>, (bool, Rewritten)>,
+    cache: FastMap<Vec<u8>, (bool, Rewritten)>,
 }
 
 impl Rewriter {
@@ -168,7 +168,7 @@ impl Rewriter {
             unigram: RewriteRules::default(),
             left: RewriteRules::default(),
             right: RewriteRules::default(),
-            cache: HashMap::new(),
+            cache: FastMap::default(),
         };
         let mut section = RewriteSection::BeforeAny;
         while let Some((number, line)) = lines.next_line()? {
@@ -278,15 +278,15 @@ impl PosIds {
 }
 
 pub(super) struct ContextIds {
-    left: HashMap<Vec<u8>, i32>,
-    right: HashMap<Vec<u8>, i32>,
+    left: FastMap<Vec<u8>, i32>,
+    right: FastMap<Vec<u8>, i32>,
     left_path: PathBuf,
     right_path: PathBuf,
 }
 
-fn read_id_table(path: &Path) -> Result<HashMap<Vec<u8>, i32>, Error> {
+fn read_id_table(path: &Path) -> Result<FastMap<Vec<u8>, i32>, Error> {
     let mut lines = Lines::open(path, None)?;
-    let mut map = HashMap::new();
+    let mut map = FastMap::default();
     while let Some((number, line)) = lines.next_line()? {
         let at = Position::new(path, number);
         let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();

@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
+
 use super::{
-    Class, Error, MAX_BLOB_FIELDS, MAX_ID_BYTES, SmallKeyMap, Spans, Stored, chars, for_each_lane,
+    Class, Error, FastMap, MAX_BLOB_FIELDS, MAX_ID_BYTES, Spans, Stored, chars, for_each_lane,
 };
 
 pub(super) struct Blob<'a> {
@@ -34,7 +36,7 @@ fn field_follows_ids(
     number_field: usize,
     field: usize,
 ) -> bool {
-    let mut map: SmallKeyMap<u64, &[u8]> = SmallKeyMap::default();
+    let mut map: FastMap<u64, &[u8]> = FastMap::default();
     for (entry, text) in entries.iter().enumerate() {
         let count = usize::from(field_counts[entry]);
         if count <= number_field || count <= field {
@@ -72,7 +74,7 @@ fn shared_text_fields(
         .collect()
 }
 
-type KnownTexts<'a> = SmallKeyMap<u64, Vec<&'a [u8]>>;
+type KnownTexts<'a> = FastMap<u64, Vec<&'a [u8]>>;
 
 fn known_texts<'a>(
     entries: &[&'a [u8]],
@@ -82,7 +84,7 @@ fn known_texts<'a>(
     chosen: &[usize],
 ) -> (KnownTexts<'a>, usize) {
     let mut fields = Vec::new();
-    let mut known: KnownTexts = SmallKeyMap::default();
+    let mut known: KnownTexts = FastMap::default();
     let mut eligible_count = 0usize;
     for (entry, text) in entries.iter().enumerate() {
         if !eligible[entry] {
@@ -191,7 +193,8 @@ pub(super) fn char_ranks(
     inline: &[&[u8]],
     blob: Option<&Blob>,
 ) -> Result<Vec<char>, Error> {
-    let mut counts: SmallKeyMap<char, u64> = SmallKeyMap::default();
+    let mut counts = CharValues::new();
+    let mut seen: Vec<char> = Vec::new();
     let blob_texts = blob.into_iter().flat_map(|blob| {
         blob.entries
             .iter()
@@ -203,10 +206,14 @@ pub(super) fn char_ranks(
         .chain(blob_texts)
     {
         for ch in text_of(bytes)?.chars() {
-            *counts.entry(ch).or_insert(0) += 1;
+            let count = counts.slot(ch);
+            if *count == 0 {
+                seen.push(ch);
+            }
+            *count += 1;
         }
     }
-    let mut ranked: Vec<(char, u64)> = counts.into_iter().collect();
+    let mut ranked: Vec<(char, u32)> = seen.into_iter().map(|ch| (ch, counts.get(ch))).collect();
     ranked.sort_by_key(|&(ch, count)| (std::cmp::Reverse(count), ch));
     if ranked.len() > chars::MAX_CHARS {
         return Err(Error::Unsupported(
@@ -216,13 +223,55 @@ pub(super) fn char_ranks(
     Ok(ranked.into_iter().map(|(ch, _)| ch).collect())
 }
 
-pub(super) fn code_text(
-    text: &[u8],
-    rank_of: &SmallKeyMap<char, usize>,
-    out: &mut Vec<u8>,
-) -> Result<(), Error> {
+const PLANE_CHARS: usize = 0x10000;
+
+struct CharValues {
+    plane: Vec<u32>,
+    astral: BTreeMap<char, u32>,
+}
+
+impl CharValues {
+    fn new() -> Self {
+        CharValues {
+            plane: vec![0; PLANE_CHARS],
+            astral: BTreeMap::new(),
+        }
+    }
+
+    fn slot(&mut self, ch: char) -> &mut u32 {
+        match self.plane.get_mut(ch as usize) {
+            Some(value) => value,
+            None => self.astral.entry(ch).or_insert(0),
+        }
+    }
+
+    fn get(&self, ch: char) -> u32 {
+        match self.plane.get(ch as usize) {
+            Some(&value) => value,
+            None => self.astral[&ch],
+        }
+    }
+}
+
+struct RankTable(CharValues);
+
+impl RankTable {
+    fn new(ranked: &[char]) -> Self {
+        let mut values = CharValues::new();
+        for (rank, &ch) in ranked.iter().enumerate() {
+            *values.slot(ch) = rank as u32;
+        }
+        RankTable(values)
+    }
+
+    fn rank(&self, ch: char) -> usize {
+        self.0.get(ch) as usize
+    }
+}
+
+fn code_text(text: &[u8], rank_of: &RankTable, out: &mut Vec<u8>) -> Result<(), Error> {
     for ch in text_of(text)?.chars() {
-        chars::push_code(rank_of[&ch], out);
+        chars::push_code(rank_of.rank(ch), out);
     }
     Ok(())
 }
@@ -233,7 +282,7 @@ struct CodedArea {
     new_starts: Vec<u32>,
 }
 
-fn code_area(area: &[u8], rank_of: &SmallKeyMap<char, usize>) -> Result<CodedArea, Error> {
+fn code_area(area: &[u8], rank_of: &RankTable) -> Result<CodedArea, Error> {
     let mut coded = CodedArea {
         bytes: Vec::new(),
         old_starts: Vec::new(),
@@ -254,10 +303,7 @@ fn code_area(area: &[u8], rank_of: &SmallKeyMap<char, usize>) -> Result<CodedAre
     Ok(coded)
 }
 
-fn code_blob(
-    blob: Option<&Blob>,
-    rank_of: &SmallKeyMap<char, usize>,
-) -> Result<(Vec<u8>, Vec<u32>), Error> {
+fn code_blob(blob: Option<&Blob>, rank_of: &RankTable) -> Result<(Vec<u8>, Vec<u32>), Error> {
     let too_large = || Error::Unsupported("feature strings of more than 4 GiB");
     let mut coded_blob: Vec<u8> = Vec::new();
     let mut blob_starts: Vec<u32> = Vec::new();
@@ -284,11 +330,7 @@ pub(super) fn recode(
     blob: Option<&Blob>,
 ) -> Result<Recoded, Error> {
     let ranked = char_ranks(area, inline, blob)?;
-    let rank_of: SmallKeyMap<char, usize> = ranked
-        .iter()
-        .enumerate()
-        .map(|(rank, &ch)| (ch, rank))
-        .collect();
+    let rank_of = RankTable::new(&ranked);
     let coded_area = code_area(area, &rank_of)?;
     let references = references
         .iter()

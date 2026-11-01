@@ -5,8 +5,8 @@ use super::strings_plan::plan_str;
 use crate::codec::coder::{Coder, UintModel};
 use crate::codec::ppm::{Interner, NOVEL, Ppm, mix};
 use crate::codec::text::{CharModel, kata};
+use crate::hash::IdSet;
 use crate::wire::{get_varint, put_varint};
-use std::collections::HashSet;
 
 pub(super) const EX_ALIGNED: u32 = 1000;
 const EX_DOMAIN: u64 = 1001;
@@ -72,7 +72,7 @@ pub(super) struct StrState {
     pub group_exact: u32,
     pub seg_ppm: Ppm,
     pub segs: Interner,
-    pub known: HashSet<u64>,
+    pub known: IdSet<u64>,
 }
 
 impl StrState {
@@ -94,7 +94,7 @@ impl StrState {
             group_exact: 0,
             seg_ppm: Ppm::default(),
             segs: Interner::default(),
-            known: HashSet::default(),
+            known: IdSet::default(),
         }
     }
 

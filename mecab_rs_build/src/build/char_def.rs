@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::text::{LINE_BUFFER_BYTES, Lines, MAX_DEF_COLUMNS, atoi, cstr, tokenize_csv, tokenize2};
@@ -7,6 +7,7 @@ use mecab_rs::__private::char_layout::{
     CATEGORY_NAME_BYTES, CHAR_BIN_COUNT_BYTES, CHAR_BIN_ENTRIES, CHAR_BIN_ENTRY_BYTES,
     DEFAULT_TYPE_SHIFT, MAX_CATEGORIES, TYPE_MASK, pack_char_info,
 };
+use mecab_rs::__private::hash::FastSet;
 use mecab_rs::__private::in_range_bytes::{u32_at, u32_values};
 use mecab_rs::Error;
 use mecab_rs::IoAction;
@@ -241,7 +242,7 @@ fn read_unknown_categories(
     unk_def: &Path,
     char_def: &Path,
     categories: &BTreeMap<Vec<u8>, CharInfo>,
-) -> Result<(HashSet<Vec<u8>>, PathBuf), Error> {
+) -> Result<(FastSet<Vec<u8>>, PathBuf), Error> {
     let mut lines = if unk_def.is_file() {
         Lines::open(unk_def, Some(LINE_BUFFER_BYTES))?
     } else {
@@ -252,7 +253,7 @@ fn read_unknown_categories(
         Lines::builtin(UNK_DEF_DEFAULT, unk_def, Some(LINE_BUFFER_BYTES))
     };
     let unk_source = lines.path().to_path_buf();
-    let mut unknown: HashSet<Vec<u8>> = HashSet::new();
+    let mut unknown: FastSet<Vec<u8>> = FastSet::default();
     while let Some((number, line)) = lines.next_line()? {
         let at = Position::new(&unk_source, number);
         let shown = String::from_utf8_lossy(cstr(line, 0)).into_owned();

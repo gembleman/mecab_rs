@@ -1,30 +1,9 @@
+use crate::hash::FastMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
 
-const MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
 const KEY_SHIFT: u32 = 16;
 
-#[derive(Default)]
-struct KeyHasher(u64);
-
-impl Hasher for KeyHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(MULTIPLIER);
-        }
-    }
-
-    fn write_u32(&mut self, value: u32) {
-        self.0 = u64::from(value).wrapping_mul(MULTIPLIER);
-    }
-}
-
-type Counts = HashMap<u32, u32, BuildHasherDefault<KeyHasher>>;
+type Counts = FastMap<u32, u32>;
 
 thread_local! {
     static COUNTS: RefCell<Counts> = RefCell::new(Counts::default());

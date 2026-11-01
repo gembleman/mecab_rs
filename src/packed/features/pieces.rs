@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 
 use super::bits_for;
+use crate::hash::FastMap;
 
 pub(super) const POSITION_BYTES: usize = 8;
 pub(super) const MAX_ENTRY_BITS: usize = u16::MAX as usize;
@@ -89,7 +90,7 @@ pub(super) fn put_bits(bytes: &mut [u8], bit: usize, width: u32, value: u64) {
 }
 
 fn ranked_uses<'a>(lists: &[Vec<&'a [u8]>], position: usize) -> Vec<(&'a [u8], u64)> {
-    let mut uses: HashMap<&[u8], u64> = HashMap::new();
+    let mut uses: FastMap<&[u8], u64> = FastMap::default();
     for list in lists {
         if let Some(&piece) = list.get(position) {
             *uses.entry(piece).or_insert(0) += 1;
@@ -103,7 +104,7 @@ fn ranked_uses<'a>(lists: &[Vec<&'a [u8]>], position: usize) -> Vec<(&'a [u8], u
 fn fill_entries(
     lists: &[Vec<&[u8]>],
     positions: &[Position],
-    locals: &[HashMap<&[u8], u32>],
+    locals: &[FastMap<&[u8], u32>],
     entry_bits: u32,
 ) -> Vec<u8> {
     let mut entries = vec![0u8; (lists.len() * entry_bits as usize).div_ceil(8)];
@@ -132,7 +133,7 @@ pub(super) fn build(programs: &[Vec<u8>]) -> Option<Pieces> {
         .collect::<Option<_>>()?;
     let count = lists.iter().map(Vec::len).max().unwrap_or(0);
     let mut positions = Vec::with_capacity(count);
-    let mut locals: Vec<HashMap<&[u8], u32>> = Vec::with_capacity(count);
+    let mut locals: Vec<FastMap<&[u8], u32>> = Vec::with_capacity(count);
     let mut offsets = vec![0u32];
     let mut pool = Vec::new();
     let mut shift = 0u32;
@@ -161,7 +162,8 @@ pub(super) fn build(programs: &[Vec<u8>]) -> Option<Pieces> {
         if !constant {
             shift += bits;
         }
-        let mut local = HashMap::with_capacity(ranked.len());
+        let mut local =
+            FastMap::with_capacity_and_hasher(ranked.len(), BuildHasherDefault::default());
         for (number, &(piece, _)) in ranked.iter().enumerate() {
             pool.extend_from_slice(piece);
             offsets.push(u32::try_from(pool.len()).ok()?);

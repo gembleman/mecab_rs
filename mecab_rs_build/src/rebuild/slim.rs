@@ -1,9 +1,9 @@
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
 use crate::tool_error::rebuild_error;
 use mecab_rs::__private::dictionary_format::{HEADER_SIZE, MAGIC_ID, TOKEN_SIZE};
+use mecab_rs::__private::hash::FastMap;
 use mecab_rs::__private::in_range_bytes::u32_at;
 use mecab_rs::Error;
 
@@ -128,8 +128,8 @@ fn read_sections(data: &[u8], path: &Path) -> Result<Sections, Error> {
 #[derive(Default)]
 struct SlimFeatures {
     blob: Vec<u8>,
-    by_text: HashMap<Vec<u8>, u32>,
-    by_offset: HashMap<u32, u32>,
+    by_text: FastMap<Vec<u8>, u32>,
+    by_offset: FastMap<u32, u32>,
 }
 
 impl SlimFeatures {

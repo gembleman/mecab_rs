@@ -52,7 +52,7 @@ pub mod files {
 }
 
 pub mod hash {
-    pub use crate::wire::{FNV_OFFSET, FNV_PRIME};
+    pub use crate::hash::{FastMap, FastSet};
 }
 
 pub mod in_range_bytes {

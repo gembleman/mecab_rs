@@ -16,6 +16,7 @@ mod expand_cache;
 mod feature_match;
 mod feature_text;
 mod file_write;
+mod hash;
 mod hot_shape;
 mod ids;
 mod int_runtime;

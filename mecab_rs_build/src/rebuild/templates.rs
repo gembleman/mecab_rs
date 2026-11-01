@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -9,6 +9,7 @@ use crate::tool_error::{io_error, rebuild_error, rebuild_error_at};
 use mecab_rs::__private::files::{
     DICRC_FILE, FEATURE_DEF_FILE, LEFT_ID_DEF_FILE, MODEL_DEF_FILE, RIGHT_ID_DEF_FILE,
 };
+use mecab_rs::__private::hash::{FastMap, FastSet};
 use mecab_rs::__private::matrix::HotShape;
 use mecab_rs::__private::template_universe::{
     id_rows, parse_side, project, read_bigrams, side_keys,
@@ -28,9 +29,9 @@ struct Source {
     name: String,
     left_keys: Vec<Option<String>>,
     right_keys: Vec<Option<String>>,
-    left_set: HashSet<String>,
-    right_set: HashSet<String>,
-    weights: HashMap<(Box<str>, u32), f64>,
+    left_set: FastSet<String>,
+    right_set: FastSet<String>,
+    weights: FastMap<(Box<str>, u32), f64>,
 }
 
 fn read_cost_factor(dicrc: &Path) -> Result<u32, Error> {
@@ -48,8 +49,8 @@ fn read_cost_factor(dicrc: &Path) -> Result<u32, Error> {
     Err(rebuild_error(dicrc, "no cost-factor"))
 }
 
-fn index_by_name(sources: &[Source]) -> HashMap<String, Vec<usize>> {
-    let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+fn index_by_name(sources: &[Source]) -> FastMap<String, Vec<usize>> {
+    let mut by_name: FastMap<String, Vec<usize>> = FastMap::default();
     for (index, source) in sources.iter().enumerate() {
         by_name.entry(source.name.clone()).or_default().push(index);
     }
@@ -88,7 +89,7 @@ fn parse_weight_line<'line, 'names>(
     line: &'line [u8],
     number: usize,
     model_def: &Path,
-    by_name: &'names HashMap<String, Vec<usize>>,
+    by_name: &'names FastMap<String, Vec<usize>>,
 ) -> Result<Option<WeightEntry<'line, 'names>>, Error> {
     let malformed = || rebuild_error_at(model_def, number, "expected `weight<TAB>name:key`");
     let tab = line
@@ -244,7 +245,7 @@ pub fn compile_templates(
             .ok_or_else(|| rebuild_error(&feature_def, format!("template {name} has no `/`")))?;
         let left_keys = side_keys(&parse_side(left_body, true), &left_rows);
         let right_keys = side_keys(&parse_side(right_body, false), &right_rows);
-        let set = |keys: &[Option<String>]| -> HashSet<String> {
+        let set = |keys: &[Option<String>]| -> FastSet<String> {
             keys.iter().flatten().cloned().collect()
         };
         sources.push(Source {
@@ -253,7 +254,7 @@ pub fn compile_templates(
             right_set: set(&right_keys),
             left_keys,
             right_keys,
-            weights: HashMap::new(),
+            weights: FastMap::default(),
         });
     }
     let model_def = source_dir.join(MODEL_DEF_FILE);

@@ -3,7 +3,8 @@ use super::num::IRREGULAR_FLAG_LIMIT;
 use super::row::RowState;
 use super::spec::LidSpec;
 use crate::codec::coder::{Coder, Flag, UintModel};
-use crate::codec::ppm::{FastMap, Ppm, hash_bytes, mix};
+use crate::codec::ppm::{Ppm, hash_bytes, mix};
+use crate::hash::IdMap;
 use crate::wire::{unzigzag, zigzag};
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -46,7 +47,7 @@ impl LidMode {
 }
 
 pub(super) struct LidState {
-    seen: FastMap<u64, u64>,
+    seen: IdMap<u64, u64>,
     order: OrderRanges,
     mode_ppm: Ppm,
     delta: UintModel,
@@ -62,7 +63,7 @@ pub(super) struct LidState {
 impl LidState {
     pub(super) fn new() -> LidState {
         LidState {
-            seen: FastMap::default(),
+            seen: IdMap::default(),
             order: BTreeMap::new(),
             mode_ppm: Ppm::default(),
             delta: UintModel::default(),

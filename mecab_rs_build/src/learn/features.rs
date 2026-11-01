@@ -1,35 +1,13 @@
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 
 use crate::build::model::{Templates, bigram_keys, unigram_keys};
 use crate::build::rewrite::{Rewriter, Rewritten};
 use crate::tool_error::learn_error;
 use mecab_rs::__private::files::{FEATURE_DEF_FILE, REWRITE_DEF_FILE};
-use mecab_rs::__private::hash::{FNV_OFFSET, FNV_PRIME};
+use mecab_rs::__private::hash::FastMap;
 use mecab_rs::Error;
 
 mod model;
-
-pub(super) struct Fnv(u64);
-
-impl Default for Fnv {
-    fn default() -> Self {
-        Self(FNV_OFFSET)
-    }
-}
-
-impl Hasher for Fnv {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
-        }
-    }
-}
 
 pub(super) const fn widen(value: u32) -> usize {
     value as usize
@@ -82,10 +60,8 @@ const FEATURE_COUNT_FITS_I32: &str = "the feature count fits an i32";
 
 pub(super) type Settings = Vec<(String, String)>;
 
-pub(super) type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fnv>>;
-
 pub(super) struct Features {
-    ids: Map<Vec<u8>, FeatureId>,
+    ids: FastMap<Vec<u8>, FeatureId>,
     list: Vec<Vec<u8>>,
     rewritten: Vec<Option<Rewritten>>,
     rewriter: Rewriter,
@@ -96,7 +72,7 @@ impl Features {
     pub(super) fn open(dic_dir: &Path) -> Result<Self, Error> {
         let rewrite_def = dic_dir.join(REWRITE_DEF_FILE);
         Ok(Self {
-            ids: Map::default(),
+            ids: FastMap::default(),
             list: Vec::new(),
             rewritten: Vec::new(),
             rewriter: Rewriter::open(&rewrite_def)?,
@@ -161,15 +137,15 @@ struct Cached {
 pub(super) struct FeatureIndex {
     templates: Templates,
     feature_def: PathBuf,
-    dic: Map<Vec<u8>, i32>,
-    cache: Map<Vec<u8>, Cached>,
+    dic: FastMap<Vec<u8>, i32>,
+    cache: FastMap<Vec<u8>, Cached>,
     pool: Vec<i32>,
     maxid: usize,
     scratch: Vec<i32>,
 }
 
 fn id_of(
-    dic: &mut Map<Vec<u8>, i32>,
+    dic: &mut FastMap<Vec<u8>, i32>,
     maxid: &mut usize,
     key: &[u8],
     feature_def: &Path,
@@ -226,8 +202,8 @@ impl FeatureIndex {
         Ok(Self {
             templates: Templates::open(&feature_def)?,
             feature_def,
-            dic: Map::default(),
-            cache: Map::default(),
+            dic: FastMap::default(),
+            cache: FastMap::default(),
             pool: Vec::new(),
             maxid: 0,
             scratch: Vec::new(),

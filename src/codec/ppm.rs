@@ -10,7 +10,7 @@ mod learn;
 mod level;
 mod table;
 
-pub(crate) use hash::{FastMap, hash_bytes, mix};
+pub(crate) use hash::{hash_bytes, mix};
 pub(crate) use intern::Interner;
 
 const TOTAL_LIMIT: u32 = 60000;
@@ -59,11 +59,16 @@ impl Default for Ppm {
     }
 }
 
+#[inline]
+fn home(key: u64, mask: usize) -> usize {
+    (key >> 1) as usize & mask
+}
+
 impl Ppm {
     #[inline]
     fn slot_for(&mut self, h: u64) -> u32 {
         let h = h | 1;
-        let mut i = h as usize & self.mask;
+        let mut i = home(h, self.mask);
         loop {
             let k = self.slots[i].key;
             if k == h {
@@ -80,7 +85,7 @@ impl Ppm {
 
     pub(crate) fn distinct(&self, h: u64) -> u32 {
         let h = h | 1;
-        let mut i = h as usize & self.mask;
+        let mut i = home(h, self.mask);
         loop {
             let k = self.slots[i].key;
             if k == h {
@@ -98,7 +103,7 @@ impl Ppm {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-            let i = (h | 1) as usize & self.mask;
+            let i = home(h | 1, self.mask);
             _mm_prefetch(self.slots.as_ptr().add(i).cast::<i8>(), _MM_HINT_T0);
         }
         #[cfg(not(target_arch = "x86_64"))]
@@ -112,7 +117,7 @@ impl Ppm {
         self.mask = n - 1;
         for s in old {
             if s.key != 0 {
-                let mut i = s.key as usize & self.mask;
+                let mut i = home(s.key, self.mask);
                 while self.slots[i].key != 0 {
                     i = (i + 1) & self.mask;
                 }

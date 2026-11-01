@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
@@ -137,7 +136,7 @@ struct Category {
 
 struct CharDefParser<'a> {
     file: &'a Path,
-    categories: HashMap<&'a [u8], Category>,
+    categories: Vec<Category>,
     names: Vec<Vec<u8>>,
     ranges: Vec<DefRange>,
 }
@@ -146,7 +145,7 @@ impl<'a> CharDefParser<'a> {
     fn new(file: &'a Path) -> Self {
         Self {
             file,
-            categories: HashMap::new(),
+            categories: Vec::new(),
             names: Vec::new(),
             ranges: Vec::new(),
         }
@@ -200,10 +199,15 @@ impl<'a> CharDefParser<'a> {
         Ok(())
     }
 
+    fn category_named(&self, name: &[u8]) -> Option<Category> {
+        let at = self.names.iter().position(|known| known == name)?;
+        Some(self.categories[at])
+    }
+
     fn chosen_categories(&self, number: usize, columns: &[&[u8]]) -> Result<Vec<Category>, Error> {
         let mut chosen = Vec::new();
         for &column in columns.iter().take_while(|column| column[0] != b'#') {
-            let Some(&category) = self.categories.get(column) else {
+            let Some(category) = self.category_named(column) else {
                 let name = String::from_utf8_lossy(column);
                 return Err(self.fail(number, format!("category [{name}] is undefined")));
             };
@@ -216,7 +220,7 @@ impl<'a> CharDefParser<'a> {
         if columns.len() < 4 {
             return Err(self.fail(number, "format error"));
         }
-        if self.categories.contains_key(columns[0]) {
+        if self.category_named(columns[0]).is_some() {
             return Err(self.fail(number, "category is already defined"));
         }
         let category = Category {
@@ -225,7 +229,7 @@ impl<'a> CharDefParser<'a> {
             group: atoi(columns[2]),
             length: atoi(columns[3]),
         };
-        self.categories.insert(columns[0], category);
+        self.categories.push(category);
         self.names.push(columns[0].to_vec());
         Ok(())
     }
@@ -235,7 +239,7 @@ impl<'a> CharDefParser<'a> {
             return Err(Error::format(self.file, "too many categories(>= 18)"));
         }
         for required in [&b"DEFAULT"[..], b"SPACE"] {
-            if !self.categories.contains_key(required) {
+            if !self.names.iter().any(|known| known == required) {
                 let name = String::from_utf8_lossy(required);
                 return Err(Error::format(
                     self.file,
@@ -260,18 +264,16 @@ fn parse_char_def(bytes: &[u8], file: &Path) -> Result<CharDef, Error> {
 
 struct Interner {
     palette: Vec<Entry>,
-    index: HashMap<Entry, u8>,
 }
 
 impl Interner {
     fn intern(&mut self, entry: Entry, file: &Path) -> Result<u8, Error> {
-        if let Some(&index) = self.index.get(&entry) {
-            return Ok(index);
+        if let Some(index) = self.palette.iter().position(|known| *known == entry) {
+            return Ok(index as u8);
         }
         let index = u8::try_from(self.palette.len())
             .map_err(|_| Error::format(file, "more than 256 distinct character entries"))?;
         self.palette.push(entry);
-        self.index.insert(entry, index);
         Ok(index)
     }
 }
@@ -385,7 +387,6 @@ impl CharTable {
         let (names, table_start) = read_names(bin, bin_path)?;
         let mut interner = Interner {
             palette: Vec::new(),
-            index: HashMap::new(),
         };
         let mut table = fill_bin_table(&bin[table_start..], &mut interner, bin_path)?;
         fill_unicode_defaults(&mut table);

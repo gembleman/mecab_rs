@@ -1,10 +1,12 @@
 use super::{
-    Class, Error, Numbers, OP_BLOB, OP_BLOB_NEXT, OP_COPY, OP_DERIVE, OP_EMPTY, OP_HIGH, OP_INLINE,
-    OP_KEY, OP_NUM, OP_NUMB, OP_REF, OP_STAR, Planner, SmallKeyMap, Spans, TextOp, blob_slot,
+    Class, Error, FastMap, Numbers, OP_BLOB, OP_BLOB_NEXT, OP_COPY, OP_DERIVE, OP_EMPTY, OP_HIGH,
+    OP_INLINE, OP_KEY, OP_NUM, OP_NUMB, OP_REF, OP_STAR, Planner, Spans, TextOp, blob_slot,
     plan_op, push_piece,
 };
 
-pub(super) fn intern_bytes(map: &mut SmallKeyMap<Vec<u8>, u32>, bytes: &[u8]) -> u32 {
+const NO_OFFSET: u32 = u32::MAX;
+
+pub(super) fn intern_bytes(map: &mut FastMap<Vec<u8>, u32>, bytes: &[u8]) -> u32 {
     if let Some(&number) = map.get(bytes) {
         return number;
     }
@@ -13,7 +15,7 @@ pub(super) fn intern_bytes(map: &mut SmallKeyMap<Vec<u8>, u32>, bytes: &[u8]) ->
     number
 }
 
-fn ordered_list(map: SmallKeyMap<Vec<u8>, u32>) -> Vec<Vec<u8>> {
+fn ordered_list(map: FastMap<Vec<u8>, u32>) -> Vec<Vec<u8>> {
     let mut list = vec![Vec::new(); map.len()];
     for (bytes, number) in map {
         list[number as usize] = bytes;
@@ -40,15 +42,17 @@ pub(super) struct ProgramBuilder<'c, 'a> {
     pub(super) entries: &'c [&'a [u8]],
     pub(super) spans: &'c Spans,
     pub(super) numbers: &'c Numbers,
-    pub(super) string_uses: &'c SmallKeyMap<&'a [u8], u32>,
+    pub(super) uses_of_id: &'c [u32],
     pub(super) set: ProgramSet<'a>,
-    pub(super) templates: SmallKeyMap<Vec<u8>, u32>,
-    pub(super) shapes: SmallKeyMap<Vec<u8>, u32>,
-    pub(super) known_strings: SmallKeyMap<&'a [u8], u32>,
+    pub(super) templates: FastMap<Vec<u8>, u32>,
+    pub(super) shapes: FastMap<Vec<u8>, u32>,
+    pub(super) offset_of_id: Vec<u32>,
     pub(super) fields: Vec<(usize, usize)>,
     pub(super) planned: Vec<Option<TextOp>>,
+    pub(super) string_ids: Vec<u32>,
     pub(super) plan_codes: Vec<u8>,
     pub(super) plan_cursor: usize,
+    pub(super) plan_begin: usize,
     pub(super) program: Vec<u8>,
     pub(super) piece: Vec<u8>,
     pub(super) ops: Vec<u8>,
@@ -60,23 +64,27 @@ impl<'c, 'a> ProgramBuilder<'c, 'a> {
         entries: &'c [&'a [u8]],
         spans: &'c Spans,
         numbers: &'c Numbers,
-        string_uses: &'c SmallKeyMap<&'a [u8], u32>,
+        uses_of_id: &'c [u32],
+        string_ids: Vec<u32>,
         plan_codes: Vec<u8>,
     ) -> Self {
+        debug_assert_eq!(string_ids.len(), plan_codes.len());
         Self {
             planner,
             entries,
             spans,
             numbers,
-            string_uses,
+            uses_of_id,
             set: ProgramSet::default(),
-            templates: SmallKeyMap::default(),
-            shapes: SmallKeyMap::default(),
-            known_strings: SmallKeyMap::default(),
+            templates: FastMap::default(),
+            shapes: FastMap::default(),
+            offset_of_id: vec![NO_OFFSET; uses_of_id.len()],
             fields: Vec::new(),
             planned: Vec::new(),
+            string_ids,
             plan_codes,
             plan_cursor: 0,
+            plan_begin: 0,
             program: Vec::new(),
             piece: Vec::new(),
             ops: Vec::new(),
@@ -98,6 +106,7 @@ impl<'c, 'a> ProgramBuilder<'c, 'a> {
                 .iter()
                 .map(|&code| plan_op(code)),
         );
+        self.plan_begin = self.plan_cursor;
         self.plan_cursor = end;
     }
 
@@ -166,28 +175,29 @@ impl<'c, 'a> ProgramBuilder<'c, 'a> {
             TextOp::Empty => self.ops.push(OP_EMPTY),
             TextOp::Copy(slot) => self.ops.push(OP_COPY + slot),
             TextOp::Derive => self.ops.push(OP_DERIVE),
-            TextOp::New if self.string_uses[value] == 1 => {
-                self.ops.push(OP_INLINE);
-                self.set.inline.push(value);
-            }
             TextOp::New => {
-                self.ops.push(OP_REF);
-                let offset = self.area_offset(value);
-                self.set.references.push(offset);
+                let id = self.string_ids[self.plan_begin + field] as usize;
+                if self.uses_of_id[id] == 1 {
+                    self.ops.push(OP_INLINE);
+                    self.set.inline.push(value);
+                } else {
+                    self.ops.push(OP_REF);
+                    let offset = self.area_offset(id, value);
+                    self.set.references.push(offset);
+                }
             }
         }
     }
 
-    pub(super) fn area_offset(&mut self, value: &'a [u8]) -> u32 {
-        let next = self.set.area.len();
-        let offset = *self
-            .known_strings
-            .entry(value)
-            .or_insert_with(|| next as u32);
-        if offset as usize == next {
-            self.set.area.extend_from_slice(value);
-            self.set.area.push(0);
+    pub(super) fn area_offset(&mut self, id: usize, value: &'a [u8]) -> u32 {
+        let known = self.offset_of_id[id];
+        if known != NO_OFFSET {
+            return known;
         }
+        let offset = self.set.area.len() as u32;
+        self.set.area.extend_from_slice(value);
+        self.set.area.push(0);
+        self.offset_of_id[id] = offset;
         offset
     }
 
