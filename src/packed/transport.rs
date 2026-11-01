@@ -5,10 +5,12 @@ pub(crate) mod matrix;
 use std::borrow::Cow;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use lzma_rust2::XzReader;
 
-use super::model::{LexiconSections, Model};
+use self::lexicon::LexiconKeys;
+use super::model::{LexiconSections, Model, PreparedSlot, PreparedTrie};
 use super::source::read_dictionary;
 use crate::Error;
 use crate::error::{IoAction, io_error};
@@ -16,7 +18,7 @@ use crate::file_write::write_file;
 use crate::wire::{fnv1a64, u32_at, u64_at};
 
 const MAGIC: &[u8; 4] = b"MRDT";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const MAX_PAYLOAD: u64 = 256 << 20;
 const MAX_PARTS: usize = 64;
 const DIGEST_BYTES: usize = 8;
@@ -211,8 +213,11 @@ pub(super) fn parse_container<'a>(payload: &'a [u8], path: &'a Path) -> Result<P
     Ok(Parts { path, parts })
 }
 
-fn lexicon_model(parts: &Parts) -> Result<Model, Error> {
-    let mut model = lexicon::decode(parts)?;
+fn lexicon_model(
+    parts: &Parts,
+    on_keys: impl FnOnce(Arc<LexiconKeys>) + Send,
+) -> Result<Model, Error> {
+    let mut model = lexicon::decode(parts, on_keys)?;
     model.char_table = parts.plain("char table", 0)?.to_vec();
     let dicrc = parts.plain("dicrc", 0)?;
     let corrupt = |reason| parts.corrupt(reason);
@@ -239,18 +244,33 @@ fn attach_matrix(model: &mut Model, (matrix, templates): (Vec<u8>, Vec<u8>)) {
     model.templates = templates;
 }
 
-fn runtime_model(parts: &Parts) -> Result<(Model, LexiconSections), Error> {
+type DecodedParts = (Model, PreparedSlot, (Vec<u8>, Vec<u8>));
+
+fn decode_parts(parts: &Parts) -> Result<DecodedParts, Error> {
     std::thread::scope(|scope| {
         let matrix = scope.spawn(|| matrix::decode(parts));
-        let lexicon = lexicon_model(parts).and_then(|model| {
-            let sections = model.encode_lexicon_sections()?;
-            Ok((model, sections))
+        let (keys_tx, keys_rx) = std::sync::mpsc::channel();
+        let trie = scope.spawn(move || {
+            keys_rx
+                .recv()
+                .ok()
+                .map(|keys: std::sync::Arc<_>| PreparedTrie::build(&keys))
         });
+        let decoded = lexicon_model(parts, move |keys| {
+            let _ = keys_tx.send(keys);
+        });
+        let prepared = trie.join().expect("the trie builder panicked");
         let matrix = matrix.join().expect("the matrix decoder panicked");
-        let ((mut model, sections), matrix) = (lexicon?, matrix?);
-        attach_matrix(&mut model, matrix);
-        Ok((model, sections))
+        Ok((decoded?, prepared, matrix?))
     })
+}
+
+fn runtime_model(payload: Vec<u8>, path: &Path) -> Result<(Model, LexiconSections), Error> {
+    let (mut model, prepared, matrix) = decode_parts(&parse_container(&payload, path)?)?;
+    drop(payload);
+    let sections = model.encode_lexicon_sections(prepared)?;
+    attach_matrix(&mut model, matrix);
+    Ok((model, sections))
 }
 
 pub fn transport_payload(dict_dir: &Path) -> Result<Vec<u8>, Error> {
@@ -280,8 +300,7 @@ pub fn expand(xz_file: &Path, out_mrd: &Path) -> Result<(), Error> {
             "the payload inside the xz stream is larger than any dictionary",
         ));
     }
-    let (model, sections) = runtime_model(&parse_container(&payload, xz_file)?)?;
-    drop(payload);
+    let (model, sections) = runtime_model(payload, xz_file)?;
     let runtime = model.finish_runtime(sections)?;
     write_file(out_mrd, |writer| runtime.write_to(writer))
 }

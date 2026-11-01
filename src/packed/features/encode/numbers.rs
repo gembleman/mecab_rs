@@ -38,6 +38,19 @@ impl Numbers {
         self.values[self.stored_values[number]][entry]
     }
 
+    fn keep_stored_columns(&mut self) {
+        let mut columns: Vec<Option<Vec<u64>>> = std::mem::take(&mut self.values)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.values = self
+            .stored_values
+            .iter()
+            .map(|&slot| columns[slot].take().expect("a stored column is unique"))
+            .collect();
+        self.stored_values = (0..self.values.len()).collect();
+    }
+
     pub(super) fn blob_id(&self, number: usize, entry: usize) -> u64 {
         self.value(number, entry) >> self.stored[number].spec.shift
     }
@@ -149,5 +162,6 @@ pub(super) fn plan_numbers(
         numbers.stored.push(stored);
         numbers.stored_values.push(slot);
     }
+    numbers.keep_stored_columns();
     numbers
 }

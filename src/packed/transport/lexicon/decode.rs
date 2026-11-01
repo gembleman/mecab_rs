@@ -1,11 +1,14 @@
+use super::sizes::LexiconSizes;
 use super::{
     COMMA, Model, NUL, NUMBER_FIELDS, Param, QUOTE, UNKNOWN_PARAM_BYTES, Undecodable, get_varint,
     visit_lexicon_records,
 };
-use crate::codec::{Record, Row};
+use crate::codec::{LexiconKeys, Record, Row};
 use crate::hash::FastMap;
 use crate::wire::{i16_at, u16_at};
 use std::borrow::Cow;
+use std::hash::BuildHasherDefault;
+use std::sync::{Arc, OnceLock};
 
 const DIRECT_COLS: usize = 5;
 const KEY_COL: usize = 0;
@@ -85,24 +88,49 @@ fn hash_feature(feature: &[u8]) -> u32 {
     (state >> HASH_SHIFT) as u32
 }
 
+const STORED_FIRST_CAPACITY: usize = 1 << 20;
+const STORED_GROWTH_DIVISOR: usize = 2;
+
+fn reserve_stored(stored: &mut Vec<u8>, extra: usize) {
+    let needed = stored.len() + extra;
+    let capacity = stored.capacity();
+    if needed <= capacity {
+        return;
+    }
+    let grown = capacity + capacity / STORED_GROWTH_DIVISOR;
+    let target = needed.max(grown).max(STORED_FIRST_CAPACITY);
+    stored.reserve_exact(target - stored.len());
+}
+
 pub(super) struct FeatureTable {
     slots: Vec<Slot>,
-    starts: Vec<usize>,
+    starts: Vec<u32>,
 }
 
 impl Default for FeatureTable {
     fn default() -> Self {
-        Self {
-            slots: vec![Slot::default(); FIRST_SLOT_COUNT],
-            starts: Vec::new(),
-        }
+        Self::with_capacity(0)
     }
 }
 
 impl FeatureTable {
+    fn with_capacity(feature_count: usize) -> Self {
+        let slot_count = (feature_count + 1)
+            .saturating_mul(2)
+            .next_power_of_two()
+            .max(FIRST_SLOT_COUNT);
+        Self {
+            slots: vec![Slot::default(); slot_count],
+            starts: Vec::with_capacity(feature_count),
+        }
+    }
+
     fn bytes_of<'b>(&self, stored: &'b [u8], number: usize) -> &'b [u8] {
-        let end = self.starts.get(number + 1).copied().unwrap_or(stored.len());
-        &stored[self.starts[number]..end - 1]
+        let end = self
+            .starts
+            .get(number + 1)
+            .map_or(stored.len(), |&end| end as usize);
+        &stored[self.starts[number] as usize..end - 1]
     }
 
     fn grow_if_full(&mut self) {
@@ -138,7 +166,9 @@ impl FeatureTable {
             at = (at + 1) & mask;
         }
         let number = self.starts.len() as u32;
-        self.starts.push(stored.len());
+        debug_assert!(u32::try_from(stored.len()).is_ok());
+        self.starts.push(stored.len() as u32);
+        reserve_stored(stored, feature.len() + 1);
         stored.extend_from_slice(feature);
         stored.push(NUL);
         self.slots[at] = Slot {
@@ -149,13 +179,36 @@ impl FeatureTable {
     }
 }
 
-#[derive(Default)]
+type SharedKeys = Arc<OnceLock<Arc<LexiconKeys>>>;
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum KeySource {
+    #[default]
+    Undecided,
+    Own,
+    Shared,
+}
+
 pub(super) struct Interner {
     pub(super) params: FastMap<ParamKey, u32>,
     pub(super) features: FeatureTable,
+    key_source: KeySource,
+    shared_keys: SharedKeys,
 }
 
 impl Interner {
+    fn new(sizes: LexiconSizes) -> Self {
+        Self {
+            params: FastMap::with_capacity_and_hasher(
+                sizes.param_count,
+                BuildHasherDefault::default(),
+            ),
+            features: FeatureTable::with_capacity(sizes.feature_count),
+            key_source: KeySource::default(),
+            shared_keys: SharedKeys::default(),
+        }
+    }
+
     pub(super) fn intern(&mut self, model: &mut Model, param: Param, feature: &[u8]) -> (u32, u32) {
         let next = self.params.len() as u32;
         let param_number = *self.params.entry(ParamKey::of(param)).or_insert_with(|| {
@@ -165,6 +218,39 @@ impl Interner {
         let feature_number = self.features.intern(&mut model.features, feature);
         (param_number, feature_number)
     }
+
+    fn decide_key_source(&mut self, model: &mut Model) -> KeySource {
+        if self.key_source == KeySource::Undecided {
+            self.key_source = match self.shared_keys.get() {
+                Some(keys) => {
+                    let tokens: usize = keys.counts.iter().map(|&count| usize::from(count)).sum();
+                    model.token_params.reserve_exact(tokens);
+                    model.token_features.reserve_exact(tokens);
+                    KeySource::Shared
+                }
+                None => KeySource::Own,
+            };
+        }
+        self.key_source
+    }
+}
+
+fn adopt_shared_keys(shared: SharedKeys, model: &mut Model) -> Result<(), Undecodable> {
+    let keys = Arc::try_unwrap(shared)
+        .ok()
+        .and_then(OnceLock::into_inner)
+        .ok_or(Undecodable("the decoded keys are not available"))?;
+    let LexiconKeys { keys, counts } = Arc::try_unwrap(keys).unwrap_or_else(|shared| LexiconKeys {
+        keys: shared.keys.clone(),
+        counts: shared.counts.clone(),
+    });
+    let tokens: usize = counts.iter().map(|&count| usize::from(count)).sum();
+    if tokens != model.token_params.len() || counts.contains(&0) {
+        return Err(Undecodable("the key counts do not match the tokens"));
+    }
+    model.keys = keys;
+    model.counts = counts;
+    Ok(())
 }
 
 pub(super) struct PosIds<'a> {
@@ -291,7 +377,7 @@ pub(super) fn decode_unknown(
     Ok(())
 }
 
-fn append_key(model: &mut Model, key: &[u8]) -> Result<(), Undecodable> {
+fn append_own_key(model: &mut Model, key: &[u8]) -> Result<(), Undecodable> {
     match (model.keys.last(), model.counts.last_mut()) {
         (Some(last), Some(count)) if last.as_bytes() == key => {
             *count = count
@@ -411,11 +497,15 @@ fn append_direct(
         mut param,
         feature,
     } = fields;
+    let source = interner.decide_key_source(model);
     param.pos_id = pos_ids.next()?;
     let (param, feature) = interner.intern(model, param, feature);
     model.token_params.push(param);
     model.token_features.push(feature);
-    append_key(model, key)
+    match source {
+        KeySource::Shared => Ok(()),
+        _ => append_own_key(model, key),
+    }
 }
 
 fn append_record(
@@ -439,16 +529,37 @@ fn append_record(
     }
 }
 
-pub(super) fn restore(lexicon: &[u8], unknown: &[u8], pos: &[u8]) -> Result<Model, Undecodable> {
+fn reserved_model(sizes: LexiconSizes) -> Model {
+    let mut model = Model::default();
+    model.features.reserve_exact(sizes.feature_bytes);
+    model.params.reserve_exact(sizes.param_count);
+    model.token_params.reserve_exact(sizes.token_count);
+    model.token_features.reserve_exact(sizes.token_count);
+    model
+}
+
+pub(super) fn restore(
+    lexicon: &[u8],
+    unknown: &[u8],
+    pos: &[u8],
+    sizes: &[u8],
+    on_keys: impl FnOnce(Arc<LexiconKeys>) + Send,
+) -> Result<Model, Undecodable> {
+    let sizes = LexiconSizes::parse(sizes, lexicon.len())?;
     let unknown = Reader {
         bytes: unknown,
         at: 0,
     };
     let mut pos_ids = PosIds::new(pos);
     let mut scratch = Vec::new();
-    let mut model = Model::default();
-    let mut interner = Interner::default();
-    visit_lexicon_records(lexicon, |record| {
+    let mut model = reserved_model(sizes);
+    let mut interner = Interner::new(sizes);
+    let slot = Arc::clone(&interner.shared_keys);
+    let publish = move |keys: Arc<LexiconKeys>| {
+        let _ = slot.set(Arc::clone(&keys));
+        on_keys(keys);
+    };
+    visit_lexicon_records(lexicon, publish, |record| {
         append_record(
             record,
             &mut scratch,
@@ -460,6 +571,9 @@ pub(super) fn restore(lexicon: &[u8], unknown: &[u8], pos: &[u8]) -> Result<Mode
     decode_unknown(unknown, &mut pos_ids, &mut model, &mut interner)?;
     if !pos_ids.at_end() {
         return Err(Undecodable("the part-of-speech ids have trailing bytes"));
+    }
+    if interner.key_source == KeySource::Shared {
+        adopt_shared_keys(std::mem::take(&mut interner.shared_keys), &mut model)?;
     }
     Ok(model)
 }

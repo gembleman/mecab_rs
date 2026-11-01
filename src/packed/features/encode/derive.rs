@@ -3,6 +3,9 @@ use super::{
     MAX_RULES, MAX_SLOTS, MIN_RULE_USES, RULE_BYTES, RULE_CHAR_BITS, RULE_HEADER_BYTES, Spans,
     blob_slot,
 };
+use std::thread;
+
+use super::lanes::lane_count;
 use crate::Error;
 
 pub(super) fn is_key(value: &[u8], key: &[u8]) -> bool {
@@ -87,6 +90,84 @@ pub(super) fn kept_bytes(key: &str, removed: u8) -> Option<usize> {
     Some(keep)
 }
 
+type SplitCounts<'a> = FastMap<RuleSite, FastMap<Split<'a>, u32>>;
+
+#[derive(Default)]
+struct ChunkCount<'a> {
+    contexts: Vec<Context<'a>>,
+    counts: SplitCounts<'a>,
+}
+
+fn count_chunk<'a>(
+    entries: &[&'a [u8]],
+    spans: &Spans,
+    tokens: &[(u32, &str)],
+    blob: Option<&Blob>,
+) -> ChunkCount<'a> {
+    let mut chunk = ChunkCount::default();
+    let mut local_ids: FastMap<Context<'a>, u32> = FastMap::default();
+    let mut fields = Vec::new();
+    for &(feature, key) in tokens {
+        let entry = feature as usize;
+        let Some(&text) = entries.get(entry) else {
+            continue;
+        };
+        let Some(last) = key.chars().next_back() else {
+            continue;
+        };
+        spans.fill(entry, &mut fields);
+        let Some(context) = context_of(text, &fields) else {
+            continue;
+        };
+        let next = chunk.contexts.len() as u32;
+        let id = *local_ids.entry(context).or_insert(next);
+        if id == next {
+            chunk.contexts.push(context);
+        }
+        let (begin, end) = fields[DERIVE_TARGET];
+        let value = &text[begin..end];
+        if blob_slot(blob, entry, DERIVE_TARGET).is_some()
+            || is_key(value, key.as_bytes())
+            || value == b"*"
+            || value.is_empty()
+        {
+            continue;
+        }
+        if let Some(split) = split_derivation(key, value) {
+            *chunk
+                .counts
+                .entry((id, last))
+                .or_default()
+                .entry(split)
+                .or_insert(0) += 1;
+        }
+    }
+    chunk
+}
+
+fn count_chunks<'a>(
+    entries: &[&'a [u8]],
+    spans: &Spans,
+    tokens: &[(u32, &str)],
+    blob: Option<&Blob>,
+    lanes: usize,
+) -> Vec<ChunkCount<'a>> {
+    if lanes <= 1 || tokens.len() <= 1 {
+        return vec![count_chunk(entries, spans, tokens, blob)];
+    }
+    let chunk_len = tokens.len().div_ceil(lanes);
+    thread::scope(|scope| {
+        let handles: Vec<_> = tokens
+            .chunks(chunk_len)
+            .map(|part| scope.spawn(move || count_chunk(entries, spans, part, blob)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("a derivation counter panicked"))
+            .collect()
+    })
+}
+
 #[derive(Default)]
 pub(super) struct Derive<'a> {
     pub(super) contexts: FastMap<Context<'a>, u32>,
@@ -110,56 +191,63 @@ impl<'a> Derive<'a> {
                 .iter()
                 .all(|&field| classes[field] == Class::Folded)
             && classes[DERIVE_TARGET] == Class::Text;
-        let mut derive = Self::default();
+        let derive = Self::default();
         if !enabled {
             return Ok(derive);
         }
-        let counts = derive.count_derivations(entries, spans, tokens, blob);
-        derive.register_rules(choose_splits(counts))?;
-        Ok(derive)
+        Self::learn_in_chunks(
+            entries,
+            spans,
+            tokens,
+            blob,
+            lane_count(tokens.len()),
+            derive,
+        )
     }
 
-    fn count_derivations(
-        &mut self,
+    fn learn_in_chunks(
         entries: &[&'a [u8]],
         spans: &Spans,
         tokens: &[(u32, &str)],
         blob: Option<&Blob>,
-    ) -> FastMap<RuleSite, FastMap<Split<'a>, u32>> {
-        let mut counts: FastMap<RuleSite, FastMap<Split<'a>, u32>> = FastMap::default();
-        let mut fields = Vec::new();
-        for &(feature, key) in tokens {
-            let entry = feature as usize;
-            let Some(&text) = entries.get(entry) else {
-                continue;
-            };
-            let Some(last) = key.chars().next_back() else {
-                continue;
-            };
-            spans.fill(entry, &mut fields);
-            let Some(context) = context_of(text, &fields) else {
-                continue;
-            };
-            let next = self.contexts.len() as u32;
-            let id = *self.contexts.entry(context).or_insert(next);
-            let (begin, end) = fields[DERIVE_TARGET];
-            let value = &text[begin..end];
-            if blob_slot(blob, entry, DERIVE_TARGET).is_some()
-                || is_key(value, key.as_bytes())
-                || value == b"*"
-                || value.is_empty()
-            {
-                continue;
-            }
-            if let Some(split) = split_derivation(key, value) {
-                *counts
-                    .entry((id, last))
-                    .or_default()
-                    .entry(split)
-                    .or_insert(0) += 1;
+        lanes: usize,
+        mut derive: Self,
+    ) -> Result<Self, Error> {
+        let chunks = count_chunks(entries, spans, tokens, blob, lanes);
+        let counts = derive.merge_chunks(chunks);
+        derive.register_rules(choose_splits(counts))?;
+        Ok(derive)
+    }
+
+    fn merge_chunks(&mut self, chunks: Vec<ChunkCount<'a>>) -> SplitCounts<'a> {
+        let mut chunks = chunks.into_iter();
+        let Some(first) = chunks.next() else {
+            return SplitCounts::default();
+        };
+        self.register_contexts(&first.contexts);
+        let mut counts = first.counts;
+        for chunk in chunks {
+            let global_ids = self.register_contexts(&chunk.contexts);
+            for ((local, last), uses) in chunk.counts {
+                let merged = counts
+                    .entry((global_ids[local as usize], last))
+                    .or_default();
+                for (split, count) in uses {
+                    *merged.entry(split).or_insert(0) += count;
+                }
             }
         }
         counts
+    }
+
+    fn register_contexts(&mut self, contexts: &[Context<'a>]) -> Vec<u32> {
+        contexts
+            .iter()
+            .map(|&context| {
+                let next = self.contexts.len() as u32;
+                *self.contexts.entry(context).or_insert(next)
+            })
+            .collect()
     }
 
     fn register_rules(&mut self, chosen: Vec<(RuleSite, Split<'a>)>) -> Result<(), Error> {

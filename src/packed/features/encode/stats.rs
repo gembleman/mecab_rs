@@ -11,15 +11,29 @@ pub(super) struct Stat<'a> {
 }
 
 impl<'a> Stat<'a> {
-    pub(super) fn new(entries: usize) -> Self {
+    pub(super) fn new() -> Self {
         Self {
             present: 0,
             values: FastMap::default(),
-            value_ids: vec![ABSENT; entries],
+            value_ids: Vec::new(),
             overflow: false,
             numeric: true,
             last: None,
         }
+    }
+
+    fn record(&mut self, entry: usize, id: u16) {
+        debug_assert!(self.value_ids.len() <= entry);
+        self.value_ids.resize(entry, ABSENT);
+        self.value_ids.push(id);
+    }
+
+    pub(super) fn id_of(&self, entry: usize) -> u16 {
+        self.value_ids.get(entry).copied().unwrap_or(ABSENT)
+    }
+
+    pub(super) fn trim(&mut self) {
+        self.value_ids.shrink_to_fit();
     }
 
     pub(super) fn observe(&mut self, entry: usize, value: &'a [u8]) {
@@ -27,7 +41,7 @@ impl<'a> Stat<'a> {
         if let Some((last, id)) = self.last
             && last == value
         {
-            self.value_ids[entry] = id;
+            self.record(entry, id);
             return;
         }
         if self.numeric && parse_number(value).is_none() {
@@ -37,7 +51,7 @@ impl<'a> Stat<'a> {
             return;
         }
         if let Some(&id) = self.values.get(value) {
-            self.value_ids[entry] = id;
+            self.record(entry, id);
             self.last = Some((value, id));
         } else if self.values.len() >= FOLD_MAX_VALUES {
             self.overflow = true;
@@ -47,7 +61,7 @@ impl<'a> Stat<'a> {
         } else {
             let id = self.values.len() as u16;
             self.values.insert(value, id);
-            self.value_ids[entry] = id;
+            self.record(entry, id);
             self.last = Some((value, id));
         }
     }

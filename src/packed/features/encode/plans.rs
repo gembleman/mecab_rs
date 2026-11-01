@@ -31,3 +31,7 @@ pub(super) fn plan_op(code: u8) -> Option<TextOp> {
         slot => Some(TextOp::Copy(slot - CODE_COPY)),
     }
 }
+
+pub(super) fn is_new_code(code: u8) -> bool {
+    code == CODE_NEW
+}

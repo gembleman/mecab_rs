@@ -1,7 +1,7 @@
 use super::{
     BLOB_SYNC_EVERY, BitWriter, Blob, Counts, Derive, Error, Layout, OP_BLOB, OP_INLINE, OP_NUM,
-    OP_NUM_MAX, OP_NUMB, OP_NUMB_MAX, OP_REF, Pieces, ProgramSet, Recoded, SYNC_EVERY, Stored,
-    bits_for,
+    OP_NUM_MAX, OP_NUMB, OP_NUMB_MAX, OP_REF, Pieces, ProgramSet, RECORD_PADDING, Recoded,
+    SYNC_EVERY, Stored, bits_for,
 };
 
 pub(super) struct Records {
@@ -9,11 +9,13 @@ pub(super) struct Records {
     pub(super) starts: Vec<u32>,
 }
 
-fn writer_after(base: usize) -> BitWriter {
-    let mut writer = BitWriter::default();
+fn writer_after(base: usize, capacity: usize) -> BitWriter {
+    let mut writer = BitWriter::with_capacity(capacity);
     writer.bytes.resize(base, 0);
     writer
 }
+
+const INLINE_FRAMING_BYTES: usize = 2;
 
 struct RecordWriter<'a, 'p> {
     set: &'a ProgramSet<'p>,
@@ -22,6 +24,7 @@ struct RecordWriter<'a, 'p> {
     blob_offsets: Vec<u32>,
     writer: BitWriter,
     base: usize,
+    capacity: usize,
     template_bits: u32,
     shape_bits: u32,
     ref_bits: u32,
@@ -48,13 +51,14 @@ impl<'a, 'p> RecordWriter<'a, 'p> {
                 recoded.blob_starts[blob.entry_of(id)]
             })
             .collect();
-        Self {
+        let mut records = Self {
             set,
             recoded,
             stored,
             blob_offsets,
-            writer: writer_after(base),
+            writer: BitWriter::default(),
             base,
+            capacity: 0,
             template_bits: bits_for(set.template_list.len() as u64),
             shape_bits: bits_for(set.shape_list.len() as u64),
             ref_bits: bits_for(recoded.area.len() as u64),
@@ -63,7 +67,50 @@ impl<'a, 'p> RecordWriter<'a, 'p> {
             next_inline: 0,
             next_number: 0,
             next_blob: 0,
+        };
+        records.capacity = base + records.record_bytes_bound() + RECORD_PADDING;
+        records.writer = writer_after(base, records.capacity);
+        records
+    }
+
+    fn op_bits(&self, op: u8) -> u32 {
+        match op {
+            OP_REF => self.ref_bits,
+            OP_BLOB => self.blob_bits,
+            OP_NUMB..=OP_NUMB_MAX => self.stored[usize::from(op - OP_NUMB)].spec.lo_bits,
+            OP_NUM..=OP_NUM_MAX => {
+                let spec = &self.stored[usize::from(op - OP_NUM)].spec;
+                spec.hi_bits + spec.lo_bits
+            }
+            _ => 0,
         }
+    }
+
+    #[allow(
+        clippy::naive_bytecount,
+        reason = "a plain count over one short shape; no bytecount dependency"
+    )]
+    fn shape_bytes_bound(&self, shape: &[u8]) -> usize {
+        let operand_bits: u32 = shape.iter().map(|&op| self.op_bits(op)).sum();
+        let bits = self.template_bits + self.shape_bits + operand_bits;
+        let inline_ops = shape.iter().filter(|&&op| op == OP_INLINE).count();
+        (bits as usize).div_ceil(8).max(1) + INLINE_FRAMING_BYTES * inline_ops
+    }
+
+    fn record_bytes_bound(&self) -> usize {
+        let per_shape: Vec<usize> = self
+            .set
+            .shape_list
+            .iter()
+            .map(|shape| self.shape_bytes_bound(shape))
+            .collect();
+        let records: usize = self
+            .set
+            .entry_shape
+            .iter()
+            .map(|&shape| per_shape[shape as usize])
+            .sum();
+        records + self.recoded.inline.len()
     }
 
     fn next_number(&mut self) -> (u64, u32) {
@@ -80,8 +127,8 @@ impl<'a, 'p> RecordWriter<'a, 'p> {
                 self.next_reference += 1;
             }
             OP_INLINE => {
-                self.writer
-                    .put_bytes(&self.recoded.inline[self.next_inline]);
+                let recoded = self.recoded;
+                self.writer.put_bytes(recoded.inline_text(self.next_inline));
                 self.next_inline += 1;
             }
             OP_BLOB => {
@@ -138,6 +185,7 @@ pub(super) fn write_records(
     for entry in 0..variant_count {
         starts.push(records.write_entry(entry)?);
     }
+    debug_assert!(records.writer.bytes.len() <= records.capacity);
     Ok(Records {
         bytes: records.writer.bytes,
         starts,

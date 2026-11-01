@@ -2,20 +2,25 @@ use std::io::Write;
 
 use super::{Part, Parts};
 use crate::Error;
+pub(super) use crate::codec::LexiconKeys;
 use crate::codec::{MAX_LEXICON_TEXT_LEN, encode_lexicon, visit_lexicon_records};
 use crate::error::Undecodable;
 use crate::packed::model::{Model, Param};
 use crate::wire::{get_varint, put_varint};
+use std::sync::Arc;
 
 mod decode;
+mod sizes;
 
 use decode::restore;
+use sizes::LexiconSizes;
 
 const ENCODING_PLAIN: u32 = 0;
 const ENCODING_CODEC: u32 = 2;
 const LEXICON_PART: &str = "lexicon";
 const UNKNOWN_PART: &str = "unknown tokens";
 const POS_PART: &str = "pos ids";
+const SIZES_PART: &str = "lexicon sizes";
 const NUL: u8 = 0;
 const COMMA: u8 = b',';
 const QUOTE: u8 = b'"';
@@ -163,7 +168,8 @@ pub(super) fn encode(model: &Model) -> Result<Vec<Part>, Error> {
     }
     let lexicon = encode_lexicon(&csv);
     let (unknown, pos) = (unknown_tokens(model), pos_runs(model));
-    let restored = restore(&lexicon, &unknown, &pos).map_err(|_| unrestorable())?;
+    let sizes = LexiconSizes::of(model).to_bytes();
+    let restored = restore(&lexicon, &unknown, &pos, &sizes, |_| {}).map_err(|_| unrestorable())?;
     if !same_lexicon(&restored, model) {
         return Err(unrestorable());
     }
@@ -183,12 +189,22 @@ pub(super) fn encode(model: &Model) -> Result<Vec<Part>, Error> {
             encoding: ENCODING_PLAIN,
             bytes: pos,
         },
+        Part {
+            name: SIZES_PART,
+            encoding: ENCODING_PLAIN,
+            bytes: sizes,
+        },
     ])
 }
 
-pub(super) fn decode(parts: &Parts) -> Result<Model, Error> {
+pub(super) fn decode(
+    parts: &Parts,
+    on_keys: impl FnOnce(Arc<LexiconKeys>) + Send,
+) -> Result<Model, Error> {
     let lexicon = parts.plain(LEXICON_PART, ENCODING_CODEC)?;
     let unknown = parts.plain(UNKNOWN_PART, ENCODING_PLAIN)?;
     let pos = parts.plain(POS_PART, ENCODING_PLAIN)?;
-    restore(lexicon, unknown, pos).map_err(|Undecodable(reason)| parts.corrupt(reason))
+    let sizes = parts.plain(SIZES_PART, ENCODING_PLAIN)?;
+    restore(lexicon, unknown, pos, sizes, on_keys)
+        .map_err(|Undecodable(reason)| parts.corrupt(reason))
 }

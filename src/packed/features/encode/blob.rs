@@ -8,11 +8,12 @@ pub(super) struct Blob<'a> {
     pub(super) number: usize,
     pub(super) fields: Vec<usize>,
     pub(super) id_bytes: usize,
-    pub(super) entries: Vec<(u64, Vec<&'a [u8]>)>,
+    pub(super) ids: Vec<u64>,
+    pub(super) texts: Vec<&'a [u8]>,
     pub(super) eligible: Vec<bool>,
 }
 
-impl Blob<'_> {
+impl<'a> Blob<'a> {
     pub(super) fn slot(&self, entry: usize, field: usize) -> Option<usize> {
         if self.eligible[entry] {
             self.fields.iter().position(|&candidate| candidate == field)
@@ -22,9 +23,31 @@ impl Blob<'_> {
     }
 
     pub(super) fn entry_of(&self, id: u64) -> usize {
-        self.entries
-            .binary_search_by_key(&id, |&(entry_id, _)| entry_id)
+        self.ids
+            .binary_search(&id)
             .expect("every id is in the blob")
+    }
+
+    pub(super) fn release_texts(&mut self) {
+        self.texts = Vec::new();
+        self.eligible = Vec::new();
+    }
+
+    pub(super) fn texts_of(&self, index: usize) -> &[&'a [u8]] {
+        let width = self.fields.len();
+        &self.texts[index * width..(index + 1) * width]
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct IdSource<'v> {
+    values: &'v [u64],
+    shift: u32,
+}
+
+impl IdSource<'_> {
+    fn id(&self, entry: usize) -> u64 {
+        self.values[entry] >> self.shift
     }
 }
 
@@ -32,7 +55,7 @@ fn field_follows_ids(
     entries: &[&[u8]],
     spans: &Spans,
     field_counts: &[u16],
-    ids: &[u64],
+    ids: IdSource,
     number_field: usize,
     field: usize,
 ) -> bool {
@@ -44,7 +67,7 @@ fn field_follows_ids(
         }
         let (begin, end) = spans.span(entry, field);
         let value = &text[begin..end];
-        if *map.entry(ids[entry]).or_insert(value) != value {
+        if *map.entry(ids.id(entry)).or_insert(value) != value {
             return false;
         }
     }
@@ -56,7 +79,7 @@ fn shared_text_fields(
     spans: &Spans,
     field_counts: &[u16],
     classes: &[Class],
-    ids: &[u64],
+    ids: IdSource,
     number_field: usize,
 ) -> Vec<usize> {
     let mut verdicts: Vec<(usize, bool)> = (0..classes.len())
@@ -74,37 +97,38 @@ fn shared_text_fields(
         .collect()
 }
 
-type KnownTexts<'a> = FastMap<u64, Vec<&'a [u8]>>;
+fn first_entries(eligible: &[bool], ids: IdSource) -> (Vec<(u64, u32)>, usize) {
+    let mut first: FastMap<u64, u32> = FastMap::default();
+    let mut eligible_count = 0usize;
+    for (entry, &is_eligible) in eligible.iter().enumerate() {
+        if is_eligible {
+            eligible_count += 1;
+            first.entry(ids.id(entry)).or_insert(entry as u32);
+        }
+    }
+    let mut sorted: Vec<(u64, u32)> = first.into_iter().collect();
+    sorted.sort_unstable();
+    (sorted, eligible_count)
+}
 
-fn known_texts<'a>(
+fn gather_texts<'a>(
     entries: &[&'a [u8]],
     spans: &Spans,
-    eligible: &[bool],
-    ids: &[u64],
+    sorted: &[(u64, u32)],
     chosen: &[usize],
-) -> (KnownTexts<'a>, usize) {
+) -> Vec<&'a [u8]> {
+    let mut texts = Vec::with_capacity(sorted.len() * chosen.len());
     let mut fields = Vec::new();
-    let mut known: KnownTexts = FastMap::default();
-    let mut eligible_count = 0usize;
-    for (entry, text) in entries.iter().enumerate() {
-        if !eligible[entry] {
-            continue;
-        }
-        eligible_count += 1;
-        let id = ids[entry];
-        if known.contains_key(&id) {
-            continue;
-        }
-        spans.fill(entry, &mut fields);
-        known.insert(
-            id,
+    for &(_, entry) in sorted {
+        let text: &'a [u8] = entries[entry as usize];
+        spans.fill(entry as usize, &mut fields);
+        texts.extend(
             chosen
                 .iter()
-                .map(|&field| &text[fields[field].0..fields[field].1])
-                .collect(),
+                .map(|&field| &text[fields[field].0..fields[field].1]),
         );
     }
-    (known, eligible_count)
+    texts
 }
 
 pub(super) fn blob_for_number<'a>(
@@ -113,7 +137,7 @@ pub(super) fn blob_for_number<'a>(
     field_counts: &[u16],
     classes: &[Class],
     stored: &[Stored],
-    ids: &[u64],
+    ids: IdSource,
     number: usize,
 ) -> Option<Blob<'a>> {
     let number_field = stored[number].field;
@@ -132,17 +156,17 @@ pub(super) fn blob_for_number<'a>(
         .iter()
         .map(|&count| usize::from(count) > last)
         .collect();
-    let (known, eligible_count) = known_texts(entries, spans, &eligible, ids, &chosen);
-    if known.len() * 2 > eligible_count {
+    let (sorted, eligible_count) = first_entries(&eligible, ids);
+    if sorted.len() * 2 > eligible_count {
         return None;
     }
-    let mut blob_entries: Vec<(u64, Vec<&[u8]>)> = known.into_iter().collect();
-    blob_entries.sort_unstable_by_key(|&(id, _)| id);
+    let texts = gather_texts(entries, spans, &sorted, &chosen);
     Some(Blob {
         number,
         fields: chosen,
         id_bytes: spec.hi_bits.div_ceil(8) as usize,
-        entries: blob_entries,
+        ids: sorted.into_iter().map(|(id, _)| id).collect(),
+        texts,
         eligible,
     })
 }
@@ -159,11 +183,11 @@ pub(super) fn plan_blob<'a>(
     let mut best: Option<Blob<'a>> = None;
     for number in 0..stored.len() {
         let shift = stored[number].spec.shift;
-        let ids: Vec<u64> = values[stored_values[number]]
-            .iter()
-            .map(|&value| value >> shift)
-            .collect();
-        let found = blob_for_number(entries, spans, field_counts, classes, stored, &ids, number);
+        let ids = IdSource {
+            values: &values[stored_values[number]],
+            shift,
+        };
+        let found = blob_for_number(entries, spans, field_counts, classes, stored, ids, number);
         if let Some(found) = found
             && best
                 .as_ref()
@@ -179,9 +203,21 @@ pub(super) struct Recoded {
     pub(super) table: Vec<u64>,
     pub(super) area: Vec<u8>,
     pub(super) references: Vec<u32>,
-    pub(super) inline: Vec<Vec<u8>>,
+    pub(super) inline: Vec<u8>,
+    pub(super) inline_ends: Vec<u32>,
     pub(super) blob: Vec<u8>,
     pub(super) blob_starts: Vec<u32>,
+}
+
+impl Recoded {
+    pub(super) fn inline_text(&self, index: usize) -> &[u8] {
+        let begin = if index == 0 {
+            0
+        } else {
+            self.inline_ends[index - 1] as usize
+        };
+        &self.inline[begin..self.inline_ends[index] as usize]
+    }
 }
 
 pub(super) fn text_of(bytes: &[u8]) -> Result<&str, Error> {
@@ -195,11 +231,7 @@ pub(super) fn char_ranks(
 ) -> Result<Vec<char>, Error> {
     let mut counts = CharValues::new();
     let mut seen: Vec<char> = Vec::new();
-    let blob_texts = blob.into_iter().flat_map(|blob| {
-        blob.entries
-            .iter()
-            .flat_map(|(_, texts)| texts.iter().copied())
-    });
+    let blob_texts = blob.into_iter().flat_map(|blob| blob.texts.iter().copied());
     for bytes in area
         .split(|&byte| byte == 0)
         .chain(inline.iter().copied())
@@ -278,15 +310,18 @@ fn code_text(text: &[u8], rank_of: &RankTable, out: &mut Vec<u8>) -> Result<(), 
 
 struct CodedArea {
     bytes: Vec<u8>,
-    old_starts: Vec<u32>,
     new_starts: Vec<u32>,
 }
 
+#[allow(
+    clippy::naive_bytecount,
+    reason = "a plain count of NUL terminators; no bytecount dependency"
+)]
 fn code_area(area: &[u8], rank_of: &RankTable) -> Result<CodedArea, Error> {
+    let strings = area.iter().filter(|&&byte| byte == 0).count();
     let mut coded = CodedArea {
-        bytes: Vec::new(),
-        old_starts: Vec::new(),
-        new_starts: Vec::new(),
+        bytes: Vec::with_capacity(area.len()),
+        new_starts: Vec::with_capacity(strings),
     };
     let mut at = 0usize;
     while at < area.len() {
@@ -294,24 +329,29 @@ fn code_area(area: &[u8], rank_of: &RankTable) -> Result<CodedArea, Error> {
             .iter()
             .position(|&byte| byte == 0)
             .expect("every string of the area ends with NUL");
-        coded.old_starts.push(at as u32);
         coded.new_starts.push(coded.bytes.len() as u32);
         code_text(&area[at..at + length], rank_of, &mut coded.bytes)?;
         coded.bytes.push(0);
         at += length + 1;
     }
+    coded.bytes.shrink_to_fit();
     Ok(coded)
+}
+
+fn blob_bytes_bound(blob: &Blob) -> usize {
+    let texts: usize = blob.texts.iter().map(|text| text.len() + 1).sum();
+    texts + blob.ids.len() * blob.id_bytes
 }
 
 fn code_blob(blob: Option<&Blob>, rank_of: &RankTable) -> Result<(Vec<u8>, Vec<u32>), Error> {
     let too_large = || Error::Unsupported("feature strings of more than 4 GiB");
-    let mut coded_blob: Vec<u8> = Vec::new();
-    let mut blob_starts: Vec<u32> = Vec::new();
+    let mut coded_blob: Vec<u8> = Vec::with_capacity(blob.map_or(0, blob_bytes_bound));
+    let mut blob_starts: Vec<u32> = Vec::with_capacity(blob.map_or(0, |blob| blob.ids.len()));
     if let Some(blob) = blob {
-        for (id, texts) in &blob.entries {
+        for (index, id) in blob.ids.iter().enumerate() {
             blob_starts.push(u32::try_from(coded_blob.len()).map_err(|_| too_large())?);
             coded_blob.extend_from_slice(&id.to_le_bytes()[..blob.id_bytes]);
-            for text in texts {
+            for text in blob.texts_of(index) {
                 code_text(text, rank_of, &mut coded_blob)?;
                 coded_blob.push(0);
             }
@@ -320,7 +360,23 @@ fn code_blob(blob: Option<&Blob>, rank_of: &RankTable) -> Result<(Vec<u8>, Vec<u
     if coded_blob.len() > u32::MAX as usize {
         return Err(too_large());
     }
+    coded_blob.shrink_to_fit();
     Ok((coded_blob, blob_starts))
+}
+
+fn code_inline(inline: &[&[u8]], rank_of: &RankTable) -> Result<(Vec<u8>, Vec<u32>), Error> {
+    let bound: usize = inline.iter().map(|text| text.len()).sum();
+    let mut codes: Vec<u8> = Vec::with_capacity(bound);
+    let mut ends: Vec<u32> = Vec::with_capacity(inline.len());
+    for text in inline {
+        code_text(text, rank_of, &mut codes)?;
+        ends.push(
+            u32::try_from(codes.len())
+                .map_err(|_| Error::Unsupported("feature strings of more than 4 GiB"))?,
+        );
+    }
+    codes.shrink_to_fit();
+    Ok((codes, ends))
 }
 
 pub(super) fn recode(
@@ -334,26 +390,16 @@ pub(super) fn recode(
     let coded_area = code_area(area, &rank_of)?;
     let references = references
         .iter()
-        .map(|offset| {
-            let number = coded_area
-                .old_starts
-                .binary_search(offset)
-                .expect("a reference names the start of a string");
-            coded_area.new_starts[number]
-        })
+        .map(|&string| coded_area.new_starts[string as usize])
         .collect();
-    let mut coded_inline = Vec::with_capacity(inline.len());
-    for text in inline {
-        let mut codes = Vec::new();
-        code_text(text, &rank_of, &mut codes)?;
-        coded_inline.push(codes);
-    }
+    let (coded_inline, inline_ends) = code_inline(inline, &rank_of)?;
     let (coded_blob, blob_starts) = code_blob(blob, &rank_of)?;
     Ok(Recoded {
         table: ranked.into_iter().map(chars::entry_of).collect(),
         area: coded_area.bytes,
         references,
         inline: coded_inline,
+        inline_ends,
         blob: coded_blob,
         blob_starts,
     })

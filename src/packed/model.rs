@@ -86,51 +86,155 @@ fn le_bytes<T: Copy, const N: usize>(values: &[T], bytes: fn(T) -> [u8; N]) -> V
     values.iter().flat_map(|&value| bytes(value)).collect()
 }
 
-impl Model {
-    fn code_table(&self) -> Result<Vec<u16>, Error> {
-        let mut frequency = vec![0u32; CHAR_SPACE];
-        for key in &self.keys {
-            for char in key.chars() {
-                frequency[char as usize] += 1;
-            }
+fn code_table_of(keys: &[String]) -> Result<Vec<u16>, Error> {
+    let mut frequency = vec![0u32; CHAR_SPACE];
+    for key in keys {
+        for char in key.chars() {
+            frequency[char as usize] += 1;
         }
-        let mut chars: Vec<(char, u32)> = frequency
-            .iter()
-            .enumerate()
-            .filter(|&(_, &count)| count != 0)
-            .filter_map(|(code, &count)| char::from_u32(code as u32).map(|char| (char, count)))
-            .collect();
-        chars.sort_unstable_by_key(|&(char, count)| (std::cmp::Reverse(count), char));
-        if chars.len() >= MAX_CODE_COUNT {
-            return Err(Error::Unsupported(
-                "more than 65534 different key characters",
-            ));
+    }
+    let mut chars: Vec<(char, u32)> = frequency
+        .iter()
+        .enumerate()
+        .filter(|&(_, &count)| count != 0)
+        .filter_map(|(code, &count)| char::from_u32(code as u32).map(|char| (char, count)))
+        .collect();
+    chars.sort_unstable_by_key(|&(char, count)| (std::cmp::Reverse(count), char));
+    if chars.len() >= MAX_CODE_COUNT {
+        return Err(Error::Unsupported(
+            "more than 65534 different key characters",
+        ));
+    }
+    let mut table = vec![0u16; CHAR_SPACE];
+    for (number, &(char, _)) in chars.iter().enumerate() {
+        table[char as usize] = number as u16 + 1;
+    }
+    Ok(table)
+}
+
+struct FlatCodes {
+    codes: Vec<u16>,
+    ends: Vec<u32>,
+}
+
+impl FlatCodes {
+    fn of(keys: &[String], table: &[u16]) -> Self {
+        let total: usize = keys.iter().map(|key| key.chars().count()).sum();
+        let mut codes = Vec::with_capacity(total);
+        let mut ends = Vec::with_capacity(keys.len());
+        for key in keys {
+            codes.extend(key.chars().map(|char| table[char as usize]));
+            ends.push(codes.len() as u32);
         }
-        let mut table = vec![0u16; CHAR_SPACE];
-        for (number, &(char, _)) in chars.iter().enumerate() {
-            table[char as usize] = number as u16 + 1;
-        }
-        Ok(table)
+        Self { codes, ends }
     }
 
-    fn trie_cells(&self, table: &[u16], layout: &order::Layout) -> Result<Vec<u64>, Error> {
-        let mut sequences: Vec<(Vec<u16>, u32, u8)> = Vec::with_capacity(self.keys.len());
-        for ((key, &count), &first_token) in
-            self.keys.iter().zip(&self.counts).zip(&layout.first_tokens)
-        {
-            let codes = key.chars().map(|char| table[char as usize]).collect();
-            sequences.push((codes, first_token, count));
+    fn of_key(&self, key: u32) -> &[u16] {
+        let key = key as usize;
+        let start = if key == 0 {
+            0
+        } else {
+            self.ends[key - 1] as usize
+        };
+        &self.codes[start..self.ends[key] as usize]
+    }
+}
+
+fn place_keys(keys: &[String], counts: &[u8], table: &[u16]) -> Result<trie::Placed, Error> {
+    let flat = FlatCodes::of(keys, table);
+    let mut order: Vec<u32> = (0..keys.len() as u32).collect();
+    order.sort_unstable_by(|&a, &b| flat.of_key(a).cmp(flat.of_key(b)));
+    let entries = order.iter().map(|&key| Entry {
+        codes: flat.of_key(key),
+        key,
+        count: counts[key as usize],
+    });
+    trie::place(entries)
+}
+
+#[cfg(feature = "xz")]
+pub(crate) struct LexiconKeys {
+    pub(crate) keys: Vec<String>,
+    pub(crate) counts: Vec<u8>,
+}
+
+#[cfg(feature = "xz")]
+pub(super) struct PreparedTrie {
+    fingerprint: u64,
+    table: Vec<u16>,
+    placed: trie::Placed,
+}
+
+#[cfg(feature = "xz")]
+pub(super) type PreparedSlot = Option<Result<PreparedTrie, Error>>;
+
+#[cfg(not(feature = "xz"))]
+pub(super) type PreparedSlot = Option<Result<std::convert::Infallible, Error>>;
+
+#[cfg(feature = "xz")]
+fn keys_fingerprint(keys: &[String], counts: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = crate::hash::FastHasher::default();
+    hasher.write_usize(keys.len());
+    hasher.write_usize(counts.len());
+    for (key, &count) in keys.iter().zip(counts) {
+        hasher.write(key.as_bytes());
+        hasher.write_u8(count);
+    }
+    hasher.finish()
+}
+
+#[cfg(feature = "xz")]
+impl PreparedTrie {
+    pub(super) fn build(source: &LexiconKeys) -> Result<Self, Error> {
+        let fingerprint = keys_fingerprint(&source.keys, &source.counts);
+        let table = code_table_of(&source.keys)?;
+        let placed = place_keys(&source.keys, &source.counts, &table)?;
+        Ok(Self {
+            fingerprint,
+            table,
+            placed,
+        })
+    }
+
+    fn describes(&self, model: &Model) -> bool {
+        self.fingerprint == keys_fingerprint(&model.keys, &model.counts)
+    }
+}
+
+type PlacedTable = (trie::Placed, Vec<u16>);
+
+impl Model {
+    fn code_table(&self) -> Result<Vec<u16>, Error> {
+        code_table_of(&self.keys)
+    }
+
+    #[cfg(feature = "xz")]
+    fn matching_prepared(model: &Model, prepared: PreparedSlot) -> Option<PlacedTable> {
+        match prepared {
+            Some(Ok(prepared)) if prepared.describes(model) => {
+                Some((prepared.placed, prepared.table))
+            }
+            _ => None,
         }
-        sequences.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let entries: Vec<Entry> = sequences
-            .iter()
-            .map(|(codes, first_token, count)| Entry {
-                codes,
-                first_token: *first_token,
-                count: *count,
-            })
-            .collect();
-        trie::build(&entries)
+    }
+
+    #[cfg(not(feature = "xz"))]
+    fn matching_prepared(_model: &Model, _prepared: PreparedSlot) -> Option<PlacedTable> {
+        None
+    }
+
+    fn tabled_trie(
+        &self,
+        prepared: PreparedSlot,
+        layout: &order::Layout,
+    ) -> Result<(Vec<u64>, Vec<u16>), Error> {
+        if let Some((placed, table)) = Self::matching_prepared(self, prepared) {
+            return Ok((placed.finish(&layout.first_tokens)?, table));
+        }
+        let table = self.code_table()?;
+        let cells = place_keys(&self.keys, &self.counts, &table)?.finish(&layout.first_tokens)?;
+        Ok((cells, table))
     }
 
     fn encode_features(&self, layout: &order::Layout) -> Result<features::encode::Encoded, Error> {
@@ -144,7 +248,7 @@ impl Model {
     }
 
     pub fn encode_runtime(&self) -> Result<Runtime<'_>, Error> {
-        self.finish_runtime(self.encode_lexicon_sections()?)
+        self.finish_runtime(self.encode_lexicon_sections(None)?)
     }
 
     fn check_token_counts(&self) -> Result<(), Error> {
@@ -182,7 +286,10 @@ impl Model {
         Ok((param_bits, feature_bits))
     }
 
-    pub(super) fn encode_lexicon_sections(&self) -> Result<LexiconSections, Error> {
+    pub(super) fn encode_lexicon_sections(
+        &self,
+        prepared: PreparedSlot,
+    ) -> Result<LexiconSections, Error> {
         let counted = self.check_token_counts();
         if counted.is_err() {
             self.code_table()?;
@@ -191,9 +298,7 @@ impl Model {
         let layout = order::by_word_cost(self);
         let (tabled, encoded) = std::thread::scope(|scope| {
             let encoded = scope.spawn(|| self.encode_features(&layout));
-            let tabled = self
-                .code_table()
-                .and_then(|table| Ok((self.trie_cells(&table, &layout)?, table)));
+            let tabled = self.tabled_trie(prepared, &layout);
             (
                 tabled,
                 encoded.join().expect("the feature encoder panicked"),

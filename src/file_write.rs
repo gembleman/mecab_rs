@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error::{Error, IoAction};
 
-const WRITE_BUFFER_BYTES: usize = 1 << 23;
+const WRITE_BUFFER_BYTES: usize = 1 << 20;
 
 static NEXT_TEMPORARY_NUMBER: AtomicUsize = AtomicUsize::new(0);
 

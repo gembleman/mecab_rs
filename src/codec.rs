@@ -201,22 +201,22 @@ fn decode_counts(
     Ok(counts)
 }
 
-struct DecodeRows<'a> {
+struct DecodeRows<'a, C> {
     plan: &'a Plan,
     keys: &'a [String],
-    counts: &'a [usize],
+    counts: &'a [C],
     text_len: u64,
 }
 
-fn decode_rows_with(
+fn decode_rows_with<C: Copy + Into<usize>>(
     coder: &mut Coder,
-    rows: &DecodeRows,
+    rows: &DecodeRows<'_, C>,
     mut push: impl FnMut(&[String]) -> u64,
 ) -> Result<(), Undecodable> {
     let mut model = Model::new(rows.plan.clone());
     for (key, &group_len) in rows.keys.iter().zip(rows.counts) {
         model.start_group();
-        for _ in 0..group_len {
+        for _ in 0..group_len.into() {
             charge_symbol(coder)?;
             model.code_row(coder, &[], key);
             let data_len = push(model.row());
@@ -359,8 +359,11 @@ fn decode_unchecked(data: &[u8]) -> Result<(Lexicon, Header), Undecodable> {
     Ok((lex, h))
 }
 
+pub(crate) use crate::packed::model::LexiconKeys;
+
 pub(crate) fn visit_lexicon_records(
     data: &[u8],
+    on_keys: impl FnOnce(Arc<LexiconKeys>) + Send,
     visit: impl FnMut(Record<'_>) -> Result<(), Undecodable>,
 ) -> Result<(), Undecodable> {
     let h = read_header(data)?;
@@ -369,7 +372,7 @@ pub(crate) fn visit_lexicon_records(
             n_keys,
             n_irregular: 0,
             plan,
-        } if plan.n_cols > 0 => visit_pipelined(data, &h, *n_keys, plan, visit),
+        } if plan.n_cols > 0 => visit_pipelined(data, &h, (*n_keys, plan), on_keys, visit),
         _ => visit_decoded(&decode_body(data, &h)?, &h, visit),
     }
 }
@@ -422,10 +425,19 @@ fn publish_chunk(
     let _ = checks.send(shared);
 }
 
+fn narrow_counts(counts: Vec<usize>) -> Result<Vec<u8>, Undecodable> {
+    counts
+        .into_iter()
+        .map(u8::try_from)
+        .collect::<Result<Vec<u8>, _>>()
+        .or_else(|_| corrupt("a key has more than 255 tokens"))
+}
+
 fn decode_chunks(
     data: &[u8],
     h: &Header,
     start: (usize, &Plan),
+    on_keys: impl FnOnce(Arc<LexiconKeys>),
     records: SyncSender<SharedChunk>,
     checks: SyncSender<SharedChunk>,
 ) -> Result<(), Undecodable> {
@@ -436,11 +448,16 @@ fn decode_chunks(
         counts,
         ..
     } = start_coded(data, h, n_keys, 0, plan)?;
+    let shared = Arc::new(LexiconKeys {
+        keys,
+        counts: narrow_counts(counts)?,
+    });
+    on_keys(Arc::clone(&shared));
     let n_cols = plan.n_cols;
     let rows = DecodeRows {
         plan,
-        keys: &keys,
-        counts: &counts,
+        keys: &shared.keys,
+        counts: &shared.counts,
         text_len: h.text_len,
     };
     let mut chunk = new_chunk(n_cols);
@@ -515,8 +532,8 @@ fn consume_chunks(
 fn visit_pipelined(
     data: &[u8],
     h: &Header,
-    n_keys: usize,
-    plan: &Plan,
+    start: (usize, &Plan),
+    on_keys: impl FnOnce(Arc<LexiconKeys>) + Send,
     visit: impl FnMut(Record<'_>) -> Result<(), Undecodable>,
 ) -> Result<(), Undecodable> {
     let (record_tx, record_rx) = sync_channel(CHUNKS_IN_FLIGHT);
@@ -524,7 +541,7 @@ fn visit_pipelined(
     let no_final_newline = h.no_final_newline;
     let (decoded, visited, checked) = std::thread::scope(|scope| {
         let decoder =
-            scope.spawn(move || decode_chunks(data, h, (n_keys, plan), record_tx, check_tx));
+            scope.spawn(move || decode_chunks(data, h, start, on_keys, record_tx, check_tx));
         let checks = scope.spawn(move || check_chunks(check_rx, no_final_newline));
         let visited = consume_chunks(record_rx, visit);
         (

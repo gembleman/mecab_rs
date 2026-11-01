@@ -5,14 +5,14 @@ use crate::hash::IdMap;
 pub(crate) struct Interner {
     map: IdMap<u64, u32>,
     buf: Vec<u8>,
-    ends: Vec<usize>,
+    ends: Vec<u32>,
 }
 
 impl Interner {
     pub(crate) fn get(&self, id: u32) -> &[u8] {
         let i = id as usize;
-        let start = if i == 0 { 0 } else { self.ends[i - 1] };
-        &self.buf[start..self.ends[i]]
+        let start = if i == 0 { 0 } else { self.ends[i - 1] as usize };
+        &self.buf[start..self.ends[i] as usize]
     }
 
     pub(crate) fn find(&self, key: &[u8]) -> Option<u32> {
@@ -33,7 +33,8 @@ impl Interner {
         }
         let id = self.ends.len() as u32;
         self.buf.extend_from_slice(key);
-        self.ends.push(self.buf.len());
+        debug_assert!(u32::try_from(self.buf.len()).is_ok());
+        self.ends.push(self.buf.len() as u32);
         self.map.insert(h, id);
         id
     }
