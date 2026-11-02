@@ -48,6 +48,7 @@ pub struct Model {
 
 pub(crate) struct LexiconSections {
     sections: [Cow<'static, [u8]>; SECTIONS],
+    token_count: u32,
     code_count: u32,
     param_bits: u32,
     feature_bits: u32,
@@ -61,6 +62,13 @@ impl std::fmt::Debug for Runtime<'_> {
             .field("sections", &self.sections.len())
             .finish_non_exhaustive()
     }
+}
+
+struct HeaderCounts {
+    token_count: u32,
+    code_count: u32,
+    param_bits: u32,
+    feature_bits: u32,
 }
 
 pub struct Runtime<'a> {
@@ -112,6 +120,24 @@ fn code_table_of(keys: &[String]) -> Result<Vec<u16>, Error> {
     Ok(table)
 }
 
+#[derive(PartialEq, Debug)]
+pub(super) struct CodeMap {
+    index: Vec<u8>,
+    blocks: Vec<u8>,
+    code_count: u32,
+}
+
+impl CodeMap {
+    fn of(table: &[u16]) -> Self {
+        let (index, blocks) = char_map(table);
+        Self {
+            index: le_bytes(&index, u16::to_le_bytes),
+            blocks: le_bytes(&blocks, u16::to_le_bytes),
+            code_count: table.iter().max().map_or(1, |&max| u32::from(max) + 1),
+        }
+    }
+}
+
 struct FlatCodes {
     codes: Vec<u16>,
     ends: Vec<u32>,
@@ -140,16 +166,19 @@ impl FlatCodes {
     }
 }
 
-fn place_keys(keys: &[String], counts: &[u8], table: &[u16]) -> Result<trie::Placed, Error> {
-    let flat = FlatCodes::of(keys, table);
-    let mut order: Vec<u32> = (0..keys.len() as u32).collect();
-    order.sort_unstable_by(|&a, &b| flat.of_key(a).cmp(flat.of_key(b)));
-    let entries = order.iter().map(|&key| Entry {
-        codes: flat.of_key(key),
-        key,
-        count: counts[key as usize],
-    });
-    trie::place(entries)
+fn place_keys(keys: &[String], counts: &[u8], flat: FlatCodes) -> Result<trie::Placed, Error> {
+    let linked = {
+        let mut order: Vec<u32> = (0..keys.len() as u32).collect();
+        order.sort_unstable_by(|&a, &b| flat.of_key(a).cmp(flat.of_key(b)));
+        let entries = order.iter().map(|&key| Entry {
+            codes: flat.of_key(key),
+            key,
+            count: counts[key as usize],
+        });
+        trie::link(entries)?
+    };
+    drop(flat);
+    linked.place()
 }
 
 #[cfg(feature = "xz")]
@@ -158,10 +187,19 @@ pub(crate) struct LexiconKeys {
     pub(crate) counts: Vec<u8>,
 }
 
+fn placed_with_code_map(keys: &[String], counts: &[u8]) -> Result<PlacedMap, Error> {
+    let table = code_table_of(keys)?;
+    let code_map = CodeMap::of(&table);
+    let flat = FlatCodes::of(keys, &table);
+    drop(table);
+    let placed = place_keys(keys, counts, flat)?;
+    Ok((placed, code_map))
+}
+
 #[cfg(feature = "xz")]
 pub(super) struct PreparedTrie {
     fingerprint: u64,
-    table: Vec<u16>,
+    code_map: CodeMap,
     placed: trie::Placed,
 }
 
@@ -188,11 +226,10 @@ fn keys_fingerprint(keys: &[String], counts: &[u8]) -> u64 {
 impl PreparedTrie {
     pub(super) fn build(source: &LexiconKeys) -> Result<Self, Error> {
         let fingerprint = keys_fingerprint(&source.keys, &source.counts);
-        let table = code_table_of(&source.keys)?;
-        let placed = place_keys(&source.keys, &source.counts, &table)?;
+        let (placed, code_map) = placed_with_code_map(&source.keys, &source.counts)?;
         Ok(Self {
             fingerprint,
-            table,
+            code_map,
             placed,
         })
     }
@@ -202,7 +239,7 @@ impl PreparedTrie {
     }
 }
 
-type PlacedTable = (trie::Placed, Vec<u16>);
+type PlacedMap = (trie::Placed, CodeMap);
 
 impl Model {
     fn code_table(&self) -> Result<Vec<u16>, Error> {
@@ -210,41 +247,49 @@ impl Model {
     }
 
     #[cfg(feature = "xz")]
-    fn matching_prepared(model: &Model, prepared: PreparedSlot) -> Option<PlacedTable> {
+    fn matching_prepared(model: &Model, prepared: PreparedSlot) -> Option<PlacedMap> {
         match prepared {
             Some(Ok(prepared)) if prepared.describes(model) => {
-                Some((prepared.placed, prepared.table))
+                Some((prepared.placed, prepared.code_map))
             }
             _ => None,
         }
     }
 
     #[cfg(not(feature = "xz"))]
-    fn matching_prepared(_model: &Model, _prepared: PreparedSlot) -> Option<PlacedTable> {
+    fn matching_prepared(_model: &Model, _prepared: PreparedSlot) -> Option<PlacedMap> {
         None
     }
 
     fn tabled_trie(
         &self,
         prepared: PreparedSlot,
-        layout: &order::Layout,
-    ) -> Result<(Vec<u64>, Vec<u16>), Error> {
-        if let Some((placed, table)) = Self::matching_prepared(self, prepared) {
-            return Ok((placed.finish(&layout.first_tokens)?, table));
-        }
-        let table = self.code_table()?;
-        let cells = place_keys(&self.keys, &self.counts, &table)?.finish(&layout.first_tokens)?;
-        Ok((cells, table))
+        first_tokens: Vec<u32>,
+    ) -> Result<(Vec<u8>, CodeMap), Error> {
+        let (placed, code_map) = match Self::matching_prepared(self, prepared) {
+            Some(found) => found,
+            None => placed_with_code_map(&self.keys, &self.counts)?,
+        };
+        let cells = placed.finish(&first_tokens)?;
+        drop(first_tokens);
+        Ok((encode_cells(&cells), code_map))
     }
 
-    fn encode_features(&self, layout: &order::Layout) -> Result<features::encode::Encoded, Error> {
-        let mut tokens: Vec<(u32, &str)> =
-            Vec::with_capacity(self.token_features.len() + self.unknown_features.len());
-        for (&feature, &key) in layout.token_features.iter().zip(&layout.token_keys) {
-            tokens.push((feature, &self.keys[key as usize]));
-        }
-        tokens.extend(self.unknown_features.iter().map(|&feature| (feature, "")));
-        features::encode::encode(&self.features, &tokens)
+    fn encode_features(
+        &self,
+        token_features: Vec<u32>,
+        token_keys: Vec<u32>,
+    ) -> Result<features::encode::Encoded, Error> {
+        let tokens = features::encode::Tokens::new(
+            &token_features,
+            &token_keys,
+            &self.keys,
+            &self.unknown_features,
+        );
+        let encoded = features::encode::encode(&self.features, tokens);
+        drop(token_features);
+        drop(token_keys);
+        encoded
     }
 
     pub fn encode_runtime(&self) -> Result<Runtime<'_>, Error> {
@@ -262,12 +307,13 @@ impl Model {
     }
 
     fn token_widths(
-        layout: &order::Layout,
+        token_params: &[u32],
+        unknown_params: &[u32],
         system_starts: &[u32],
         unknown_starts: &[u32],
     ) -> Result<(u32, u32), Error> {
         let param_bits = width_of(
-            (layout.token_params.iter().chain(&layout.unknown_params))
+            (token_params.iter().chain(unknown_params))
                 .copied()
                 .max()
                 .map_or(0, u64::from),
@@ -286,54 +332,87 @@ impl Model {
         Ok((param_bits, feature_bits))
     }
 
+    fn checked_token_counts(&self) -> Result<(), Error> {
+        if let Err(error) = self.check_token_counts() {
+            self.code_table()?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(super) fn encode_lexicon_sections(
         &self,
         prepared: PreparedSlot,
     ) -> Result<LexiconSections, Error> {
-        let counted = self.check_token_counts();
-        if counted.is_err() {
-            self.code_table()?;
-            return counted.map(|()| unreachable!());
-        }
+        self.checked_token_counts()?;
         let layout = order::by_word_cost(self);
+        self.encode_with_layout(layout, prepared)
+    }
+
+    #[cfg(feature = "xz")]
+    pub(super) fn encode_lexicon_sections_releasing(
+        &mut self,
+        prepared: PreparedSlot,
+    ) -> Result<LexiconSections, Error> {
+        self.checked_token_counts()?;
+        let layout = order::by_word_cost(self);
+        self.token_params = Vec::new();
+        self.token_features = Vec::new();
+        let sections = self.encode_with_layout(layout, prepared);
+        self.keys = Vec::new();
+        self.counts = Vec::new();
+        sections
+    }
+
+    fn encode_with_layout(
+        &self,
+        layout: order::Layout,
+        prepared: PreparedSlot,
+    ) -> Result<LexiconSections, Error> {
+        let order::Layout {
+            first_tokens,
+            token_params,
+            token_features,
+            token_keys,
+            params,
+            unknown_params,
+        } = layout;
         let (tabled, encoded) = std::thread::scope(|scope| {
-            let encoded = scope.spawn(|| self.encode_features(&layout));
-            let tabled = self.tabled_trie(prepared, &layout);
+            let encoded = scope.spawn(move || self.encode_features(token_features, token_keys));
+            let tabled = self.tabled_trie(prepared, first_tokens);
             (
                 tabled,
                 encoded.join().expect("the feature encoder panicked"),
             )
         });
-        let (cells, table) = tabled?;
+        let (cells, code_map) = tabled?;
         let encoded = encoded?;
-        let code_count = table.iter().max().map_or(1, |&max| u32::from(max) + 1);
-        let (system_starts, unknown_starts) = encoded.starts.split_at(self.token_features.len());
+        let CodeMap {
+            index,
+            blocks,
+            code_count,
+        } = code_map;
+        let (system_starts, unknown_starts) = encoded.starts.split_at(token_params.len());
         let mut sections: [Cow<'static, [u8]>; SECTIONS] = Default::default();
-        let (index, blocks) = char_map(&table);
-        sections[CHAR_INDEX] = le_bytes(&index, u16::to_le_bytes).into();
-        sections[CHAR_BLOCKS] = le_bytes(&blocks, u16::to_le_bytes).into();
-        sections[CELLS] = encode_cells(&cells).into();
-        let (param_bits, feature_bits) =
-            Self::token_widths(&layout, system_starts, unknown_starts)?;
-        sections[TOKENS] = encode_tokens(
-            &layout.token_params,
+        sections[CHAR_INDEX] = index.into();
+        sections[CHAR_BLOCKS] = blocks.into();
+        sections[CELLS] = cells.into();
+        let (param_bits, feature_bits) = Self::token_widths(
+            &token_params,
+            &unknown_params,
             system_starts,
-            param_bits,
-            feature_bits,
-        )
-        .into();
-        sections[PARAMS] = encode_params(&layout.params).into();
+            unknown_starts,
+        )?;
+        sections[TOKENS] =
+            encode_tokens(&token_params, system_starts, param_bits, feature_bits).into();
+        sections[PARAMS] = encode_params(&params).into();
         sections[FEATURES] = encoded.bytes.into();
         sections[UNKNOWN_STARTS] = le_bytes(&self.unknown_starts, u32::to_le_bytes).into();
-        sections[UNKNOWN_TOKENS] = encode_tokens(
-            &layout.unknown_params,
-            unknown_starts,
-            param_bits,
-            feature_bits,
-        )
-        .into();
+        sections[UNKNOWN_TOKENS] =
+            encode_tokens(&unknown_params, unknown_starts, param_bits, feature_bits).into();
         Ok(LexiconSections {
             sections,
+            token_count: token_params.len() as u32,
             code_count,
             param_bits,
             feature_bits,
@@ -365,8 +444,13 @@ impl Model {
         dicrc
     }
 
-    fn runtime_header(&self, widths: (u32, u32, u32), sections: &[Cow<'_, [u8]>]) -> Vec<u8> {
-        let (code_count, param_bits, feature_bits) = widths;
+    fn runtime_header(&self, widths: &HeaderCounts, sections: &[Cow<'_, [u8]>]) -> Vec<u8> {
+        let &HeaderCounts {
+            token_count,
+            code_count,
+            param_bits,
+            feature_bits,
+        } = widths;
         let mut out = vec![0u8; HEADER_BYTES];
         out[..MAGIC_BYTES].copy_from_slice(MAGIC);
         let flags = u32::from(!self.templates.is_empty()) * (FLAG_HOT_MATRIX | FLAG_INT_TEMPLATES);
@@ -374,7 +458,7 @@ impl Model {
             (VERSION_AT, VERSION),
             (FLAGS_AT, flags),
             (CODE_COUNT_AT, code_count),
-            (TOKEN_COUNT_AT, self.token_params.len() as u32),
+            (TOKEN_COUNT_AT, token_count),
             (PARAM_COUNT_AT, self.params.len() as u32),
             (
                 CATEGORY_COUNT_AT,
@@ -400,6 +484,7 @@ impl Model {
     pub(super) fn finish_runtime(&self, lexicon: LexiconSections) -> Result<Runtime<'_>, Error> {
         let LexiconSections {
             sections,
+            token_count,
             code_count,
             param_bits,
             feature_bits,
@@ -409,7 +494,13 @@ impl Model {
         sections[TEMPLATES] = self.templates_section()?;
         sections[CHAR_TABLE] = Cow::Borrowed(&self.char_table);
         sections[DICRC] = self.dicrc_section().into();
-        let header = self.runtime_header((code_count, param_bits, feature_bits), &sections);
+        let counts = HeaderCounts {
+            token_count,
+            code_count,
+            param_bits,
+            feature_bits,
+        };
+        let header = self.runtime_header(&counts, &sections);
         Ok(Runtime {
             header,
             sections: sections.into(),

@@ -80,7 +80,13 @@ fn encode_counts(input: &EncodeInput, key_model: &mut KeyModel, coder: &mut Code
     }
 }
 
-fn encode_rows(input: &EncodeInput, plan: &Plan, coder: &mut Coder, hints: &mut Vec<PpmHint>) {
+fn encode_rows(
+    input: &EncodeInput,
+    plan: &Plan,
+    coder: &mut Coder,
+    hints: &mut Vec<PpmHint>,
+    sizes: &mut Vec<u32>,
+) {
     let lex = &input.parsed.lex;
     if lex.n_cols == 0 {
         return;
@@ -98,6 +104,7 @@ fn encode_rows(input: &EncodeInput, plan: &Plan, coder: &mut Coder, hints: &mut 
         }
     }
     model.hints(hints);
+    model.sizes(sizes);
 }
 
 fn encode_irregular(lex: &Lexicon, coder: &mut Coder, hints: &mut Vec<PpmHint>) {
@@ -137,12 +144,13 @@ pub fn encode_lexicon(csv: &[u8]) -> Vec<u8> {
 
     let mut coder = Coder::encoder();
     let mut hints = Vec::new();
+    let mut sizes = Vec::new();
     let mut key_model = KeyModel::new(&mut HintReader::untrained());
     encode_keys(&input, &mut key_model, &mut coder);
     encode_counts(&input, &mut key_model, &mut coder);
     key_model.hints(&mut hints);
     drop(key_model);
-    encode_rows(&input, &plan, &mut coder, &mut hints);
+    encode_rows(&input, &plan, &mut coder, &mut hints, &mut sizes);
     encode_irregular(lex, &mut coder, &mut hints);
     let payload = coder.finish();
 
@@ -157,6 +165,7 @@ pub fn encode_lexicon(csv: &[u8]) -> Vec<u8> {
             n_irregular: lex.irregular.len(),
             plan: &plan,
             hints: &hints,
+            sizes: &sizes,
         },
     );
     out.extend_from_slice(&payload);
@@ -303,7 +312,7 @@ fn start_coded<'a>(
 ) -> Result<CodedStart<'a>, Undecodable> {
     let mut coder = Coder::decoder(&data[h.payload..]);
     coder.limit_symbols(symbol_budget(h.text_len));
-    let mut hints = HintReader::new(h.body.hints(), symbol_budget(h.text_len));
+    let mut hints = HintReader::new(h.body.hints(), h.body.sizes(), symbol_budget(h.text_len));
     let n_cols = plan.n_cols;
     if n_cols == 0 && n_keys > 0 {
         return corrupt("bad key count");

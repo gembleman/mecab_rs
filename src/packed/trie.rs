@@ -3,8 +3,9 @@ use super::{
     TERMINAL_FLAG, UNUSED_LABEL, Unit, VALUE_MASK, unit,
 };
 use crate::Error;
+use std::collections::VecDeque;
 
-const NONE: u32 = u32::MAX;
+const BITS_PER_WORD: usize = 64;
 const FRONT_TRIES: usize = 6000;
 const UNIT_SLACK_DIVISOR: usize = 3;
 const TOO_BIG: &str = "the double array needs more than 16 million units";
@@ -18,44 +19,43 @@ pub(super) struct Entry<'a> {
 
 pub(super) struct Placed {
     cells: Vec<u64>,
-    fills: Vec<(u32, u32)>,
 }
 
 impl Placed {
     pub(super) fn finish(mut self, first_tokens: &[u32]) -> Result<Vec<u64>, Error> {
-        for &(cell, key) in &self.fills {
-            let first_token = first_tokens[key as usize];
+        for cell in &mut self.cells {
+            let unit = Unit::from_bits(*cell);
+            if unit.label() != DATA_LABEL && !unit.is_inline() {
+                continue;
+            }
+            let first_token = first_tokens[unit.value() as usize];
             if u64::from(first_token) > VALUE_MASK {
                 return Err(Error::Unsupported("more than 16 million tokens"));
             }
-            self.cells[cell as usize] |= u64::from(first_token);
+            *cell = *cell & !VALUE_MASK | u64::from(first_token);
         }
         Ok(self.cells)
     }
 }
 
+pub(super) struct Linked {
+    nodes: Vec<Node>,
+}
+
 struct Node {
-    first_child: u32,
-    last_child: u32,
-    next_sibling: u32,
-    children: u32,
+    end: u32,
+    key: u32,
     code: u16,
     count: u8,
-    key: u32,
-    position: u32,
 }
 
 impl Node {
     fn new(code: u16) -> Self {
         Self {
-            first_child: NONE,
-            last_child: NONE,
-            next_sibling: NONE,
-            children: 0,
+            end: 0,
+            key: 0,
             code,
             count: 0,
-            key: 0,
-            position: 0,
         }
     }
 
@@ -63,19 +63,49 @@ impl Node {
         self.count > 0
     }
 
-    fn is_inline(&self) -> bool {
-        self.is_terminal() && self.children == 0 && self.count <= INLINE_COUNT_MASK
+    fn is_leaf(&self, id: u32) -> bool {
+        self.end == id + 1
     }
 
-    fn needs_data_unit(&self) -> bool {
-        self.is_terminal() && !self.is_inline()
+    fn is_inline(&self, id: u32) -> bool {
+        self.is_terminal() && self.is_leaf(id) && self.count <= INLINE_COUNT_MASK
+    }
+
+    fn needs_data_unit(&self, id: u32) -> bool {
+        self.is_terminal() && !self.is_inline(id)
+    }
+}
+
+struct TakenBases {
+    words: Vec<u64>,
+}
+
+impl TakenBases {
+    fn with_capacity(bases: usize) -> Self {
+        Self {
+            words: Vec::with_capacity(bases / BITS_PER_WORD + 1),
+        }
+    }
+
+    fn contains(&self, base: usize) -> bool {
+        self.words
+            .get(base / BITS_PER_WORD)
+            .is_some_and(|word| word >> (base % BITS_PER_WORD) & 1 != 0)
+    }
+
+    fn insert(&mut self, base: usize) {
+        let word = base / BITS_PER_WORD;
+        if word >= self.words.len() {
+            self.words.resize(word + 1, 0);
+        }
+        self.words[word] |= 1 << (base % BITS_PER_WORD);
     }
 }
 
 struct Units {
     cells: Vec<u64>,
     skip: Vec<u32>,
-    bases: Vec<bool>,
+    bases: TakenBases,
     cursor: usize,
 }
 
@@ -85,14 +115,11 @@ impl Units {
     }
 
     fn base_is_taken(&self, base: usize) -> bool {
-        self.bases.get(base).copied().unwrap_or(false)
+        self.bases.contains(base)
     }
 
     fn take_base(&mut self, base: usize) {
-        if base >= self.bases.len() {
-            self.bases.resize(base + 1, false);
-        }
-        self.bases[base] = true;
+        self.bases.insert(base);
     }
 
     fn set_value(&mut self, index: usize, value: u32) {
@@ -132,55 +159,50 @@ impl Units {
     }
 }
 
-fn collect_children(nodes: &[Node], id: usize, codes: &mut Vec<u16>, children: &mut Vec<u32>) {
+fn collect_children(nodes: &[Node], id: u32, codes: &mut Vec<u16>, children: &mut Vec<u32>) {
     codes.clear();
     children.clear();
-    if nodes[id].needs_data_unit() {
+    let node = &nodes[id as usize];
+    if node.needs_data_unit(id) {
         codes.push(0);
     }
-    let mut child = nodes[id].first_child;
-    while child != NONE {
+    let mut child = id + 1;
+    while child < node.end {
         codes.push(nodes[child as usize].code);
         children.push(child);
-        child = nodes[child as usize].next_sibling;
+        child = nodes[child as usize].end;
     }
 }
 
-fn child_unit(node: &Node) -> u64 {
-    let flags = if node.is_inline() {
-        TERMINAL_FLAG | INLINE_FLAG | node.count << INLINE_COUNT_SHIFT
+fn child_unit(node: &Node, id: u32) -> u64 {
+    if node.is_inline(id) {
+        let flags = TERMINAL_FLAG | INLINE_FLAG | node.count << INLINE_COUNT_SHIFT;
+        unit(node.key, node.code, flags)
     } else if node.is_terminal() {
-        TERMINAL_FLAG
+        unit(0, node.code, TERMINAL_FLAG)
     } else {
-        0
-    };
-    unit(0, node.code, flags)
+        unit(0, node.code, 0)
+    }
 }
 
 fn place_children(
     units: &mut Units,
-    nodes: &mut [Node],
-    id: usize,
+    nodes: &[Node],
+    (id, position): (u32, u32),
     base: usize,
     children: &[u32],
-    queue: &mut Vec<u32>,
-    fills: &mut Vec<(u32, u32)>,
+    queue: &mut VecDeque<(u32, u32)>,
 ) {
-    units.set_value(nodes[id].position as usize, base as u32);
-    if nodes[id].needs_data_unit() {
-        let node = &nodes[id];
-        units.take(base, unit(0, DATA_LABEL, node.count));
-        fills.push((base as u32, node.key));
+    units.set_value(position as usize, base as u32);
+    let node = &nodes[id as usize];
+    if node.needs_data_unit(id) {
+        units.take(base, unit(node.key, DATA_LABEL, node.count));
     }
     for &child in children {
-        let node = &mut nodes[child as usize];
+        let node = &nodes[child as usize];
         let position = base + usize::from(node.code);
-        node.position = position as u32;
-        units.take(position, child_unit(node));
-        if node.is_inline() {
-            fills.push((position as u32, node.key));
-        }
-        queue.push(child);
+        units.take(position, child_unit(node, child));
+        queue.push_back((child, position as u32));
     }
 }
 
@@ -200,44 +222,48 @@ fn node_count<'a>(entries: impl Iterator<Item = Entry<'a>>) -> usize {
     count
 }
 
-pub(super) fn place<'a>(
-    entries: impl ExactSizeIterator<Item = Entry<'a>> + Clone,
-) -> Result<Placed, Error> {
-    let entry_count = entries.len();
+pub(super) fn link<'a>(entries: impl Iterator<Item = Entry<'a>> + Clone) -> Result<Linked, Error> {
     let mut nodes = Vec::with_capacity(node_count(entries.clone()));
     nodes.push(Node::new(0));
     link_trie(entries, &mut nodes)?;
-    let expected_units = nodes.len() + nodes.len() / UNIT_SLACK_DIVISOR;
-    let mut units = Units {
-        cells: Vec::with_capacity(expected_units),
-        skip: Vec::with_capacity(expected_units),
-        bases: Vec::with_capacity(expected_units),
-        cursor: 0,
-    };
-    units.grow(1)?;
-    units.take(0, unit(0, ROOT_LABEL, 0));
-    let mut queue = vec![0u32];
-    let mut codes: Vec<u16> = Vec::new();
-    let mut children: Vec<u32> = Vec::new();
-    let mut fills: Vec<(u32, u32)> = Vec::with_capacity(entry_count);
-    let mut at = 0;
-    while at < queue.len() {
-        let id = queue[at] as usize;
-        at += 1;
-        collect_children(&nodes, id, &mut codes, &mut children);
-        if codes.is_empty() {
-            continue;
+    Ok(Linked { nodes })
+}
+
+impl Linked {
+    pub(super) fn place(self) -> Result<Placed, Error> {
+        let nodes = self.nodes;
+        let expected_units = nodes.len() + nodes.len() / UNIT_SLACK_DIVISOR;
+        let mut units = Units {
+            cells: Vec::with_capacity(expected_units),
+            skip: Vec::with_capacity(expected_units),
+            bases: TakenBases::with_capacity(expected_units),
+            cursor: 0,
+        };
+        units.grow(1)?;
+        units.take(0, unit(0, ROOT_LABEL, 0));
+        let mut queue = VecDeque::from([(0u32, 0u32)]);
+        let mut codes: Vec<u16> = Vec::new();
+        let mut children: Vec<u32> = Vec::new();
+        while let Some(front) = queue.pop_front() {
+            collect_children(&nodes, front.0, &mut codes, &mut children);
+            if codes.is_empty() {
+                continue;
+            }
+            let base = find_base(&mut units, &codes)?;
+            units.take_base(base);
+            place_children(&mut units, &nodes, front, base, &children, &mut queue);
         }
-        let base = find_base(&mut units, &codes)?;
-        units.take_base(base);
-        place_children(
-            &mut units, &mut nodes, id, base, &children, &mut queue, &mut fills,
-        );
+        units.cells.shrink_to_fit();
+        Ok(Placed { cells: units.cells })
     }
-    Ok(Placed {
-        cells: units.cells,
-        fills,
-    })
+}
+
+fn close_path(nodes: &mut [Node], path: &mut Vec<u32>, keep: usize) {
+    let end = nodes.len() as u32;
+    while path.len() > keep {
+        let id = path.pop().expect("the path is longer than keep");
+        nodes[id as usize].end = end;
+    }
 }
 
 fn link_trie<'a>(
@@ -256,26 +282,20 @@ fn link_trie<'a>(
         if codes.is_empty() || shared == codes.len() || entry.count == 0 {
             return Err(Error::Unsupported("an empty, repeated or tokenless key"));
         }
-        path.truncate(shared + 1);
+        if u64::from(entry.key) > VALUE_MASK {
+            return Err(Error::Unsupported("more than 16 million keys"));
+        }
+        close_path(nodes, &mut path, shared + 1);
         for &code in &codes[shared..] {
-            let id = nodes.len() as u32;
-            let parent = *path.last().expect("the root stays on the path") as usize;
+            path.push(nodes.len() as u32);
             nodes.push(Node::new(code));
-            if nodes[parent].first_child == NONE {
-                nodes[parent].first_child = id;
-            } else {
-                let last = nodes[parent].last_child as usize;
-                nodes[last].next_sibling = id;
-            }
-            nodes[parent].last_child = id;
-            nodes[parent].children += 1;
-            path.push(id);
         }
         let node = &mut nodes[*path.last().expect("the path is not empty") as usize];
         node.count = entry.count;
         node.key = entry.key;
         previous = codes;
     }
+    close_path(nodes, &mut path, 0);
     Ok(())
 }
 

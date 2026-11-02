@@ -1,7 +1,7 @@
 use super::{
     Blob, Class, DERIVE_CONTEXT, DERIVE_TARGET, FastMap, MAX_REMOVED_CHARS, MAX_RULE_SUFFIX,
     MAX_RULES, MAX_SLOTS, MIN_RULE_USES, RULE_BYTES, RULE_CHAR_BITS, RULE_HEADER_BYTES, Spans,
-    blob_slot,
+    Tokens, blob_slot,
 };
 use std::thread;
 
@@ -101,13 +101,13 @@ struct ChunkCount<'a> {
 fn count_chunk<'a>(
     entries: &[&'a [u8]],
     spans: &Spans,
-    tokens: &[(u32, &str)],
+    tokens: Tokens<'_>,
     blob: Option<&Blob>,
 ) -> ChunkCount<'a> {
     let mut chunk = ChunkCount::default();
     let mut local_ids: FastMap<Context<'a>, u32> = FastMap::default();
     let mut fields = Vec::new();
-    for &(feature, key) in tokens {
+    for (feature, key) in tokens.iter() {
         let entry = feature as usize;
         let Some(&text) = entries.get(entry) else {
             continue;
@@ -148,7 +148,7 @@ fn count_chunk<'a>(
 fn count_chunks<'a>(
     entries: &[&'a [u8]],
     spans: &Spans,
-    tokens: &[(u32, &str)],
+    tokens: Tokens<'_>,
     blob: Option<&Blob>,
     lanes: usize,
 ) -> Vec<ChunkCount<'a>> {
@@ -182,7 +182,7 @@ impl<'a> Derive<'a> {
     pub(super) fn learn(
         entries: &[&'a [u8]],
         spans: &Spans,
-        tokens: &[(u32, &str)],
+        tokens: Tokens<'_>,
         classes: &[Class],
         blob: Option<&Blob>,
     ) -> Result<Self, Error> {
@@ -208,7 +208,7 @@ impl<'a> Derive<'a> {
     fn learn_in_chunks(
         entries: &[&'a [u8]],
         spans: &Spans,
-        tokens: &[(u32, &str)],
+        tokens: Tokens<'_>,
         blob: Option<&Blob>,
         lanes: usize,
         mut derive: Self,

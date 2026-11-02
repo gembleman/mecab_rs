@@ -268,7 +268,7 @@ fn decode_parts(parts: &Parts) -> Result<DecodedParts, Error> {
 fn runtime_model(payload: Vec<u8>, path: &Path) -> Result<(Model, LexiconSections), Error> {
     let (mut model, prepared, matrix) = decode_parts(&parse_container(&payload, path)?)?;
     drop(payload);
-    let sections = model.encode_lexicon_sections(prepared)?;
+    let sections = model.encode_lexicon_sections_releasing(prepared)?;
     attach_matrix(&mut model, matrix);
     Ok((model, sections))
 }

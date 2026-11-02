@@ -33,9 +33,9 @@ impl PosModel {
     pub(super) fn new(cols: usize, hints: &mut HintReader) -> PosModel {
         PosModel {
             ppm: hints.ppm(),
-            intern: Interner::default(),
+            intern: hints.interner(),
             comp_ppm: (0..cols).map(|_| hints.ppm()).collect(),
-            comp_intern: (0..cols).map(|_| Interner::default()).collect(),
+            comp_intern: (0..cols).map(|_| hints.interner()).collect(),
             comp_chars: CharModel::new(COMP_CHAR_ORDER, hints),
             hashes: Vec::new(),
             cols,
@@ -46,6 +46,13 @@ impl PosModel {
         out.push(self.ppm.hint());
         out.extend(self.comp_ppm.iter().map(Ppm::hint));
         self.comp_chars.hints(out);
+    }
+
+    pub(super) fn sizes(&self, out: &mut Vec<u32>) {
+        self.intern.sizes(out);
+        for intern in &self.comp_intern {
+            intern.sizes(out);
+        }
     }
 
     #[inline]

@@ -18,8 +18,12 @@ impl CatState {
     pub(super) fn new(hints: &mut HintReader) -> CatState {
         CatState {
             ppm: hints.ppm(),
-            intern: Interner::default(),
+            intern: hints.interner(),
         }
+    }
+
+    pub(super) fn sizes(&self, out: &mut Vec<u32>) {
+        self.intern.sizes(out);
     }
 
     pub(super) fn hints(&self, out: &mut Vec<PpmHint>) {
@@ -39,6 +43,10 @@ impl CatGroup {
         out.push(self.ppm.hint());
     }
 
+    pub(super) fn sizes(&self, out: &mut Vec<u32>) {
+        self.tuples.sizes(out);
+    }
+
     pub(super) fn new(
         plan_steps: &[Step],
         ctx_col: Option<usize>,
@@ -46,7 +54,7 @@ impl CatGroup {
     ) -> CatGroup {
         CatGroup {
             ppm: hints.ppm(),
-            tuples: Interner::default(),
+            tuples: hints.interner(),
             ctx_col,
             steps: plan_steps
                 .iter()

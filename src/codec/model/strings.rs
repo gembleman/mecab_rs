@@ -82,20 +82,20 @@ impl StrState {
             limit: recent_limit as usize,
             srcs,
             tuple_ppm: hints.ppm(),
-            tuples: Interner::default(),
+            tuples: hints.interner(),
             ref_ppm: hints.ppm(),
             trim: UintModel::default(),
             chars: CharModel::new(STR_CHAR_ORDER, hints),
             ex_ppm: hints.ppm(),
             run_ppm: hints.ppm(),
-            run_readings: Interner::default(),
+            run_readings: hints.interner(),
             read_chars: CharModel::new(STR_CHAR_ORDER, hints),
             recent: Vec::new(),
             group_plan: None,
             group_exact: 0,
             seg_ppm: hints.ppm(),
-            segs: Interner::default(),
-            known: IdSet::default(),
+            segs: hints.interner(),
+            known: hints.set(),
         }
     }
 
@@ -107,6 +107,13 @@ impl StrState {
         out.push(self.run_ppm.hint());
         self.read_chars.hints(out);
         out.push(self.seg_ppm.hint());
+    }
+
+    pub(super) fn sizes(&self, out: &mut Vec<u32>) {
+        self.tuples.sizes(out);
+        self.run_readings.sizes(out);
+        self.segs.sizes(out);
+        out.push(self.known.len() as u32);
     }
 
     pub(super) fn code_ex(&mut self, row: &RowState, coder: &mut Coder, want: u32) -> u32 {

@@ -1,7 +1,5 @@
-use std::borrow::Cow;
-
 use super::IntTemplates;
-use super::cluster::{ClusterData, RuntimeInputs, cluster_data, cluster_plans};
+use super::cluster::{ClusterData, ClusterTables, RuntimeInputs, cluster_data, cluster_plans};
 use crate::error::Error;
 use crate::hot_shape::HotShape;
 use crate::int_runtime::runtime_form_from;
@@ -33,7 +31,7 @@ impl IntTemplates {
             shapes: &shapes,
             left_keys: &left_keys,
             right_keys: &right_keys,
-            tables: Cow::Owned(tables),
+            tables: ClusterTables::Owned(tables),
             exception_cells: &self.exception_cells,
             exception_values: &self.exception_values,
         };

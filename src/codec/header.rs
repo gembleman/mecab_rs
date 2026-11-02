@@ -1,5 +1,5 @@
 use super::coder::Coder;
-use super::hints::{read_hints, write_hints};
+use super::hints::{read_hints, read_sizes, write_hints, write_sizes};
 use super::model::Plan;
 use super::ppm::PpmHint;
 use crate::error::Undecodable;
@@ -24,6 +24,7 @@ pub(super) enum Body {
         n_irregular: usize,
         plan: Plan,
         hints: Vec<PpmHint>,
+        sizes: Vec<u32>,
     },
 }
 
@@ -32,6 +33,13 @@ impl Body {
         match self {
             Body::Stored => &[],
             Body::Coded { hints, .. } => hints,
+        }
+    }
+
+    pub(super) fn sizes(&self) -> &[u32] {
+        match self {
+            Body::Stored => &[],
+            Body::Coded { sizes, .. } => sizes,
         }
     }
 }
@@ -94,6 +102,7 @@ pub(super) struct CodedHeader<'a> {
     pub n_irregular: usize,
     pub plan: &'a Plan,
     pub hints: &'a [PpmHint],
+    pub sizes: &'a [u32],
 }
 
 pub(super) fn write_coded_header(out: &mut Vec<u8>, header: &CodedHeader) {
@@ -105,6 +114,7 @@ pub(super) fn write_coded_header(out: &mut Vec<u8>, header: &CodedHeader) {
     put_varint(out, header.n_irregular as u64);
     header.plan.write(out);
     write_hints(out, header.hints);
+    write_sizes(out, header.sizes);
 }
 
 struct Prefix {
@@ -163,11 +173,15 @@ fn read_coded_body(data: &[u8], prefix: &mut Prefix) -> Result<Body, Undecodable
     let Some(hints) = read_hints(data, pos) else {
         return corrupt("bad size hints");
     };
+    let Some(sizes) = read_sizes(data, pos) else {
+        return corrupt("bad size hints");
+    };
     Ok(Body::Coded {
         n_keys: n_keys as usize,
         n_irregular: n_irregular as usize,
         plan,
         hints,
+        sizes,
     })
 }
 

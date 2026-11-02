@@ -4,13 +4,26 @@ use super::MAX_FIELDS;
 use super::lanes::lane_count;
 use super::scan::split_fields;
 
+const OVERFLOW_LENGTH: u8 = u8::MAX;
+
 trait EndWord: Copy + Default + Send {
-    fn pack(end: usize) -> Self;
+    fn pack(begin: usize, end: usize) -> Self;
     fn unpack(self) -> usize;
 }
 
+impl EndWord for u8 {
+    fn pack(begin: usize, end: usize) -> Self {
+        debug_assert!(begin <= end);
+        u8::try_from(end - begin).unwrap_or(OVERFLOW_LENGTH)
+    }
+
+    fn unpack(self) -> usize {
+        usize::from(self)
+    }
+}
+
 impl EndWord for u16 {
-    fn pack(end: usize) -> Self {
+    fn pack(_begin: usize, end: usize) -> Self {
         debug_assert!(u16::try_from(end).is_ok());
         end as u16
     }
@@ -21,7 +34,7 @@ impl EndWord for u16 {
 }
 
 impl EndWord for u32 {
-    fn pack(end: usize) -> Self {
+    fn pack(_begin: usize, end: usize) -> Self {
         debug_assert!(u32::try_from(end).is_ok());
         end as u32
     }
@@ -32,6 +45,7 @@ impl EndWord for u32 {
 }
 
 enum SpanEnds {
+    Lengths(Vec<u8>),
     Narrow(Vec<u16>),
     Wide(Vec<u32>),
 }
@@ -39,6 +53,7 @@ enum SpanEnds {
 impl SpanEnds {
     fn at(&self, index: usize) -> usize {
         match self {
+            Self::Lengths(_) => unreachable!("lengths are summed, not indexed"),
             Self::Narrow(ends) => ends[index].unpack(),
             Self::Wide(ends) => ends[index].unpack(),
         }
@@ -81,8 +96,8 @@ fn scan_part<T: EndWord>(entries: &[&[u8]], counts: &mut [u16], ends: &mut [T]) 
         split_fields(text, &mut fields);
         *count = fields.len() as u16;
         let room = &mut ends[written..written + fields.len()];
-        for (slot, &(_, end)) in room.iter_mut().zip(&fields) {
-            *slot = T::pack(end);
+        for (slot, &(begin, end)) in room.iter_mut().zip(&fields) {
+            *slot = T::pack(begin, end);
         }
         written += fields.len();
     }
@@ -163,6 +178,36 @@ fn push_fields<T: EndWord>(ends: &[T], fields: &mut Vec<(usize, usize)>) {
     }
 }
 
+fn lengths_extent(lengths: &[u8]) -> usize {
+    let total: usize = lengths.iter().map(|&length| usize::from(length)).sum();
+    total + lengths.len()
+}
+
+fn push_lengths(lengths: &[u8], fields: &mut Vec<(usize, usize)>) {
+    let mut begin = 0usize;
+    for &length in lengths {
+        let end = begin + usize::from(length);
+        fields.push((begin, end));
+        begin = end + 1;
+    }
+}
+
+fn scan_narrowest(entries: &[&[u8]], field_counts: &mut [u16]) -> SpanEnds {
+    if longest(entries) < usize::from(OVERFLOW_LENGTH) {
+        return SpanEnds::Lengths(scan_all(entries, field_counts));
+    }
+    let lengths = scan_all::<u8>(entries, field_counts);
+    if !lengths.contains(&OVERFLOW_LENGTH) {
+        return SpanEnds::Lengths(lengths);
+    }
+    drop(lengths);
+    if u16::try_from(longest(entries)).is_ok() {
+        SpanEnds::Narrow(scan_all(entries, field_counts))
+    } else {
+        SpanEnds::Wide(scan_all(entries, field_counts))
+    }
+}
+
 pub(super) struct Spans {
     ends: SpanEnds,
     offsets: Vec<u32>,
@@ -171,11 +216,7 @@ pub(super) struct Spans {
 impl Spans {
     pub(super) fn build(entries: &[&[u8]]) -> (Self, Vec<u16>) {
         let mut field_counts = vec![0u16; entries.len()];
-        let ends = if u16::try_from(longest(entries)).is_ok() {
-            SpanEnds::Narrow(scan_all(entries, &mut field_counts))
-        } else {
-            SpanEnds::Wide(scan_all(entries, &mut field_counts))
-        };
+        let ends = scan_narrowest(entries, &mut field_counts);
         let mut offsets = Vec::with_capacity(entries.len() + 1);
         let mut running = 0usize;
         offsets.push(0);
@@ -189,6 +230,10 @@ impl Spans {
 
     pub(super) fn span(&self, entry: usize, field: usize) -> (usize, usize) {
         let base = self.offsets[entry] as usize;
+        if let SpanEnds::Lengths(lengths) = &self.ends {
+            let begin = lengths_extent(&lengths[base..base + field]);
+            return (begin, begin + usize::from(lengths[base + field]));
+        }
         let begin = if field == 0 {
             0
         } else {
@@ -205,6 +250,7 @@ impl Spans {
         fields.clear();
         let range = self.offsets[entry] as usize..self.offsets[entry + 1] as usize;
         match &self.ends {
+            SpanEnds::Lengths(lengths) => push_lengths(&lengths[range], fields),
             SpanEnds::Narrow(ends) => push_fields(&ends[range], fields),
             SpanEnds::Wide(ends) => push_fields(&ends[range], fields),
         }

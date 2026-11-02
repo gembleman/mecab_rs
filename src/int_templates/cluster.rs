@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -42,7 +41,7 @@ pub(super) struct ClusterData {
     pub(super) shapes: Vec<ClusterShape>,
     pub(super) left_keys: Vec<u16>,
     pub(super) right_keys: Vec<u16>,
-    pub(super) tables: Vec<i32>,
+    pub(super) tables: Vec<Vec<i32>>,
 }
 
 pub(super) fn cluster_data(
@@ -65,12 +64,11 @@ pub(super) fn cluster_data(
             shape
         })
         .collect();
-    let mut tables = vec![0i32; table_start];
-    let mut unfilled = tables.as_mut_slice();
+    let mut tables = Vec::with_capacity(plans.len());
     for plan in plans {
-        let (table, rest) = unfilled.split_at_mut(plan.cells());
-        fill_int_table(plan, parts, threads, table)?;
-        unfilled = rest;
+        let mut table = vec![0i32; plan.cells()];
+        fill_int_table(plan, parts, threads, &mut table)?;
+        tables.push(table);
     }
     Ok(ClusterData {
         shapes,
@@ -88,9 +86,40 @@ pub(super) fn write_clusters(data: &ClusterData, output: &mut impl Write) -> io:
             .map(|shape| (shape.left_keys, shape.right_keys)),
         &data.left_keys,
         &data.right_keys,
-        data.tables.len(),
+        data.tables.iter().map(Vec::len).sum(),
     )?;
-    write_array(output, &data.tables, i32::to_le_bytes)
+    data.tables
+        .iter()
+        .try_for_each(|table| write_array(output, table, i32::to_le_bytes))
+}
+
+pub(crate) enum ClusterTables<'a> {
+    Borrowed(&'a [i32]),
+    #[cfg(feature = "xz")]
+    Owned(Vec<Vec<i32>>),
+}
+
+impl ClusterTables<'_> {
+    #[cfg(feature = "xz")]
+    pub(crate) fn table(&self, cluster: usize, start: usize) -> &[i32] {
+        match self {
+            Self::Borrowed(flat) => &flat[start..],
+            Self::Owned(tables) => &tables[cluster],
+        }
+    }
+
+    #[cfg(not(feature = "xz"))]
+    pub(crate) fn table(&self, _cluster: usize, start: usize) -> &[i32] {
+        let Self::Borrowed(flat) = self;
+        &flat[start..]
+    }
+
+    #[cfg(feature = "xz")]
+    pub(crate) fn release(&mut self, cluster: usize) {
+        if let Self::Owned(tables) = self {
+            tables[cluster] = Vec::new();
+        }
+    }
 }
 
 pub(crate) struct RuntimeInputs<'a> {
@@ -101,7 +130,7 @@ pub(crate) struct RuntimeInputs<'a> {
     pub(crate) shapes: &'a [ClusterShape],
     pub(crate) left_keys: &'a [u16],
     pub(crate) right_keys: &'a [u16],
-    pub(crate) tables: Cow<'a, [i32]>,
+    pub(crate) tables: ClusterTables<'a>,
     pub(crate) exception_cells: &'a [u32],
     pub(crate) exception_values: &'a [i16],
 }

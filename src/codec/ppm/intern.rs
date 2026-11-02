@@ -1,3 +1,5 @@
+use std::hash::BuildHasherDefault;
+
 use super::hash::hash_bytes;
 use crate::hash::IdMap;
 
@@ -9,6 +11,19 @@ pub(crate) struct Interner {
 }
 
 impl Interner {
+    pub(crate) fn with_sizes(count: usize, bytes: usize) -> Self {
+        Interner {
+            map: IdMap::with_capacity_and_hasher(count, BuildHasherDefault::default()),
+            buf: Vec::with_capacity(bytes),
+            ends: Vec::with_capacity(count),
+        }
+    }
+
+    pub(crate) fn sizes(&self, out: &mut Vec<u32>) {
+        out.push(self.ends.len() as u32);
+        out.push(self.buf.len() as u32);
+    }
+
     pub(crate) fn get(&self, id: u32) -> &[u8] {
         let i = id as usize;
         let start = if i == 0 { 0 } else { self.ends[i - 1] as usize };

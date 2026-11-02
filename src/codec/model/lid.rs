@@ -64,7 +64,7 @@ pub(super) struct LidState {
 impl LidState {
     pub(super) fn new(hints: &mut HintReader) -> LidState {
         LidState {
-            seen: IdMap::default(),
+            seen: hints.map(),
             order: BTreeMap::new(),
             mode_ppm: hints.ppm(),
             delta: UintModel::default(),
@@ -82,6 +82,10 @@ impl LidState {
         out.push(self.mode_ppm.hint());
         out.push(self.lo_ppm.hint());
         out.push(self.hi_ppm.hint());
+    }
+
+    pub(super) fn sizes(&self, out: &mut Vec<u32>) {
+        out.push(self.seen.len() as u32);
     }
 
     fn choose_mode(&self, near: Neighbours, id: u64, seen: Option<u64>) -> LidMode {

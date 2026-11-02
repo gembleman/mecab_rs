@@ -26,19 +26,25 @@ impl NumState {
     pub(super) fn new(hints: &mut HintReader) -> NumState {
         NumState {
             ppm: hints.ppm(),
-            intern: Interner::default(),
+            intern: hints.interner(),
             uint: UintModel::default(),
             irregular: Flag::default(),
             d_ppm: hints.ppm(),
-            d_intern: Interner::default(),
+            d_intern: hints.interner(),
             d_uint: UintModel::default(),
-            refs: IdMap::default(),
+            refs: hints.map(),
         }
     }
 
     pub(super) fn hints(&self, out: &mut Vec<PpmHint>) {
         out.push(self.ppm.hint());
         out.push(self.d_ppm.hint());
+    }
+
+    pub(super) fn sizes(&self, out: &mut Vec<u32>) {
+        self.intern.sizes(out);
+        self.d_intern.sizes(out);
+        out.push(self.refs.len() as u32);
     }
 }
 

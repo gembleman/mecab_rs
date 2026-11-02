@@ -84,6 +84,20 @@ impl ModelState {
         self.str_group.hints(out);
     }
 
+    pub(super) fn sizes(&self, out: &mut Vec<u32>) {
+        for step in &self.steps {
+            match step {
+                StepState::Cat(st) => st.sizes(out),
+                StepState::Str(st) => st.sizes(out),
+                StepState::Lid(st) => st.sizes(out),
+                StepState::Num(st) => st.sizes(out),
+            }
+        }
+        self.pos.sizes(out);
+        self.cat_group.sizes(out);
+        self.str_group.sizes(out);
+    }
+
     pub(super) fn new(plan: &Plan, hints: &mut HintReader) -> ModelState {
         ModelState {
             steps: build_steps(plan, hints),

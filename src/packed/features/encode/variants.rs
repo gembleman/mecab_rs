@@ -3,7 +3,7 @@ use std::{mem, thread};
 
 use super::lanes::lane_count;
 use super::plans::{is_new_code, plan_code};
-use super::{Error, NO_STRING, NO_VARIANT, Planner, Spans, TextOp};
+use super::{Error, NO_STRING, NO_VARIANT, Planner, Spans, TextOp, Tokens};
 use crate::hash::{FastHasher, FastSet};
 
 const WINDOW_TOKENS: usize = 1 << 17;
@@ -14,6 +14,7 @@ const FLAG_KEYED: u8 = 1;
 const FLAG_LOCALLY_NEW: u8 = 2;
 const EMPTY_SLOT: u32 = u32::MAX;
 const MIN_SLOTS: usize = 16;
+const MAX_HASH_SLOTS: usize = 1 << 32;
 const SLOTS_PER_ITEM: usize = 2;
 
 pub(super) struct Variants {
@@ -118,10 +119,10 @@ struct ChunkPlans {
     ops: Vec<u8>,
 }
 
-fn plan_chunk<'k, 'a>(
+fn plan_chunk<'a>(
     entries: &[&'a [u8]],
     spans: &Spans,
-    tokens: &'k [(u32, &'k str)],
+    tokens: Tokens<'_>,
     planner: &Planner<'_, 'a>,
 ) -> Result<ChunkPlans, Error> {
     let mut plans = ChunkPlans {
@@ -134,7 +135,7 @@ fn plan_chunk<'k, 'a>(
     let mut slots: Vec<&[u8]> = Vec::new();
     let mut fields = Vec::new();
     let mut filled_entry = usize::MAX;
-    for &(feature, key) in tokens {
+    for (feature, key) in tokens.iter() {
         let entry = feature as usize;
         let text = *entries.get(entry).ok_or(Error::Unsupported(
             "a token with a feature that is not there",
@@ -171,7 +172,7 @@ fn plan_chunk<'k, 'a>(
 fn plan_window<'a>(
     entries: &[&'a [u8]],
     spans: &Spans,
-    window: &[(u32, &str)],
+    window: Tokens<'_>,
     planner: &Planner<'_, 'a>,
     lanes: usize,
 ) -> Result<Vec<ChunkPlans>, Error> {
@@ -204,20 +205,18 @@ fn variant_hash(feature: u32, key: &[u8]) -> u64 {
 }
 
 struct Numbering<'k> {
-    tokens: &'k [(u32, &'k str)],
-    entry_of: Vec<u32>,
+    tokens: Tokens<'k>,
     token_of: Vec<u32>,
-    hash_of: Vec<u64>,
+    hash_of: Vec<u32>,
     table: SlotTable,
     plain_variant: Vec<u32>,
     starts_of: Vec<u32>,
 }
 
 impl<'k> Numbering<'k> {
-    fn new(tokens: &'k [(u32, &'k str)], entry_count: usize) -> Self {
+    fn new(tokens: Tokens<'k>, entry_count: usize) -> Self {
         Self {
             tokens,
-            entry_of: Vec::new(),
             token_of: Vec::new(),
             hash_of: Vec::new(),
             table: SlotTable::with_items(tokens.len()),
@@ -227,25 +226,33 @@ impl<'k> Numbering<'k> {
     }
 
     fn into_lists(self) -> (Vec<u32>, Vec<u32>) {
-        (self.entry_of, self.starts_of)
+        let tokens = self.tokens;
+        let list: Vec<u32> = self
+            .token_of
+            .iter()
+            .map(|&token| tokens.at(token as usize).0)
+            .collect();
+        (list, self.starts_of)
     }
 
     fn keyed_number(&mut self, token: usize, hash: u64, next: u32) -> u32 {
         let tokens = self.tokens;
-        let (feature, key) = tokens[token];
+        let (feature, key) = tokens.at(token);
         let key = key.as_bytes();
         let token_of = &self.token_of;
         let hash_of = &self.hash_of;
+        let short_hash = hash as u32;
+        debug_assert!(self.table.slots.len() <= MAX_HASH_SLOTS);
         self.table.find_or_insert(
             hash,
             next,
             |number| {
-                let (other_feature, other_key) = tokens[token_of[number as usize] as usize];
-                hash_of[number as usize] == hash
+                let (other_feature, other_key) = tokens.at(token_of[number as usize] as usize);
+                hash_of[number as usize] == short_hash
                     && other_feature == feature
                     && other_key.as_bytes() == key
             },
-            |number| hash_of[number as usize],
+            |number| u64::from(hash_of[number as usize]),
         )
     }
 
@@ -259,7 +266,7 @@ impl<'k> Numbering<'k> {
         let mut ops_at = 0usize;
         for (offset, &flags) in plans.flags.iter().enumerate() {
             let token = first + offset;
-            let (feature, key) = self.tokens[token];
+            let (feature, key) = self.tokens.at(token);
             let entry = feature as usize;
             let key: &[u8] = if flags & FLAG_KEYED != 0 {
                 key.as_bytes()
@@ -275,7 +282,7 @@ impl<'k> Numbering<'k> {
             } else {
                 None
             };
-            let next = self.entry_of.len() as u32;
+            let next = self.token_of.len() as u32;
             let mut hash = 0u64;
             let number = if key.is_empty() {
                 let slot = &mut self.plain_variant[entry];
@@ -290,9 +297,8 @@ impl<'k> Numbering<'k> {
             if number == next {
                 let planned =
                     planned.ok_or(Error::Unsupported("a new feature variant without a plan"))?;
-                self.entry_of.push(feature);
                 self.token_of.push(token as u32);
-                self.hash_of.push(hash);
+                self.hash_of.push(hash as u32);
                 pending.push((entry, planned));
             }
             self.starts_of.push(number);
@@ -550,10 +556,10 @@ impl<'a> Emitter<'a> {
     }
 }
 
-pub(super) fn collect_variants<'k, 'a>(
+pub(super) fn collect_variants<'a>(
     entries: &[&'a [u8]],
     spans: &Spans,
-    tokens: &'k [(u32, &'k str)],
+    tokens: Tokens<'_>,
     planner: &Planner<'_, 'a>,
 ) -> Result<Variants, Error> {
     collect_windowed(
@@ -567,10 +573,10 @@ pub(super) fn collect_variants<'k, 'a>(
     )
 }
 
-fn collect_windowed<'k, 'a>(
+fn collect_windowed<'a>(
     entries: &[&'a [u8]],
     spans: &Spans,
-    tokens: &'k [(u32, &'k str)],
+    tokens: Tokens<'_>,
     planner: &Planner<'_, 'a>,
     window_tokens: usize,
     lanes: usize,

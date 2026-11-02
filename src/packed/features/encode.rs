@@ -18,6 +18,7 @@ mod scan;
 mod spans;
 mod split;
 mod stats;
+mod tokens;
 mod variants;
 
 use crate::hash::FastMap;
@@ -33,6 +34,8 @@ use spans::Spans;
 use split::split_entries;
 use stats::{Class, Stat, choose_split};
 use variants::{Variants, collect_variants};
+
+pub(in crate::packed) use tokens::Tokens;
 
 const MAX_FIELDS: usize = 256;
 const FOLD_MAX_VALUES: usize = 256;
@@ -183,7 +186,7 @@ fn assembly_of<'s, 'a>(
     }
 }
 
-pub(in crate::packed) fn encode(features: &[u8], tokens: &[(u32, &str)]) -> Result<Encoded, Error> {
+pub(in crate::packed) fn encode(features: &[u8], tokens: Tokens<'_>) -> Result<Encoded, Error> {
     let entries = split_entries(features)?;
     let (spans, field_counts) = Spans::build(&entries);
     let (classes, numbers) = classify_and_number(&entries, &spans, &field_counts);

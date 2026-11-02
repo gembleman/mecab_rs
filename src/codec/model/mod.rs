@@ -40,6 +40,10 @@ impl Model {
         self.state.hints(out);
     }
 
+    pub(crate) fn sizes(&self, out: &mut Vec<u32>) {
+        self.state.sizes(out);
+    }
+
     pub(crate) fn set_active(&mut self, mask: Option<Vec<bool>>, bundle_cats: bool) {
         self.state.set_active(mask, bundle_cats);
     }

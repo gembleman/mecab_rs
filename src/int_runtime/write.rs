@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::path::Path;
 
 use memmap2::MmapOptions;
@@ -113,7 +112,8 @@ fn computed_total(inputs: &RuntimeInputs, starts: &[usize], row: usize, column: 
         .map(|(cluster, (shape, &start))| {
             let left = usize::from(inputs.left_keys[column * count + cluster]);
             let right = usize::from(inputs.right_keys[row * count + cluster]);
-            i64::from(inputs.tables[start + right * shape.left_keys + left])
+            let table = inputs.tables.table(cluster, start);
+            i64::from(table[right * shape.left_keys + left])
         })
         .sum()
 }
@@ -191,19 +191,20 @@ fn reordered_cells(
 }
 
 fn renumber_clusters(
-    inputs: &RuntimeInputs,
+    inputs: &mut RuntimeInputs,
     starts: &[usize],
     (hot_left, hot_right): (usize, usize),
     min_sparse_gain: usize,
 ) -> RenumberedClusters {
-    let count = inputs.shapes.len();
+    let (shapes, left_keys, right_keys) = (inputs.shapes, inputs.left_keys, inputs.right_keys);
+    let count = shapes.len();
     let mut result = RenumberedClusters {
         left_keys: vec![0u16; inputs.left_size * count],
         right_keys: vec![0u16; inputs.right_size * count],
         tables: Vec::with_capacity(count),
         shapes: Vec::with_capacity(count),
     };
-    for (cluster, (shape, &original_start)) in inputs.shapes.iter().zip(starts).enumerate() {
+    for (cluster, (shape, &original_start)) in shapes.iter().zip(starts).enumerate() {
         let side = |keys: &[u16], key_count, hot| {
             renumber(
                 keys.iter().skip(cluster).step_by(count).copied(),
@@ -211,11 +212,11 @@ fn renumber_clusters(
                 hot,
             )
         };
-        let left = side(inputs.left_keys, shape.left_keys, hot_left);
-        let right = side(inputs.right_keys, shape.right_keys, hot_right);
+        let left = side(left_keys, shape.left_keys, hot_left);
+        let right = side(right_keys, shape.right_keys, hot_right);
         for (new_keys, old_keys, renumbered) in [
-            (&mut result.left_keys, inputs.left_keys, &left),
-            (&mut result.right_keys, inputs.right_keys, &right),
+            (&mut result.left_keys, left_keys, &left),
+            (&mut result.right_keys, right_keys, &right),
         ] {
             for (new, old) in new_keys
                 .iter_mut()
@@ -226,8 +227,14 @@ fn renumber_clusters(
                 *new = renumbered.new_of_old[usize::from(*old)];
             }
         }
-        let table = &inputs.tables[original_start..];
-        let cells = reordered_cells(table, shape, &left, &right);
+        let cells = reordered_cells(
+            inputs.tables.table(cluster, original_start),
+            shape,
+            &left,
+            &right,
+        );
+        #[cfg(feature = "xz")]
+        inputs.tables.release(cluster);
         let encoded = encode_table(&cells, min_sparse_gain);
         drop(cells);
         result.tables.push(encoded.bytes);
@@ -265,8 +272,7 @@ fn write_runtime(
     }
     let starts = cluster_starts(&inputs);
     let exceptions = exceptions_outside_hot(&inputs, shape, &starts)?;
-    let clusters = renumber_clusters(&inputs, &starts, hot, min_sparse_gain);
-    inputs.tables = Cow::Borrowed(&[]);
+    let clusters = renumber_clusters(&mut inputs, &starts, hot, min_sparse_gain);
     assemble_runtime(&inputs, hot, &exceptions, clusters)
 }
 

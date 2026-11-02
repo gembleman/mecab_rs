@@ -29,10 +29,14 @@ impl StrGroup {
         out.push(self.ppm.hint());
     }
 
+    pub(super) fn sizes(&self, out: &mut Vec<u32>) {
+        self.vecs.sizes(out);
+    }
+
     pub(super) fn new(plan_steps: &[Step], hints: &mut HintReader) -> StrGroup {
         StrGroup {
             ppm: hints.ppm(),
-            vecs: Interner::default(),
+            vecs: hints.interner(),
             steps: plan_steps
                 .iter()
                 .enumerate()

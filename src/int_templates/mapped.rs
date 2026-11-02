@@ -1,7 +1,7 @@
-use std::borrow::Cow;
 use std::fmt;
 use std::path::Path;
 
+use super::cluster::ClusterTables;
 use super::{MAX_PARTS, RuntimeInputs, TemplateHeader, int_cost, validate};
 use crate::clusters::MappedClusters;
 use crate::error::Error;
@@ -138,7 +138,7 @@ impl<S: SectionSource> MappedIntTemplates<S> {
             shapes: &clusters.shapes,
             left_keys: clusters.left_keys.view_source(&self.map),
             right_keys: clusters.right_keys.view_source(&self.map),
-            tables: Cow::Borrowed(clusters.tables.view_source(&self.map)),
+            tables: ClusterTables::Borrowed(clusters.tables.view_source(&self.map)),
             exception_cells: self.exception_cells.view_source(&self.map),
             exception_values: self.exception_values.view_source(&self.map),
         })
