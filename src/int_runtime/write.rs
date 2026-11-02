@@ -46,11 +46,14 @@ impl<S: SectionSource> MappedIntTemplates<S> {
         let inputs = self.runtime_inputs().ok_or(Error::Unsupported(
             "integer templates without clusters have no runtime form",
         ))?;
-        runtime_form_from(inputs, shape)
+        runtime_form_from(&inputs, shape)
     }
 }
 
-pub(crate) fn runtime_form_from(inputs: RuntimeInputs, shape: &HotShape) -> Result<Vec<u8>, Error> {
+pub(crate) fn runtime_form_from(
+    inputs: &RuntimeInputs,
+    shape: &HotShape,
+) -> Result<Vec<u8>, Error> {
     write_runtime(inputs, shape, MIN_SPARSE_GAIN)
 }
 
@@ -102,20 +105,52 @@ fn cluster_starts(inputs: &RuntimeInputs) -> Vec<usize> {
         .collect()
 }
 
-fn computed_total(inputs: &RuntimeInputs, starts: &[usize], row: usize, column: usize) -> i64 {
-    let count = inputs.shapes.len();
-    inputs
-        .shapes
+struct PendingException {
+    row: u32,
+    column: u16,
+    value: i16,
+}
+
+fn pending_exceptions(inputs: &RuntimeInputs, shape: &HotShape) -> Vec<PendingException> {
+    let left_size = inputs.left_size;
+    let outside = |&cell: &u32| {
+        let cell = cell as usize;
+        !shape.contains(cell / left_size, cell % left_size)
+    };
+    let count = inputs
+        .exception_cells
         .iter()
-        .zip(starts)
-        .enumerate()
-        .map(|(cluster, (shape, &start))| {
-            let left = usize::from(inputs.left_keys[column * count + cluster]);
-            let right = usize::from(inputs.right_keys[row * count + cluster]);
-            let table = inputs.tables.table(cluster, start);
-            i64::from(table[right * shape.left_keys + left])
-        })
-        .sum()
+        .filter(|&c| outside(c))
+        .count();
+    let mut pending = Vec::with_capacity(count);
+    for (cell, &value) in inputs.exception_cells.iter().zip(inputs.exception_values) {
+        if outside(cell) {
+            let cell = *cell as usize;
+            pending.push(PendingException {
+                row: (cell / left_size) as u32,
+                column: (cell % left_size) as u16,
+                value,
+            });
+        }
+    }
+    debug_assert_eq!(pending.len(), count);
+    pending
+}
+
+fn add_cluster_totals(
+    inputs: &RuntimeInputs,
+    cluster: usize,
+    shape: &ClusterShape,
+    table: &[i32],
+    pending: &[PendingException],
+    totals: &mut [i64],
+) {
+    let count = inputs.shapes.len();
+    for (exception, total) in pending.iter().zip(totals) {
+        let left = usize::from(inputs.left_keys[usize::from(exception.column) * count + cluster]);
+        let right = usize::from(inputs.right_keys[exception.row as usize * count + cluster]);
+        *total += i64::from(table[right * shape.left_keys + left]);
+    }
 }
 
 struct ExceptionColumns {
@@ -123,33 +158,27 @@ struct ExceptionColumns {
     columns: Vec<u16>,
 }
 
-fn exceptions_outside_hot(
+fn exception_columns(
     inputs: &RuntimeInputs,
-    shape: &HotShape,
-    starts: &[usize],
+    pending: &[PendingException],
+    totals: &[i64],
 ) -> Result<ExceptionColumns, Error> {
-    let (left_size, right_size) = (inputs.left_size, inputs.right_size);
-    let mut row_starts = vec![0u32; right_size + 1];
-    let mut columns = Vec::new();
-    for (&cell, &value) in inputs.exception_cells.iter().zip(inputs.exception_values) {
-        let (row, column) = (cell as usize / left_size, cell as usize % left_size);
-        if shape.contains(row, column) {
-            continue;
-        }
-        let total = computed_total(inputs, starts, row, column);
+    let mut row_starts = vec![0u32; inputs.right_size + 1];
+    let mut columns = Vec::with_capacity(pending.len());
+    for (exception, &total) in pending.iter().zip(totals) {
         let computed = int_cost(total, inputs.cost_factor, inputs.shift);
-        match i32::from(value) - i32::from(computed) {
-            1 => columns.push(column as u16 | ABOVE),
-            -1 => columns.push(column as u16),
+        match i32::from(exception.value) - i32::from(computed) {
+            1 => columns.push(exception.column | ABOVE),
+            -1 => columns.push(exception.column),
             _ => {
                 return Err(Error::Unsupported(
                     "an exception differs from the computed cost by more than one",
                 ));
             }
         }
-        row_starts[row + 1] += 1;
+        row_starts[exception.row as usize + 1] += 1;
     }
-    for row in 0..right_size {
+    for row in 0..inputs.right_size {
         row_starts[row + 1] += row_starts[row];
     }
     Ok(ExceptionColumns {
@@ -191,11 +220,13 @@ fn reordered_cells(
 }
 
 fn renumber_clusters(
-    inputs: &mut RuntimeInputs,
+    inputs: &RuntimeInputs,
     starts: &[usize],
     (hot_left, hot_right): (usize, usize),
     min_sparse_gain: usize,
-) -> RenumberedClusters {
+    pending: &[PendingException],
+    totals: &mut [i64],
+) -> Result<RenumberedClusters, Error> {
     let (shapes, left_keys, right_keys) = (inputs.shapes, inputs.left_keys, inputs.right_keys);
     let count = shapes.len();
     let mut result = RenumberedClusters {
@@ -227,14 +258,10 @@ fn renumber_clusters(
                 *new = renumbered.new_of_old[usize::from(*old)];
             }
         }
-        let cells = reordered_cells(
-            inputs.tables.table(cluster, original_start),
-            shape,
-            &left,
-            &right,
-        );
-        #[cfg(feature = "xz")]
-        inputs.tables.release(cluster);
+        let table = inputs.tables.table(cluster, original_start)?;
+        add_cluster_totals(inputs, cluster, shape, &table, pending, totals);
+        let cells = reordered_cells(&table, shape, &left, &right);
+        drop(table);
         let encoded = encode_table(&cells, min_sparse_gain);
         drop(cells);
         result.tables.push(encoded.bytes);
@@ -249,11 +276,11 @@ fn renumber_clusters(
             encoded.nonzero as u32,
         ]);
     }
-    result
+    Ok(result)
 }
 
 fn write_runtime(
-    mut inputs: RuntimeInputs,
+    inputs: &RuntimeInputs,
     shape: &HotShape,
     min_sparse_gain: usize,
 ) -> Result<Vec<u8>, Error> {
@@ -270,10 +297,13 @@ fn write_runtime(
             "too many left ids for the exceptions of a runtime form",
         ));
     }
-    let starts = cluster_starts(&inputs);
-    let exceptions = exceptions_outside_hot(&inputs, shape, &starts)?;
-    let clusters = renumber_clusters(&mut inputs, &starts, hot, min_sparse_gain);
-    assemble_runtime(&inputs, hot, &exceptions, clusters)
+    let starts = cluster_starts(inputs);
+    let pending = pending_exceptions(inputs, shape);
+    let mut totals = vec![0i64; pending.len()];
+    let clusters = renumber_clusters(inputs, &starts, hot, min_sparse_gain, &pending, &mut totals)?;
+    let exceptions = exception_columns(inputs, &pending, &totals)?;
+    drop((pending, totals));
+    assemble_runtime(inputs, hot, &exceptions, clusters)
 }
 
 fn runtime_capacity(exceptions: &ExceptionColumns, clusters: &RenumberedClusters) -> usize {

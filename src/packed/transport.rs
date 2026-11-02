@@ -15,7 +15,7 @@ use super::source::read_dictionary;
 use crate::Error;
 use crate::error::{IoAction, io_error};
 use crate::file_write::write_file;
-use crate::wire::{fnv1a64, u32_at, u64_at};
+use crate::wire::{fnv1a, fnv1a64, u32_at, u64_at};
 
 const MAGIC: &[u8; 4] = b"MRDT";
 const VERSION: u32 = 5;
@@ -114,103 +114,170 @@ pub fn container(parts: &[Part]) -> Vec<u8> {
     out
 }
 
-type PartSlice<'a> = (&'a str, u32, &'a [u8]);
-
-struct ContainerCursor<'a> {
-    path: &'a Path,
-    body: &'a [u8],
-    at: usize,
+struct OwnedPart {
+    name: String,
+    encoding: u32,
+    bytes: Vec<u8>,
 }
 
-impl<'a> ContainerCursor<'a> {
-    fn take(&mut self, length: usize) -> Result<&'a [u8], Error> {
-        let end = self
-            .at
-            .checked_add(length)
-            .filter(|&end| end <= self.body.len())
-            .ok_or_else(|| Error::format(self.path, "the data ends early"))?;
-        let slice = &self.body[self.at..end];
-        self.at = end;
-        Ok(slice)
+struct OwnedParts<'a> {
+    path: &'a Path,
+    parts: Vec<OwnedPart>,
+}
+
+impl OwnedParts<'_> {
+    fn remove(&mut self, name: &str) -> Result<OwnedPart, Error> {
+        let at = self
+            .parts
+            .iter()
+            .position(|part| part.name == name)
+            .ok_or_else(|| Error::format(self.path, format!("the part {name} is missing")))?;
+        Ok(self.parts.swap_remove(at))
     }
 
-    fn word(&mut self) -> Result<u32, Error> {
-        Ok(u32_at(self.take(4)?, 0))
-    }
-
-    fn length(&mut self) -> Result<usize, Error> {
-        let length = u64_at(self.take(8)?, 0);
-        usize::try_from(length).map_err(|_| Error::format(self.path, "a part is too long"))
-    }
-
-    fn name(&mut self) -> Result<&'a str, Error> {
-        let name_length = usize::from(self.take(1)?[0]);
-        str::from_utf8(self.take(name_length)?)
-            .map_err(|_| Error::format(self.path, "a part name is not valid UTF-8"))
-    }
-
-    fn expect_end(&self) -> Result<(), Error> {
-        if self.at == self.body.len() {
-            Ok(())
-        } else {
-            Err(Error::format(self.path, "the data has trailing bytes"))
+    fn view(&self) -> Parts<'_> {
+        Parts {
+            path: self.path,
+            parts: self
+                .parts
+                .iter()
+                .map(|part| (part.name.as_str(), part.encoding, part.bytes.as_slice()))
+                .collect(),
         }
     }
 }
 
-fn split_digest<'a>(payload: &'a [u8], path: &Path) -> Result<&'a [u8], Error> {
-    let body_length = payload
-        .len()
-        .checked_sub(DIGEST_BYTES)
-        .ok_or_else(|| Error::format(path, "the data is too short"))?;
-    let (body, digest) = payload.split_at(body_length);
-    if fnv1a64(body) != u64_at(digest, 0) {
-        return Err(Error::format(path, "the FNV digest does not match"));
-    }
-    Ok(body)
+struct ContainerReader<'a, R> {
+    path: &'a Path,
+    reader: R,
+    digest: u64,
+    consumed: u64,
 }
 
-fn read_part_count(cursor: &mut ContainerCursor) -> Result<usize, Error> {
-    if cursor.take(MAGIC.len())? != MAGIC {
-        return Err(Error::format(cursor.path, "the magic is not valid"));
+impl<'a, R: Read> ContainerReader<'a, R> {
+    fn new(path: &'a Path, reader: R) -> Self {
+        Self {
+            path,
+            reader,
+            digest: fnv1a64(&[]),
+            consumed: 0,
+        }
     }
-    if cursor.word()? != VERSION {
-        return Err(Error::format(
-            cursor.path,
-            "the transport format version is not supported; pack the dictionary again",
-        ));
+
+    fn read_error(&self, cause: std::io::Error) -> Error {
+        if cause.kind() == std::io::ErrorKind::UnexpectedEof {
+            Error::format(self.path, "the data ends early")
+        } else {
+            Error::format(self.path, "the xz stream cannot be decoded").caused_by(cause)
+        }
     }
-    let count = cursor.word()? as usize;
-    if count > MAX_PARTS {
-        return Err(Error::format(cursor.path, "the part count is too large"));
+
+    fn check_room(&self, length: u64) -> Result<(), Error> {
+        if length > MAX_PAYLOAD.saturating_sub(self.consumed) {
+            return Err(Error::format(
+                self.path,
+                "the payload inside the xz stream is larger than any dictionary",
+            ));
+        }
+        Ok(())
     }
-    Ok(count)
+
+    fn fill(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
+        let length = buffer.len() as u64;
+        self.check_room(length)?;
+        self.reader
+            .read_exact(buffer)
+            .map_err(|cause| self.read_error(cause))?;
+        self.digest = fnv1a(self.digest, buffer);
+        self.consumed += length;
+        Ok(())
+    }
+
+    fn word(&mut self) -> Result<u32, Error> {
+        let mut bytes = [0u8; 4];
+        self.fill(&mut bytes)?;
+        Ok(u32_at(&bytes, 0))
+    }
+
+    fn length(&mut self) -> Result<usize, Error> {
+        let mut bytes = [0u8; 8];
+        self.fill(&mut bytes)?;
+        usize::try_from(u64_at(&bytes, 0))
+            .map_err(|_| Error::format(self.path, "a part is too long"))
+    }
+
+    fn name(&mut self) -> Result<String, Error> {
+        let mut length = [0u8; 1];
+        self.fill(&mut length)?;
+        let mut bytes = vec![0u8; usize::from(length[0])];
+        self.fill(&mut bytes)?;
+        String::from_utf8(bytes)
+            .map_err(|_| Error::format(self.path, "a part name is not valid UTF-8"))
+    }
+
+    fn part_count(&mut self) -> Result<usize, Error> {
+        let mut magic = [0u8; MAGIC.len()];
+        self.fill(&mut magic)?;
+        if &magic != MAGIC {
+            return Err(Error::format(self.path, "the magic is not valid"));
+        }
+        if self.word()? != VERSION {
+            return Err(Error::format(
+                self.path,
+                "the transport format version is not supported; pack the dictionary again",
+            ));
+        }
+        let count = self.word()? as usize;
+        if count > MAX_PARTS {
+            return Err(Error::format(self.path, "the part count is too large"));
+        }
+        Ok(count)
+    }
+
+    fn part(&mut self, read: &[OwnedPart]) -> Result<OwnedPart, Error> {
+        let name = self.name()?;
+        let encoding = self.word()?;
+        let length = self.length()?;
+        if read.iter().any(|part| part.name == name) {
+            return Err(Error::format(self.path, "a part is repeated"));
+        }
+        self.check_room(length as u64)?;
+        let mut bytes = vec![0u8; length];
+        self.fill(&mut bytes)?;
+        Ok(OwnedPart {
+            name,
+            encoding,
+            bytes,
+        })
+    }
+
+    fn finish(mut self) -> Result<(), Error> {
+        let mut digest = [0u8; DIGEST_BYTES];
+        self.reader
+            .read_exact(&mut digest)
+            .map_err(|cause| self.read_error(cause))?;
+        if self.digest != u64_at(&digest, 0) {
+            return Err(Error::format(self.path, "the FNV digest does not match"));
+        }
+        let mut extra = [0u8; 1];
+        match self.reader.read(&mut extra) {
+            Ok(0) => Ok(()),
+            Ok(_) => Err(Error::format(self.path, "the data has trailing bytes")),
+            Err(cause) => Err(self.read_error(cause)),
+        }
+    }
 }
 
-fn read_part<'a>(
-    cursor: &mut ContainerCursor<'a>,
-    read: &[PartSlice<'a>],
-) -> Result<PartSlice<'a>, Error> {
-    let name = cursor.name()?;
-    let encoding = cursor.word()?;
-    let length = cursor.length()?;
-    if read.iter().any(|part| part.0 == name) {
-        return Err(Error::format(cursor.path, "a part is repeated"));
-    }
-    Ok((name, encoding, cursor.take(length)?))
-}
-
-pub(super) fn parse_container<'a>(payload: &'a [u8], path: &'a Path) -> Result<Parts<'a>, Error> {
-    let body = split_digest(payload, path)?;
-    let mut cursor = ContainerCursor { path, body, at: 0 };
-    let count = read_part_count(&mut cursor)?;
-    let mut parts: Vec<PartSlice<'a>> = Vec::new();
+fn read_parts<R: Read>(reader: R, path: &Path) -> Result<OwnedParts<'_>, Error> {
+    let mut container = ContainerReader::new(path, reader);
+    let count = container.part_count()?;
+    let mut parts: Vec<OwnedPart> = Vec::with_capacity(count);
     for _ in 0..count {
-        let part = read_part(&mut cursor, &parts)?;
+        let part = container.part(&parts)?;
         parts.push(part);
     }
-    cursor.expect_end()?;
-    Ok(Parts { path, parts })
+    container.finish()?;
+    Ok(OwnedParts { path, parts })
 }
 
 fn lexicon_model(
@@ -246,9 +313,17 @@ fn attach_matrix(model: &mut Model, (matrix, templates): (Vec<u8>, Vec<u8>)) {
 
 type DecodedParts = (Model, PreparedSlot, (Vec<u8>, Vec<u8>));
 
-fn decode_parts(parts: &Parts) -> Result<DecodedParts, Error> {
+fn decode_parts(mut owned: OwnedParts<'_>) -> Result<DecodedParts, Error> {
+    let matrix_part = owned.remove("matrix")?;
+    let path = owned.path;
     std::thread::scope(|scope| {
-        let matrix = scope.spawn(|| matrix::decode(parts));
+        let matrix = scope.spawn(move || {
+            let parts = Parts {
+                path,
+                parts: vec![("matrix", matrix_part.encoding, matrix_part.bytes.as_slice())],
+            };
+            matrix::decode(&parts)
+        });
         let (keys_tx, keys_rx) = std::sync::mpsc::channel();
         let trie = scope.spawn(move || {
             keys_rx
@@ -256,18 +331,18 @@ fn decode_parts(parts: &Parts) -> Result<DecodedParts, Error> {
                 .ok()
                 .map(|keys: std::sync::Arc<_>| PreparedTrie::build(&keys))
         });
-        let decoded = lexicon_model(parts, move |keys| {
+        let decoded = lexicon_model(&owned.view(), move |keys| {
             let _ = keys_tx.send(keys);
         });
+        drop(owned);
         let prepared = trie.join().expect("the trie builder panicked");
         let matrix = matrix.join().expect("the matrix decoder panicked");
         Ok((decoded?, prepared, matrix?))
     })
 }
 
-fn runtime_model(payload: Vec<u8>, path: &Path) -> Result<(Model, LexiconSections), Error> {
-    let (mut model, prepared, matrix) = decode_parts(&parse_container(&payload, path)?)?;
-    drop(payload);
+fn runtime_model(owned: OwnedParts<'_>) -> Result<(Model, LexiconSections), Error> {
+    let (mut model, prepared, matrix) = decode_parts(owned)?;
     let sections = model.encode_lexicon_sections_releasing(prepared)?;
     attach_matrix(&mut model, matrix);
     Ok((model, sections))
@@ -287,20 +362,8 @@ pub fn transport_payload(dict_dir: &Path) -> Result<Vec<u8>, Error> {
 
 pub fn expand(xz_file: &Path, out_mrd: &Path) -> Result<(), Error> {
     let file = std::fs::File::open(xz_file).map_err(io_error(IoAction::Open, xz_file))?;
-    let mut payload = Vec::new();
-    XzReader::new(std::io::BufReader::new(file), false)
-        .take(MAX_PAYLOAD + 1)
-        .read_to_end(&mut payload)
-        .map_err(|cause| {
-            Error::format(xz_file, "the xz stream cannot be decoded").caused_by(cause)
-        })?;
-    if payload.len() as u64 > MAX_PAYLOAD {
-        return Err(Error::format(
-            xz_file,
-            "the payload inside the xz stream is larger than any dictionary",
-        ));
-    }
-    let (model, sections) = runtime_model(payload, xz_file)?;
+    let owned = read_parts(XzReader::new(std::io::BufReader::new(file), false), xz_file)?;
+    let (model, sections) = runtime_model(owned)?;
     let runtime = model.finish_runtime(sections)?;
     write_file(out_mrd, |writer| runtime.write_to(writer))
 }

@@ -1,10 +1,14 @@
+use std::borrow::Cow;
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::clusters::{
     ClusterPlan, ClusterShape, fill_cells, interleaved_ids, left_ids, plan_clusters, right_ids,
     write_cluster_layout,
 };
+use crate::dict_files::MATRIX_ITP_FILE;
+use crate::error::Error;
 use crate::part::{PartSlices, total_of};
 use crate::templates::write_array;
 
@@ -44,15 +48,9 @@ pub(super) struct ClusterData {
     pub(super) tables: Vec<Vec<i32>>,
 }
 
-pub(super) fn cluster_data(
-    parts: &[PartSlices<i32>],
-    plans: &[ClusterPlan],
-    left_size: usize,
-    right_size: usize,
-    threads: usize,
-) -> io::Result<ClusterData> {
+pub(super) fn cluster_shapes(plans: &[ClusterPlan]) -> Vec<ClusterShape> {
     let mut table_start = 0;
-    let shapes = plans
+    plans
         .iter()
         .map(|plan| {
             let shape = ClusterShape {
@@ -63,15 +61,32 @@ pub(super) fn cluster_data(
             table_start += plan.cells();
             shape
         })
-        .collect();
-    let mut tables = Vec::with_capacity(plans.len());
-    for plan in plans {
-        let mut table = vec![0i32; plan.cells()];
-        fill_int_table(plan, parts, threads, &mut table)?;
-        tables.push(table);
-    }
+        .collect()
+}
+
+pub(super) fn cluster_table(
+    parts: &[PartSlices<i32>],
+    plan: &ClusterPlan,
+    threads: usize,
+) -> io::Result<Vec<i32>> {
+    let mut table = vec![0i32; plan.cells()];
+    fill_int_table(plan, parts, threads, &mut table)?;
+    Ok(table)
+}
+
+pub(super) fn cluster_data(
+    parts: &[PartSlices<i32>],
+    plans: &[ClusterPlan],
+    left_size: usize,
+    right_size: usize,
+    threads: usize,
+) -> io::Result<ClusterData> {
+    let tables = plans
+        .iter()
+        .map(|plan| cluster_table(parts, plan, threads))
+        .collect::<io::Result<_>>()?;
     Ok(ClusterData {
-        shapes,
+        shapes: cluster_shapes(plans),
         left_keys: interleaved_ids(plans, left_size, left_ids),
         right_keys: interleaved_ids(plans, right_size, right_ids),
         tables,
@@ -93,32 +108,43 @@ pub(super) fn write_clusters(data: &ClusterData, output: &mut impl Write) -> io:
         .try_for_each(|table| write_array(output, table, i32::to_le_bytes))
 }
 
+#[cfg(feature = "xz")]
+pub(crate) struct BuiltTables<'a> {
+    pub(crate) parts: &'a [PartSlices<'a, i32>],
+    pub(crate) plans: &'a [ClusterPlan],
+    pub(crate) threads: usize,
+}
+
 pub(crate) enum ClusterTables<'a> {
     Borrowed(&'a [i32]),
     #[cfg(feature = "xz")]
-    Owned(Vec<Vec<i32>>),
+    Built(BuiltTables<'a>),
+}
+
+fn borrowed_table(flat: &[i32], start: usize) -> Result<&[i32], Error> {
+    flat.get(start..).ok_or_else(|| {
+        Error::format(
+            Path::new(MATRIX_ITP_FILE),
+            "the cluster table lies outside of the matrix data",
+        )
+    })
 }
 
 impl ClusterTables<'_> {
     #[cfg(feature = "xz")]
-    pub(crate) fn table(&self, cluster: usize, start: usize) -> &[i32] {
+    pub(crate) fn table(&self, cluster: usize, start: usize) -> Result<Cow<'_, [i32]>, Error> {
         match self {
-            Self::Borrowed(flat) => &flat[start..],
-            Self::Owned(tables) => &tables[cluster],
+            Self::Borrowed(flat) => borrowed_table(flat, start).map(Cow::Borrowed),
+            Self::Built(built) => cluster_table(built.parts, &built.plans[cluster], built.threads)
+                .map(Cow::Owned)
+                .map_err(|_| Error::Unsupported("a cluster sum that does not fit an i32")),
         }
     }
 
     #[cfg(not(feature = "xz"))]
-    pub(crate) fn table(&self, _cluster: usize, start: usize) -> &[i32] {
+    pub(crate) fn table(&self, _cluster: usize, start: usize) -> Result<Cow<'_, [i32]>, Error> {
         let Self::Borrowed(flat) = self;
-        &flat[start..]
-    }
-
-    #[cfg(feature = "xz")]
-    pub(crate) fn release(&mut self, cluster: usize) {
-        if let Self::Owned(tables) = self {
-            tables[cluster] = Vec::new();
-        }
+        borrowed_table(flat, start).map(Cow::Borrowed)
     }
 }
 
