@@ -1,7 +1,7 @@
 use super::align::{Run, Span};
 use crate::codec::coder::Coder;
 use crate::codec::hints::HintReader;
-use crate::codec::ppm::{NOVEL, PpmHint};
+use crate::codec::ppm::{NOVEL, PpmHint, hash_bytes, mix};
 use crate::codec::text::CharModel;
 use crate::wire::{get_varint, put_varint};
 
@@ -26,6 +26,10 @@ pub(super) struct RowState {
     pub lid_ref_key: u64,
     pub cat_group_id: u32,
     pub surf_hash: u64,
+    pub cat_pos_ctx: Option<[u64; 3]>,
+    pub cat_group_ctx: Option<[u64; 2]>,
+    pub str_group_ctx: Option<u64>,
+    pub ref_ctx: Option<[u64; 3]>,
     pub str_shape: u64,
     pub str_group_id: u32,
     pub prev_str_group_id: u32,
@@ -61,6 +65,10 @@ impl RowState {
             lid_ref_key: 0,
             cat_group_id: 0,
             surf_hash: 0,
+            cat_pos_ctx: None,
+            cat_group_ctx: None,
+            str_group_ctx: None,
+            ref_ctx: None,
             str_shape: 0,
             str_group_id: 0,
             prev_str_group_id: 0,
@@ -128,4 +136,77 @@ pub(super) fn read_str(bytes: &[u8], pos: &mut usize, dest: &mut String) {
 pub(super) fn put_str(out: &mut Vec<u8>, s: &str) {
     put_varint(out, s.len() as u64);
     out.extend_from_slice(s.as_bytes());
+}
+
+const CAT_POS_SALT: u64 = 1;
+const CAT_POS_ORDER2_SALT: u64 = 2;
+const CAT_POS_FIRST_SALT: u64 = 3;
+const CAT_GROUP_FIRST_SALT: u64 = 9;
+const CAT_GROUP_POS_SALT: u64 = 5;
+const STR_GROUP_FIRST_SALT: u64 = 66;
+const REF_GROUP_SALT: u64 = 24;
+const REF_POS_SALT: u64 = 20;
+const REF_FIRST_SALT: u64 = 21;
+
+impl RowState {
+    #[inline]
+    pub(super) fn cat_pos_ctx(&mut self) -> [u64; 3] {
+        let (pos, first) = (self.pos_hash, self.pos_first_hash);
+        *self.cat_pos_ctx.get_or_insert_with(|| {
+            [
+                mix(CAT_POS_SALT, pos),
+                mix(CAT_POS_ORDER2_SALT, pos),
+                mix(CAT_POS_FIRST_SALT, first),
+            ]
+        })
+    }
+
+    #[inline]
+    pub(super) fn cat_group_ctx(&mut self) -> [u64; 2] {
+        let (pos, first_in_group, prev) =
+            (self.pos_hash, self.first_in_group, self.prev_cat_group_id);
+        *self.cat_group_ctx.get_or_insert_with(|| {
+            [
+                mix(
+                    mix(CAT_GROUP_FIRST_SALT + u64::from(first_in_group), pos),
+                    u64::from(prev),
+                ),
+                mix(CAT_GROUP_POS_SALT, pos),
+            ]
+        })
+    }
+
+    #[inline]
+    pub(super) fn str_group_ctx(&mut self) -> u64 {
+        let (pos, first_in_group, prev) =
+            (self.pos_hash, self.first_in_group, self.prev_str_group_id);
+        *self.str_group_ctx.get_or_insert_with(|| {
+            mix(
+                mix(STR_GROUP_FIRST_SALT + u64::from(first_in_group), pos),
+                u64::from(prev),
+            )
+        })
+    }
+
+    #[inline]
+    pub(super) fn ref_ctx(&mut self) -> [u64; 3] {
+        let (pos, first, group) = (self.pos_hash, self.pos_first_hash, self.str_group_id);
+        *self.ref_ctx.get_or_insert_with(|| {
+            [
+                mix(mix(REF_GROUP_SALT, pos), u64::from(group)),
+                mix(REF_POS_SALT, pos),
+                mix(REF_FIRST_SALT, first),
+            ]
+        })
+    }
+}
+
+impl RowState {
+    #[inline]
+    pub(super) fn surface_hash(&mut self) -> u64 {
+        if self.surf_hash == 0 {
+            self.surf_hash = hash_bytes(self.fields[0].as_bytes());
+        }
+        self.surf_hash
+    }
 }

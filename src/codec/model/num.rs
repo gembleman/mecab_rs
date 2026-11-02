@@ -70,9 +70,10 @@ fn num_contexts(row: &RowState, mode: NumMode) -> ([u64; MAX_NUM_CONTEXTS], usiz
         ),
         NumMode::Surface => {
             let base = mix(u64::from(row.pos_sym), u64::from(row.cat_group_id));
+            let surf_hash = row.surf_hash;
             (
                 [
-                    mix(mix(70, base), row.surf_hash),
+                    mix(mix(70, base), surf_hash),
                     mix(71, base),
                     mix(72, u64::from(row.pos_sym)),
                     mix(73, row.pos_first_two_hash),
@@ -83,15 +84,14 @@ fn num_contexts(row: &RowState, mode: NumMode) -> ([u64; MAX_NUM_CONTEXTS], usiz
             )
         }
         NumMode::SurfacePrevious => {
-            let base = mix(
-                mix(u64::from(row.pos_sym), u64::from(row.cat_group_id)),
-                row.prev_num as u64,
-            );
+            let pos_group = mix(u64::from(row.pos_sym), u64::from(row.cat_group_id));
+            let base = mix(pos_group, row.prev_num as u64);
+            let surf_hash = row.surf_hash;
             (
                 [
-                    mix(mix(80, base), row.surf_hash),
+                    mix(mix(80, base), surf_hash),
                     mix(81, base),
-                    mix(82, mix(u64::from(row.pos_sym), u64::from(row.cat_group_id))),
+                    mix(82, pos_group),
                     mix(83, u64::from(row.pos_sym)),
                     mix(84, row.pos_first_two_hash),
                     85,
@@ -148,6 +148,9 @@ fn code_num_value(
     mode: NumMode,
 ) {
     let dec = coder.is_decoder();
+    if mode.uses_surface() {
+        row.surface_hash();
+    }
     let (ctxs, n) = num_contexts(row, mode);
     let skip = usize::from(mode.uses_surface() && st.ppm.distinct(ctxs[1]) < 2);
     let ctxs = &ctxs[skip..n];

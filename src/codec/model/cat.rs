@@ -66,12 +66,10 @@ impl CatGroup {
     }
 
     #[inline]
-    pub(super) fn prefetch(&self, row: &RowState) {
-        self.ppm.prefetch(mix(
-            mix(9 + u64::from(row.first_in_group), row.pos_hash),
-            u64::from(row.prev_cat_group_id),
-        ));
-        self.ppm.prefetch(mix(5, row.pos_hash));
+    pub(super) fn prefetch(&self, row: &mut RowState) {
+        let [with_previous, pos_only] = row.cat_group_ctx();
+        self.ppm.prefetch(with_previous);
+        self.ppm.prefetch(pos_only);
     }
 
     #[inline]
@@ -84,17 +82,15 @@ impl CatGroup {
     }
 
     #[inline]
-    fn contexts(&self, row: &RowState) -> ([u64; GROUP_CTX_COUNT], usize) {
+    fn contexts(&self, row: &mut RowState) -> ([u64; GROUP_CTX_COUNT], usize) {
+        let [with_previous, pos_only] = row.cat_group_ctx();
         let colh = self
             .ctx_col
             .map_or(0, |k| hash_bytes(row.fields[k].as_bytes()));
         let ctxs = [
             mix(mix(8, row.pos_hash), colh),
-            mix(
-                mix(9 + u64::from(row.first_in_group), row.pos_hash),
-                u64::from(row.prev_cat_group_id),
-            ),
-            mix(5, row.pos_hash),
+            with_previous,
+            pos_only,
             mix(6, row.pos_first_hash),
             7,
         ];
@@ -131,15 +127,16 @@ impl CatGroup {
 }
 
 #[inline]
-fn cat_contexts(row: &RowState, prev: u64) -> ([u64; MAX_CAT_CONTEXTS], usize) {
+fn cat_contexts(row: &mut RowState, prev: u64) -> ([u64; MAX_CAT_CONTEXTS], usize) {
     let mut ctxs = [0u64; MAX_CAT_CONTEXTS];
     let mut ctx_count = 0;
+    let [base, pos_only, first_only] = row.cat_pos_ctx();
     if prev != NO_PREVIOUS {
-        ctxs[ctx_count] = mix(mix(1, row.pos_hash), prev);
+        ctxs[ctx_count] = mix(base, prev);
         ctx_count += 1;
     }
-    ctxs[ctx_count] = mix(2, row.pos_hash);
-    ctxs[ctx_count + 1] = mix(3, row.pos_first_hash);
+    ctxs[ctx_count] = pos_only;
+    ctxs[ctx_count + 1] = first_only;
     ctxs[ctx_count + 2] = 4;
     (ctxs, ctx_count + 3)
 }

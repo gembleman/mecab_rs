@@ -86,20 +86,25 @@ impl Big {
         s
     }
 
-    pub(super) fn find(&self, mut target: u32) -> (usize, u32) {
+    pub(super) fn find(&self, probe: u32, unit: u32) -> (usize, u32) {
         let cap = self.cap();
-        let start = target;
+        let mut remaining = probe;
+        let mut cumulative = 0;
         let mut pos = 0usize;
         let mut step = cap;
         while step > 0 {
             let next = pos + step;
-            if next <= cap && self.tree[next] <= target {
-                pos = next;
-                target -= self.tree[next];
+            if next <= cap {
+                let span = self.tree[next] * unit;
+                if span <= remaining {
+                    pos = next;
+                    remaining -= span;
+                    cumulative += self.tree[next];
+                }
             }
             step >>= 1;
         }
-        (pos, start - target)
+        (pos, cumulative)
     }
 
     pub(super) fn halve(&mut self) -> u32 {

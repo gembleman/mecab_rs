@@ -85,8 +85,9 @@ fn decode_small(
     coder: &mut Coder,
     excluded: &Exclusions,
 ) -> Option<(usize, u32)> {
-    let target = coder.target(open.span());
-    if target >= open.total {
+    let probe = coder.begin(open.span());
+    let unit = coder.unit();
+    if probe >= unit * open.total {
         coder.consume(open.total, open.distinct);
         return None;
     }
@@ -95,7 +96,7 @@ fn decode_small(
         if excluded.hides(s) {
             continue;
         }
-        if target < cumulative + n {
+        if probe < unit * (cumulative + n) {
             coder.consume(cumulative, n);
             return Some((i, s));
         }
@@ -144,9 +145,10 @@ pub(super) fn code_big(
 
 #[inline]
 fn decode_big(big: &Big, mass: Mass, coder: &mut Coder) -> Option<(usize, u32)> {
-    let target = coder.target(mass.span());
-    if target < mass.total {
-        let (pos, cumulative) = big.find(target);
+    let probe = coder.begin(mass.span());
+    let unit = coder.unit();
+    if probe < unit * mass.total {
+        let (pos, cumulative) = big.find(probe, unit);
         coder.consume(cumulative, big.counts[pos]);
         return Some((pos, big.syms[pos]));
     }

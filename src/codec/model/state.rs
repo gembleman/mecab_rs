@@ -9,7 +9,7 @@ use super::strings::{StrState, code_str};
 use super::strings_group::{StrGroup, code_str_group};
 use crate::codec::coder::{Coder, Flag};
 use crate::codec::hints::HintReader;
-use crate::codec::ppm::{PpmHint, hash_bytes};
+use crate::codec::ppm::PpmHint;
 
 pub(super) enum StepState {
     Cat(Box<CatState>),
@@ -149,7 +149,11 @@ impl ModelState {
         row.cat_group_id = 0;
         row.str_shape = 0;
         row.str_group_id = 0;
-        row.surf_hash = hash_bytes(row.fields[0].as_bytes());
+        row.surf_hash = 0;
+        row.cat_pos_ctx = None;
+        row.cat_group_ctx = None;
+        row.str_group_ctx = None;
+        row.ref_ctx = None;
     }
 
     #[inline]
@@ -271,12 +275,12 @@ impl ModelState {
         self.reset_group_state();
         let cat = self.bundle_cats && !self.cat_group.steps.is_empty();
         if cat {
-            self.cat_group.prefetch(&self.row_state);
+            self.cat_group.prefetch(&mut self.row_state);
         }
         self.code_irregular_flag(&plan.steps, coder);
         let string = self.active.is_none() && !self.str_group.steps.is_empty();
         if string {
-            self.str_group.prefetch(&self.row_state);
+            self.str_group.prefetch(&mut self.row_state);
         }
         self.code_steps(&plan.steps, Bundles { cat, string }, coder);
         self.row_state.finish_row();

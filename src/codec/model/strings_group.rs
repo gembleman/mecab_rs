@@ -47,11 +47,8 @@ impl StrGroup {
     }
 
     #[inline]
-    pub(super) fn prefetch(&self, row: &RowState) {
-        self.ppm.prefetch(mix(
-            mix(66 + u64::from(row.first_in_group), row.pos_hash),
-            u64::from(row.prev_str_group_id),
-        ));
+    pub(super) fn prefetch(&self, row: &mut RowState) {
+        self.ppm.prefetch(row.str_group_ctx());
     }
 
     fn plan_members(&self, steps: &mut [StepState], plan_steps: &[Step], row: &mut RowState) {
@@ -86,7 +83,7 @@ impl StrGroup {
         self.vecs.find_or_add(&row.key_buf)
     }
 
-    fn load_members(&self, steps: &mut [StepState], row: &RowState, id: u32) {
+    fn load_members(&self, steps: &mut [StepState], row: &mut RowState, id: u32) {
         let key = self.vecs.get(id);
         for (k, &si) in self.steps.iter().enumerate() {
             if let StepState::Str(st) = &mut steps[si] {
@@ -100,10 +97,10 @@ impl StrGroup {
 }
 
 #[inline]
-fn prefetch_tuple(st: &StrState, row: &RowState) {
-    st.tuple_ppm
-        .prefetch(mix(mix(24, row.pos_hash), u64::from(row.str_group_id)));
-    st.tuple_ppm.prefetch(mix(20, row.pos_hash));
+fn prefetch_tuple(st: &StrState, row: &mut RowState) {
+    let [with_group, pos_only, _] = row.ref_ctx();
+    st.tuple_ppm.prefetch(with_group);
+    st.tuple_ppm.prefetch(pos_only);
 }
 
 pub(super) fn code_str_group(
@@ -125,10 +122,7 @@ pub(super) fn code_str_group(
         g.vecs.find(&row.key_buf).unwrap_or(NOVEL)
     };
     let ctxs = [
-        mix(
-            mix(66 + u64::from(row.first_in_group), row.pos_hash),
-            u64::from(row.prev_str_group_id),
-        ),
+        row.str_group_ctx(),
         mix(60, row.pos_hash),
         mix(61, row.pos_first_hash),
         62,
@@ -140,5 +134,6 @@ pub(super) fn code_str_group(
     };
     g.ppm.update(id);
     row.str_group_id = id + 1;
+    row.ref_ctx = None;
     g.load_members(steps, row, id);
 }

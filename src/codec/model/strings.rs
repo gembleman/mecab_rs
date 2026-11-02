@@ -231,13 +231,9 @@ fn put_ref_key(key: &mut Vec<u8>, source: SourceRef, trim: usize, app: &str) {
 }
 
 #[inline]
-fn ref_contexts(row: &RowState) -> ([u64; 4], usize) {
-    let ctxs = [
-        mix(mix(24, row.pos_hash), u64::from(row.str_group_id)),
-        mix(20, row.pos_hash),
-        mix(21, row.pos_first_hash),
-        22,
-    ];
+fn ref_contexts(row: &mut RowState) -> ([u64; 4], usize) {
+    let [with_group, pos_only, first_only] = row.ref_ctx();
+    let ctxs = [with_group, pos_only, first_only, 22];
     (ctxs, usize::from(row.str_group_id == 0))
 }
 

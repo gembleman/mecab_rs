@@ -153,6 +153,18 @@ impl<'a> Coder<'a> {
     }
 
     #[inline]
+    pub(crate) fn begin(&mut self, total: u32) -> u32 {
+        self.unit = self.range / total;
+        debug_assert!(self.unit > 0);
+        self.code.min(self.unit * total - 1)
+    }
+
+    #[inline]
+    pub(crate) fn unit(&self) -> u32 {
+        self.unit
+    }
+
+    #[inline]
     pub(crate) fn consume(&mut self, cum: u32, freq: u32) {
         self.code = self.code.wrapping_sub(self.unit.wrapping_mul(cum));
         self.range = self.unit.wrapping_mul(freq);
@@ -218,8 +230,8 @@ impl Flag {
         let f1 = 2 * self.n1 + 1;
         let total = f0 + f1;
         let bit = if coder.is_decoder() {
-            let slot = coder.target(total);
-            let is_one = slot >= f0;
+            let probe = coder.begin(total);
+            let is_one = probe >= coder.unit() * f0;
             if is_one {
                 coder.consume(f0, f1);
             } else {
