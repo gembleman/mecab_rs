@@ -2,8 +2,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use mecab_rs_build::cli_options::{OptionSpec, Options, lossy_arguments};
-use mecab_rs_build::learn::{TrainOptions, train};
+use mecab_rs_tools::cli_options::{OptionSpec, Options, lossy_arguments};
+use mecab_rs_tools::learn::{TrainOptions, train};
 
 const USAGE: &str = "usage: mecab-rs-cost-train [options] corpus model
 

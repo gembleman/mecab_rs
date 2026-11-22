@@ -2,8 +2,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use mecab_rs_build::cli_options::{OptionSpec, Options, lossy_arguments};
-use mecab_rs_build::learn::test_sentences;
+use mecab_rs_tools::cli_options::{OptionSpec, Options, lossy_arguments};
+use mecab_rs_tools::learn::test_sentences;
 
 const USAGE: &str = "usage: mecab-rs-test-gen [options] [files]
 

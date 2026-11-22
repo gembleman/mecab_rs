@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "mecab_rs_build"]
+members = [".", "mecab_rs_tools"]
 exclude = ["compare"]
 
 [package]

@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use mecab_rs_build::rebuild::{PAIR_COUNT_BYTES, PairCount};
+use mecab_rs_tools::rebuild::{PAIR_COUNT_BYTES, PairCount};
 
 use crate::shown;
 

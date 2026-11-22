@@ -2,8 +2,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use mecab_rs::__private::matrix::HotShape;
-use mecab_rs_build::cli_options::{Arity, NamedSpec, Options, lossy_arguments};
-use mecab_rs_build::rebuild::{self, PAIR_COUNT_BYTES, PairCount, hot_shape_from_pair_counts};
+use mecab_rs_tools::cli_options::{Arity, NamedSpec, Options, lossy_arguments};
+use mecab_rs_tools::rebuild::{self, PAIR_COUNT_BYTES, PairCount, hot_shape_from_pair_counts};
 
 const HOT_SPECS: [NamedSpec; 8] = [
     NamedSpec {

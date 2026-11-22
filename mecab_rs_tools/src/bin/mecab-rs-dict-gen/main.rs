@@ -2,8 +2,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use mecab_rs_build::cli_options::{OptionSpec, Options, lossy_arguments};
-use mecab_rs_build::learn::{GenerateOptions, generate};
+use mecab_rs_tools::cli_options::{OptionSpec, Options, lossy_arguments};
+use mecab_rs_tools::learn::{GenerateOptions, generate};
 
 const USAGE: &str = "usage: mecab-rs-dict-gen [options]
 

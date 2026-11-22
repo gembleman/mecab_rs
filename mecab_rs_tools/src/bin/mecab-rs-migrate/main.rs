@@ -56,7 +56,7 @@ fn packed_command(command: &str, args: &[OsString]) -> Result<(), String> {
     let output = Path::new(&args[1]);
     match command {
         "pack" => mecab_rs::packed::write_runtime(input, output).map_err(shown),
-        "pack-transport" => mecab_rs_build::transport::write_transport(input, output)
+        "pack-transport" => mecab_rs_tools::transport::write_transport(input, output)
             .map(|_| ())
             .map_err(shown),
         "expand" => mecab_rs::packed::expand(input, output).map_err(shown),

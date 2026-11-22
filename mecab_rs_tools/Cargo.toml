@@ -1,5 +1,5 @@
 [package]
-name = "mecab_rs_build"
+name = "mecab_rs_tools"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"

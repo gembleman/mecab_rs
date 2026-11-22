@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::time::Instant;
 
-use mecab_rs_build::rebuild;
+use mecab_rs_tools::rebuild;
 
 use crate::matrix_args::{MatrixArgs, positional};
 use crate::shown;

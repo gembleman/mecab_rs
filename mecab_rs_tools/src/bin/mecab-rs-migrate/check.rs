@@ -8,8 +8,8 @@ use mecab_rs::__private::in_range_bytes::i16_at;
 use mecab_rs::__private::matrix::{
     IntTemplates, MATRIX_COST_BYTES, MATRIX_HEADER_BYTES, MappedIntTemplates, RuntimeIntTemplates,
 };
-use mecab_rs_build::cli_options::{Arity, NamedSpec, Options, lossy_arguments};
-use mecab_rs_build::rebuild;
+use mecab_rs_tools::cli_options::{Arity, NamedSpec, Options, lossy_arguments};
+use mecab_rs_tools::rebuild;
 
 use crate::shown;
 

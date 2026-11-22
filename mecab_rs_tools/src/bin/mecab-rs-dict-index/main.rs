@@ -3,8 +3,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use mecab_rs_build::build::{self, BuildOptions, BuildReport};
-use mecab_rs_build::cli_options::{OptionSpec, Options, lossy_arguments};
+use mecab_rs_tools::build::{self, BuildOptions, BuildReport};
+use mecab_rs_tools::cli_options::{OptionSpec, Options, lossy_arguments};
 
 const USAGE: &str = "usage: mecab-rs-dict-index [options] [files]
 
