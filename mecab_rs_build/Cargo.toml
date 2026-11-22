@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 mecab_rs = { path = ".." }
 memmap2 = "0.9"
-lzma-rust2 = { version = "0.19", default-features = false, features = ["std", "encoder", "optimization", "xz"] }
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "encoder", "optimization", "xz"] }
 
 [features]
 pair-stats = ["mecab_rs/pair-stats"]

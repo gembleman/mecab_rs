@@ -16,7 +16,7 @@ include = ["src/", "README.md", "LICENSE", "Cargo.toml"]
 
 [dependencies]
 memmap2 = "0.9"
-lzma-rust2 = { version = "0.24", default-features = false, features = [
+lzma-rust2 = { version = "0.25", default-features = false, features = [
     "std",
     "optimization",
     "xz",
