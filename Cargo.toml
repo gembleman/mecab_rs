@@ -21,10 +21,15 @@ lzma-rust2 = { version = "0.25", default-features = false, features = [
     "optimization",
     "xz",
 ], optional = true }
+mecab_dict_unidic = { version = "0.1.0", optional = true }
+mecab_dict_ipadic = { version = "0.1.0", optional = true }
+dirs = { version = "6", optional = true }
 
 [features]
 default = ["xz"]
 xz = ["dep:lzma-rust2"]
+unidic = ["xz", "dep:mecab_dict_unidic", "dep:dirs"]
+ipadic = ["xz", "dep:mecab_dict_ipadic", "dep:dirs"]
 pair-stats = []
 
 [profile.release]

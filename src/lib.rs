@@ -2,6 +2,8 @@
 
 #[doc(hidden)]
 pub mod __private;
+#[cfg(any(feature = "unidic", feature = "ipadic"))]
+pub mod bundled;
 mod char_layout;
 mod char_property;
 mod char_table;

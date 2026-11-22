@@ -4,3 +4,4 @@ Cargo.lock
 *.def
 *.bin
 *.dic
+/.cargo/
