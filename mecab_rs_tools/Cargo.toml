@@ -2,7 +2,6 @@
 name = "mecab_rs_tools"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
 license = "BSD-3-Clause"
 description = "Dictionary building, learning and packing tools for mecab_rs"
 publish = false
