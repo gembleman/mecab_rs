@@ -12,7 +12,7 @@ mecab_rs = { path = ".." }
 vibrato = { git = "https://github.com/daac-tools/vibrato.git", rev = "6d80c52a2e5c200fc0c7091840487ee55faf9aaa", default-features = false }
 lindera = { git = "https://github.com/lindera/lindera.git", rev = "2c20c389b6d640053dda2af66c2c109fd3e17a9b", default-features = false, features = ["mmap"] }
 sudachi = { git = "https://github.com/WorksApplications/sudachi.rs.git", rev = "1c21940d1ca6b045eb211ecc1cdb767326f3783f" }
-zstd = "0.12"
+zstd = "0.14"
 serde_json = "1"
 
 [profile.release]
