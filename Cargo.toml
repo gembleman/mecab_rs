@@ -4,7 +4,7 @@ exclude = ["compare"]
 
 [package]
 name = "mecab_rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "BSD-3-Clause"
 description = "Japanese morphological analyzer in pure Rust: a MeCab port with byte-identical output, bundled UniDic and IPAdic, fast and memory-light"
