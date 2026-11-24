@@ -11,8 +11,11 @@ description = "Japanese morphological analyzer in pure Rust: a MeCab port with b
 readme = "README.md"
 repository = "https://github.com/gembleman/mecab_rs"
 keywords = ["mecab", "japanese", "morphology", "tokenizer", "nlp"]
-categories = ["text-processing"]
+categories = ["text-processing", "internationalization"]
 include = ["src/", "README.md", "LICENSE", "Cargo.toml"]
+
+[package.metadata.docs.rs]
+features = ["unidic", "ipadic"]
 
 [dependencies]
 memmap2 = "0.9"

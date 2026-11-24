@@ -1,0 +1,1 @@
+doc-valid-idents = ["MeCab", "UniDic", "IPAdic", "SudachiDict", "mecab_rs", ".."]
